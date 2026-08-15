@@ -2,6 +2,7 @@
 // dynamically imports this module behind that flag, so production never fetches it.
 //   ?mock=1            representative board
 //   &offline=1         session reported offline (banner)
+//   &session=busy      session attached but its drain cursor is behind (dot only, no banner)
 //   &live=1            drip a few scripted events (chime + badge + reconciliation)
 //   &theme=dark|light  force a theme for verification
 // It stubs window.fetch (for /api/* only) and window.EventSource.
@@ -49,7 +50,7 @@ const nextSeq = () => ++seq;
 
 const state = {
   sprint: { id: 3, title: 'Board polish + billing bugs', opened_at: iso(5 * HOUR), closed_at: null, hold_mode: false },
-  sessionOnline: true,
+  sessionStatus: 'online',      // online | busy | offline
   cards: [],
   timelines: {},
   evidence: {},
@@ -320,10 +321,25 @@ state.sidebar = [
 
 function findCard(num) { return state.cards.find((c) => c.num === Number(num)); }
 
+// busy = the waiter is polling right now but the drain cursor is minutes behind:
+// a session mid-dispatch. online = caught up. offline = the waiter itself is gone.
+function sessionPayload() {
+  if (state.sessionStatus === 'busy') {
+    return { status: 'busy', online: true, cursor: 501, head: seq,
+             seconds_since_cursor_move: 214.0, seconds_since_waiter: 1.2 };
+  }
+  if (state.sessionStatus === 'offline') {
+    return { status: 'offline', online: false, cursor: 501, head: seq,
+             seconds_since_cursor_move: 320.0, seconds_since_waiter: 186.0 };
+  }
+  return { status: 'online', online: true, cursor: seq, head: seq,
+           seconds_since_cursor_move: 3.0, seconds_since_waiter: 0.8 };
+}
+
 function boardPayload() {
   return {
     sprint: state.sprint,
-    session: state.sessionOnline ? { status: 'online', last_seen: iso(4000) } : { status: 'offline', last_seen: iso(3 * MIN) },
+    session: sessionPayload(),
     seq,
     cards: state.cards.map((c) => ({ ...c })),
     sidebar: state.sidebar,
@@ -508,7 +524,9 @@ function route(method, path, query, body) {
 let unauth = false;
 
 export function installMock(params) {
-  if (params.get('offline')) state.sessionOnline = false;
+  if (params.get('offline')) state.sessionStatus = 'offline';
+  const sess = params.get('session');
+  if (sess === 'busy' || sess === 'offline' || sess === 'online') state.sessionStatus = sess;
   if (params.get('unauth')) unauth = true;   // &unauth=1 exercises the 401 re-auth wall
 
   const realFetch = window.fetch.bind(window);

@@ -44,14 +44,23 @@ DEFAULT_PORT = 8377
 DATA_DIRNAME = ".sprint"
 DB_FILENAME = "sprint.db"
 SERVER_JSON = "server.json"
+TOKEN_FILENAME = "token"       # survives `stop`; server.json does not
 SERVER_LOG = "server.log"
 ATTACH_DIRNAME = "attachments"
 COOKIE_NAME = "sprint_token"
+# The session's waiter identifies itself with this header so its polling can
+# count as proof-of-life. A browser polling /api/events never sends it -- a
+# browser is not the session, and pretending otherwise would be fake liveness.
+WAITER_HEADER = "X-Sprint-Waiter"
+WAITER_CURSOR = "waiter"       # row in `cursors` holding the last waiter sighting
 
 DEFAULT_MAX_UPLOAD = 25 * 1024 * 1024          # 25 MB, per spec
 DEFAULT_SILENCE_SECONDS = 300.0                 # 5 minutes, per spec
 DEFAULT_SILENCE_TICK = 5.0
-DEFAULT_SESSION_OFFLINE_SECONDS = 90.0          # per spec
+DEFAULT_SESSION_OFFLINE_SECONDS = 90.0          # per spec: cursor lag that counts as "behind"
+DEFAULT_WAITER_ONLINE_SECONDS = 10.0            # waiter seen this recently == attached
+DEFAULT_WAITER_GONE_SECONDS = 30.0             # waiter unseen this long == really gone
+DEFAULT_WAITER_PERSIST_SECONDS = 5.0           # how often the waiter mark hits disk
 DEFAULT_SSE_HEARTBEAT = 15.0                    # per spec
 
 ACTORS = ("user", "session", "worker", "server")
@@ -347,6 +356,9 @@ class App:
     def __init__(self, project_root: str, data_dir: str = None, token: str = None,
                  silence_seconds: float = None, silence_tick: float = None,
                  session_offline_seconds: float = None,
+                 waiter_online_seconds: float = None,
+                 waiter_gone_seconds: float = None,
+                 waiter_persist_seconds: float = None,
                  sse_heartbeat: float = None, max_upload: int = None,
                  log=None):
         self.project_root = os.path.realpath(project_root)
@@ -366,6 +378,15 @@ class App:
         self.session_offline_seconds = (
             session_offline_seconds if session_offline_seconds is not None
             else env_float("SPRINT_SESSION_OFFLINE_SECONDS", DEFAULT_SESSION_OFFLINE_SECONDS))
+        self.waiter_online_seconds = (
+            waiter_online_seconds if waiter_online_seconds is not None
+            else env_float("SPRINT_WAITER_ONLINE_SECONDS", DEFAULT_WAITER_ONLINE_SECONDS))
+        self.waiter_gone_seconds = (
+            waiter_gone_seconds if waiter_gone_seconds is not None
+            else env_float("SPRINT_WAITER_GONE_SECONDS", DEFAULT_WAITER_GONE_SECONDS))
+        self.waiter_persist_seconds = (
+            waiter_persist_seconds if waiter_persist_seconds is not None
+            else env_float("SPRINT_WAITER_PERSIST_SECONDS", DEFAULT_WAITER_PERSIST_SECONDS))
         self.sse_heartbeat = (
             sse_heartbeat if sse_heartbeat is not None
             else env_float("SPRINT_SSE_HEARTBEAT", DEFAULT_SSE_HEARTBEAT))
@@ -383,6 +404,12 @@ class App:
         with self.lock:
             self.conn.executescript(SCHEMA)
         self._silence_thread = None
+        # Waiter proof-of-life. In memory for the hot path (every poll), flushed
+        # to the `cursors` table at most every waiter_persist_seconds so a server
+        # restart doesn't forget that the session was attached a moment ago.
+        row = self.q1("SELECT * FROM cursors WHERE name=?", (WAITER_CURSOR,))
+        self._waiter_seen_at = float(row["updated_at"]) if row else None
+        self._waiter_persisted_at = self._waiter_seen_at or 0.0
 
     # -- infra ------------------------------------------------------------
 
@@ -916,22 +943,95 @@ class App:
         row = self.q1("SELECT * FROM cursors WHERE name=?", (name,))
         return int(row["seq"]) if row else 0
 
+    def note_waiter_seen(self, at: float = None) -> float:
+        """The session's waiter just polled us. That poll IS the session being
+        attached -- it is the one signal that does not go quiet while the
+        orchestrator is busy dispatching, which is exactly when the old
+        cursor-only rule cried 'offline' at a perfectly healthy session.
+
+        Hot path: in-memory. Disk write is throttled, and never blocks a poll.
+        """
+        ts = at if at is not None else now()
+        if self._waiter_seen_at is None or ts > self._waiter_seen_at:
+            self._waiter_seen_at = ts
+        if ts - self._waiter_persisted_at >= self.waiter_persist_seconds:
+            self._waiter_persisted_at = ts
+            try:
+                with self.lock:
+                    self.conn.execute(
+                        "INSERT INTO cursors(name, seq, updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(name) DO UPDATE SET seq=excluded.seq, "
+                        "updated_at=excluded.updated_at",
+                        (WAITER_CURSOR, self.max_seq(), ts))
+            except sqlite3.Error:
+                pass        # liveness must never be able to fail a poll
+        return ts
+
+    def waiter_seen_at(self):
+        """Last waiter sighting: memory first, disk as the cold-start fallback."""
+        if self._waiter_seen_at is not None:
+            return self._waiter_seen_at
+        row = self.q1("SELECT * FROM cursors WHERE name=?", (WAITER_CURSOR,))
+        return float(row["updated_at"]) if row else None
+
     def session_liveness(self) -> dict:
+        """Three honest states, in the user's words:
+
+        - online  -- caught up, or the cursor moved recently, or the waiter just polled
+        - busy    -- the waiter is alive but the cursor is behind pending events
+                     for more than session_offline_seconds ("on it -- catching up")
+        - offline -- events are pending, the cursor is stale, AND the waiter itself
+                     has been gone longer than waiter_gone_seconds
+
+        Nothing here invents liveness: every branch is grounded in something the
+        session actually did (moved its cursor, or polled for events).
+        """
         row = self.q1("SELECT * FROM cursors WHERE name='orchestrator'")
         cursor_seq = int(row["seq"]) if row else 0
         last_seen = float(row["updated_at"]) if row else self.started_at
         head = self.max_seq()
         pending = max(0, head - cursor_seq)
-        stale_for = now() - last_seen
-        online = not (pending > 0 and stale_for > self.session_offline_seconds)
+        ts = now()
+        stale_for = ts - last_seen
+        waiter_at = self.waiter_seen_at()
+        waiter_age = None if waiter_at is None else max(0.0, ts - waiter_at)
+        waiter_fresh = waiter_age is not None and waiter_age <= self.waiter_online_seconds
+        waiter_alive = waiter_age is not None and waiter_age <= self.waiter_gone_seconds
+        cursor_lagging = stale_for > self.session_offline_seconds
+
+        if pending <= 0 or not cursor_lagging:
+            # Caught up, or the cursor moved inside the window: nothing is behind.
+            status = "online"
+        elif waiter_alive:
+            # Behind, but the waiter is right there polling for the next event.
+            # That is a busy session, not a dead one, and it gets no banner.
+            status = "busy"
+        else:
+            status = "offline"
+
+        note = {
+            "online": None,
+            "busy": "session is on it — catching up",
+            "offline": "session offline — items will queue",
+        }[status]
         return {
-            "status": "online" if online else "offline",
+            "status": status,
+            # `online` is what the UI keys its banner off: busy is NOT offline.
+            "online": status != "offline",
+            "note": note,
             "cursor": cursor_seq,
             "head": head,
             "pending": pending,
             "last_cursor_move_at": last_seen,
             "seconds_since_cursor_move": round(stale_for, 1),
             "offline_after_seconds": self.session_offline_seconds,
+            "waiter_seen_at": waiter_at,
+            "seconds_since_waiter": None if waiter_age is None else round(waiter_age, 1),
+            # polling right now (fresh) vs merely seen recently enough to trust
+            "waiter_polling": bool(waiter_fresh),
+            "waiter_alive": bool(waiter_alive),
+            "waiter_online_seconds": self.waiter_online_seconds,
+            "waiter_gone_seconds": self.waiter_gone_seconds,
         }
 
     # -- evidence gate ----------------------------------------------------
@@ -1766,6 +1866,18 @@ def make_handler(app: App):
                 return False
             return secrets.compare_digest(str(given), app.token)
 
+        def is_waiter(self, query) -> bool:
+            """Is this authenticated request the session's own waiter/drain?
+
+            Only something that says so counts. A browser polling /api/events is
+            not the session, and treating its polling as session liveness would
+            be exactly the fake green this card is about.
+            """
+            if (self.headers.get(WAITER_HEADER) or "").strip():
+                return True
+            val = (query.get("waiter") or [""])[0]
+            return str(val).strip().lower() in ("1", "true", "yes", "waiter")
+
         # -- routing ----------------------------------------------------
 
         def do_GET(self):  # noqa: N802
@@ -1832,6 +1944,9 @@ def make_handler(app: App):
             if path == "/api/events":
                 after = int((query.get("after") or ["0"])[0] or 0)
                 limit = max(1, min(2000, int((query.get("limit") or ["500"])[0] or 500)))
+                # The session's waiter drains here; its poll is proof it is attached.
+                if self.is_waiter(query):
+                    app.note_waiter_seen()
                 events = app.events_after(after, limit)
                 return self.json_out(200, {"events": events, "after": after,
                                            "head": app.max_seq(),
@@ -2011,6 +2126,9 @@ def make_handler(app: App):
                     seq = int(seq)
                 except (TypeError, ValueError):
                     raise ApiError(400, "missing_field", "seq is required", field="seq")
+                # Only the session posts its own drain cursor -- that is a
+                # sighting of the session by definition.
+                app.note_waiter_seen()
                 return 200, app.set_cursor("orchestrator", seq)
 
             m = re.match(r"^/api/cards/(\d+)/([a-z_]+)$", path)
@@ -2117,9 +2235,38 @@ def paths_for(project_root: str, data_dir: str = None) -> dict:
     return {
         "data_dir": data,
         "server_json": os.path.join(data, SERVER_JSON),
+        "token": os.path.join(data, TOKEN_FILENAME),
         "log": os.path.join(data, SERVER_LOG),
         "db": os.path.join(data, DB_FILENAME),
     }
+
+
+def read_token_file(path: str):
+    """The bearer token, kept OUTSIDE server.json so it survives `stop`.
+
+    server.json is a liveness record and is deleted when the server exits; the
+    token is an identity and must not be. Minting a new one on every restart
+    logs every open browser out and invalidates the printed URL.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            tok = fh.read().strip()
+    except OSError:
+        return None
+    return tok or None
+
+
+def write_token_file(path: str, token: str):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(token + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def read_server_json(path: str):
@@ -2143,12 +2290,15 @@ def write_server_json(path: str, info: dict):
         pass
 
 
-def http_get(host: str, port: int, path: str, token: str = None, timeout: float = 3.0):
+def http_get(host: str, port: int, path: str, token: str = None, timeout: float = 3.0,
+             extra_headers: dict = None):
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         headers = {"Accept": "application/json"}
         if token:
             headers["Authorization"] = "Bearer " + token
+        if extra_headers:
+            headers.update(extra_headers)
         conn.request("GET", path, headers=headers)
         resp = conn.getresponse()
         raw = resp.read()
@@ -2281,7 +2431,15 @@ def cmd_start(args) -> int:
 
     port = args.port if args.port is not None else (
         (info or {}).get("port") or DEFAULT_PORT)
-    token = args.token or (info or {}).get("token") or secrets.token_urlsafe(24)
+    # Token identity survives stop/start: the printed URL keeps working and every
+    # logged-in browser stays logged in. --new-token is the explicit rotate.
+    if args.token:
+        token = args.token                       # an explicit value always wins
+    elif args.new_token:
+        token = secrets.token_urlsafe(24)        # deliberate rotation
+    else:
+        token = ((info or {}).get("token")
+                 or read_token_file(p["token"]) or secrets.token_urlsafe(24))
 
     ts_ip = "" if args.no_tailscale else tailscale_ip()
     if not ts_ip:
@@ -2336,6 +2494,11 @@ def cmd_start(args) -> int:
         "hosts": hosts, "token": token, "project_root": project_root,
         "started_at": app.started_at, "data_dir": p["data_dir"],
     })
+    try:
+        write_token_file(p["token"], token)
+    except OSError as exc:
+        app.log("could not persist token file %s (%s) -- the token will not "
+                "survive a stop/start" % (p["token"], exc))
 
     urls = [board_url(h, actual_port, token) for h in hosts]
     app.log("listening on %s (project %s)" % (
@@ -2451,9 +2614,13 @@ def cmd_status(args) -> int:
         if state == "healthy":
             print("running  pid=%s  %s" % (out.get("pid"), out.get("url")))
             if out.get("session"):
-                print("session: %s (cursor %s of %s)" % (
-                    out["session"].get("status"), out["session"].get("cursor"),
-                    out["session"].get("head")))
+                sess = out["session"]
+                line = "session: %s (cursor %s of %s" % (
+                    sess.get("status"), sess.get("cursor"), sess.get("head"))
+                since = sess.get("seconds_since_waiter")
+                line += ", waiter %s)" % (
+                    "never seen" if since is None else "seen %ss ago" % since)
+                print(line)
         else:
             print("not running (%s)" % state)
     return 0 if state == "healthy" else 1
@@ -2476,7 +2643,10 @@ def cmd_wait(args) -> int:
         try:
             status, raw = http_get("127.0.0.1", port,
                                    "/api/events?after=%d&limit=1" % after, token,
-                                   timeout=5.0)
+                                   timeout=5.0,
+                                   # every poll is a heartbeat: this is the
+                                   # session sitting here waiting for work
+                                   extra_headers={WAITER_HEADER: "sprintd-wait"})
         except (OSError, http.client.HTTPException) as exc:
             print("sprintd unreachable on 127.0.0.1:%s (%s)" % (port, exc), file=sys.stderr)
             return 3
@@ -2667,6 +2837,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--port", type=int, default=None,
                    help="port (default %d, reused across restarts)" % DEFAULT_PORT)
     s.add_argument("--token", default=None, help="force a bearer token")
+    s.add_argument("--new-token", action="store_true",
+                   help="mint a fresh token (default: reuse the existing one so "
+                        "the printed URL and every logged-in browser survive a restart)")
     s.add_argument("--foreground", action="store_true", help="do not daemonize")
     s.add_argument("--no-tailscale", action="store_true",
                    help="skip tailscale lookup; bind loopback only")

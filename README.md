@@ -58,6 +58,22 @@ propose sensible batches (e.g. a dozen small CSS issues → one agent, one
 branch) instead of spinning up a worktree per card. Release when you're
 ready.
 
+## What the session dot means
+
+Top-right of the board, next to "session":
+
+| Dot | Reads | What's true |
+|---|---|---|
+| green | session live | It's caught up on everything you've sent. |
+| amber | session catching up | It's attached and working, but hasn't read the last few items yet — usually because it's mid-dispatch. Nothing to do; it'll catch up. |
+| red + banner | session offline | Nothing is listening. What you send waits in the queue and gets picked up when the session comes back. |
+
+Only the red state raises a banner. "Catching up" is a working session,
+so it stays on the dot where you can ignore it. The board knows the
+difference because the session's waiter polls `/api/events` continuously
+while it's attached — that polling is the proof of life, not the drain
+cursor, which legitimately falls minutes behind during a busy dispatch.
+
 ## Power-outage recovery
 
 The Mac this runs on is online 24/7, but power outages happen. Recovery
@@ -82,6 +98,22 @@ like real work), and picks the drain loop back up exactly where it left
 off. There's no separate "resume mode" to remember the syntax for — the
 same "start a sprint" trigger works too; the skill figures out on its
 own whether this is a fresh boot or a resume.
+
+**Your board URL survives a restart.** `sprintd stop` followed by
+`sprintd start` reuses the same port *and the same token*, so the URL you
+bookmarked keeps working and any browser already logged in stays logged
+in. The token is kept in `.sprint/token` (mode 0600), separate from
+`.sprint/server.json` — `server.json` is a liveness record and is deleted
+when the server exits; the token is an identity and isn't. To deliberately
+rotate it (and log every open browser out), start with `--new-token`:
+
+```
+bin/sprintd stop
+bin/sprintd start --new-token      # prints a fresh URL; the old one 401s
+```
+
+`--token <value>` still forces a specific token, and whatever you force
+becomes the one that's reused on the next plain `start`.
 
 Optional: `sprintd doctor --install-launchd` writes a macOS LaunchAgent
 (`~/Library/LaunchAgents/com.sprint.<hash-of-project-root>.plist`) with
@@ -132,7 +164,8 @@ lives in the session, driven by the skill in
   tailnet available → loopback-only, and it says so instead of silently
   narrowing your reach.
 - **Bearer token.** A random token is generated on first start and
-  stored in `.sprint/server.json`. The browser gets it once via
+  stored in `.sprint/token` (mirrored into `.sprint/server.json` while
+  the server is up), both mode 0600. The browser gets it once via
   `?t=TOKEN` (sets a cookie); the API accepts either the cookie or an
   `Authorization: Bearer` header. Worker subagents receive the token
   only through their dispatch brief — it's never hardcoded, never
