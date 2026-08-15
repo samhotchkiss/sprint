@@ -177,6 +177,17 @@ Dispatch order: pinned cards first, then oldest-queued-first. Don't
 dispatch `held` cards — those wait for hold mode to release or an
 explicit per-card `release`.
 
+**Merge on ready (user policy, verbatim): "we shouldn't hesitate to
+merge 'ready' fixes — often testing is much easier once it's merged
+anyway... let it merge and go to staging so we can test the fuller
+environment."** When a card's evidence packet is accepted and the gate
+is green on a trial merge, merge it THEN — do not wait for the verdict.
+The card stays `ready` with a "merged & live" note; the user's Approve
+just closes it, and a post-merge Bounce is fix-forward (a follow-up
+commit by the same agent), never a revert. Restart `sprintd` after
+server-code merges (one restart per batch of merges, with the persisted
+token) and say so in the sidebar.
+
 **A "queued behind X" promise is a trigger, not a note.** Every time ANY
 card changes state — a merge lands, a card flips ready, an agent frees a
 slot — re-walk every `queued` and `blocked` card and ask: does its
