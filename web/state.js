@@ -48,6 +48,7 @@ export const store = {
   seq: 0,
   detail: null,           // {num, card, timeline, evidence, attachments, pendingLines}
   drafts: new Map(),      // freeform text kept across re-renders
+  expanded: new Set(),    // event keys whose long version you opened (see detail.js)
   doneOpen: false,
   loaded: false,
 };
@@ -321,6 +322,14 @@ function sorterFor(key, now) {
   if (key === 'needs_you' || key === 'blocked' || key === 'ready') return wrap(oldestFirst);
   if (key === 'done') return wrap(newestFirst);
   return wrap(oldestFirst);
+}
+
+/** Which expanded details you left open, so a re-render doesn't slam them shut. */
+export function detailOpen(key, value) {
+  if (value === undefined) return store.expanded.has(key);
+  if (value) store.expanded.add(key);
+  else store.expanded.delete(key);
+  return value;
 }
 
 export function draft(key, value) {

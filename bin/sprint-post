@@ -2,9 +2,22 @@
 """sprint-post — post a progress/chat/note/error event to a sprint card.
 
 Usage:
-  sprint-post <num> <kind> <text...> [--long-running] [--server URL] [--token TOKEN]
+  sprint-post <num> <kind> <text...> [--detail TEXT | --detail-file PATH]
+                                     [--long-running] [--server URL] [--token TOKEN]
 
   kind must be one of: progress, chat, note, error
+
+Every event is TWO things: a one-line `text` you can skim in a scrolling
+timeline, and an OPTIONAL `detail` you can expand when you want to dig in
+(command output, a test log, the reasoning behind the line). The board shows
+the one-liner and hides the detail behind a "more" toggle.
+
+  sprint-post 42 progress "suite green — 118 pass, 0 fail" --detail-file /tmp/test.log
+  sprint-post 42 note "picked sqlite over a file lock" --detail "Three reasons: ..."
+
+`text` is kept to one line and 140 characters. Too long is never an error: it
+gets truncated with a notice on stderr, and if you didn't pass a detail of your
+own the full text is moved into `detail` so nothing you wrote is lost.
 
 Reads server URL and bearer token from --server/--token or the
 SPRINT_SERVER / SPRINT_TOKEN environment variables. Validates client-side
@@ -24,13 +37,28 @@ import urllib.request
 
 KINDS = ("progress", "chat", "note", "error")
 
+# The one-liner is what a human skims in a scrolling timeline; anything longer
+# belongs in --detail. Big detail still gets a ceiling so a runaway log can't
+# blow past the server's request cap.
+ONE_LINER_MAX = 140
+DETAIL_MAX = 200_000
 
-def fail(field, detail=""):
+
+def fail(field, why=""):
     msg = f"sprint-post: missing required field: {field}"
-    if detail:
-        msg += f" ({detail})"
+    if why:
+        msg += f" ({why})"
     print(msg, file=sys.stderr)
     sys.exit(2)
+
+
+def notice(msg):
+    print(f"sprint-post: {msg}", file=sys.stderr)
+
+
+def one_line(text, limit=ONE_LINER_MAX):
+    s = str("" if text is None else text).strip().split("\n")[0].strip()
+    return s if len(s) <= limit else s[:limit - 1].rstrip() + "…"
 
 
 def parse_args(argv):
@@ -41,6 +69,10 @@ def parse_args(argv):
     p.add_argument("num", nargs="?", help="card number")
     p.add_argument("kind", nargs="?", help="progress|chat|note|error")
     p.add_argument("text", nargs="*", help="event text (quote it, or pass multiple words)")
+    p.add_argument("--detail", default=None,
+                    help="optional expanded version (multi-line ok): output, reasoning, a log")
+    p.add_argument("--detail-file", default=None, dest="detail_file",
+                    help="read the expanded version from a file (e.g. a captured test log)")
     p.add_argument("--long-running", action="store_true", dest="long_running",
                     help="mark this as a legit long-running step (suppresses the 5-minute silence timer)")
     p.add_argument("--server", default=os.environ.get("SPRINT_SERVER"),
@@ -68,14 +100,51 @@ def validate(args):
         fail("server", "pass --server or set SPRINT_SERVER")
     if not args.token:
         fail("token", "pass --token or set SPRINT_TOKEN")
-    return num, args.kind, text
+    return num, args.kind, text, read_detail(args)
+
+
+def read_detail(args):
+    """--detail / --detail-file → one string (or None). They're exclusive."""
+    if args.detail is not None and args.detail_file is not None:
+        fail("detail", "pass --detail or --detail-file, not both")
+    detail = args.detail
+    if args.detail_file is not None:
+        try:
+            with open(args.detail_file, "r", encoding="utf-8", errors="replace") as fh:
+                detail = fh.read()
+        except OSError as e:
+            fail("detail-file", f"could not read {args.detail_file}: {e.strerror or e}")
+    if detail is None:
+        return None
+    if not detail.strip():
+        return None                       # empty file / empty string: nothing to expand
+    if len(detail) > DETAIL_MAX:
+        notice(f"detail is {len(detail)} chars — keeping the first {DETAIL_MAX}")
+        detail = detail[:DETAIL_MAX].rstrip() + f"\n\n… [truncated at {DETAIL_MAX} characters]"
+    return detail.rstrip()
+
+
+def skim_line(text, detail):
+    """Keep `text` to one skimmable line. Never rejects: it truncates, says so
+    on stderr, and moves the full text into `detail` so nothing you wrote is
+    lost -- the timeline stays skimmable, the words stay readable."""
+    line = one_line(text)
+    if line == text.strip():
+        return line, detail
+    notice(f"text was longer than one line / {ONE_LINER_MAX} chars — kept the first "
+           "line as the one-liner and moved the full text into the expanded detail")
+    full = text.strip()
+    return line, full if detail is None else full + "\n\n" + detail
 
 
 def main(argv):
     args = parse_args(argv)
-    num, kind, text = validate(args)
+    num, kind, text, detail = validate(args)
+    text, detail = skim_line(text, detail)
 
     payload = {"text": text}
+    if detail:
+        payload["detail"] = detail
     if args.long_running:
         payload["long_running"] = True
 
@@ -94,11 +163,12 @@ def main(argv):
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
-            print(f"sprint-post: posted {kind} event to #{num}")
+            extra = f" (+{len(detail)} chars of detail)" if detail else ""
+            print(f"sprint-post: posted {kind} event to #{num}{extra}")
             return 0
     except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")
-        print(f"sprint-post: server rejected the event ({e.code}): {detail}", file=sys.stderr)
+        why = e.read().decode("utf-8", "replace")
+        print(f"sprint-post: server rejected the event ({e.code}): {why}", file=sys.stderr)
         return 1
     except urllib.error.URLError as e:
         print(f"sprint-post: could not reach {server}: {e.reason}", file=sys.stderr)

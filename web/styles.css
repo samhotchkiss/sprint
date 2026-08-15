@@ -634,6 +634,37 @@ ol.validate li::marker { color: var(--green); font-weight: 600; }
 .msg.actor-worker.kind-question .msg-text { background: var(--violet-bg); }
 .msg.pending { opacity: .6; }
 
+/* ---------- skim the one-liner, dig into the long version ---------- */
+/* Every event line reads on its own. When there's more behind it — a test log,
+   the reasoning, a stack — it hides under a quiet "more" and opens in place.
+   Nothing above the line moves; the page never jumps under your eyes. */
+.sysline-wrap { display: flex; flex-direction: column; gap: 3px; }
+.detail { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-top: 2px; }
+.detail-toggle {
+  display: inline-flex; align-items: center; gap: 5px;
+  font: inherit; font-size: 11.5px; line-height: 1.5;
+  color: var(--ink-3); background: none; cursor: pointer;
+  border: 1px solid transparent; border-radius: 999px; padding: 2px 9px 2px 7px;
+}
+.detail-toggle:hover { color: var(--ink-2); background: var(--sunk); border-color: var(--line); }
+.detail-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.detail-toggle.is-open { color: var(--ink-2); }
+.detail-chev { display: inline-block; font-size: 13px; line-height: 1; transition: transform .12s ease-out; }
+.detail-toggle.is-open .detail-chev { transform: rotate(90deg); }
+.detail-hint { color: var(--ink-3); opacity: .8; }
+.detail-body {
+  margin: 0; width: 100%; max-width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.5; color: var(--ink-2);
+  background: var(--sunk); border: 1px solid var(--line); border-radius: 9px;
+  padding: 8px 10px; white-space: pre; tab-size: 2;
+  max-height: 46vh; overflow: auto; overscroll-behavior: contain;
+}
+.detail-body[hidden] { display: none; }
+.detail.small { margin-left: 10px; }
+.detail.small .detail-toggle { font-size: 11px; }
+.detail.small .detail-body { font-size: 11.5px; max-height: 34vh; }
+
 .drawer-foot { border-top: 1px solid var(--line); padding: 10px 14px; display: flex; flex-direction: column; gap: 9px; background: var(--panel); }
 .verdict-block { display: flex; flex-direction: column; gap: 8px; }
 .verdicts { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -726,6 +757,7 @@ ol.validate li::marker { color: var(--green); font-weight: 600; }
   .board { padding: 8px 12px 12px; gap: 9px; }
   .card { padding: 9px 11px 10px; }
   .btn.quick { min-height: 40px; }
+  .detail-toggle { min-height: 40px; padding-inline: 11px 14px; }
   .answer-box { min-height: 40px; }
   .done-row { min-height: 40px; }
   .drawer { width: min(560px, 92vw); }
