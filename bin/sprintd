@@ -3524,16 +3524,16 @@ function render(data){
     var counts = r.reachable
       ? '<span class="'+(r.needs_you?'hot':'')+'"><b>'+r.needs_you+'</b> need you</span>'+
         ' / <b>'+r.ready+'</b> ready / <b>'+r.in_motion+'</b> in motion'
-      : (r.detail? esc(r.detail) : 'not answering on port '+r.port);
+      : 'unreachable — last seen '+
+        age(t-(r.last_seen||r.started_at||t))+' ago';
     var actAge = r.last_activity_at!=null ? age(t-r.last_activity_at) : null;
     var meta = r.reachable
       ? (r.last_activity? esc(r.last_activity)+" · "+actAge+" ago"
                         : "no activity yet")
-      : "unreachable — last seen "+age(t-(r.last_seen||r.started_at||t))+" ago";
+      : (r.detail? esc(r.detail) : "nothing answering on port "+r.port);
     var right = r.reachable && r.url
-      ? '<a class="open" href="'+esc(r.url)+'">open board</a>'
-      : '<span class="gone">port '+r.port+'</span>';
-    return '<li class="'+cls.join(" ")+'">'+
+      ? '<a class="open" href="'+esc(r.url)+'">open board</a>' : '';
+    return '<li class="'+cls.join(" ")+'" title="'+esc(r.project_root)+'">'+
       '<span class="left">'+
         '<span class="name"><span class="dot '+(r.reachable?esc(r.session||""):"")+
           '"></span>'+esc(r.name)+stuck+'</span>'+
@@ -3542,7 +3542,7 @@ function render(data){
       '</span>'+
       '<span class="right">'+right+
         '<span class="gone">'+(r.reachable? esc(sessionLabel(r.session))
-                                          : 'offline')+'</span>'+
+                                          : 'board not running')+'</span>'+
       '</span></li>';
   }).join("");
 }

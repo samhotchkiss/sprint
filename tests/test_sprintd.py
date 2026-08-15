@@ -2342,5 +2342,645 @@ class TestSprintPostHelper(Base):
         self.assertNotIn("detail", p)
 
 
+class RegistryBase(unittest.TestCase):
+    """Every registry/hub test points $SPRINT_REGISTRY at a temp file, so the
+    real ~/.sprint on this machine is never read, written, or pruned."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-reg-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.registry = os.path.join(self.tmp, "hubstate", "registry.json")
+        self._old_env = os.environ.get("SPRINT_REGISTRY")
+        os.environ["SPRINT_REGISTRY"] = self.registry
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        if self._old_env is None:
+            os.environ.pop("SPRINT_REGISTRY", None)
+        else:
+            os.environ["SPRINT_REGISTRY"] = self._old_env
+
+    def entry(self, name, port, pid=None, started_at=None, root=None, data_dir=None):
+        root = root or os.path.join(self.tmp, name)
+        os.makedirs(root, exist_ok=True)
+        return sprintd.registry_entry(root, port, "127.0.0.1", data_dir=data_dir,
+                                      pid=pid if pid is not None else os.getpid(),
+                                      started_at=started_at)
+
+
+class TestRegistry(RegistryBase):
+    def test_env_override_keeps_the_real_home_registry_untouched(self):
+        self.assertEqual(sprintd.registry_path(), os.path.abspath(self.registry))
+        home_reg = os.path.join(os.path.expanduser("~"), ".sprint", "registry.json")
+        before = os.path.exists(home_reg)
+        before_mtime = os.path.getmtime(home_reg) if before else None
+        sprintd.registry_register(self.entry("alpha", 9101))
+        self.assertTrue(os.path.exists(self.registry))
+        self.assertEqual(os.path.exists(home_reg), before)
+        if before:
+            self.assertEqual(os.path.getmtime(home_reg), before_mtime)
+
+    def test_explicit_argument_beats_the_env_override(self):
+        other = os.path.join(self.tmp, "other", "reg.json")
+        self.assertEqual(sprintd.registry_path(other), os.path.abspath(other))
+        sprintd.registry_register(self.entry("beta", 9102), other)
+        self.assertTrue(os.path.exists(other))
+        self.assertFalse(os.path.exists(self.registry))
+
+    def test_hub_state_lives_beside_the_registry(self):
+        """One override has to move the whole machine-wide state -- otherwise a
+        test hub would read (or clobber) the real hub's token."""
+        self.assertEqual(os.path.dirname(sprintd.hub_token_path()),
+                         os.path.dirname(os.path.abspath(self.registry)))
+        self.assertEqual(os.path.dirname(sprintd.hub_json_path()),
+                         os.path.dirname(os.path.abspath(self.registry)))
+
+    def test_register_writes_one_row_per_project_root(self):
+        e = self.entry("alpha", 9101)
+        sprintd.registry_register(e)
+        rows = sprintd.read_registry()
+        self.assertEqual(list(rows), [e["project_root"]])
+        self.assertEqual(rows[e["project_root"]]["name"], "alpha")
+        self.assertEqual(rows[e["project_root"]]["port"], 9101)
+
+    def test_restarting_the_same_board_updates_its_row_not_adds_one(self):
+        """One Claude session == one sprint == one project root: a restart is
+        the same board, never a second row on the hub."""
+        root = os.path.join(self.tmp, "alpha")
+        sprintd.registry_register(self.entry("alpha", 9101, pid=111, root=root))
+        sprintd.registry_register(self.entry("alpha", 9109, pid=222, root=root))
+        rows = sprintd.read_registry()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[os.path.realpath(root)]["port"], 9109)
+        self.assertEqual(rows[os.path.realpath(root)]["pid"], 222)
+
+    def test_two_projects_are_two_rows(self):
+        sprintd.registry_register(self.entry("alpha", 9101))
+        sprintd.registry_register(self.entry("beta", 9102))
+        self.assertEqual(len(sprintd.read_registry()), 2)
+
+    def test_unregister_removes_only_that_row(self):
+        a = self.entry("alpha", 9101)
+        b = self.entry("beta", 9102)
+        sprintd.registry_register(a)
+        sprintd.registry_register(b)
+        self.assertTrue(sprintd.registry_unregister(a["project_root"]))
+        rows = sprintd.read_registry()
+        self.assertEqual(list(rows), [b["project_root"]])
+        # removing something already gone is a no-op, not an error
+        self.assertFalse(sprintd.registry_unregister(a["project_root"]))
+
+    def test_a_dying_server_cannot_delete_the_row_a_newer_one_just_wrote(self):
+        root = os.path.join(self.tmp, "alpha")
+        sprintd.registry_register(self.entry("alpha", 9101, pid=111, root=root))
+        sprintd.registry_register(self.entry("alpha", 9109, pid=222, root=root))
+        self.assertFalse(sprintd.registry_unregister(root, pid=111))
+        self.assertEqual(len(sprintd.read_registry()), 1)
+        self.assertTrue(sprintd.registry_unregister(root, pid=222))
+        self.assertEqual(sprintd.read_registry(), {})
+
+    def test_write_is_atomic_and_0600_with_no_tmp_left_behind(self):
+        sprintd.registry_register(self.entry("alpha", 9101))
+        self.assertEqual(oct(os.stat(self.registry).st_mode)[-3:], "600")
+        leftovers = [f for f in os.listdir(os.path.dirname(self.registry))
+                     if ".tmp" in f]
+        self.assertEqual(leftovers, [], "temp files must be renamed, not left")
+
+    def test_a_reader_never_sees_a_half_written_registry(self):
+        """The rename-based write is what makes the hub safe to poll while two
+        boards are starting: a reader sees the old file or the new one."""
+        sprintd.registry_register(self.entry("alpha", 9101))
+        stop = threading.Event()
+        seen = []
+
+        def reader():
+            while not stop.is_set():
+                seen.append(len(sprintd.read_registry()))
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        try:
+            for i in range(60):
+                sprintd.registry_register(self.entry("beta", 9200 + i))
+                sprintd.registry_unregister(os.path.join(self.tmp, "beta"))
+        finally:
+            stop.set()
+            t.join(timeout=5)
+        self.assertGreater(len(seen), 10, "reader thread never ran")
+        self.assertNotIn(0, seen,
+                         "a torn/truncated read would have shown zero entries")
+
+    def test_a_corrupt_registry_reads_as_empty_instead_of_exploding(self):
+        os.makedirs(os.path.dirname(self.registry), exist_ok=True)
+        with open(self.registry, "w", encoding="utf-8") as fh:
+            fh.write("{not json at all")
+        self.assertEqual(sprintd.read_registry(), {})
+        # ...and the next register repairs it
+        sprintd.registry_register(self.entry("alpha", 9101))
+        self.assertEqual(len(sprintd.read_registry()), 1)
+
+    def test_missing_registry_is_simply_empty(self):
+        self.assertEqual(sprintd.read_registry(), {})
+
+    def test_touch_merges_fields_into_an_existing_row_only(self):
+        a = self.entry("alpha", 9101)
+        sprintd.registry_register(a)
+        sprintd.registry_touch(a["project_root"], {"last_seen": 12345.0})
+        self.assertEqual(sprintd.read_registry()[a["project_root"]]["last_seen"],
+                         12345.0)
+        sprintd.registry_touch("/nope/not/here", {"last_seen": 1.0})
+        self.assertEqual(len(sprintd.read_registry()), 1)
+
+    def test_a_fresh_start_clears_the_stale_last_seen(self):
+        a = self.entry("alpha", 9101)
+        sprintd.registry_register(a)
+        sprintd.registry_touch(a["project_root"], {"last_seen": 12345.0})
+        sprintd.registry_register(self.entry("alpha", 9101))
+        self.assertNotIn("last_seen",
+                         sprintd.read_registry()[a["project_root"]])
+
+
+class HubBase(RegistryBase):
+    """Spins real boards (real HTTP server, real sqlite, temp data dir) and
+    points a real HubApp at them through a temp registry."""
+
+    def setUp(self):
+        super().setUp()
+        self.boards = {}
+
+    def board(self, name, token=None, write_token=True):
+        token = token or ("%s-token" % name)
+        root = os.path.join(self.tmp, name)
+        os.makedirs(root, exist_ok=True)
+        logfh = open(os.path.join(self.tmp, "%s.log" % name), "a", encoding="utf-8")
+        self.addCleanup(logfh.close)
+        app = sprintd.App(root, log=logfh, token=token,
+                          session_offline_seconds=90.0)
+        httpd = sprintd.make_server(app, "127.0.0.1", 0)
+        port = httpd.server_address[1]
+        self.assertNotEqual(port, sprintd.DEFAULT_PORT)
+        threading.Thread(target=httpd.serve_forever,
+                         kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        def shutdown():
+            httpd.shutdown()
+            httpd.server_close()
+            app.close()
+
+        self.addCleanup(shutdown)
+        if write_token:
+            # exactly what `sprintd start` writes; it is where the hub reads from
+            sprintd.write_token_file(os.path.join(app.data_dir, "token"), token)
+        b = {"app": app, "port": port, "token": token, "root": root,
+             "data_dir": app.data_dir, "name": name}
+        self.boards[name] = b
+        sprintd.registry_register(sprintd.registry_entry(
+            root, port, "127.0.0.1", data_dir=app.data_dir))
+        return b
+
+    def bpost(self, b, path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", b["port"], timeout=10)
+        try:
+            conn.request("POST", path,
+                         body=json.dumps(body or {}).encode("utf-8"),
+                         headers={"Authorization": "Bearer " + b["token"],
+                                  "Content-Type": "application/json"})
+            resp = conn.getresponse()
+            raw = resp.read()
+            return resp.status, json.loads(raw.decode("utf-8"))
+        finally:
+            conn.close()
+
+    def card(self, b, text="something"):
+        status, card = self.bpost(b, "/api/cards", {"text": text})
+        self.assertEqual(status, 201, card)
+        return card["num"]
+
+    def card_in_progress(self, b, text="working"):
+        num = self.card(b, text)
+        self.bpost(b, "/api/cards/%d/state" % num, {"state": "triaging"})
+        self.bpost(b, "/api/cards/%d/state" % num, {"state": "in_progress"})
+        return num
+
+    def card_needs_you(self, b, text="stuck", question="which one?"):
+        num = self.card_in_progress(b, text)
+        status, body = self.bpost(b, "/api/cards/%d/question" % num, {"text": question})
+        self.assertIn(status, (200, 201), body)
+        return num
+
+    def card_ready(self, b, text="done"):
+        num = self.card_in_progress(b, text)
+        packet = dict(GOOD_PACKET)
+        status, body = self.bpost(b, "/api/cards/%d/ready" % num, {"packet": packet})
+        self.assertEqual(status, 200, body)
+        return num
+
+    def rows(self, hub):
+        return {r["name"]: r for r in hub.refresh()["sprints"]}
+
+
+class TestHubAggregation(HubBase):
+    def test_counts_every_board_separately(self):
+        a = self.board("alpha")
+        b = self.board("beta")
+        self.card_needs_you(a, "a1")
+        self.card_needs_you(a, "a2")
+        self.card_in_progress(a, "a3")
+        self.card_ready(b, "b1")
+        self.card(b, "b2")           # sits in queued
+
+        hub = sprintd.HubApp(token="hub-token")
+        rows = self.rows(hub)
+        self.assertEqual(set(rows), {"alpha", "beta"})
+        self.assertEqual((rows["alpha"]["needs_you"], rows["alpha"]["ready"],
+                          rows["alpha"]["in_motion"]), (2, 0, 1))
+        self.assertEqual((rows["beta"]["needs_you"], rows["beta"]["ready"],
+                          rows["beta"]["in_motion"]), (0, 1, 0))
+        self.assertEqual(rows["beta"]["queued"], 1)
+        self.assertTrue(rows["alpha"]["reachable"])
+        self.assertEqual(rows["alpha"]["status"], "live")
+
+    def test_the_link_carries_that_board_s_own_token(self):
+        a = self.board("alpha", token="alpha-secret")
+        hub = sprintd.HubApp(token="hub-token")
+        url = self.rows(hub)["alpha"]["url"]
+        self.assertEqual(url, "http://127.0.0.1:%d/?t=alpha-secret" % a["port"])
+        # and it really signs you in: the board takes it as the query token
+        status, _ = sprintd.http_get("127.0.0.1", a["port"], "/api/board",
+                                     "alpha-secret")
+        self.assertEqual(status, 200)
+
+    def test_needs_you_sorts_to_the_top_with_the_oldest_question_s_age(self):
+        quiet = self.board("quiet")
+        waiting = self.board("waiting")
+        self.card_ready(quiet)
+        num = self.card_needs_you(waiting, "old one", "answer me")
+        self.card_needs_you(waiting, "new one", "and me")
+        # backdate the FIRST question by 22 minutes: "stuck 22m" is the oldest
+        # thing waiting on the user, not the newest.
+        waiting["app"].conn.execute(
+            "UPDATE questions SET created_at=created_at-1320 WHERE card_num=?", (num,))
+        waiting["app"].conn.commit()
+
+        hub = sprintd.HubApp(token="hub-token")
+        snap = hub.refresh()
+        self.assertEqual([r["name"] for r in snap["sprints"]], ["waiting", "quiet"])
+        top = snap["sprints"][0]
+        self.assertEqual(top["stuck_card"], num)
+        self.assertGreater(top["stuck_seconds"], 1300)
+        self.assertLess(top["stuck_seconds"], 1400)
+        self.assertEqual(snap["needs_you_total"], 2)
+
+    def test_the_longest_wait_sorts_above_a_shorter_one(self):
+        first = self.board("newer")
+        second = self.board("older")
+        self.card_needs_you(first)
+        num = self.card_needs_you(second)
+        second["app"].conn.execute(
+            "UPDATE questions SET created_at=created_at-600 WHERE card_num=?", (num,))
+        second["app"].conn.commit()
+        hub = sprintd.HubApp(token="hub-token")
+        self.assertEqual([r["name"] for r in hub.refresh()["sprints"]],
+                         ["older", "newer"])
+
+    def test_liveness_and_last_activity_come_from_the_board_itself(self):
+        a = self.board("alpha")
+        self.card(a, "hello")
+        hub = sprintd.HubApp(token="hub-token")
+        row = self.rows(hub)["alpha"]
+        self.assertIn(row["session"], ("online", "busy", "offline"))
+        self.assertIsNotNone(row["last_activity_at"])
+        self.assertIn("#1", row["last_activity"])
+
+    def test_an_empty_registry_is_an_empty_page_not_an_error(self):
+        hub = sprintd.HubApp(token="hub-token")
+        snap = hub.refresh()
+        self.assertEqual(snap["sprints"], [])
+        self.assertEqual(snap["count"], 0)
+        self.assertEqual(snap["needs_you_total"], 0)
+
+
+class TestHubDeadBoards(HubBase):
+    def test_a_dead_board_is_greyed_and_kept_not_dropped(self):
+        alive = self.board("alive")
+        self.card(alive)
+        # a board that went away: pid gone, nothing on the port, seen 4m ago
+        dead_root = os.path.join(self.tmp, "gone")
+        os.makedirs(dead_root, exist_ok=True)
+        sprintd.registry_register(sprintd.registry_entry(
+            dead_root, self._closed_port(), "127.0.0.1", pid=999999,
+            started_at=sprintd.now() - 240))
+
+        hub = sprintd.HubApp(token="hub-token", prune_seconds=900.0)
+        snap = hub.refresh()
+        names = [r["name"] for r in snap["sprints"]]
+        self.assertEqual(names, ["alive", "gone"], "dead boards sink, never vanish")
+        dead = snap["sprints"][-1]
+        self.assertFalse(dead["reachable"])
+        self.assertEqual(dead["status"], "unreachable")
+        self.assertIsNone(dead["url"], "no sign-in link to a board that is gone")
+        self.assertFalse(dead["pid_alive"])
+        # still on file, so the row keeps rendering with "last seen Xm"
+        self.assertIn(os.path.realpath(dead_root), sprintd.read_registry())
+
+    def test_a_long_dead_board_is_pruned_from_the_registry(self):
+        dead_root = os.path.join(self.tmp, "ancient")
+        os.makedirs(dead_root, exist_ok=True)
+        sprintd.registry_register(sprintd.registry_entry(
+            dead_root, self._closed_port(), "127.0.0.1", pid=999999,
+            started_at=sprintd.now() - 5000))
+        hub = sprintd.HubApp(token="hub-token", prune_seconds=900.0)
+        snap = hub.refresh()
+        self.assertEqual(snap["sprints"], [])
+        self.assertEqual(sprintd.read_registry(), {},
+                         "the file is advisory: the hub prunes what it proved dead")
+
+    def test_a_live_pid_is_never_pruned_however_old_the_entry(self):
+        """Pruning needs BOTH proofs. A board whose process is alive but is
+        mid-restart (port briefly closed) must survive the sweep."""
+        root = os.path.join(self.tmp, "restarting")
+        os.makedirs(root, exist_ok=True)
+        sprintd.registry_register(sprintd.registry_entry(
+            root, self._closed_port(), "127.0.0.1", pid=os.getpid(),
+            started_at=sprintd.now() - 99999))
+        hub = sprintd.HubApp(token="hub-token", prune_seconds=1.0)
+        snap = hub.refresh()
+        self.assertEqual(len(snap["sprints"]), 1)
+        self.assertTrue(snap["sprints"][0]["pid_alive"])
+        self.assertIn(os.path.realpath(root), sprintd.read_registry())
+
+    def test_a_port_stolen_by_another_project_is_not_reported_as_that_board(self):
+        """Ports get recycled. The hub health-checks project_root before it
+        believes a row -- otherwise it would show one project's counts under
+        another project's name."""
+        real = self.board("real")
+        impostor_root = os.path.join(self.tmp, "impostor")
+        os.makedirs(impostor_root, exist_ok=True)
+        sprintd.registry_register(sprintd.registry_entry(
+            impostor_root, real["port"], "127.0.0.1", pid=999999))
+        hub = sprintd.HubApp(token="hub-token", prune_seconds=99999.0)
+        row = self.rows(hub)["impostor"]
+        self.assertFalse(row["reachable"])
+        self.assertIn("another project", row["detail"])
+
+    def test_a_board_with_no_token_on_disk_says_so_instead_of_lying(self):
+        b = self.board("tokenless", write_token=False)
+        os.remove(os.path.join(b["data_dir"], "token")) if os.path.exists(
+            os.path.join(b["data_dir"], "token")) else None
+        hub = sprintd.HubApp(token="hub-token")
+        row = self.rows(hub)["tokenless"]
+        self.assertEqual(row["status"], "no_token")
+        self.assertFalse(row["reachable"])
+
+    def test_a_stale_token_on_disk_is_reported_not_silently_zeroed(self):
+        b = self.board("rotated")
+        sprintd.write_token_file(os.path.join(b["data_dir"], "token"), "the-old-one")
+        hub = sprintd.HubApp(token="hub-token")
+        row = self.rows(hub)["rotated"]
+        self.assertEqual(row["status"], "unauthorized")
+        self.assertEqual(row["needs_you"], 0)
+        self.assertIsNone(row["url"])
+
+    def test_a_successful_poll_stamps_last_seen_on_the_registry(self):
+        self.board("alpha")
+        hub = sprintd.HubApp(token="hub-token")
+        hub.refresh()
+        row = list(sprintd.read_registry().values())[0]
+        self.assertIn("last_seen", row)
+        self.assertLess(sprintd.now() - row["last_seen"], 30)
+
+    def _closed_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        finally:
+            s.close()
+        return port
+
+
+class TestHubServer(HubBase):
+    """The hub page and its API, over real HTTP."""
+
+    def setUp(self):
+        super().setUp()
+        self.hub = sprintd.HubApp(token="hub-secret", poll_seconds=60.0)
+        self.httpd = sprintd.make_hub_server(self.hub, "127.0.0.1", 0)
+        self.hub_port = self.httpd.server_address[1]
+        self.assertNotEqual(self.hub_port, sprintd.DEFAULT_HUB_PORT)
+        threading.Thread(target=self.httpd.serve_forever,
+                         kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        def shutdown():
+            self.httpd.shutdown()
+            self.httpd.server_close()
+            self.hub.close()
+
+        self.addCleanup(shutdown)
+
+    def hget(self, path, token="hub-secret", headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.hub_port, timeout=10)
+        try:
+            hdrs = {"Accept": "application/json"}
+            if token:
+                hdrs["Authorization"] = "Bearer " + token
+            hdrs.update(headers or {})
+            conn.request("GET", path, headers=hdrs)
+            resp = conn.getresponse()
+            raw = resp.read()
+            return resp.status, raw, dict(resp.getheaders())
+        finally:
+            conn.close()
+
+    def test_healthz_needs_no_token_and_identifies_itself_as_the_hub(self):
+        status, raw, _ = self.hget("/healthz", token=None)
+        self.assertEqual(status, 200)
+        body = json.loads(raw.decode())
+        self.assertTrue(body["hub"])
+        self.assertEqual(os.path.realpath(body["registry"]),
+                         os.path.realpath(self.registry))
+
+    def test_the_page_and_the_api_both_require_the_hub_token(self):
+        """The hub links into token-guarded boards -- it is a keyring, so it
+        cannot be the one unauthenticated surface."""
+        for path in ("/", "/api/hub"):
+            status, raw, _ = self.hget(path, token=None)
+            self.assertEqual(status, 401, path)
+            self.assertIn("unauthorized", raw.decode())
+        status, _, _ = self.hget("/api/hub", token="not-the-hub-token")
+        self.assertEqual(status, 401)
+
+    def test_query_token_sets_a_cookie_and_redirects(self):
+        status, _, headers = self.hget("/?t=hub-secret", token=None)
+        self.assertEqual(status, 302)
+        self.assertEqual(headers.get("Location"), "/")
+        cookie = headers.get("Set-Cookie") or ""
+        self.assertIn(sprintd.HUB_COOKIE_NAME + "=hub-secret", cookie)
+        self.assertIn("HttpOnly", cookie)
+        # the cookie alone is enough from then on
+        status, raw, _ = self.hget(
+            "/api/hub", token=None,
+            headers={"Cookie": "%s=hub-secret" % sprintd.HUB_COOKIE_NAME})
+        self.assertEqual(status, 200)
+        self.assertIn("sprints", json.loads(raw.decode()))
+
+    def test_the_hub_cookie_does_not_collide_with_a_board_cookie(self):
+        """Cookies ignore the port, so a hub on the same host that reused the
+        board's cookie name would sign every open board out."""
+        self.assertNotEqual(sprintd.HUB_COOKIE_NAME, sprintd.COOKIE_NAME)
+        status, _, _ = self.hget(
+            "/api/hub", token=None,
+            headers={"Cookie": "%s=hub-secret" % sprintd.COOKIE_NAME})
+        self.assertEqual(status, 401, "a board cookie must not open the hub")
+
+    def test_a_wrong_query_token_does_not_hand_out_a_cookie(self):
+        status, _, headers = self.hget("/?t=guessing", token=None)
+        self.assertEqual(status, 401)
+        self.assertIsNone(headers.get("Set-Cookie"))
+
+    def test_the_page_is_self_contained_html(self):
+        status, raw, headers = self.hget("/")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers.get("Content-Type", ""))
+        page = raw.decode()
+        self.assertIn("sprint boards on this machine", page)
+        for marker in ("http://", "https://", "//cdn", "<link"):
+            if marker in ("http://", "https://"):
+                self.assertNotIn('src="' + marker, page)
+                self.assertNotIn('href="' + marker, page)
+            else:
+                self.assertNotIn(marker, page)
+
+    def test_the_api_serves_the_rows_the_page_renders(self):
+        a = self.board("alpha")
+        self.card_needs_you(a)
+        status, raw, _ = self.hget("/api/hub?fresh=1")
+        self.assertEqual(status, 200)
+        body = json.loads(raw.decode())
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["needs_you_total"], 1)
+        self.assertEqual(body["sprints"][0]["name"], "alpha")
+        self.assertEqual(body["sprints"][0]["port"], a["port"])
+
+    def test_a_cached_snapshot_is_served_between_polls(self):
+        self.board("alpha")
+        first = self.hub.get()
+        second = self.hub.get()
+        self.assertEqual(first["server_time"], second["server_time"])
+        self.assertNotEqual(self.hub.refresh()["server_time"], first["server_time"])
+
+    def test_unknown_paths_404(self):
+        status, _, _ = self.hget("/nope")
+        self.assertEqual(status, 404)
+
+
+class TestHubCli(unittest.TestCase):
+    """The real CLI, end to end: two daemonized boards register themselves, the
+    hub lists them both, and --stop cleans up."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-hubcli-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.registry = os.path.join(self.tmp, "hubstate", "registry.json")
+        self.env = dict(os.environ, SPRINT_REGISTRY=self.registry)
+        self.roots = {}
+        self.addCleanup(self._kill_leftovers)
+
+    def _free_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def _run(self, *argv, timeout=60):
+        import subprocess
+        return subprocess.run([sys.executable, SPRINTD_PATH] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=self.env, timeout=timeout)
+
+    def _kill_leftovers(self):
+        for root in list(self.roots.values()):
+            self._run("--project-root", root, "stop")
+        self._run("hub", "--stop")
+
+    def start_board(self, name, token):
+        root = os.path.join(self.tmp, name)
+        os.makedirs(root, exist_ok=True)
+        self.roots[name] = root
+        port = self._free_port()
+        r = self._run("--project-root", root, "start", "--port", port,
+                      "--no-tailscale", "--token", token)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        return root, port
+
+    def test_boards_register_themselves_and_the_hub_lists_them(self):
+        root_a, port_a = self.start_board("alpha", "alpha-tok")
+        root_b, port_b = self.start_board("beta", "beta-tok")
+
+        reg = sprintd.read_registry(self.registry)
+        self.assertEqual(sorted(r["name"] for r in reg.values()), ["alpha", "beta"])
+        self.assertEqual(oct(os.stat(self.registry).st_mode)[-3:], "600")
+
+        hub_port = self._free_port()
+        r = self._run("hub", "--port", hub_port, "--no-tailscale", "--token", "hub-tok")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("http://127.0.0.1:%d/?t=hub-tok" % hub_port, r.stdout.decode())
+
+        status, raw = sprintd.http_get("127.0.0.1", hub_port, "/api/hub?fresh=1",
+                                       "hub-tok", timeout=10.0)
+        self.assertEqual(status, 200)
+        body = json.loads(raw.decode())
+        rows = {r["name"]: r for r in body["sprints"]}
+        self.assertEqual(sorted(rows), ["alpha", "beta"])
+        self.assertTrue(all(r["reachable"] for r in rows.values()))
+        self.assertEqual(rows["alpha"]["url"],
+                         "http://127.0.0.1:%d/?t=alpha-tok" % port_a)
+        self.assertEqual(rows["beta"]["url"],
+                         "http://127.0.0.1:%d/?t=beta-tok" % port_b)
+
+        # a second `hub` reuses the running one instead of fighting for the port
+        r2 = self._run("hub", "--port", hub_port, "--no-tailscale")
+        self.assertEqual(r2.returncode, 0, r2.stderr.decode())
+        self.assertIn("already running", r2.stdout.decode())
+
+        # stopping a board takes its row off the hub
+        self._run("--project-root", root_b, "stop")
+        self.assertEqual(sorted(n["name"] for n in
+                                sprintd.read_registry(self.registry).values()),
+                         ["alpha"])
+        status, raw = sprintd.http_get("127.0.0.1", hub_port, "/api/hub?fresh=1",
+                                       "hub-tok", timeout=10.0)
+        self.assertEqual([r["name"] for r in json.loads(raw.decode())["sprints"]],
+                         ["alpha"])
+
+        # hub token persisted beside the registry, 0600, and reused next time
+        tok_file = os.path.join(os.path.dirname(self.registry), "hub-token")
+        self.assertEqual(sprintd.read_token_file(tok_file), "hub-tok")
+        self.assertEqual(oct(os.stat(tok_file).st_mode)[-3:], "600")
+
+        r3 = self._run("hub", "--stop")
+        self.assertEqual(r3.returncode, 0, r3.stderr.decode())
+        try:
+            sprintd.http_get("127.0.0.1", hub_port, "/healthz", timeout=2.0)
+            self.fail("hub still listening after --stop")
+        except (OSError, http.client.HTTPException):
+            pass
+
+    def test_hub_stop_when_nothing_is_running_is_a_clean_no_op(self):
+        r = self._run("hub", "--stop")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("not running", r.stdout.decode())
+
+    def test_the_registry_env_override_keeps_the_hub_off_the_real_home_dir(self):
+        self.start_board("alpha", "alpha-tok")
+        self.assertTrue(os.path.exists(self.registry))
+        home_reg = os.path.join(os.path.expanduser("~"), ".sprint", "registry.json")
+        if os.path.exists(home_reg):
+            self.assertNotIn(os.path.realpath(os.path.join(self.tmp, "alpha")),
+                             sprintd.read_registry(home_reg))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
