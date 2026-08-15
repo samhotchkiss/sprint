@@ -230,24 +230,44 @@ your assigned worktree; one branch; never push to main; never touch other cards'
   treat as **~980×740 CSS px landscape**: 3 columns + sidebar as slide-over, touch-sized targets
   (44px min). Vertical space is scarce on the Fold: compact card rows, independently scrolling
   columns. No narrow-phone layout work (a basic usable fallback is fine, not optimized).
-- Columns: Held (only when nonempty) / Queued / In progress / Needs you / Blocked / Ready / Done
-  (Done collapses to a count + list). Card face: `#num`, title, state age, agent badge (batch
-  shared), last activity one-liner, amber-on-silence. needs_you cards render the question + inline
-  answer box + quick-reply buttons (when options supplied) ON the card face.
+- **Two layouts, one toggle** (persisted in `localStorage`). **List** is the default and the daily
+  driver: a 4px proportional meter + legend, then Needs you (the only generously spaced section) /
+  In motion / Blocked / Queued & held, each quieter than the last, then Done. **Board** is the
+  kanban: four columns — Needs you / In progress / Blocked / Queued & held. Needs you deliberately
+  holds both shapes of asking (an open question, and a packet waiting on a verdict); they are told
+  apart by rail colour and an ASKS/SIGNOFF tag. Done is a count that opens into a plain list.
+  Card face: `#num`, title, tag, last-activity one-liner, agent, state age, amber-on-silence.
   The title on the face is the **condensed** title (≤8 words, set by the session at assign time and
   refined by the worker at triage); the user's original submission is never rewritten and shows in
-  full in the drawer.
-- Card drawer: one interleaved timeline (status changes are system lines in the chat), chat input,
-  evidence packet above the fold when ready (claim, diffstat, test counts, screenshot thumbs →
-  lightbox, live URL), Approve / Bounce-with-notes / Reject.
-- Submit box (top): textarea + paste-to-attach multiple images (thumbnails, removable) +
-  `<input type=file multiple accept="image/*">` fallback + Hold toggle. Cmd/Ctrl+Enter submits.
-- Sidebar: session chat thread, `#N` autolinks to cards, session online/offline dot.
+  full in the rail.
+- **Answering**: a question with options answers inline from its row in the List — one tap, no
+  navigation. Free text, and every question on the Board layout, answers in the rail: Board cards
+  are never interactive surfaces, so a decision is never half on a tile and half in a panel.
+- **Right rail (480px)**: the session chat OR one card's thread, never both. Card thread is one
+  interleaved timeline of four item types — message bubbles (yours right-aligned, a "More context"
+  disclosure only where an event really carries `payload.detail`), screenshot tiles → lightbox,
+  question panels of ≥46px option rows, and centred status changes (events, not speech). The
+  evidence packet renders **as a message in the stream** — claim, "Check it yourself" numbered
+  steps, screenshots, mono metadata (branch, diffstat, test counts), live URL, then Approve /
+  Bounce-with-notes / Reject. Composer pinned at the bottom: Return sends, Shift+Return newlines.
+- **Submit**: a "+ Drop work" modal sheet — textarea + paste-to-attach multiple images (thumbnails,
+  removable) + `<input type=file multiple accept="image/*">` fallback + Hold toggle. Return submits,
+  Shift+Return makes a new line (Cmd/Ctrl+Enter still submits). Pasting an image anywhere opens it.
+- **Chat button**: the product's single notification surface, with four states — closed, open
+  (sage dot), **gold + pulse when a session line arrived while you were not looking**, and dimmed
+  because a card has taken the rail. No counters anywhere.
 - SSE-live throughout; optimistic UI with reconciliation; Last-Event-ID reconnect; one tab-title/
   favicon badge + one soft chime on flips to needs_you/ready (no repeat, no unread counters
-  anywhere else). Light + dark via `prefers-color-scheme`, both first-class.
-- Aesthetic: calm, dense, plain-English labels. No spinners (show last activity + elapsed instead).
-  No held-count in any header/chrome.
+  anywhere else).
+- **Dark only.** This line previously called for light + dark via `prefers-color-scheme`, both
+  first-class. The design work in 2026-08 scoped light out and shipped a dark-only Calm palette; a
+  light Calm palette has not been designed, and a half-translated one reads worse than an honest
+  single theme. Light is a real open item, not a shipped feature.
+- Aesthetic: calm, dense, plain-English labels. No spinners — the In-motion hairline is *recency*
+  (it drains across the five-minute silence window), never invented progress, because nothing on
+  the wire knows how far along a job is. No held-count in any header/chrome.
+- All type is self-hosted from `web/fonts/` (Instrument Serif, IBM Plex Sans/Mono, Press Start 2P,
+  all OFL): the page makes zero external requests.
 
 ## Packaging
 

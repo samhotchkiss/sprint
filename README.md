@@ -41,16 +41,21 @@ running inside the project you want a board for.
    running in tmux (see "Power-outage recovery" for why tmux matters).
 2. Say **"start a sprint."** The skill runs `sprintd doctor`, starts the
    server, and prints a URL like `http://100.x.x.x:8377/?t=<token>`.
-3. Open that URL. Drop feedback into the submit box at the top — text,
-   pasted screenshots, or both. Cmd/Ctrl+Enter submits.
-4. Watch cards move across the board (Held → Queued → In progress →
-   Needs you / Blocked → Ready → Done) as the session dispatches
-   subagents, one worktree and branch per card (or per batch of related
-   cards, if you told it not to start yet and let a pile build up).
-5. Answer questions inline on the card face, approve/bounce/reject from
-   the card drawer once something's `ready`, or just chat in the
-   sidebar — it's the same session, so it can act on what you say there,
-   not just answer.
+3. Open that URL. Hit **+ Drop work** and type — text, pasted
+   screenshots, or both. Return sends; Shift+Return makes a new line.
+   (You can also just paste an image anywhere on the page.)
+4. Read the page top to bottom. The 4px meter is the shape of the whole
+   sprint; **Needs you** is the only section that wants anything from
+   you, and everything under it — In motion, Blocked, Queued & held —
+   gets quieter on purpose. **LIST/BOARD** in the header swaps the
+   reading order for the kanban columns; it remembers which you picked.
+5. Answer a multiple-choice question straight from its row in the list.
+   Everything else happens in the right rail: click a card and its whole
+   thread opens there, with the evidence packet — claim, "check it
+   yourself" steps, screenshots, Approve / Bounce / Reject — in the
+   stream where it arrived. Click **Chat** for the session itself; it's
+   the same brain as the terminal, so it can act on what you say there,
+   not just answer. The rail holds one or the other, never both.
 
 Dumping a bunch of issues at once? Say "hold" first — new cards land in
 a `held` column instead of dispatching immediately, so the session can
