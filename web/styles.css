@@ -647,7 +647,15 @@ body.rail-open .rail { display: flex; }
 .item.centered { align-items: center; }
 
 /* status change — an event, never speech */
-.status-line { display: flex; align-items: center; gap: 9px; padding: 2px 0; }
+.status-line {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 4px 9px;
+  padding: 2px 0;
+  text-align: center;
+}
 .status-dot { width: 4px; height: 4px; border-radius: 99px; display: block; background: var(--meta); }
 .status-label {
   font-family: var(--font-label);

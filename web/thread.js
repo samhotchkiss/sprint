@@ -145,7 +145,9 @@ function statusLabel(ev) {
   if (ev.kind === 'state') {
     const to = ev.payload.to;
     const label = STATE_LABEL[to] || to || 'updated';
-    return ev.payload.reason ? `${label} — ${firstLine(ev.payload.reason, 80)}` : label;
+    // The reason is a machine string that can run long; the thread wants a line,
+    // and the whole reason is one click away on the card itself.
+    return ev.payload.reason ? `${label} — ${firstLine(ev.payload.reason, 52)}` : label;
   }
   return firstLine(eventText(ev), 90);
 }
