@@ -1,7 +1,9 @@
 // Card drawer: evidence above the fold, one interleaved timeline, chat, verdicts.
 import { h, clear, timeEl, ageSuffix, richText, plural } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
-import { STATE_LABEL, SYSTEM_KINDS, eventText, cardState, isSilent, draft } from './state.js';
+import {
+  STATE_LABEL, SYSTEM_KINDS, eventText, cardState, isSilent, draft, messageStatus,
+} from './state.js';
 
 const ACTOR_LABEL = { user: 'You', session: 'Session', worker: 'Agent', server: 'Board' };
 
@@ -191,7 +193,12 @@ function shotStrip(shots, app, small) {
 function timeline(detail, app) {
   const wrap = h('div.timeline');
   const items = (detail.timeline || []).slice();
-  for (const p of detail.pendingLines || []) items.push(p);
+  const known = new Set(items.map((ev) => ev.seq).filter((s) => s != null));
+  for (const p of detail.pendingLines || []) {
+    // Once the server's own copy is in the timeline, drop our local echo of it.
+    if (p.seq != null && known.has(p.seq)) continue;
+    items.push(p);
+  }
   if (!items.length) {
     wrap.appendChild(h('p.col-empty', 'Nothing yet.'));
     return wrap;
@@ -204,13 +211,18 @@ function timeline(detail, app) {
       continue;
     }
     const mine = ev.actor === 'user';
-    const row = h('div.msg', { class: `msg actor-${ev.actor}${mine ? ' mine' : ''}${ev.pending ? ' pending' : ''}` });
+    // Your messages to the agent get the same honest delivery status as the
+    // sidebar: landed when the board has it, "session is on it" once the
+    // session's drain cursor has passed it (that is who routes it to the agent).
+    const st = mine ? messageStatus(ev) : null;
+    const row = h('div.msg', { class: `msg actor-${ev.actor}${mine ? ' mine' : ''}${ev.pending ? ' pending' : ''}${ev.failed ? ' failed' : ''}` });
     row.appendChild(h('div.msg-head',
       h('span.msg-actor', ACTOR_LABEL[ev.actor] || ev.actor),
       ev.kind === 'question' ? h('span.msg-kind', 'question') : null,
       ev.kind === 'progress' ? h('span.msg-kind', 'progress') : null,
       h('span.grow'),
-      h('span.msg-time', ev.pending ? 'sending…' : ageSuffix(ev.ts))));
+      st ? h('span.msg-status', { class: `msg-status is-${st.key}`, title: st.title }, st.label) : null,
+      h('span.msg-time', st && (st.key === 'sending' || st.key === 'failed') ? '' : ageSuffix(ev.ts))));
     row.appendChild(h('div.msg-text', richText(eventText(ev), app.openCard)));
     const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
     if (Array.isArray(atts) && atts.length) row.appendChild(shotStrip(atts, app, true));

@@ -686,6 +686,80 @@ class TestEventsCursor(Base):
         _, board = self.get("/api/board")
         self.assertEqual(board["session"]["pending"], 0)
 
+    def test_every_read_surface_exposes_the_drain_cursor(self):
+        """Per-message status is derived from (event seq vs drain cursor), so
+        every surface the UI reads has to carry the cursor -- board, card
+        detail and the events poll alike."""
+        card = self.new_card("cursor please")
+        num = card["num"]
+        for path in ("/api/board", "/api/cards/%d" % num, "/api/events?after=0"):
+            status, body = self.get(path)
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body.get("cursor"), 0, "%s: cursor missing/wrong" % path)
+        _, board = self.get("/api/board")
+        self.assertEqual(board["session"]["cursor"], 0)
+
+        head = self.app.max_seq()
+        self.post("/api/cursors/orchestrator", {"seq": head})
+        for path in ("/api/board", "/api/cards/%d" % num, "/api/events?after=0"):
+            status, body = self.get(path)
+            self.assertEqual(body.get("cursor"), head, "%s did not follow the cursor" % path)
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["session"]["cursor"], head)
+        self.assertEqual(detail["session"]["status"], "online")
+
+    def test_a_sent_message_gets_a_seq_and_only_then_is_seen(self):
+        """The two honest facts behind the UI's ticks: the POST hands back the
+        seq that means 'landed', and only a cursor at/past that seq means the
+        session actually read it. Sidebar and card chat both."""
+        card = self.new_card("chat with me")
+        num = card["num"]
+        status, side = self.post("/api/sidebar", {"text": "hello session", "actor": "user"})
+        self.assertEqual(status, 201, side)
+        status, chat = self.post("/api/cards/%d/chat" % num, {"text": "hello agent"})
+        self.assertEqual(status, 201, chat)
+
+        side_seq, chat_seq = side["event"]["seq"], chat["event"]["seq"]
+        for seq in (side_seq, chat_seq):
+            self.assertIsInstance(seq, int)
+            self.assertGreater(seq, 0)
+        # landed means durable: both are readable back out of the log
+        _, log = self.get("/api/events?after=0&limit=1000")
+        by_seq = {e["seq"]: e for e in log["events"]}
+        self.assertEqual(by_seq[side_seq]["payload"]["text"], "hello session")
+        self.assertEqual(by_seq[chat_seq]["payload"]["text"], "hello agent")
+
+        # not seen yet -- the session has drained nothing
+        self.assertLess(log["cursor"], side_seq)
+
+        # the session drains only as far as the sidebar line
+        self.post("/api/cursors/orchestrator", {"seq": side_seq})
+        _, log = self.get("/api/events?after=0&limit=1000")
+        self.assertGreaterEqual(log["cursor"], side_seq, "sidebar line has been read")
+        self.assertLess(log["cursor"], chat_seq, "card chat line has NOT been read yet")
+
+    def test_cursor_post_wakes_the_streams_immediately(self):
+        """A cursor move appends no event, so a stream parked on the condition
+        only learns about it because set_cursor notifies. Without the notify the
+        waiter sits there until its own timeout -- 'session is on it' would show
+        up seconds late, which is exactly the lag this card is about."""
+        elapsed = []
+
+        def watcher():
+            started = time.time()
+            with self.app.cond:
+                self.app.cond.wait(timeout=6.0)
+            elapsed.append(time.time() - started)
+
+        t = threading.Thread(target=watcher, daemon=True)
+        t.start()
+        time.sleep(0.2)
+        self.post("/api/cursors/orchestrator", {"seq": 1})
+        t.join(timeout=8.0)
+        self.assertTrue(elapsed, "watcher never returned")
+        self.assertLess(elapsed[0], 1.5,
+                        "set_cursor must notify() the waiters, not let them time out")
+
     def test_wait_cli_exit_codes(self):
         info = {"pid": os.getpid(), "port": self.port, "host": self.host,
                 "token": "test-token", "project_root": self.project_root,
@@ -1054,20 +1128,74 @@ class TestStream(Base):
         beat = self._read_lines(resp, lambda t: t.startswith(": heartbeat"), timeout=6)
         self.assertTrue(any(t.startswith(": heartbeat") for t in beat), beat)
 
-    def test_frames_are_id_plus_data_only(self):
-        """`id:` = seq, `data:` = one event JSON. No `event:` line -- a named
-        event type would never reach the browser's default message handler."""
+    def test_event_frames_are_id_plus_data_only(self):
+        """Event frames: `id:` = seq, `data:` = one event JSON, and no `event:`
+        line -- a named type would never reach the browser's default message
+        handler. The ONLY named frame on this stream is `cursor`, which is not
+        an event and therefore carries no `id:` (it must never become
+        Last-Event-ID)."""
         self.new_card("framing")
         _conn, resp = self._open_stream()
-        lines = self._read_lines(resp, lambda t: t.startswith("data:"))
-        self.assertFalse([t for t in lines if t.startswith("event:")], lines)
-        data = [t for t in lines if t.startswith("data:")]
-        ids = [t for t in lines if t.startswith("id:")]
-        self.assertTrue(data and ids, lines)
-        ev = json.loads(data[0][5:].strip())
-        self.assertEqual(int(ids[0][3:].strip()), ev["seq"])
-        for key in ("seq", "card_num", "ts", "actor", "kind", "payload"):
-            self.assertIn(key, ev)
+        lines = self._read_lines(resp, lambda t: t.startswith("data:") and '"seq"' in t)
+        named = [t for t in lines if t.startswith("event:")]
+        self.assertTrue(all(t.strip() == "event: cursor" for t in named), lines)
+
+        # walk frames: a `cursor` frame is named + un-id'd, an event frame is
+        # id'd + anonymous.
+        kind, ident, seen_event = None, None, False
+        for text in lines:
+            if text.startswith("event:"):
+                kind = text.split(":", 1)[1].strip()
+            elif text.startswith("id:"):
+                ident = int(text[3:].strip())
+            elif text.startswith("data:"):
+                payload = json.loads(text[5:].strip())
+                if kind == "cursor":
+                    self.assertIsNone(ident, "a cursor frame must not carry an id")
+                    self.assertIn("cursor", payload)
+                else:
+                    seen_event = True
+                    self.assertIsNotNone(ident, "an event frame must carry its seq as id")
+                    self.assertEqual(ident, payload["seq"])
+                    for key in ("seq", "card_num", "ts", "actor", "kind", "payload"):
+                        self.assertIn(key, payload)
+                kind, ident = None, None
+        self.assertTrue(seen_event, lines)
+
+    def test_stream_opens_with_the_drain_cursor(self):
+        """The browser has to know where the session is the moment it connects,
+        or every message it already sent would read 'landed' forever."""
+        self.new_card("hello")
+        self.post("/api/cursors/orchestrator", {"seq": self.app.max_seq()})
+        _conn, resp = self._open_stream()
+        lines = self._read_lines(resp, lambda t: t.startswith("data:") and '"cursor"' in t)
+        frames = [t for t in lines if t.startswith("data:") and '"cursor"' in t]
+        self.assertTrue(frames, lines)
+        payload = json.loads(frames[0][5:].strip())
+        self.assertEqual(payload["cursor"], self.app.max_seq())
+
+    def test_cursor_move_is_pushed_live(self):
+        """This is what flips a sent message from 'landed' to 'session is on
+        it' without a reload: the cursor moving past its seq."""
+        _conn, resp = self._open_stream()
+        self._read_lines(resp, lambda t: t.startswith("data:") and '"cursor"' in t)
+
+        status, sent = self.post("/api/sidebar", {"text": "you there?", "actor": "user"})
+        self.assertEqual(status, 201, sent)
+        seq = sent["event"]["seq"]
+
+        # the message is in the log but the session has not read it yet
+        self.assertLess(self.app.cursor_seq(), seq)
+        self.post("/api/cursors/orchestrator", {"seq": seq})
+
+        def is_seen(text):
+            if not (text.startswith("data:") and '"cursor"' in text):
+                return False
+            return json.loads(text[5:].strip())["cursor"] >= seq
+
+        lines = self._read_lines(resp, is_seen)
+        self.assertTrue(any(is_seen(t) for t in lines),
+                        "the cursor move must reach the browser: %r" % (lines,))
 
     def test_last_event_id_resumes(self):
         self.new_card("first")

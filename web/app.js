@@ -3,7 +3,7 @@ import { h, clear, $, debounce, tickTimes, uid, firstLine } from './util.js';
 import { api, ApiError, initAuth } from './api.js';
 import { Live } from './live.js';
 import {
-  store, applyBoard, applyEvents, normCard, normEvent, eventText,
+  store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
 } from './state.js';
 import { renderBoard } from './board.js';
 import { renderDrawer, openLightbox, closeLightbox } from './drawer.js';
@@ -189,11 +189,14 @@ async function answer(card, question, text) {
 }
 
 async function chat(card, text) {
-  pushPending(card.num, { actor: 'user', kind: 'chat', payload: { text } });
+  const line = pushPending(card.num, { actor: 'user', kind: 'chat', payload: { text } });
   render();
   try {
-    await api.chat(card.num, text);
-    settlePending(card.num);
+    const res = await api.chat(card.num, text);
+    // Stamp the real seq on our own line so it reads "landed" the instant the
+    // POST returns, and flips to "session is on it" when the cursor passes it.
+    settlePending(card.num, false, res && res.event, line);
+    render();
     refreshDetail();
   } catch (err) {
     settlePending(card.num, true);
@@ -270,16 +273,34 @@ async function retryCard(card) {
 }
 
 function pushPending(num, line) {
-  if (!store.detail || store.detail.num !== num) return;
+  if (!store.detail || store.detail.num !== num) return null;
   store.detail.pendingLines = store.detail.pendingLines || [];
-  store.detail.pendingLines.push({ ...normEvent({ ...line, ts: new Date().toISOString() }), pending: true, localId: uid() });
+  const entry = { ...normEvent({ ...line, ts: new Date().toISOString() }), pending: true, localId: uid() };
+  store.detail.pendingLines.push(entry);
+  return entry;
 }
 
-function settlePending(num, failed) {
+/**
+ * Settle our optimistic line. On success we keep it — now stamped with the
+ * server's real seq, so it says "landed" and can flip to "session is on it" —
+ * until the next detail fetch supplies the server's own copy (the timeline
+ * dedupes on seq). On failure it stays visible, marked "not sent".
+ */
+function settlePending(num, failed, event, entry) {
   if (!store.detail || store.detail.num !== num) return;
   const lines = store.detail.pendingLines || [];
-  if (failed) lines.forEach((l) => { l.pending = false; l.failed = true; });
-  else store.detail.pendingLines = [];
+  if (failed) { lines.forEach((l) => { l.pending = false; l.failed = true; }); return; }
+  const seq = event && Number(event.seq);
+  const targets = entry ? [entry] : lines;
+  for (const l of targets) {
+    l.pending = false;
+    if (seq && !Number.isNaN(seq)) {
+      l.seq = seq;
+      l.ts = event.ts || l.ts;
+      store.seq = Math.max(store.seq, seq);
+    }
+  }
+  if (!entry && !(seq && !Number.isNaN(seq))) store.detail.pendingLines = [];
 }
 
 // ---- drawer --------------------------------------------------------------
@@ -408,14 +429,22 @@ async function boot() {
     sidebarText.value = '';
     sidebarText.style.height = '';
     const localLine = normEvent({ actor: 'user', kind: 'chat', ts: new Date().toISOString(), payload: { text } });
-    localLine.local = true;        // "sending…"
+    localLine.local = true;        // "sending…" — no seq yet, so nothing is claimed
     localLine.localEcho = true;    // replaced when the server's own copy arrives
-    localLine.seq = store.seq + 0.5;
+    localLine.sortSeq = store.seq + 0.5;   // ordering only, never a delivery claim
     store.sidebar.push(localLine);
     render();
     try {
-      await api.sidebar(text);
+      const res = await api.sidebar(text);
       localLine.local = false;
+      // The server's own seq for this message: this is what "landed" means, and
+      // what the drain cursor gets compared against.
+      const seq = res && res.event && Number(res.event.seq);
+      if (seq && !Number.isNaN(seq)) {
+        localLine.seq = seq;
+        localLine.ts = res.event.ts || localLine.ts;
+        store.seq = Math.max(store.seq, seq);
+      }
       render();
     } catch (err) {
       localLine.local = false;
@@ -481,6 +510,9 @@ async function firstLoad() {
       render();
     },
     onStatus: (mode) => { app.transport = mode; renderSessionStatus(app); },
+    // The session drained further: messages it has now read flip to
+    // "session is on it" without waiting for the next board fetch.
+    onCursor: (seq) => { if (applyCursor(seq)) render(); },
     onAuthError: showAuthWall,
   });
   live.start(store.seq);
