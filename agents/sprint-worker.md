@@ -67,6 +67,29 @@ the `SPRINT_SERVER`/`SPRINT_TOKEN` environment variables your brief set.
   after.
   Also used for `chat`/`note`/`error` kinds:
   `sprint-post <num> note "..."`, `sprint-post <num> error "..."`.
+
+  **One line always; everything long goes in `--detail`.** The user skims
+  the timeline first and digs in only where they care, so every event is
+  two things: a one-line `text` that stands on its own, and an optional
+  expanded `detail` the board keeps collapsed behind a "more" toggle.
+
+  ```
+  sprint-post 42 progress "suite green — 118 pass, 0 fail" --detail-file /tmp/test.log
+  sprint-post 42 note "picked sqlite over a file lock" --detail "Three reasons: …"
+  ```
+
+  - `--detail "text"` for reasoning or a short capture; `--detail-file PATH`
+    for real output you already have on disk (test logs, a build failure, a
+    diff). Multi-line is the point — it renders preformatted.
+  - Command output, stack traces, full test runs, long reasoning: `--detail`,
+    never the one-liner. The one-liner says what happened; the detail shows
+    the receipts.
+  - The one-liner is capped at one line / 140 characters. Going over is not
+    an error — it's truncated with a notice on stderr and the full text is
+    moved into the detail — but a line you had to have truncated is a line
+    you should have written shorter.
+  - A card's face and the "last activity" line only ever show the one-liner,
+    so if the one-liner doesn't stand alone, nobody reads it.
 - `sprint-ask <num> "question" [--options '["a","b"]']` — when you're
   genuinely stuck on something only the user can resolve. This flips the
   card to `needs_you`. **Then END YOUR TURN.** Don't keep working, don't
@@ -110,11 +133,18 @@ check on you.
    real commits, not one giant blob at the end.
 3. Run the actual test/build/lint commands for whatever you touched.
    Capture real output — you need real counts for the evidence packet,
-   not a vibe.
-4. If the diff touches anything under a frontend/UI path, treat this as
+   not a vibe. Post the counts as the one-liner and the captured run as
+   `--detail-file`, so the user can skim "118 pass, 0 fail" and open the
+   log only if they doubt it.
+4. **Commit before any destructive verification.** Mutation testing,
+   `git checkout -- <path>`, `git stash`, reverting a file to prove a test
+   really fails — all of it can erase uncommitted work, and it has. Commit
+   first, then break things; the commit is what makes the experiment safe
+   to run and safe to undo.
+5. If the diff touches anything under a frontend/UI path, treat this as
    `ui_change: true` in your evidence packet (see below) — no exceptions
    for "just a copy change."
-5. For `ui_change: true` work, start your OWN preview server (whatever
+6. For `ui_change: true` work, start your OWN preview server (whatever
    this repo uses — `npm run dev`, etc.) from inside your worktree,
    bound to the machine's tailnet IP if one exists (`tailscale ip -4`),
    falling back to loopback if it doesn't, on the **deterministic port**
@@ -168,7 +198,7 @@ worktree root — not committed) shaped like:
   it), even for a change you're sure isn't UI.
 - `ui_change: true` requires `screenshots` — capture **before/after,
   light AND dark**, from **your own worktree's own preview server**
-  (see "Doing the work" step 5), never a shared/serving dev server
+  (see "Doing the work" step 6), never a shared/serving dev server
   (that's someone else's live session; touching it breaks their view of
   the app). It also requires `live_url` pointed at that same preview
   server — start it bound to the tailnet IP (loopback fallback) on port
