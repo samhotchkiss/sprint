@@ -3,7 +3,6 @@
 //   ?mock=1            representative board
 //   &offline=1         session reported offline (banner)
 //   &live=1            drip a few scripted events (chime + badge + reconciliation)
-//   &theme=dark|light  force a theme for verification
 // It stubs window.fetch (for /api/* only) and window.EventSource.
 
 const now = Date.now();

@@ -475,7 +475,12 @@ export function motionState(card, now = Date.now()) {
       title: 'flagged as a long job — the five-minute silence timer is suppressed' };
   }
   if (quiet) {
-    return { key: 'quiet', label: `quiet ${age(card.last_activity_at)}`, color: 'var(--warn)', pct: 0,
+    // The number has to be how long the AGENT has been silent. Once the server
+    // appends its own agent_silent event, last_activity_at is the age of that
+    // notice, not of the silence — so below the window we say "quiet" flat
+    // rather than "quiet just now", which would be both wrong and absurd.
+    const stale = elapsed >= SILENT_MS ? ` ${age(card.last_activity_at, now)}` : '';
+    return { key: 'quiet', label: `quiet${stale}`, color: 'var(--warn)', pct: 0,
       title: 'no word from the agent for five minutes — the session is checking on it' };
   }
   if (st === 'triaging') {

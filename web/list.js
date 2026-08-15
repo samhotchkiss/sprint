@@ -126,7 +126,9 @@ function motionSection(col, app) {
 export function motionRow(card, app) {
   const st = motionState(card);
   const row = openable('row work-row', card, app);
-  const last = card.last_event ? firstLine(app.eventText(card.last_event), 160) : '';
+  // The silence notice is already the whole right-hand side of this row; saying
+  // it twice would push out the last thing the agent actually did.
+  const last = lastAction(card, app);
   row.appendChild(h('span.row-num', '#' + card.num));
   row.appendChild(h('span.row-main',
     h('span.row-title', card.title),
@@ -136,6 +138,12 @@ export function motionRow(card, app) {
     h('span.prog-label', { style: { color: st.color } }, st.label)));
   row.appendChild(h('span.row-agent', shortAgent(card.agent_name)));
   return row;
+}
+
+function lastAction(card, app) {
+  const ev = card.last_event;
+  if (!ev || ev.kind === 'agent_silent') return '';
+  return firstLine(app.eventText(ev), 160);
 }
 
 // ---- 3. blocked ----------------------------------------------------------

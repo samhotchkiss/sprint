@@ -151,7 +151,10 @@ function faceSub(card, state, col, app) {
     return { text: r.text, color: r.bad ? 'var(--bad)' : 'var(--faint)' };
   }
   if (col === 'in_motion') {
-    return { text: card.last_event ? firstLine(app.eventText(card.last_event), 140) : '', color: null };
+    const ev = card.last_event;
+    // the tag already says "quiet Nm" — the face does not repeat it
+    if (!ev || ev.kind === 'agent_silent') return { text: '', color: null };
+    return { text: firstLine(app.eventText(ev), 140), color: null };
   }
   return { text: '', color: null };
 }
