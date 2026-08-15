@@ -1,37 +1,47 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="skin-calm">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="light dark">
+<meta name="color-scheme" content="dark">
 <title>sprint</title>
-<link rel="icon" id="favicon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%233a6ea5'/%3E%3Crect x='14' y='16' width='9' height='32' rx='3' fill='white'/%3E%3Crect x='28' y='16' width='9' height='22' rx='3' fill='white' opacity='.75'/%3E%3Crect x='42' y='16' width='9' height='14' rx='3' fill='white' opacity='.5'/%3E%3C/svg%3E">
+<link rel="icon" id="favicon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230e1013'/%3E%3Crect x='12' y='40' width='40' height='4' rx='2' fill='%23d8a45c'/%3E%3Crect x='12' y='28' width='28' height='4' rx='2' fill='%237fa88a'/%3E%3Crect x='12' y='16' width='18' height='4' rx='2' fill='%235c4a4c'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="fonts/fonts.css">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <div id="app">
 
   <header class="topbar" id="topbar">
-    <div class="brand">
-      <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-name">sprint</span>
+    <h1 class="sprint-name" id="sprint-title">loading…</h1>
+    <p class="headline" id="headline"></p>
+    <span class="grow"></span>
+    <div class="seg" id="view-seg" role="group" aria-label="layout">
+      <button class="seg-btn" type="button" data-view="list">List</button>
+      <button class="seg-btn" type="button" data-view="board">Board</button>
     </div>
-    <div class="sprint-title" id="sprint-title">loading…</div>
-    <div class="topbar-right">
-      <div class="session-pill" id="session-pill" title="session status">
-        <span class="dot" id="session-dot"></span>
-        <span id="session-label">session</span>
-      </div>
-      <button class="btn ghost sidebar-toggle" id="sidebar-toggle" type="button">Chat</button>
-    </div>
+    <button class="btn drop-btn" id="drop-btn" type="button">+ Drop work</button>
+    <button class="btn chat-btn" id="chat-btn" type="button" aria-pressed="false">
+      <span class="dot" id="chat-dot" aria-hidden="true"></span>
+      <span>Chat</span>
+    </button>
   </header>
 
   <div class="banner-slot" id="banner-slot" hidden>
     <div class="banner" id="banner"></div>
   </div>
 
-  <form class="compose" id="compose" autocomplete="off">
-    <textarea id="compose-text" rows="1" placeholder="Drop work here — a bug, an idea, a screenshot."></textarea>
+  <main class="main" id="main" aria-label="board"></main>
+
+  <aside class="rail" id="rail" aria-label="session chat or card thread"></aside>
+
+</div>
+
+<div class="scrim" id="scrim" hidden></div>
+
+<div class="sheet-wrap" id="compose-wrap" hidden>
+  <form class="sheet compose" id="compose" autocomplete="off">
+    <textarea id="compose-text" rows="4" placeholder="Drop work here — a bug, an idea, a screenshot."></textarea>
     <div class="thumbs" id="compose-thumbs" hidden></div>
     <div class="compose-row">
       <label class="switch" title="New items land in Held until you say go">
@@ -39,36 +49,17 @@
         <span class="switch-track"><span class="switch-knob"></span></span>
         <span class="switch-label">Hold new items</span>
       </label>
-      <span class="spacer"></span>
+      <span class="grow"></span>
       <span class="compose-err" id="compose-err" hidden></span>
       <label class="btn ghost" for="compose-file">Images</label>
       <input type="file" id="compose-file" multiple accept="image/*" hidden>
-      <span class="kbd-hint">⌘⏎</span>
-      <button class="btn primary" id="compose-send" type="submit">Send</button>
+      <button class="btn ghost" id="compose-cancel" type="button">Cancel</button>
+      <button class="btn send" id="compose-send" type="submit">Send</button>
     </div>
+    <p class="compose-hint">Return sends · Shift+Return for a new line</p>
   </form>
-
-  <main class="board" id="board" aria-label="board"></main>
-
-  <aside class="sidebar" id="sidebar" aria-label="chat with the session">
-    <div class="sidebar-head">
-      <div class="sidebar-title">
-        <span class="dot" id="sidebar-dot"></span>
-        <span>Session</span>
-      </div>
-      <button class="btn ghost icon sidebar-close" id="sidebar-close" type="button" aria-label="close chat">✕</button>
-    </div>
-    <div class="thread" id="sidebar-thread"></div>
-    <form class="sidebar-compose" id="sidebar-form" autocomplete="off">
-      <textarea id="sidebar-text" rows="1" placeholder="Ask the session anything…"></textarea>
-      <button class="btn primary icon" id="sidebar-send" type="submit" aria-label="send">↑</button>
-    </form>
-  </aside>
-
 </div>
 
-<div class="scrim" id="scrim" hidden></div>
-<section class="drawer" id="drawer" hidden aria-label="card detail"></section>
 <div class="lightbox" id="lightbox" hidden></div>
 <div class="toasts" id="toasts"></div>
 <div class="authwall" id="authwall" hidden></div>

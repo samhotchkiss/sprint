@@ -4,7 +4,6 @@
 //   &offline=1         session reported offline (banner)
 //   &session=busy      session attached but its drain cursor is behind (dot only, no banner)
 //   &live=1            drip a few scripted events (chime + badge + reconciliation)
-//   &theme=dark|light  force a theme for verification
 // It stubs window.fetch (for /api/* only) and window.EventSource.
 
 const now = Date.now();
