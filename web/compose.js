@@ -58,8 +58,13 @@ export function initCompose({ form, textarea, thumbsEl, fileInput, errEl, onSubm
     }
     if (files.length) { e.preventDefault(); addFiles(files); }
   });
+  // Return sends, Shift+Return makes a new line. Cmd/Ctrl+Return still sends,
+  // because that is what the spec documented and muscle memory is real.
   textarea.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); form.requestSubmit(); }
+    if (e.key !== 'Enter') return;
+    if (e.shiftKey) return;
+    e.preventDefault();
+    form.requestSubmit();
   });
   fileInput.addEventListener('change', () => { addFiles(fileInput.files); fileInput.value = ''; });
 
@@ -87,7 +92,12 @@ export function initCompose({ form, textarea, thumbsEl, fileInput, errEl, onSubm
   });
 
   grow();
-  return { addFiles, focus: () => textarea.focus() };
+  return {
+    addFiles,
+    focus: () => textarea.focus(),
+    grow,
+    isEmpty: () => !textarea.value.trim() && !images.length,
+  };
 }
 
 function readFile(file) {

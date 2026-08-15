@@ -4,22 +4,31 @@ import { api, ApiError, initAuth } from './api.js';
 import { Live } from './live.js';
 import {
   store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
+  sections, headline, loadView, setView, setChatOpen,
 } from './state.js';
-import { renderBoard } from './board.js';
-import { renderDrawer, openLightbox, closeLightbox } from './drawer.js';
-import { renderSidebar, renderSessionStatus } from './sidebar.js';
+import { renderList } from './list.js';
+import { renderBoard, renderFold } from './board.js';
+import { renderPhone } from './phone.js';
+import { renderRail, openLightbox, closeLightbox } from './rail.js';
 import { initCompose, toBase64List } from './compose.js';
 import { installNotifications, attention, armNotifications, clearBadge } from './notify.js';
 
 const el = {};
+let compose = null;
+
 const app = {
   transport: 'idle',
   eventText,
   render,
   openCard, closeCard,
-  answer, chat, verdict, cardAction, markDuplicate, retryCard, retrySubmit,
+  answer, chat, sessionChat, verdict, cardAction, markDuplicate, retryCard, retrySubmit,
   lightbox: (urls, i, caps) => openLightbox(el.lightbox, urls, i, caps),
 };
+
+// Which shell we are in. The Fold is the spec's real mobile target (980×740),
+// and the phone below it is an explicit fallback, not an optimisation.
+const foldQuery = window.matchMedia('(max-width: 1199px)');
+const phoneQuery = window.matchMedia('(max-width: 600px)');
 
 // ---- render --------------------------------------------------------------
 
@@ -32,20 +41,66 @@ function render() {
 
 function paint() {
   const focus = captureFocus();
+  const secs = sections();
 
   const title = store.sprint ? store.sprint.title : 'starting up…';
   if (el.sprintTitle.textContent !== title) el.sprintTitle.textContent = title;
+  // On the Fold the header is 54px and the whole headline will not fit; the one
+  // number that changes what you do next survives, in the accent colour.
+  const needs = secs.needs_you.cards.length;
+  el.headline.classList.toggle('fold-need', foldQuery.matches);
+  el.headline.textContent = !store.loaded ? ''
+    : foldQuery.matches ? (needs ? `${needs} need you` : 'nothing needs you')
+      : headline(secs);
   if (store.sprint && el.hold.checked !== !!store.sprint.hold_mode) el.hold.checked = !!store.sprint.hold_mode;
   document.body.classList.toggle('hold-on', !!(store.sprint && store.sprint.hold_mode));
 
-  renderBoard(el.board, app);
-  renderSidebar(el.thread, app);
-  renderSessionStatus(app);
-  renderDrawer(el.drawer, store.detail, app);
-  el.drawer.hidden = !store.detail;
-  el.scrim.hidden = !store.detail && !document.body.classList.contains('sidebar-open');
+  for (const btn of el.viewBtns) btn.classList.toggle('is-on', btn.dataset.view === store.view);
+  paintChatButton();
 
+  clear(el.main);
+  if (phoneQuery.matches) renderPhone(el.main, app);
+  else if (foldQuery.matches) renderFold(el.main, app);
+  else if (store.view === 'board') renderBoard(el.main, app);
+  else renderList(el.main, app);
+
+  const railOpen = !!store.detail || store.chatOpen;
+  document.body.classList.toggle('rail-open', railOpen);
+  renderRail(el.rail, app);
+
+  // The scrim only exists where the rail floats over the board (Fold, phone).
+  el.scrim.hidden = !(railOpen && foldQuery.matches);
+
+  renderSessionBanner();
   restoreFocus(focus);
+}
+
+/**
+ * The Chat button is the spec's single notification surface, and it has exactly
+ * four states — closed, open, a session line you have not seen (gold, pulsing),
+ * and dimmed because a card has taken the rail. There is no counter anywhere.
+ */
+function paintChatButton() {
+  const b = el.chatBtn;
+  const cardOpen = !!store.detail;
+  b.classList.toggle('is-open', store.chatOpen && !cardOpen);
+  b.classList.toggle('is-unseen', store.unseen && !cardOpen && !store.chatOpen);
+  b.classList.toggle('is-dim', cardOpen);
+  b.setAttribute('aria-pressed', store.chatOpen && !cardOpen ? 'true' : 'false');
+  b.title = cardOpen ? 'a card has the rail — click to go back to the session'
+    : store.unseen ? 'the session said something while you were not looking'
+      : store.chatOpen ? 'hide the session chat' : 'chat with the session';
+}
+
+function renderSessionBanner() {
+  const offline = store.loaded && store.session.online === false;
+  const transportDown = app.transport === 'error';
+  if (!offline && !transportDown) { el.bannerSlot.hidden = true; return; }
+  el.bannerSlot.hidden = false;
+  clear(el.banner);
+  el.banner.className = offline ? 'banner warn' : 'banner dim';
+  el.banner.appendChild(h('span',
+    offline ? 'session offline — items will queue' : 'lost the board connection — retrying'));
 }
 
 function captureFocus() {
@@ -131,6 +186,7 @@ async function submit(payload) {
     error: null,
   };
   store.pending.push(pending);
+  closeCompose();
   render();
   await sendSubmit(pending);
 }
@@ -165,6 +221,9 @@ async function answer(card, question, text) {
   const q = question || card.question || {};
   patch(card.num, 'in_progress');
   card.question = null;
+  // "Delivered — the agent sees it next turn": the optimistic status line the
+  // question panel is replaced by, in the thread, immediately.
+  if (store.detail && store.detail.num === card.num) store.detail.justAnswered = true;
   pushPending(card.num, { actor: 'user', kind: 'answer', payload: { text } });
   render();
   try {
@@ -176,7 +235,10 @@ async function answer(card, question, text) {
     store.patches.delete(card.num);
     card.state = before;
     card.question = q.text ? q : card.question;
+    if (store.detail && store.detail.num === card.num) store.detail.justAnswered = false;
     if (err instanceof ApiError && err.status === 409) {
+      // Someone (or a second click) already answered this one. Say so gently
+      // and catch up — never throw a 409 in the user's face.
       toast('That question was already answered — catching up.');
       refreshBoard();
     } else {
@@ -201,6 +263,33 @@ async function chat(card, text) {
   } catch (err) {
     settlePending(card.num, true);
     toast(errText(err, 'message did not send'));
+    handleError(err, null);
+    render();
+  }
+}
+
+/** A line to the session itself, in the sprint-level chat. */
+async function sessionChat(text) {
+  const line = normEvent({ actor: 'user', kind: 'chat', ts: new Date().toISOString(), payload: { text } });
+  line.local = true;         // "sending…" — no seq yet, so nothing is claimed
+  line.localEcho = true;     // replaced when the server's own copy arrives
+  line.sortSeq = store.seq + 0.5;   // ordering only, never a delivery claim
+  store.sidebar.push(line);
+  render();
+  try {
+    const res = await api.sidebar(text);
+    line.local = false;
+    const seq = res && res.event && Number(res.event.seq);
+    if (seq && !Number.isNaN(seq)) {
+      line.seq = seq;
+      line.ts = res.event.ts || line.ts;
+      store.seq = Math.max(store.seq, seq);
+    }
+    render();
+  } catch (err) {
+    line.local = false;
+    line.failed = true;
+    toast(errText(err, 'the session did not get that'));
     handleError(err, null);
     render();
   }
@@ -303,13 +392,15 @@ function settlePending(num, failed, event, entry) {
   if (!entry && !(seq && !Number.isNaN(seq))) store.detail.pendingLines = [];
 }
 
-// ---- drawer --------------------------------------------------------------
+// ---- the rail ------------------------------------------------------------
 
 function openCard(num) {
   if (num == null) return;
   const card = store.cards.get(Number(num)) || null;
-  store.detail = { num: Number(num), card, timeline: [], evidence: card && card.evidence, pendingLines: [], error: null };
-  document.body.classList.add('drawer-open');
+  store.detail = {
+    num: Number(num), card, timeline: [], evidence: card && card.evidence,
+    pendingLines: [], justAnswered: false, error: null,
+  };
   if (location.hash !== `#/c/${num}`) history.replaceState(null, '', `#/c/${num}`);
   render();
   refreshDetail();
@@ -317,9 +408,31 @@ function openCard(num) {
 
 function closeCard() {
   store.detail = null;
-  document.body.classList.remove('drawer-open');
   if (location.hash.startsWith('#/c/')) history.replaceState(null, '', location.pathname + location.search);
   render();
+}
+
+function toggleChat(force) {
+  const want = force != null ? force : !(store.chatOpen && !store.detail);
+  setChatOpen(want);
+  if (want) {
+    store.unseen = false;
+    store.detail = null;
+    if (location.hash.startsWith('#/c/')) history.replaceState(null, '', location.pathname + location.search);
+  }
+  render();
+  if (want) setTimeout(() => { const t = $('#sidebar-text'); if (t) t.focus(); }, 60);
+}
+
+// ---- compose sheet -------------------------------------------------------
+
+function openCompose() {
+  el.composeWrap.hidden = false;
+  setTimeout(() => compose && compose.focus(), 40);
+}
+
+function closeCompose() {
+  el.composeWrap.hidden = true;
 }
 
 // ---- chrome --------------------------------------------------------------
@@ -351,22 +464,13 @@ function showAuthWall() {
   el.authwall.appendChild(h('div.authwall-card',
     h('h2', 'This board needs its link'),
     h('p', 'The access token is missing or expired. Open the URL the session printed when it started the sprint — the one ending in ?t=… — and this page will work again.'),
-    h('button.btn.primary', { type: 'button', onclick: () => location.reload() }, 'Reload')));
-}
-
-function toggleSidebar(force) {
-  const on = force != null ? force : !document.body.classList.contains('sidebar-open');
-  document.body.classList.toggle('sidebar-open', on);
-  el.scrim.hidden = !on && !store.detail;
-  if (on) setTimeout(() => el.sidebarText.focus(), 60);
+    h('button.btn.send', { type: 'button', onclick: () => location.reload() }, 'Reload')));
 }
 
 // ---- boot ----------------------------------------------------------------
 
 async function boot() {
   const params = new URLSearchParams(location.search);
-  const theme = params.get('theme');
-  if (theme === 'dark' || theme === 'light') document.documentElement.dataset.theme = theme;
   const mock = params.get('mock');
   if (mock) {
     const m = await import('./mock.js');
@@ -376,19 +480,24 @@ async function boot() {
 
   initAuth();
   installNotifications();
+  loadView();
 
-  el.board = $('#board');
-  el.drawer = $('#drawer');
+  el.main = $('#main');
+  el.rail = $('#rail');
   el.scrim = $('#scrim');
-  el.thread = $('#sidebar-thread');
   el.lightbox = $('#lightbox');
   el.toasts = $('#toasts');
   el.authwall = $('#authwall');
   el.sprintTitle = $('#sprint-title');
+  el.headline = $('#headline');
   el.hold = $('#hold-toggle');
-  el.sidebarText = $('#sidebar-text');
+  el.chatBtn = $('#chat-btn');
+  el.bannerSlot = $('#banner-slot');
+  el.banner = $('#banner');
+  el.composeWrap = $('#compose-wrap');
+  el.viewBtns = Array.from(document.querySelectorAll('.seg-btn'));
 
-  initCompose({
+  compose = initCompose({
     form: $('#compose'),
     textarea: $('#compose-text'),
     thumbsEl: $('#compose-thumbs'),
@@ -409,57 +518,39 @@ async function boot() {
     }
   });
 
-  $('#sidebar-toggle').addEventListener('click', () => toggleSidebar());
-  $('#sidebar-close').addEventListener('click', () => toggleSidebar(false));
-  el.scrim.addEventListener('click', () => { toggleSidebar(false); closeCard(); });
+  for (const btn of el.viewBtns) {
+    btn.addEventListener('click', () => { if (setView(btn.dataset.view)) render(); });
+  }
+  el.chatBtn.addEventListener('click', () => toggleChat());
+  $('#drop-btn').addEventListener('click', () => openCompose());
+  $('#compose-cancel').addEventListener('click', () => closeCompose());
+  el.composeWrap.addEventListener('mousedown', (e) => { if (e.target === el.composeWrap) closeCompose(); });
+  el.scrim.addEventListener('click', () => { if (store.detail) closeCard(); else toggleChat(false); });
 
-  const sidebarForm = $('#sidebar-form');
-  const sidebarText = el.sidebarText;
-  sidebarText.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sidebarForm.requestSubmit(); }
-  });
-  sidebarText.addEventListener('input', () => {
-    sidebarText.style.height = 'auto';
-    sidebarText.style.height = Math.min(140, Math.max(sidebarText.scrollHeight, 38)) + 'px';
-  });
-  sidebarForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const text = sidebarText.value.trim();
-    if (!text) return;
-    sidebarText.value = '';
-    sidebarText.style.height = '';
-    const localLine = normEvent({ actor: 'user', kind: 'chat', ts: new Date().toISOString(), payload: { text } });
-    localLine.local = true;        // "sending…" — no seq yet, so nothing is claimed
-    localLine.localEcho = true;    // replaced when the server's own copy arrives
-    localLine.sortSeq = store.seq + 0.5;   // ordering only, never a delivery claim
-    store.sidebar.push(localLine);
-    render();
-    try {
-      const res = await api.sidebar(text);
-      localLine.local = false;
-      // The server's own seq for this message: this is what "landed" means, and
-      // what the drain cursor gets compared against.
-      const seq = res && res.event && Number(res.event.seq);
-      if (seq && !Number.isNaN(seq)) {
-        localLine.seq = seq;
-        localLine.ts = res.event.ts || localLine.ts;
-        store.seq = Math.max(store.seq, seq);
-      }
-      render();
-    } catch (err) {
-      localLine.local = false;
-      localLine.failed = true;
-      toast(errText(err, 'the session did not get that'));
-      handleError(err, null);
-      render();
+  // Paste or drop an image anywhere and the sheet opens with it already attached.
+  window.addEventListener('paste', (e) => {
+    if (!el.composeWrap.hidden) return;
+    const a = document.activeElement;
+    if (a && (a instanceof HTMLTextAreaElement || a instanceof HTMLInputElement)) return;
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    const files = [];
+    for (const it of items) {
+      if (it.kind === 'file' && /^image\//.test(it.type)) { const f = it.getAsFile(); if (f) files.push(f); }
     }
+    if (!files.length) return;
+    e.preventDefault();
+    openCompose();
+    compose.addFiles(files);
   });
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       if (!el.lightbox.hidden) { closeLightbox(el.lightbox); return; }
+      if (!el.composeWrap.hidden) { closeCompose(); return; }
       if (store.detail) { closeCard(); return; }
-      if (document.body.classList.contains('sidebar-open')) toggleSidebar(false);
+      if (store.chatOpen) toggleChat(false);
+      return;
     }
     if (!el.lightbox.hidden && el.lightbox._nav) {
       if (e.key === 'ArrowRight') el.lightbox._nav(1);
@@ -478,8 +569,13 @@ async function boot() {
     if (m) openCard(Number(m[1]));
     else if (store.detail) closeCard();
   });
+  for (const q of [foldQuery, phoneQuery]) {
+    if (q.addEventListener) q.addEventListener('change', render);
+    else if (q.addListener) q.addListener(render);
+  }
 
   setInterval(() => tickTimes(document), 20000);
+  setInterval(() => render(), 30000);          // the recency hairlines drain live
   setInterval(() => refreshBoard(), 45000);
 
   await firstLoad();
@@ -509,7 +605,7 @@ async function firstLoad() {
       if (store.detail && (out.touched.has(store.detail.num) || out.needsBoard)) refreshDetail();
       render();
     },
-    onStatus: (mode) => { app.transport = mode; renderSessionStatus(app); },
+    onStatus: (mode) => { app.transport = mode; render(); },
     // The session drained further: messages it has now read flip to
     // "session is on it" without waiting for the next board fetch.
     onCursor: (seq) => { if (applyCursor(seq)) render(); },

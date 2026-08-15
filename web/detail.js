@@ -25,27 +25,26 @@ export function detailBlock(ev, app, { small = false } = {}) {
   const key = detailKey(ev);
   let open = detailOpen(key);
 
-  const body = h('pre.detail-body', { hidden: !open });
+  const body = h('div.detail-body', { hidden: !open });
   body.appendChild(preText(text, app && app.openCard));
 
-  const chev = h('span.detail-chev', '›');
-  const label = h('span.detail-label', open ? 'less' : 'more');
+  const label = h('span.detail-label', open ? 'Less' : 'More context');
   const toggle = h('button.detail-toggle', {
     type: 'button',
     'aria-expanded': open ? 'true' : 'false',
-    title: open ? 'hide the long version' : 'show the long version',
+    title: open ? 'hide the long version' : lineHint(text),
     onclick: (e) => {
       e.preventDefault();
       e.stopPropagation();
       open = !open;
       detailOpen(key, open);
       body.hidden = !open;
-      label.textContent = open ? 'less' : 'more';
+      label.textContent = open ? 'Less' : 'More context';
       toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-      toggle.title = open ? 'hide the long version' : 'show the long version';
+      toggle.title = open ? 'hide the long version' : lineHint(text);
       toggle.classList.toggle('is-open', open);
     },
-  }, chev, label, h('span.detail-hint', lineHint(text)));
+  }, label);
   if (open) toggle.classList.add('is-open');
 
   return h('div.detail', { class: small ? 'detail small' : 'detail' }, toggle, body);
@@ -61,7 +60,7 @@ function detailKey(ev) {
 
 function lineHint(text) {
   const lines = text.split('\n').length;
-  return lines > 1 ? `${lines} lines` : `${text.length} chars`;
+  return lines > 1 ? `show the long version — ${lines} lines` : 'show the long version';
 }
 
 /** Preformatted, so a log keeps its shape — plus #N autolinks. */

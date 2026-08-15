@@ -1,30 +1,71 @@
 // The client-side projection of the board. Tolerant normalizers: the server owns the
 // truth, we only ever *display* it, so unknown/missing fields degrade instead of throwing.
-import { firstLine, ms } from './util.js';
+import { age, firstLine, ms } from './util.js';
 
 export const SILENT_MS = 5 * 60 * 1000;   // spec: 5 minutes with no worker event
 
+/**
+ * The four sections the design reads the sprint as, top to bottom, plus Done.
+ * "Needs you" deliberately holds both shapes of asking: a card with an open
+ * question, and a card whose evidence packet is waiting on a verdict — both are
+ * the same thing to a human ("this one is on me"), so they share a section and
+ * are told apart by their rail colour and tag.
+ */
 export const COLUMNS = [
-  { key: 'held', title: 'Held', states: ['held'], hideWhenEmpty: true },
-  { key: 'queued', title: 'Queued', states: ['queued'] },
-  { key: 'in_progress', title: 'In progress', states: ['triaging', 'in_progress'] },
-  { key: 'needs_you', title: 'Needs you', states: ['needs_you'] },
-  { key: 'blocked', title: 'Blocked', states: ['blocked', 'failed', 'stale'] },
-  { key: 'ready', title: 'Ready', states: ['ready', 'integrating'] },
-  { key: 'done', title: 'Done', states: ['completed', 'rejected', 'duplicate', 'canceled'], collapsed: true },
+  {
+    key: 'needs_you',
+    title: 'Needs you',
+    board: 'Needs you',
+    states: ['needs_you', 'ready', 'integrating'],
+    dot: 'var(--accent)',
+  },
+  {
+    key: 'in_motion',
+    title: 'In motion',
+    board: 'In progress',
+    states: ['triaging', 'in_progress'],
+    dot: 'var(--good)',
+  },
+  {
+    key: 'blocked',
+    title: 'Blocked',
+    board: 'Blocked',
+    states: ['blocked', 'failed', 'stale'],
+    dot: 'var(--bad)',
+  },
+  {
+    key: 'waiting',
+    title: 'Queued & held',
+    board: 'Queued & held',
+    states: ['queued', 'held'],
+    dot: 'var(--faint)',
+  },
+  {
+    key: 'done',
+    title: 'Done',
+    board: 'Done',
+    states: ['completed', 'rejected', 'duplicate', 'canceled'],
+    collapsed: true,
+  },
 ];
 
-// Fallback mapping. The server ships an advisory `column_of` on every board and
-// that wins whenever it's there — the server owns the state machine, so it also
-// owns which column a state belongs in.
+/** The 4px meter, in the design's order and colours. Done is not on it. */
+export const METER = [
+  { key: 'needs_you', color: '#d8a45c', word: 'need you' },
+  { key: 'in_motion', color: '#7fa88a', word: 'in motion' },
+  { key: 'blocked', color: '#5c4a4c', word: 'blocked' },
+  { key: 'waiting', color: '#2a2d33', word: 'queued' },
+];
+
+// State → section. The server ships an advisory `column_of`, but its columns are
+// the state machine's (held/queued/ready/…) and these four are a reading order
+// for a human, so the grouping is ours. Anything the server invents that we have
+// never heard of lands in Queued & held rather than vanishing off the board.
 const COL_OF = {};
 for (const c of COLUMNS) for (const s of c.states) COL_OF[s] = c.key;
-const COL_KEYS = new Set(COLUMNS.map((c) => c.key));
 
 export function columnOf(state) {
-  const server = store.columnOf && store.columnOf[state];
-  if (server && COL_KEYS.has(server)) return server;
-  return COL_OF[state] || 'queued';
+  return COL_OF[state] || 'waiting';
 }
 
 export const STATE_LABEL = {
@@ -51,7 +92,45 @@ export const store = {
   expanded: new Set(),    // event keys whose long version you opened (see detail.js)
   doneOpen: false,
   loaded: false,
+
+  // ---- rail + layout (client only) ----------------------------------------
+  // Only one thing owns the rail at a time: a card, or the session chat.
+  view: 'list',           // 'list' | 'board' — persisted
+  chatOpen: false,        // session chat wants the rail
+  unseen: false,          // a session line arrived while the rail was closed
 };
+
+const VIEW_KEY = 'sprint.view';
+const CHAT_KEY = 'sprint.chat';
+
+/** Which layout you chose last time. Persisted; anything unrecognised is List. */
+export function loadView() {
+  let v = null;
+  try { v = localStorage.getItem(VIEW_KEY); } catch { v = null; }
+  store.view = v === 'board' ? 'board' : 'list';
+  // On a desktop the rail starts on the session, because a board with nothing
+  // open should still show you the one conversation that is always there. On the
+  // Fold and below it starts closed — there the rail is a slide-over on top of
+  // the work, and opening over the board uninvited would be rude.
+  let c = null;
+  try { c = localStorage.getItem(CHAT_KEY); } catch { c = null; }
+  const roomForIt = !(window.matchMedia && window.matchMedia('(max-width: 1199px)').matches);
+  store.chatOpen = c == null ? roomForIt : c === '1';
+  return store.view;
+}
+
+export function setView(v) {
+  const next = v === 'board' ? 'board' : 'list';
+  if (next === store.view) return false;
+  store.view = next;
+  try { localStorage.setItem(VIEW_KEY, next); } catch {}
+  return true;
+}
+
+export function setChatOpen(on) {
+  store.chatOpen = !!on;
+  try { localStorage.setItem(CHAT_KEY, on ? '1' : '0'); } catch {}
+}
 
 // ---- normalizers ---------------------------------------------------------
 
@@ -235,6 +314,10 @@ export function applyEvents(events) {
       }
       if (!store.sidebar.some((e) => e.seq != null && e.seq === ev.seq)) store.sidebar.push(ev);
       out.sidebar = true;
+      // The Chat button is the only "there's something here" signal in the
+      // product: a line from the session that arrived while you were not
+      // looking at the chat lights it gold, and opening the chat clears it.
+      if (ev.actor === 'session' && !(store.chatOpen && !store.detail)) store.unseen = true;
       continue;
     }
     if (ev.card_num == null) { out.needsBoard = true; continue; }
@@ -300,9 +383,8 @@ export function columns() {
   for (const card of store.cards.values()) {
     buckets.get(columnOf(cardState(card))).push(card);
   }
-  for (const p of store.pending) {
-    buckets.get(p.hold ? 'held' : 'queued').unshift(p);
-  }
+  // A card you just dropped is on the board before the server has confirmed it.
+  for (const p of store.pending) buckets.get('waiting').unshift(p);
   const now = Date.now();
   for (const [key, arr] of buckets) arr.sort(sorterFor(key, now));
   return COLUMNS.map((c) => ({ ...c, cards: buckets.get(c.key) }));
@@ -313,15 +395,111 @@ function sorterFor(key, now) {
   const newestFirst = (a, b) => (ms(b.updated_at || b.last_activity_at) || 0) - (ms(a.updated_at || a.last_activity_at) || 0);
   const pin = (a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0);
   const wrap = (fn) => (a, b) => pin(a, b) || fn(a, b) || (a.num || 0) - (b.num || 0);
-  if (key === 'queued') return wrap((a, b) => {
+  if (key === 'waiting') return wrap((a, b) => {
+    // held sinks below queued: it is the pile nobody has been told to start
+    const ha = cardState(a) === 'held' ? 1 : 0;
+    const hb = cardState(b) === 'held' ? 1 : 0;
+    if (ha !== hb) return ha - hb;
     const qa = a.queue_position == null ? 9999 : a.queue_position;
     const qb = b.queue_position == null ? 9999 : b.queue_position;
     return qa - qb;
   });
-  if (key === 'in_progress') return wrap((a, b) => (isSilent(b, now) ? 1 : 0) - (isSilent(a, now) ? 1 : 0) || oldestFirst(a, b));
-  if (key === 'needs_you' || key === 'blocked' || key === 'ready') return wrap(oldestFirst);
+  if (key === 'in_motion') return wrap((a, b) => (isSilent(b, now) ? 1 : 0) - (isSilent(a, now) ? 1 : 0) || oldestFirst(a, b));
   if (key === 'done') return wrap(newestFirst);
   return wrap(oldestFirst);
+}
+
+/** Sections keyed for the callers that want one by name. */
+export function sections() {
+  const out = {};
+  for (const col of columns()) out[col.key] = col;
+  return out;
+}
+
+/**
+ * The 4px meter. Each segment grows by its count, so the bar IS the shape of the
+ * sprint — no chart, no axis, and no number on it bigger than the legend's 12.5px.
+ * A segment with nothing in it is dropped rather than drawn as a sliver.
+ */
+export function meterSegments(secs = sections()) {
+  return METER
+    .map((m) => {
+      const n = (secs[m.key] && secs[m.key].cards.length) || 0;
+      return { ...m, count: n, label: `${n} ${m.word}` };
+    })
+    .filter((m) => m.count > 0);
+}
+
+/** The one-line headline beside the sprint title. Zero-count parts are dropped. */
+export function headline(secs = sections()) {
+  const n = (k) => (secs[k] && secs[k].cards.length) || 0;
+  const parts = [];
+  if (n('needs_you')) parts.push(`${n('needs_you')} need you`);
+  if (n('in_motion')) parts.push(`${n('in_motion')} running`);
+  if (n('blocked')) parts.push(`${n('blocked')} blocked`);
+  if (n('waiting')) parts.push(`${n('waiting')} waiting`);
+  return parts.join(' · ');
+}
+
+/**
+ * Which of the two "this one is on me" shapes a Needs-you card is:
+ *   question — an agent is stuck on an answer only you can give
+ *   signoff  — an evidence packet is waiting on your verdict
+ */
+export function needsKind(card) {
+  const st = cardState(card);
+  if (st === 'ready' || st === 'integrating') return 'signoff';
+  return 'question';
+}
+
+/**
+ * The In-motion row's 2px hairline and state label.
+ *
+ * The bar is NOT progress — nothing on the wire knows how far along a job is,
+ * and inventing a percentage would be the spinner the spec bans, only worse
+ * because it looks like a fact. It is *recency*: full the moment the agent says
+ * something, draining to empty across the five-minute silence window that trips
+ * the server's own agent_silent timer. Full bar = just heard from it; empty bar
+ * = the session is about to go check on it. Long jobs suppress the drain, since
+ * silence there is expected and the amber would be a lie.
+ */
+export function motionState(card, now = Date.now()) {
+  const st = cardState(card);
+  const quiet = isSilent(card, now);
+  const since = ms(card.last_activity_at);
+  const elapsed = since == null ? SILENT_MS : Math.max(0, now - since);
+  let pct = Math.round(100 * (1 - Math.min(1, elapsed / SILENT_MS)));
+
+  if (card.long_running) {
+    return { key: 'long', label: 'long job', color: 'var(--info)', pct: 100,
+      title: 'flagged as a long job — the five-minute silence timer is suppressed' };
+  }
+  if (quiet) {
+    return { key: 'quiet', label: `quiet ${age(card.last_activity_at)}`, color: 'var(--warn)', pct: 0,
+      title: 'no word from the agent for five minutes — the session is checking on it' };
+  }
+  if (st === 'triaging') {
+    return { key: 'triaging', label: 'triaging', color: 'var(--alt)', pct: Math.max(pct, 12),
+      title: 'the agent is reading the card and restating it before it writes anything' };
+  }
+  return { key: 'active', label: `active · ${age(card.last_activity_at)}`, color: 'var(--good)', pct: Math.max(pct, 6),
+    title: 'how recently the agent said something — the bar drains over five minutes of silence' };
+}
+
+/** The machine reason a blocked card carries, and whether it reads as bad news. */
+export function blockedReason(card) {
+  const st = cardState(card);
+  const raw = (st === 'failed' && card.error) ? card.error : (card.reason || card.error || '');
+  const text = firstLine(raw, 160) || (st === 'failed' ? 'the agent died mid-run' : 'blocked — no reason recorded');
+  const bad = st === 'failed' || /^(ci_red|ci red|failed|error)/i.test(String(raw).trim());
+  return { text, bad };
+}
+
+/** The word on a Queued-&-held pill. */
+export function waitingMark(card) {
+  if (card.pendingSubmit) return card.error ? 'not sent' : 'sending';
+  if (card.pinned) return 'pinned';
+  return cardState(card) === 'held' ? 'held' : 'queued';
 }
 
 /** Which expanded details you left open, so a re-render doesn't slam them shut. */

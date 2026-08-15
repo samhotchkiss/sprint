@@ -1,238 +1,194 @@
-// The kanban surface: columns, card faces, inline answers.
-import { h, clear, timeEl, age, firstLine, plural } from './util.js';
-import { columns, cardState, isSilent, STATE_LABEL, store, draft } from './state.js';
+// The Board layout — the spec's kanban, four columns wide.
+//
+// Same header, same meter, same rail. What changes is that the work stops being
+// a reading order and becomes a distribution you can see across at a glance.
+//
+// Cards here are NOT interactive surfaces: there is no inline answering, no
+// verdict buttons, no expanders. A card face says who and how long and what
+// last happened, and clicking anywhere on it hands the card to the rail. That is
+// the whole contract — every decision is made in one place, with the thread
+// under it, rather than half on a tile and half in a panel.
+import { h, timeEl, firstLine } from './util.js';
+import {
+  columns, cardState, needsKind, motionState, blockedReason, waitingMark,
+  meterSegments, sections, isSilent, STATE_LABEL,
+} from './state.js';
+import { renderMeter } from './meter.js';
+import { renderDone } from './done.js';
+import { shortAgent } from './list.js';
 
 const scrollMemo = new Map();
 
 export function renderBoard(root, app) {
-  for (const el of root.querySelectorAll('.col-body')) {
-    scrollMemo.set(el.dataset.col, el.scrollTop);
-  }
-  clear(root);
-  const cols = columns();
-  for (const col of cols) {
-    if (col.hideWhenEmpty && !col.cards.length) continue;
-    root.appendChild(renderColumn(col, app));
-  }
-  for (const el of root.querySelectorAll('.col-body')) {
-    const v = scrollMemo.get(el.dataset.col);
-    if (v) el.scrollTop = v;
-  }
+  const secs = sections();
+  root.appendChild(renderMeter(meterSegments(secs)));
+  root.appendChild(boardGrid(app, { fold: false }));
+  root.appendChild(renderDone(secs.done, app));
 }
 
-function renderColumn(col, app) {
-  const isDone = col.key === 'done';
-  const open = !isDone || store.doneOpen;
+/**
+ * The Fold interior: the same four buckets, but only three get a column —
+ * vertical space is the scarce thing on a 740px-tall screen, so the queue moves
+ * to the "Elsewhere" strip at the bottom and Done drops out entirely (it is a
+ * desktop reading surface; on the Fold it would cost a third of the height).
+ */
+export function renderFold(root, app) {
+  root.appendChild(boardGrid(app, { fold: true }));
+  root.appendChild(elsewhereStrip(app));
+}
 
-  if (isDone && !open) {
-    return h('section.col.col-done.is-rail', { 'data-col': 'done' },
-      h('button.rail-btn', {
-        type: 'button', title: 'show finished cards',
-        onclick: () => { store.doneOpen = true; app.render(); },
-      }, h('span.rail-label', 'Done'), col.cards.length ? h('span.col-count', String(col.cards.length)) : null));
+function boardGrid(app, { fold }) {
+  const grid = h('div', { class: fold ? 'fold-cols' : 'board' });
+  const wanted = fold
+    ? ['needs_you', 'in_motion', 'blocked']
+    : ['needs_you', 'in_motion', 'blocked', 'waiting'];
+
+  for (const col of columns()) {
+    if (!wanted.includes(col.key)) continue;
+    // remember where each column was scrolled to across re-renders
+    const prev = scrollMemo.get(col.key);
+
+    const body = h('div.col-body', { 'data-col': col.key });
+    if (!col.cards.length) body.appendChild(h('p.col-empty', emptyText(col.key)));
+    for (const card of col.cards) body.appendChild(renderCardFace(card, app));
+    if (prev) requestAnimationFrame(() => { body.scrollTop = prev; });
+    body.addEventListener('scroll', () => scrollMemo.set(col.key, body.scrollTop), { passive: true });
+
+    grid.appendChild(h('section.col', { class: `col col-${col.key}` },
+      h('div.col-head',
+        h('span.col-dot', { style: { background: col.dot } }),
+        h('span.col-name', col.board),
+        h('span.grow'),
+        h('span.col-count', String(col.cards.length))),
+      body));
   }
-
-  const body = h('div.col-body', { 'data-col': col.key });
-
-  if (isDone) {
-    if (open) {
-      if (!col.cards.length) body.appendChild(h('p.col-empty', 'Nothing shipped yet.'));
-      for (const card of col.cards) body.appendChild(doneRow(card, app));
-    }
-  } else if (!col.cards.length) {
-    body.appendChild(h('p.col-empty', emptyText(col.key)));
-  } else {
-    for (const card of col.cards) body.appendChild(renderCard(card, app));
-  }
-
-  const count = col.cards.length;
-  // No count on Held — a held pile is not chrome.
-  const showCount = col.key !== 'held' && count > 0;
-
-  const head = h('div.col-head', { 'data-col': col.key },
-    h('span.col-name', col.title),
-    showCount ? h('span.col-count', String(count)) : null,
-    isDone ? h('button.btn.ghost.tiny', {
-      type: 'button',
-      onclick: () => { store.doneOpen = false; app.render(); },
-    }, 'Hide') : null,
-  );
-
-  return h('section.col', { 'data-col': col.key, class: `col col-${col.key}${isDone ? ' col-done' : ''}` }, head, body);
+  return grid;
 }
 
 function emptyText(key) {
   return {
-    queued: 'Nothing waiting.',
-    in_progress: 'No agent is running.',
     needs_you: 'Nothing needs you.',
+    in_motion: 'No agent is running.',
     blocked: 'Nothing is stuck.',
-    ready: 'Nothing to review.',
-    held: 'Nothing held.',
+    waiting: 'Nothing waiting.',
   }[key] || '—';
 }
 
 // ---- card face -----------------------------------------------------------
 
-export function renderCard(card, app) {
-  if (card.pendingSubmit) return pendingCard(card, app);
+export function renderCardFace(card, app) {
+  if (card.pendingSubmit) return pendingFace(card, app);
+
   const state = cardState(card);
-  const silent = isSilent(card);
-  const el = h('article.card', {
-    'data-num': card.num,
-    class: `card state-${state}${silent ? ' is-silent' : ''}${store.patches.has(card.num) ? ' is-optimistic' : ''}`,
-    tabindex: '0',
-    role: 'button',
-    onclick: (e) => { if (!e.target.closest('.no-open')) app.openCard(card.num); },
-    onkeydown: (e) => {
-      if ((e.key === 'Enter' || e.key === ' ') && e.target === el) { e.preventDefault(); app.openCard(card.num); }
-    },
-  });
-
-  el.appendChild(h('div.card-head',
-    h('span.card-num', '#' + card.num),
-    card.pinned ? h('span.pin', { title: 'pinned' }, '★') : null,
-    h('span.grow'),
-    // Only batches get a face badge — a solo agent's name is just the card number.
-    card.batch_id && card.agent_name
-      ? h('span.badge.agent', { title: 'shared with the rest of this batch' }, '⛓ ' + shortAgent(card.agent_name))
-      : null,
-    card.bounce_count ? h('span.badge.bounce', { title: 'bounced ' + plural(card.bounce_count, 'time') },
-      '↩ ' + card.bounce_count) : null,
-    state === 'integrating'
-      ? h('span.badge.merging', { title: 'the session is rebasing, gating and merging this branch' }, 'merging…')
-      : null,
-  ));
-
-  el.appendChild(h('h3.card-title', card.title));
-
-  if (state === 'needs_you' && card.question) {
-    el.appendChild(questionBlock(card, app));
-  }
-
-  if (state === 'blocked' && card.reason) {
-    el.appendChild(h('p.card-reason', h('span.reason-key', 'blocked:'), ' ' + card.reason));
-  }
-  if ((state === 'failed' || card.error) && state !== 'needs_you' && card.error) {
-    el.appendChild(h('p.card-reason.is-error', h('span.reason-key', 'error:'), ' ' + firstLine(card.error, 120)));
-  }
-  if ((state === 'ready' || state === 'integrating') && card.evidence) {
-    el.appendChild(evidenceTeaser(card, state));
-  }
-
-  const lastText = card.last_event ? app.eventText(card.last_event) : null;
-  if (lastText && state !== 'needs_you') {
-    el.appendChild(h('p.card-last', firstLine(lastText, 120)));
-  }
-
-  const foot = h('div.card-foot');
-  foot.appendChild(h('span.state-age',
-    h('span.state-dot'), STATE_LABEL[state] || state, ' ',
-    timeEl(card.state_since || card.updated_at || card.created_at, { suffix: false })));
-  if (state === 'queued' && card.queue_position != null) {
-    foot.appendChild(h('span.qpos', 'next ' + ordinal(card.queue_position)));
-  }
-  if (card.long_running) foot.appendChild(h('span.foot-flag', 'long job'));
-  if (silent) {
-    foot.appendChild(h('span.foot-flag.is-silent', 'quiet ', timeEl(card.last_activity_at, { suffix: false })));
-  } else if (card.last_activity_at && (state === 'in_progress' || state === 'triaging')) {
-    foot.appendChild(h('span.foot-quiet', 'last word ', timeEl(card.last_activity_at, { suffix: false })));
-  }
-  el.appendChild(foot);
-  return el;
-}
-
-function shortAgent(name) {
-  return String(name).replace(/^sprint-/, '').replace(/^card-/, '#');
-}
-
-function ordinal(n) {
-  const s = ['th', 'st', 'nd', 'rd'], v = n % 100;
-  return n + (s[(v - 20) % 10] || s[v] || s[0]);
-}
-
-function questionBlock(card, app) {
-  const q = card.question;
-  const key = `answer:${card.num}`;
-  const box = h('div.question.no-open');
-  box.appendChild(h('p.question-text', q.text));
-  if (q.options && q.options.length) {
-    const opts = h('div.quick-replies');
-    for (const opt of q.options) {
-      opts.appendChild(h('button.btn.quick', {
-        type: 'button',
-        onclick: () => app.answer(card, q, opt.value),
-      }, opt.label));
-    }
-    box.appendChild(opts);
-  }
-  const ta = h('textarea.answer-box', {
-    id: `answer-${card.num}`,
-    rows: '1',
-    placeholder: q.options && q.options.length ? 'or answer in your own words…' : 'Answer…',
-    oninput: (e) => { draft(key, e.target.value); autogrow(e.target); },
-    onkeydown: (e) => {
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
-      else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-    },
-  });
-  ta.value = draft(key);
-  const btn = h('button.btn.primary.small', { type: 'button', onclick: () => send() }, 'Answer');
-  function send() {
-    const text = ta.value.trim();
-    if (!text) { ta.focus(); return; }
-    draft(key, null);
-    app.answer(card, q, text);
-  }
-  box.appendChild(h('div.answer-row', ta, btn));
-  return box;
-}
-
-export function autogrow(ta, max = 160) {
-  ta.style.height = 'auto';
-  ta.style.height = Math.min(max, ta.scrollHeight) + 'px';
-}
-
-function evidenceTeaser(card, state) {
-  const p = card.evidence || {};
-  const bits = [];
-  if (p.test_result) bits.push(p.test_result);
-  if (p.diffstat) bits.push(firstLine(p.diffstat, 40));
-  const shots = Array.isArray(p.screenshots) ? p.screenshots.length : 0;
-  if (shots) bits.push(plural(shots, 'shot'));
-  const steps = Array.isArray(p.validate) ? p.validate.length : 0;
-  return h('div.teaser', { class: state === 'integrating' ? 'teaser merging' : 'teaser' },
-    p.claim ? h('p.teaser-claim', firstLine(p.claim, 140)) : null,
-    bits.length ? h('p.teaser-bits', bits.join(' · ')) : null,
-    state === 'integrating'
-      ? h('p.teaser-cta', 'merging — waiting for the branch to land')
-      : h('p.teaser-cta', steps ? `Check it yourself — ${plural(steps, 'step')} →` : 'Review evidence →'),
-  );
-}
-
-function doneRow(card, app) {
-  const state = cardState(card);
-  return h('button.done-row', {
+  const col = colOf(state);
+  const face = h('button.card', {
     type: 'button',
-    class: `done-row state-${state}`,
+    'data-num': card.num,
+    class: `card${col === 'needs_you' ? ' is-needs' : ''}${isSilent(card) ? ' is-quiet' : ''}`,
     onclick: () => app.openCard(card.num),
-  },
-    h('span.done-mark', state === 'completed' ? '✓' : state === 'rejected' ? '✕' : '·'),
+  });
+
+  const tag = faceTag(card, state, col);
+  face.appendChild(h('div.card-top',
     h('span.card-num', '#' + card.num),
-    h('span.done-title', card.title),
-    h('span.done-age', age(card.updated_at)),
-  );
+    h('span.grow'),
+    h('span.card-tag', { style: tag.color ? { color: tag.color } : null }, tag.text)));
+  face.appendChild(h('span.card-title', card.title));
+
+  const sub = faceSub(card, state, col, app);
+  if (sub.text) face.appendChild(h('span.card-sub', { style: sub.color ? { color: sub.color } : null }, sub.text));
+
+  if (col === 'in_motion') {
+    const st = motionState(card);
+    face.appendChild(h('span.prog-track', { title: st.title },
+      h('span.prog-fill', { style: { width: st.pct + '%', background: st.color } })));
+  }
+
+  face.appendChild(h('div.card-foot',
+    h('span', shortAgent(card.agent_name)),
+    h('span.grow'),
+    h('span', timeEl(card.last_activity_at || card.state_since, { suffix: false }))));
+  return face;
 }
 
-function pendingCard(card, app) {
-  return h('article.card.is-pending',
-    h('div.card-head', h('span.card-num', '#…'), h('span.grow'),
-      h('span.badge', card.error ? 'not sent' : 'sending')),
-    h('h3.card-title', card.title || firstLine(card.text || '', 90) || 'New item'),
-    card.images && card.images.length ? h('p.card-last', plural(card.images.length, 'image')) : null,
+function colOf(state) {
+  if (state === 'needs_you' || state === 'ready' || state === 'integrating') return 'needs_you';
+  if (state === 'triaging' || state === 'in_progress') return 'in_motion';
+  if (state === 'blocked' || state === 'failed' || state === 'stale') return 'blocked';
+  if (state === 'queued' || state === 'held') return 'waiting';
+  return 'done';
+}
+
+function faceTag(card, state, col) {
+  if (col === 'needs_you') {
+    if (state === 'integrating') return { text: 'Merging', color: 'var(--good)' };
+    return needsKind(card) === 'question'
+      ? { text: 'Asks', color: 'var(--accent)' }
+      : { text: 'Signoff', color: 'var(--good)' };
+  }
+  if (col === 'in_motion') {
+    const st = motionState(card);
+    return { text: st.label, color: st.color };
+  }
+  if (col === 'blocked') {
+    return { text: state === 'failed' ? 'failed' : state === 'stale' ? 'stale' : 'blocked', color: null };
+  }
+  if (col === 'waiting') return { text: waitingMark(card), color: null };
+  return { text: STATE_LABEL[state] || state, color: null };
+}
+
+function faceSub(card, state, col, app) {
+  if (col === 'needs_you') {
+    if (needsKind(card) === 'question') {
+      const q = card.question;
+      return { text: q && q.text ? firstLine(q.text, 140) : 'Waiting on you.', color: 'var(--dim)' };
+    }
+    const p = card.evidence || {};
+    return { text: firstLine(p.claim || 'Evidence packet is in.', 140), color: 'var(--good)' };
+  }
+  if (col === 'blocked') {
+    const r = blockedReason(card);
+    return { text: r.text, color: r.bad ? 'var(--bad)' : 'var(--faint)' };
+  }
+  if (col === 'in_motion') {
+    return { text: card.last_event ? firstLine(app.eventText(card.last_event), 140) : '', color: null };
+  }
+  return { text: '', color: null };
+}
+
+function pendingFace(card, app) {
+  return h('div.card.is-pending',
+    h('div.card-top', h('span.card-num', '#…'), h('span.grow'),
+      h('span.card-tag', card.error ? 'not sent' : 'sending')),
+    h('span.card-title', card.title || firstLine(card.text || '', 90) || 'New item'),
     card.error
-      ? h('div.card-foot', h('span.foot-flag.is-silent', card.error),
-        h('button.btn.tiny.no-open', { type: 'button', onclick: () => app.retrySubmit(card) }, 'Retry'))
-      : h('div.card-foot', h('span.foot-quiet', 'sending…')),
-  );
+      ? h('button.btn.tiny', { type: 'button', onclick: () => app.retrySubmit(card) }, 'Retry')
+      : null);
+}
+
+// ---- the Fold's "Elsewhere" strip ---------------------------------------
+
+function elsewhereStrip(app) {
+  const secs = sections();
+  const strip = h('div.elsewhere');
+  strip.appendChild(h('span.elsewhere-label', 'Elsewhere'));
+  const cards = secs.waiting.cards;
+  if (!cards.length) {
+    strip.appendChild(h('span.pill-mark', 'nothing queued'));
+    return strip;
+  }
+  for (const card of cards) {
+    if (card.pendingSubmit) continue;
+    const mark = waitingMark(card);
+    strip.appendChild(h('button.pill', {
+      type: 'button',
+      class: `pill${mark === 'held' ? ' is-held' : ''}`,
+      title: card.title,
+      onclick: () => app.openCard(card.num),
+    },
+      h('span.pill-num', '#' + card.num),
+      h('span.pill-title', card.title),
+      h('span.pill-mark', mark)));
+  }
+  return strip;
 }
