@@ -932,6 +932,13 @@ class App:
             self.notify()
         return fired
 
+    def cursor_seq(self, name: str = "orchestrator") -> int:
+        """How far the session has actually drained. A user message with seq <= this
+        has been read by the session -- that is what the UI's per-message status
+        stands on, so it must never be estimated."""
+        row = self.q1("SELECT * FROM cursors WHERE name=?", (name,))
+        return int(row["seq"]) if row else 0
+
     def session_liveness(self) -> dict:
         row = self.q1("SELECT * FROM cursors WHERE name='orchestrator'")
         cursor_seq = int(row["seq"]) if row else 0
@@ -1566,7 +1573,11 @@ class App:
                 "INSERT INTO cursors(name, seq, updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(name) DO UPDATE SET seq=excluded.seq, updated_at=excluded.updated_at",
                 (name, int(seq), now()))
-        return {"ok": True, "name": name, "seq": int(seq)}
+        # Wake the streams: a cursor move is what flips a user's message from
+        # "landed" to "session is on it" in the browser. It appends no event --
+        # the log stays the log -- so the SSE loop notices by comparing values.
+        self.notify()
+        return {"ok": True, "name": name, "seq": int(seq), "head": self.max_seq()}
 
     def sprint_action(self, action: str, body: dict, actor: str = "session") -> dict:
         if action == "open":
@@ -1654,6 +1665,8 @@ class App:
             "sidebar": self.sidebar_thread(limit=200),
             "batches": [self.batch_json(b) for b in batch_ids],
             "session": self.session_liveness(),
+            # Flat mirror of session.cursor: how far the session has drained.
+            "cursor": self.cursor_seq(),
             "states": list(STATES),
             # `integrating` stays in the Ready column with a "merging…" note --
             # a card only reaches Done once its branch actually landed.
@@ -1682,6 +1695,10 @@ class App:
                     "SELECT * FROM evidence WHERE card_num=? ORDER BY created_at", (num,))],
             "batch": self.batch_json(row["batch_id"]) if row["batch_id"] else None,
             "column_of": dict(COLUMN_OF),
+            # The drawer needs the drain cursor too: it is what tells the user
+            # whether the message they just sent has been picked up yet.
+            "session": self.session_liveness(),
+            "cursor": self.cursor_seq(),
             "seq": self.max_seq(),
         }
 
@@ -1893,6 +1910,9 @@ def make_handler(app: App):
                 events = app.events_after(after, limit)
                 return self.json_out(200, {"events": events, "after": after,
                                            "head": app.max_seq(),
+                                           # so a polling browser learns cursor
+                                           # moves without a second round trip
+                                           "cursor": app.cursor_seq(),
                                            "next": events[-1]["seq"] if events else after})
             if path == "/api/stream":
                 return self._stream(query)
@@ -1973,8 +1993,19 @@ def make_handler(app: App):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             self.close_connection = True
+
+            def cursor_frame(cur):
+                # A named `cursor` frame, deliberately WITHOUT an `id:` line:
+                # the drain cursor is not an event, so it must never become the
+                # browser's Last-Event-ID. The browser listens for it to flip a
+                # sent message from "landed" to "session is on it".
+                return ("event: cursor\ndata: %s\n\n"
+                        % jdump({"cursor": cur, "head": app.max_seq()})).encode("utf-8")
+
             try:
                 self.wfile.write(b": connected\n\nretry: 2000\n\n")
+                cursor = app.cursor_seq()
+                self.wfile.write(cursor_frame(cursor))
                 self.wfile.flush()
                 last_beat = now()
                 while not app.stopping.is_set():
@@ -1984,6 +2015,11 @@ def make_handler(app: App):
                         events = app.events_after(after, 200)
                         if not events:
                             app.cond.wait(timeout=min(app.sse_heartbeat, 1.0))
+                    moved = app.cursor_seq()
+                    if moved != cursor:
+                        cursor = moved
+                        self.wfile.write(cursor_frame(cursor))
+                        self.wfile.flush()
                     if events:
                         buf = []
                         for ev in events:

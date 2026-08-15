@@ -452,6 +452,31 @@ body.hold-on .switch-label { color: var(--amber); }
 .smsg.failed .smsg-text { border-color: var(--red); }
 .smsg.failed .msg-time { color: var(--red); }
 .msg-actor { font-weight: 600; color: var(--ink-2); }
+
+/* ---------- delivery status on your own messages ---------- */
+/* Words, not ticks: "landed" means the board has it; "session is on it" means
+   the session's drain cursor has actually passed it. Both themes first-class. */
+.msg-status {
+  white-space: nowrap; font-size: 11px; line-height: 1.5;
+  padding: 0 6px; border-radius: 999px;
+  border: 1px solid transparent; color: var(--ink-3);
+}
+.msg-status.is-sending { color: var(--ink-3); }
+.msg-status.is-landed {
+  color: var(--ink-2); background: var(--sunk);
+  border-color: var(--line);
+}
+.msg-status.is-seen {
+  color: var(--green); background: var(--green-bg);
+  border-color: color-mix(in srgb, var(--green) 30%, var(--line));
+  font-weight: 560;
+}
+.msg-status.is-failed {
+  color: var(--red); background: var(--red-bg);
+  border-color: color-mix(in srgb, var(--red) 34%, var(--line));
+}
+.smsg.failed .msg-status.is-failed, .msg.failed .msg-status.is-failed { font-weight: 560; }
+.msg.failed .msg-text { border-color: var(--red); }
 .sidebar-compose {
   display: flex; gap: 7px; align-items: flex-end;
   padding: 10px 12px; border-top: 1px solid var(--line);

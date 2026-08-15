@@ -9,10 +9,13 @@ const POLL_MAX_MS = 15000;
 const SSE_RETRY_MS = 120000;    // while polling, occasionally re-try the stream
 
 export class Live {
-  constructor({ onEvents, onStatus, onAuthError }) {
+  constructor({ onEvents, onStatus, onAuthError, onCursor }) {
     this.onEvents = onEvents;
     this.onStatus = onStatus || (() => {});
     this.onAuthError = onAuthError || (() => {});
+    // The session's drain cursor arrives out-of-band (a named `cursor` SSE frame,
+    // or the `cursor` field on a poll) — it is not an event and never advances seq.
+    this.onCursor = onCursor || (() => {});
     this.seq = 0;
     this.mode = 'idle';         // idle | sse | polling | error
     this.fails = 0;
@@ -65,6 +68,7 @@ export class Live {
     const handle = (e) => this.ingestMessage(e);
     es.onmessage = handle;
     for (const kind of ['event', 'events', 'sprint']) es.addEventListener(kind, handle);
+    es.addEventListener('cursor', (e) => this.ingestCursor(e));
     es.onerror = () => {
       // EventSource retries on its own; only count a failure when it truly closed,
       // or when it never opened.
@@ -92,6 +96,14 @@ export class Live {
       if (!Number.isNaN(n)) list[0].seq = n;
     }
     this.deliver(list);
+  }
+
+  ingestCursor(e) {
+    if (!e || !e.data) return;
+    let data;
+    try { data = JSON.parse(e.data); } catch { return; }
+    const seq = Number(data && data.cursor != null ? data.cursor : data && data.seq);
+    if (!Number.isNaN(seq)) this.onCursor(seq);
   }
 
   // ---- polling -----------------------------------------------------------
@@ -127,6 +139,10 @@ export class Live {
   async catchUp() {
     const res = await api.events(this.seq, 500);
     const list = Array.isArray(res) ? res : (res && Array.isArray(res.events) ? res.events : []);
+    if (res && !Array.isArray(res) && res.cursor != null) {
+      const cur = Number(res.cursor);
+      if (!Number.isNaN(cur)) this.onCursor(cur);
+    }
     if (list.length) this.deliver(list);
     return list;
   }

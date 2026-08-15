@@ -38,7 +38,9 @@ export const STATE_LABEL = {
 export const store = {
   sprint: null,           // {title, hold_mode, opened_at, closed_at}
   columnOf: null,         // server-advised state -> column map (board.column_of)
-  session: { online: true, since: null },
+  // `cursor` is the session's real drain cursor: every event with seq <= cursor
+  // has been read by the session. Never guessed — the server is the only writer.
+  session: { online: true, since: null, cursor: null },
   cards: new Map(),       // num -> card
   patches: new Map(),     // num -> {state, ts} optimistic, reconciled on next board
   pending: [],            // submitted-but-unconfirmed cards
@@ -124,13 +126,33 @@ function normQuestion(q) {
 function normSession(board) {
   let s = board.session != null ? board.session : board.session_status;
   if (s == null && board.session_online != null) s = board.session_online ? 'online' : 'offline';
-  if (typeof s === 'string') return { online: s !== 'offline', since: null, note: null };
+  // A flat `cursor` on the payload wins nothing over session.cursor — they are
+  // the same number; either shape is accepted so older/newer servers both work.
+  const flat = num(board.cursor);
+  if (typeof s === 'string') return { online: s !== 'offline', since: null, note: null, cursor: flat };
   if (s && typeof s === 'object') {
     const st = s.status || s.state;
     const online = s.online != null ? !!s.online : (st ? st !== 'offline' : true);
-    return { online, since: s.since || s.last_seen || s.last_seen_at || null, note: s.note || null };
+    const cursor = s.cursor != null ? num(s.cursor) : flat;
+    return {
+      online,
+      since: s.since || s.last_seen || s.last_seen_at || null,
+      note: s.note || null,
+      cursor: cursor != null ? cursor : null,
+    };
   }
-  return { online: true, since: null, note: null };
+  return { online: true, since: null, note: null, cursor: flat };
+}
+
+/** The session drained up to `seq`. Monotonic: a cursor never walks backwards
+ *  in the UI, so a stale payload can't un-see a message. */
+export function applyCursor(seq) {
+  const n = num(seq);
+  if (n == null) return false;
+  const cur = store.session.cursor;
+  if (cur != null && n <= cur) return false;
+  store.session = { ...store.session, cursor: n };
+  return true;
 }
 
 // ---- board ---------------------------------------------------------------
@@ -146,7 +168,12 @@ export function applyBoard(board) {
     hold_mode: !!(sprint.hold_mode != null ? sprint.hold_mode
       : (board.hold_mode != null ? board.hold_mode : sprint.hold)),
   };
-  store.session = normSession(board);
+  const sess = normSession(board);
+  // Keep the furthest cursor we've been told about: a board fetch that raced a
+  // live cursor frame must not un-see messages the session has already read.
+  const known = store.session && store.session.cursor;
+  if (known != null && (sess.cursor == null || sess.cursor < known)) sess.cursor = known;
+  store.session = sess;
   if (board.column_of && typeof board.column_of === 'object') store.columnOf = board.column_of;
 
   const list = Array.isArray(board.cards) ? board.cards : [];
@@ -332,3 +359,43 @@ export function eventText(ev) {
 }
 
 export const SYSTEM_KINDS = new Set(['state', 'agent_silent', 'verdict', 'evidence', 'error', 'submitted']);
+
+// ---- what happened to the message I just sent ---------------------------
+//
+// Three honest states, each standing on something the server actually told us:
+//   sending…          the POST is still in flight — we know nothing yet
+//   landed            the server gave the event a seq: it is in the log, durably
+//   session is on it  the session's drain cursor has passed that seq — it read it
+// Nothing here is a timer or an animation. If we can't prove a step, we don't
+// claim it: an unknown cursor leaves the message at "landed" forever, which is
+// true, rather than pretending it was picked up.
+
+export function messageStatus(ev) {
+  if (!ev) return null;
+  if (ev.failed) {
+    return { key: 'failed', label: 'not sent', title: 'the board never acknowledged this — send it again' };
+  }
+  if (ev.pending || ev.local || ev.seq == null) {
+    return { key: 'sending', label: 'sending…', title: 'still on its way to the board' };
+  }
+  const cursor = store.session ? store.session.cursor : null;
+  if (cursor != null && cursor >= ev.seq) {
+    return {
+      key: 'seen',
+      label: 'session is on it',
+      title: `the session has read this message (drained past #${ev.seq})`,
+    };
+  }
+  if (store.session && store.session.online === false) {
+    return {
+      key: 'landed',
+      label: 'landed — session offline',
+      title: 'saved on the board; the session is not reading right now, so it waits in the queue',
+    };
+  }
+  return {
+    key: 'landed',
+    label: 'landed',
+    title: 'saved on the board; the session has not read it yet',
+  };
+}
