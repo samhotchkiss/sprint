@@ -1,6 +1,7 @@
 // Chat with the session itself. Sprint-level events only — no worker telemetry.
 import { h, clear, ageSuffix, richText } from './util.js';
 import { store, messageStatus } from './state.js';
+import { detailBlock } from './detail.js';
 
 export function renderSidebar(threadEl, app) {
   const atBottom = threadEl.scrollHeight - threadEl.scrollTop - threadEl.clientHeight < 80;
@@ -27,7 +28,9 @@ export function renderSidebar(threadEl, app) {
         st ? h('span.msg-status', { class: `msg-status is-${st.key}`, title: st.title }, st.label) : null,
         // in-flight/failed lines have no meaningful age yet — the status says it all
         h('span.msg-time', st && (st.key === 'sending' || st.key === 'failed') ? '' : ageSuffix(ev.ts))),
-      h('div.smsg-text', richText(ev.payload && ev.payload.text, app.openCard))));
+      h('div.smsg-text', richText(ev.payload && ev.payload.text, app.openCard)),
+      // The session can answer in one line and park the working underneath it.
+      detailBlock(ev, app)));
   }
   if (atBottom) requestAnimationFrame(() => { threadEl.scrollTop = threadEl.scrollHeight; });
 }

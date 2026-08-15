@@ -79,6 +79,12 @@ as quiet system lines ("→ in progress", "bounced with notes"). Never two tabs.
 bottom; user messages show a delivery hint when the agent is mid-task ("delivered — agent will see
 it next turn") rather than pretending instant delivery.
 
+**Skim, then dig in.** Every entry is a one-liner you can scan down the whole history. An entry
+that has more behind it — a test log, the reasoning, a stack trace — carries an optional expanded
+`detail` and shows a quiet "more" toggle under the line: collapsed by default, opening in place,
+nothing above it moving. Card faces and "last activity" only ever render the one-liner. Same
+toggle in the sidebar thread, so the session can answer in a line and park its working underneath.
+
 **Ready cards put the evidence packet above the fold**, in this order:
 1. One-sentence claim of what changed.
 2. **"Check it yourself"** — 1–3 numbered plain-English steps to validate the fix *without reading

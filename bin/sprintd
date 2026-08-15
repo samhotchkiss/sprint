@@ -245,6 +245,15 @@ def jload(raw, default=None):
         return default
 
 
+ONE_LINER_MAX = 140
+
+
+def one_line(text, limit: int = ONE_LINER_MAX) -> str:
+    """First line, clipped -- the skim version of anything multi-line."""
+    s = str("" if text is None else text).strip().split("\n")[0].strip()
+    return s if len(s) <= limit else s[:limit - 1].rstrip() + "…"
+
+
 def find_project_root(start: str = None) -> str:
     start = os.path.realpath(start or os.getcwd())
     try:
@@ -449,10 +458,13 @@ class App:
     # -- events -----------------------------------------------------------
 
     # ONE payload contract, so every reader (UI, session, tests) needs one field:
-    #   text   -- the human one-liner, on EVERY event
+    #   text   -- the human one-liner, on EVERY event (the skim version)
+    #   detail -- OPTIONAL expanded version: command output, reasoning, a log.
+    #             Multi-line, rendered collapsed behind a "more" toggle. Never
+    #             required to understand the line; `text` always stands alone.
     #   state events additionally carry from/to (+reason)
     #   attachment refs always carry a ready-to-use `url`
-    TEXT_ALIASES = ("text", "message", "note", "summary", "detail", "claim",
+    TEXT_ALIASES = ("text", "message", "note", "summary", "claim",
                     "reason", "error")
 
     def normalize_payload(self, payload):
@@ -461,12 +473,25 @@ class App:
         if not isinstance(payload, dict):
             return {"text": payload if isinstance(payload, str) else jdump(payload)}
         out = dict(payload)
+        if "detail" in out:
+            detail = out["detail"]
+            if detail is None or (isinstance(detail, str) and not detail.strip()):
+                out.pop("detail")          # nothing to expand: same as not sending it
+            elif not isinstance(detail, str):
+                raise ApiError(400, "bad_detail",
+                               "detail must be a string (the expanded version of "
+                               "text); got %s" % type(detail).__name__,
+                               field="detail")
         if not (isinstance(out.get("text"), str) and out["text"].strip()):
             for key in self.TEXT_ALIASES:
                 val = out.get(key)
                 if isinstance(val, str) and val.strip():
                     out["text"] = val.strip()
                     break
+            else:
+                # detail-only: the skim line is its first line, never the blob.
+                if isinstance(out.get("detail"), str):
+                    out["text"] = one_line(out["detail"])
         for key in ("attachments", "images", "screenshots"):
             if isinstance(out.get(key), list) and out[key]:
                 out[key] = self.ingest_refs(out[key])
@@ -1348,16 +1373,21 @@ class App:
         return {"ok": True, "event": self.event_row(seq),
                 "card": self.card_json(self.card_row(num), brief=True)}
 
-    def sidebar_post(self, text: str, actor: str) -> dict:
+    def sidebar_post(self, text: str, actor: str, detail=None) -> dict:
         text = (text or "").strip()
         if not text:
             raise ApiError(400, "missing_field", "text is required", field="text")
         if actor not in ("user", "session"):
             raise ApiError(400, "bad_actor", "sidebar actor must be user or session")
+        # Same two-part shape as a card event: a line to skim, an optional
+        # expanded version the session can park its working in.
+        payload = {"text": text}
+        if detail is not None:
+            payload["detail"] = detail
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
-                seq = self._append_event(None, actor, "chat", {"text": text})
+                seq = self._append_event(None, actor, "chat", payload)
                 self.conn.execute("COMMIT")
             except Exception:
                 self.conn.execute("ROLLBACK")
@@ -2071,7 +2101,8 @@ def make_handler(app: App):
             if path == "/api/sidebar":
                 return 201, app.sidebar_post(body.get("text"),
                                              actor_hint if actor_hint in ("user", "session")
-                                             else "user")
+                                             else "user",
+                                             detail=body.get("detail"))
 
             if path == "/api/batches":
                 return 201, app.make_batch(body.get("card_nums"), body.get("agent_name"),

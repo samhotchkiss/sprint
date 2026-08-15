@@ -4,6 +4,7 @@ import { attachmentUrl, attachmentCaption } from './api.js';
 import {
   STATE_LABEL, SYSTEM_KINDS, eventText, cardState, isSilent, draft, messageStatus,
 } from './state.js';
+import { detailBlock } from './detail.js';
 
 const ACTOR_LABEL = { user: 'You', session: 'Session', worker: 'Agent', server: 'Board' };
 
@@ -215,9 +216,13 @@ function timeline(detail, app) {
   }
   for (const ev of items) {
     if (SYSTEM_KINDS.has(ev.kind) && ev.kind !== 'submitted') {
-      wrap.appendChild(h('div.sysline', { class: `sysline kind-${ev.kind}` },
-        h('span.sysline-text', eventText(ev)),
-        h('span.sysline-time', timeEl(ev.ts, { suffix: false }))));
+      // Skim line on the row; the long version (an error's stack, say) tucks
+      // in underneath it, closed.
+      wrap.appendChild(h('div.sysline-wrap',
+        h('div.sysline', { class: `sysline kind-${ev.kind}` },
+          h('span.sysline-text', eventText(ev)),
+          h('span.sysline-time', timeEl(ev.ts, { suffix: false }))),
+        detailBlock(ev, app, { small: true })));
       continue;
     }
     const mine = ev.actor === 'user';
@@ -234,6 +239,9 @@ function timeline(detail, app) {
       st ? h('span.msg-status', { class: `msg-status is-${st.key}`, title: st.title }, st.label) : null,
       h('span.msg-time', st && (st.key === 'sending' || st.key === 'failed') ? '' : ageSuffix(ev.ts))));
     row.appendChild(h('div.msg-text', richText(eventText(ev), app.openCard)));
+    // One line to skim; "more" opens the command output / reasoning in place.
+    const more = detailBlock(ev, app);
+    if (more) row.appendChild(more);
     const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
     if (Array.isArray(atts) && atts.length) row.appendChild(shotStrip(atts, app, true));
     wrap.appendChild(row);

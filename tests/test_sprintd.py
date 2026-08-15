@@ -1909,5 +1909,219 @@ class TestStartStopSubprocess(unittest.TestCase):
         self.assertEqual(self._run("stop").returncode, 0)
 
 
+class TestEventDetail(Base):
+    """Skim then dig in: every event keeps a one-line `text`, and an OPTIONAL
+    `detail` carries the long version (a test log, the reasoning) alongside it."""
+
+    LOG = ("$ python3 tests/test_sprintd.py\n"
+           "test_detail_rides_through ... ok\n"
+           "----------------------------------------------------------------------\n"
+           "Ran 118 tests in 4.21s\n\nOK")
+
+    def event(self, num, payload, kind="progress"):
+        return self.post("/api/cards/%d/events" % num, {"kind": kind, "payload": payload})
+
+    def progress_events(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return [e for e in detail["timeline"] if e["kind"] == "progress"]
+
+    def test_detail_rides_through_events_board_and_card_reads(self):
+        num = self.new_card("run the suite")["num"]
+        self.to_in_progress(num)
+        status, body = self.event(num, {"text": "suite green — 118 pass, 0 fail",
+                                        "detail": self.LOG})
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["event"]["payload"]["detail"], self.LOG)
+
+        ev = self.progress_events(num)[-1]
+        self.assertEqual(ev["payload"]["text"], "suite green — 118 pass, 0 fail")
+        self.assertEqual(ev["payload"]["detail"], self.LOG,
+                         "the drawer timeline is where you dig in — detail has to survive")
+
+        card = [c for c in self.get("/api/board")[1]["cards"] if c["num"] == num][0]
+        self.assertEqual(card["last_event"]["payload"]["text"],
+                         "suite green — 118 pass, 0 fail")
+        self.assertEqual(card["last_event"]["payload"]["detail"], self.LOG)
+
+        drained = self.get("/api/events?after=0&limit=500")[1]["events"]
+        self.assertTrue(any(e["payload"].get("detail") == self.LOG for e in drained),
+                        "the session drains the same payload the browser sees")
+
+    def test_non_string_detail_is_a_400_and_lands_nothing(self):
+        num = self.new_card("bad detail")["num"]
+        self.to_in_progress(num)
+        for bad in ({"lines": ["a"]}, ["a", "b"], 17, True):
+            status, body = self.event(num, {"text": "one-liner", "detail": bad})
+            self.assertEqual(status, 400, (bad, body))
+            self.assertEqual(body["error"], "bad_detail")
+            self.assertEqual(body["field"], "detail")
+        self.assertEqual(self.progress_events(num), [],
+                         "a rejected event must not be half-written to the log")
+
+    def test_empty_detail_is_the_same_as_no_detail(self):
+        num = self.new_card("nothing to expand")["num"]
+        self.to_in_progress(num)
+        for empty in ("", "   \n  ", None):
+            status, body = self.event(num, {"text": "no long version", "detail": empty})
+            self.assertEqual(status, 201, body)
+            self.assertNotIn("detail", body["event"]["payload"],
+                             "an empty detail must not render an empty expander")
+
+    def test_detail_only_payload_still_gets_a_one_line_text(self):
+        """The card face renders `text`. A detail-only post must not put a
+        20-line blob there."""
+        num = self.new_card("detail only")["num"]
+        self.to_in_progress(num)
+        status, body = self.event(num, {"detail": self.LOG})
+        self.assertEqual(status, 201, body)
+        p = body["event"]["payload"]
+        self.assertEqual(p["text"], "$ python3 tests/test_sprintd.py")
+        self.assertEqual(p["detail"], self.LOG)
+
+        long_line = "x" * 400
+        _, body = self.event(num, {"detail": long_line})
+        p = body["event"]["payload"]
+        self.assertEqual(len(p["text"]), sprintd.ONE_LINER_MAX)
+        self.assertTrue(p["text"].endswith("…"))
+        self.assertEqual(p["detail"], long_line)
+
+    def test_any_worker_kind_can_carry_detail(self):
+        num = self.new_card("kinds")["num"]
+        self.to_in_progress(num)
+        for kind in ("progress", "chat", "note", "error"):
+            status, body = self.event(num, {"text": kind + " line",
+                                            "detail": "expanded\n" + kind}, kind=kind)
+            self.assertEqual(status, 201, body)
+            self.assertEqual(body["event"]["payload"]["detail"], "expanded\n" + kind)
+
+    def test_sidebar_lines_can_carry_detail_too(self):
+        """The session answers in one line and parks the working underneath."""
+        status, body = self.post("/api/sidebar", {
+            "actor": "session",
+            "text": "#12 and #14 are blocked on the same red CI job",
+            "detail": "#12 — waiting on build 4471 (lint)\n#14 — same job, queued behind it",
+        })
+        self.assertEqual(status, 201, body)
+        thread = self.get("/api/board")[1]["sidebar"]
+        line = thread[-1]
+        self.assertEqual(line["payload"]["text"],
+                         "#12 and #14 are blocked on the same red CI job")
+        self.assertIn("build 4471", line["payload"]["detail"])
+
+        status, body = self.post("/api/sidebar", {"actor": "session", "text": "hi",
+                                                  "detail": ["not", "a", "string"]})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "detail")
+
+    def test_detail_and_long_running_coexist(self):
+        num = self.new_card("long job")["num"]
+        self.to_in_progress(num)
+        status, body = self.event(num, {"text": "full suite, ~10min",
+                                        "detail": "make test\nmake lint",
+                                        "long_running": True})
+        self.assertEqual(status, 201, body)
+        self.assertTrue(body["card"]["long_running"])
+        self.assertEqual(body["event"]["payload"]["detail"], "make test\nmake lint")
+
+
+class TestSprintPostHelper(Base):
+    """bin/sprint-post is how a worker actually writes these. The one-liner is
+    never rejected for being long -- it gets truncated, loudly."""
+
+    SPRINT_POST = os.path.join(os.path.dirname(HERE), "bin", "sprint-post")
+
+    def run_post(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_POST] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def last_payload(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return detail["timeline"][-1]["payload"]
+
+    def test_detail_flag_posts_text_plus_detail(self):
+        num = self.new_card("helper")["num"]
+        self.to_in_progress(num)
+        r = self.run_post(num, "progress", "fix applied, running tests",
+                          "--detail", "ran: make test\nsaw: 118 pass, 0 fail")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        p = self.last_payload(num)
+        self.assertEqual(p["text"], "fix applied, running tests")
+        self.assertEqual(p["detail"], "ran: make test\nsaw: 118 pass, 0 fail")
+
+    def test_detail_file_reads_a_captured_log(self):
+        num = self.new_card("helper file")["num"]
+        self.to_in_progress(num)
+        log = os.path.join(self.tmp, "test.log")
+        body = "Ran 118 tests in 4.2s\n\nOK\n"
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        r = self.run_post(num, "progress", "suite green", "--detail-file", log)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        p = self.last_payload(num)
+        self.assertEqual(p["text"], "suite green")
+        self.assertEqual(p["detail"], body.rstrip())
+
+    def test_detail_and_detail_file_together_is_a_named_failure(self):
+        num = self.new_card("both")["num"]
+        r = self.run_post(num, "progress", "x", "--detail", "a", "--detail-file", "/tmp/nope")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("detail", r.stderr.decode())
+
+    def test_unreadable_detail_file_names_the_field(self):
+        num = self.new_card("missing file")["num"]
+        r = self.run_post(num, "progress", "x", "--detail-file",
+                          os.path.join(self.tmp, "not-here.log"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("detail-file", r.stderr.decode())
+
+    def test_empty_detail_file_sends_no_detail(self):
+        num = self.new_card("empty file")["num"]
+        self.to_in_progress(num)
+        log = os.path.join(self.tmp, "empty.log")
+        open(log, "w").close()
+        r = self.run_post(num, "progress", "nothing to expand", "--detail-file", log)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertNotIn("detail", self.last_payload(num))
+
+    def test_long_text_is_truncated_with_a_notice_and_kept_in_detail(self):
+        num = self.new_card("long one-liner")["num"]
+        self.to_in_progress(num)
+        long_text = "the fix is " + ("really " * 40) + "long"
+        r = self.run_post(num, "progress", long_text)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("one line", r.stderr.decode(),
+                      "a truncated one-liner has to say so, not silently clip")
+        p = self.last_payload(num)
+        self.assertEqual(len(p["text"]), 140)
+        self.assertTrue(p["text"].endswith("…"))
+        self.assertEqual(p["detail"], long_text,
+                         "nothing the worker wrote may be thrown away")
+
+    def test_multiline_text_keeps_the_first_line_and_loses_nothing(self):
+        num = self.new_card("multiline")["num"]
+        self.to_in_progress(num)
+        r = self.run_post(num, "progress", "headline\nand a second line",
+                          "--detail", "my own detail")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        p = self.last_payload(num)
+        self.assertEqual(p["text"], "headline")
+        self.assertEqual(p["detail"], "headline\nand a second line\n\nmy own detail")
+
+    def test_a_normal_one_liner_is_untouched_and_quiet(self):
+        num = self.new_card("plain")["num"]
+        self.to_in_progress(num)
+        r = self.run_post(num, "progress", "read the CSS, found the misaligned flex item")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(r.stderr.decode(), "")
+        p = self.last_payload(num)
+        self.assertEqual(p["text"], "read the CSS, found the misaligned flex item")
+        self.assertNotIn("detail", p)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
