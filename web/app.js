@@ -225,7 +225,7 @@ async function verdict(card, kind, notes) {
 }
 
 async function cardAction(card, action, extra) {
-  const optimistic = { hold: 'held', release: 'queued', cancel: 'canceled', retry: 'queued' }[action];
+  const optimistic = { hold: 'held', release: 'queued', cancel: 'canceled', retry: 'queued', reopen: 'queued' }[action];
   const before = card.state;
   const wasPinned = card.pinned;
   if (optimistic) patch(card.num, optimistic);

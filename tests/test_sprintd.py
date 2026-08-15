@@ -1490,6 +1490,80 @@ class TestAssignStartsTheWork(Base):
             ["titled: Assign should start the work"])
 
 
+class TestReopenIsTheUsersUndo(Base):
+    """User verbatim: "you should never move a card to closed. I lost it."
+    Closing is the user's call -- and getting it back must not need a DBA."""
+
+    def close_completed(self, num):
+        self.to_in_progress(num)
+        status, _ = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200)
+        self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+        status, _ = self.post("/api/cards/%d/integrated" % num, {"ok": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "completed")
+
+    def test_reopen_brings_back_a_canceled_card(self):
+        num = self.new_card("I still want this")["num"]
+        self.post("/api/cards/%d/action" % num, {"action": "cancel"})
+        self.assertEqual(self.state_of(num), "canceled")
+        status, body = self.post("/api/cards/%d/action" % num, {"action": "reopen"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["card"]["state"], "queued")
+        _, detail = self.get("/api/cards/%d" % num)
+        st = [e for e in detail["timeline"] if e["kind"] == "state"][-1]
+        self.assertEqual(st["payload"]["from"], "canceled")
+        self.assertEqual(st["payload"]["to"], "queued")
+        self.assertIn("reopened", st["payload"]["text"])
+        self.assertEqual(st["payload"]["reopened_from"], "canceled")
+
+    def test_reopen_brings_back_a_completed_card(self):
+        num = self.new_card("closed too early")["num"]
+        self.close_completed(num)
+        status, body = self.post("/api/cards/%d/action" % num, {"action": "reopen"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "queued")
+        _, detail = self.get("/api/cards/%d" % num)
+        st = [e for e in detail["timeline"] if e["kind"] == "state"][-1]
+        self.assertEqual(st["payload"]["reopened_from"], "completed")
+        self.assertEqual(detail["card"]["column"], "queued")
+
+    def test_reopen_brings_back_a_duplicate(self):
+        keep = self.new_card("the original")["num"]
+        num = self.new_card("marked dup by mistake")["num"]
+        self.post("/api/cards/%d/action" % num, {"action": "duplicate_of", "dup_of": keep})
+        self.assertEqual(self.state_of(num), "duplicate")
+        status, _ = self.post("/api/cards/%d/action" % num, {"action": "reopen"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "queued")
+
+    def test_reopen_on_a_live_card_is_409(self):
+        num = self.new_card()["num"]
+        for _ in range(1):
+            status, body = self.post("/api/cards/%d/action" % num, {"action": "reopen"})
+            self.assertEqual(status, 409, body)
+            self.assertEqual(body["error"], "not_reopenable")
+            self.assertEqual(self.state_of(num), "queued")
+        self.to_in_progress(num)
+        status, body = self.post("/api/cards/%d/action" % num, {"action": "reopen"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_unknown_action_message_names_reopen(self):
+        num = self.new_card()["num"]
+        status, body = self.post("/api/cards/%d/action" % num, {"action": "yolo"})
+        self.assertEqual(status, 400, body)
+        self.assertIn("reopen", body["message"])
+
+    def test_a_completed_card_still_cannot_walk_back_into_the_work(self):
+        num = self.new_card()["num"]
+        self.close_completed(num)
+        for state in ("in_progress", "triaging", "ready"):
+            status, _ = self.post("/api/cards/%d/state" % num, {"state": state})
+            self.assertIn(status, (409, 422))
+            self.assertEqual(self.state_of(num), "completed")
+
+
 class TestPinIsExplicit(Base):
     def test_pin_takes_an_explicit_value(self):
         num = self.new_card()["num"]

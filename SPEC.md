@@ -93,7 +93,11 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
   liveness (see below). `GET /api/cards/:num` — full interleaved timeline + evidence + attachments.
 - `POST /api/cards/:num/chat` `{text}` (user→card). `POST /api/cards/:num/answer`
   `{question_id, text}` — flips needs_you→in_progress optimistically.
-- `POST /api/cards/:num/action` `{action: pin|cancel|hold|release|duplicate_of}`.
+- `POST /api/cards/:num/action` `{action: pin|unpin|cancel|hold|release|duplicate_of|retry|reopen}`.
+  `reopen` is the user's undo for a card closed too early: any terminal state → `queued` with a
+  "reopened" state event (409 on a non-terminal card). **Closing is a user verb — the session never
+  puts a card in a terminal state on its own; work with no code change goes to `ready` with an
+  answer-style packet and the user closes it.**
 - `POST /api/cards/:num/verdict` `{verdict: approve|bounce|reject, notes?}` — approve: ready→integrating;
   bounce: ready→in_progress, bounce_count++; server emits event either way, session does the git work.
 - `POST /api/cards/:num/integrated` `{ok: bool, reason?}` (session surface) — integrating→completed,

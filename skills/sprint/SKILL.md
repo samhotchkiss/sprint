@@ -48,7 +48,12 @@ held → queued → triaging → in_progress ⇄ needs_you | blocked → ready �
                                         integrating → in_progress (integration failure, not a bounce)
 in_progress/triaging → failed
 any non-terminal → stale (session-gap) → canceled/duplicate via action
+any closed state → queued via the `reopen` action (user's undo)
 ```
+
+Assigning a **queued** card (`POST /api/cards/:num/assign`) flips it
+`queued`→`triaging` itself — an assigned card never sits in Queued. On a
+card that's already moving, assign only records the agent.
 
 `integrating` is new: the user's approve verdict flips `ready`→`integrating`
 synchronously (UI shows "merging…", still visually in the Ready column —
@@ -171,6 +176,12 @@ question or an external wall.
 Dispatch order: pinned cards first, then oldest-queued-first. Don't
 dispatch `held` cards — those wait for hold mode to release or an
 explicit per-card `release`.
+
+**Never close a card instead of dispatching it.** A card you think needs
+no work is not yours to cancel or complete — see "Closing a card is the
+user's verb" in step 6. Dispatch it, or answer it into `ready`, or say
+your piece in the sidebar and leave it queued. `cancel`, `complete`,
+`reject` and `duplicate` are user verbs.
 
 ### Auto-split multi-complaint dumps
 
@@ -320,6 +331,34 @@ them.
 ---
 
 ## 6. Verdicts
+
+### Closing a card is the user's verb, never yours
+
+**User ruling, verbatim: "you should never move a card to closed. I lost
+it. you can move it to 'ready' but then I have to be the one to close
+it."**
+
+You never put a card into a terminal state — `completed`, `rejected`,
+`canceled`, `duplicate` — on your own initiative. Not for a card that
+turned out to need no work, not for one the user already fixed
+themselves, not for a stale dump, not for something you decided was out
+of scope. The only terminal writes you ever make are the ones the user's
+own verdict authorized: `POST /integrated` after they clicked Approve.
+
+- A card that needs **no code change** still goes to `ready` — with an
+  evidence packet whose `claim` is the answer and whose `validate` steps
+  are how the user checks that answer ("it already does this: open X,
+  click Y"). The user closes it (or doesn't).
+- A card that's a **question you can answer** — answer it in the
+  timeline and leave it where it is, or take it to `ready` the same way.
+- A card that's a **duplicate** or genuinely dead: say so in a note or
+  in the sidebar and let the user hit cancel/duplicate. Proposing is
+  yours; closing is theirs.
+- If a card DID get closed early — by you, by a misfire, by a stray
+  action — the fix is `POST /api/cards/:num/action {"action":"reopen"}`,
+  which puts any closed card (completed/rejected/canceled/duplicate)
+  back in `queued` with a "reopened" state event. The user has the same
+  button in the card drawer. Nobody edits the database.
 
 **Approve**: the card flips `ready`→`integrating` on the board the
 instant the user clicks it (UI shows "merging…" — an honest in-between

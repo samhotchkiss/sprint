@@ -84,8 +84,10 @@ TRANSITIONS = {
     # integrating, so Done means the branch actually landed.
     "ready": {"integrating", "in_progress", "rejected", "canceled", "failed"},
     "integrating": {"completed", "in_progress", "canceled", "rejected", "failed"},
-    "completed": set(),
-    "rejected": set(),
+    # Closed is not a grave: the `reopen` action puts a card the user closed
+    # too early back in the queue. Nothing else moves out of a closed state.
+    "completed": {"queued"},
+    "rejected": {"queued"},
     "failed": {"queued", "in_progress", "triaging", "canceled", "rejected",
                "duplicate", "stale"},
     "stale": {"queued", "in_progress", "triaging", "canceled", "rejected",
@@ -1540,10 +1542,22 @@ class App:
                     self.conn.execute("ROLLBACK")
                     raise
             self.transition(num, "queued", actor, reason="retry with a fresh agent")
+        elif action == "reopen":
+            # Closing a card is the USER's call, and so is undoing it. A card
+            # that got closed too early comes straight back to the queue --
+            # nobody should ever have to edit the database to get work back.
+            if row["state"] not in TERMINAL_STATES:
+                raise ApiError(409, "not_reopenable",
+                               "#%s is %s; only a closed card (%s) can be reopened"
+                               % (num, row["state"], ", ".join(sorted(TERMINAL_STATES))),
+                               from_state=row["state"], to_state="queued")
+            self.transition(num, "queued", actor,
+                            reason="reopened — back in the queue",
+                            extra={"reopened_from": row["state"]})
         else:
             raise ApiError(400, "bad_action",
                            "action must be pin, unpin, cancel, hold, release, "
-                           "duplicate_of or retry")
+                           "duplicate_of, retry or reopen")
         return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
 
     def set_cursor(self, name: str, seq: int) -> dict:

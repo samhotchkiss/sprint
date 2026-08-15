@@ -78,7 +78,13 @@ function closeBtn(app) {
 
 function drawerHead(card, state, app) {
   const menu = h('div.menu', { hidden: true });
-  const actions = [
+  // A closed card is closed, not buried: the only thing on offer is getting it
+  // back. Closing is the user's call, and so is undoing it.
+  const closed = ['completed', 'rejected', 'duplicate', 'canceled'].includes(state);
+  const actions = closed ? [
+    { label: 'Reopen — back to Queued', run: () => app.cardAction(card, 'reopen') },
+    { label: card.pinned ? 'Unpin' : 'Pin to top', run: () => app.cardAction(card, card.pinned ? 'unpin' : 'pin') },
+  ] : [
     { label: card.pinned ? 'Unpin' : 'Pin to top', run: () => app.cardAction(card, card.pinned ? 'unpin' : 'pin') },
     state === 'held'
       ? { label: 'Release — start work', run: () => app.cardAction(card, 'release') }

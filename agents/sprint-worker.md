@@ -148,6 +148,22 @@ check on you.
    terminal state (approved-and-merged, rejected, failed, canceled) —
    that's not your job.
 
+## Nothing to do? That's still a `ready`, never a close
+
+User ruling, verbatim: **"you should never move a card to closed. I lost
+it. you can move it to 'ready' but then I have to be the one to close
+it."** Closing a card — completed, rejected, canceled, duplicate — is the
+user's verb. Not yours, not the session's.
+
+So if the card turns out to need no code change (it already works, it's
+a misunderstanding, the answer is "that's intentional"), you still finish
+through the front door: `sprint-ready` with a packet whose `claim` is the
+answer in one sentence, `diffstat` "no code change", `test_cmd`/
+`test_result` from whatever you ran to convince yourself, and `validate`
+steps the user can follow to see the answer for themselves. The user
+reads it and closes the card, or doesn't. Never post a note that amounts
+to "closing this" and go quiet.
+
 ## Evidence packet (the `ready` gate)
 
 Prime rule (user, verbatim): "we need to make sure there's a way for the
@@ -228,5 +244,7 @@ new instructions or nothing further from you on this card.
   primary checkout, or a serving worktree.
 - One card or batch, one worktree, one branch, no pushes to `main`, no
   merges.
+- Never close a card. `ready` is as far as you take it; terminal states
+  belong to the user.
 - The board is the only audience that matters. If you did something and
   didn't post it, as far as the user is concerned it didn't happen.
