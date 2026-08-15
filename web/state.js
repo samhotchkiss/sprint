@@ -40,7 +40,7 @@ export const store = {
   columnOf: null,         // server-advised state -> column map (board.column_of)
   // `cursor` is the session's real drain cursor: every event with seq <= cursor
   // has been read by the session. Never guessed — the server is the only writer.
-  session: { online: true, since: null, cursor: null },
+  session: { status: 'online', online: true, since: null, cursor: null, waiterSeconds: null },
   cards: new Map(),       // num -> card
   patches: new Map(),     // num -> {state, ts} optimistic, reconciled on next board
   pending: [],            // submitted-but-unconfirmed cards
@@ -124,25 +124,40 @@ function normQuestion(q) {
   };
 }
 
+// online | busy | offline. `busy` means the session is attached and polling but
+// its drain cursor is behind — a working session, not a missing one, so it never
+// gets the offline banner.
+const SESSION_STATUSES = ['online', 'busy', 'offline'];
+
 function normSession(board) {
   let s = board.session != null ? board.session : board.session_status;
   if (s == null && board.session_online != null) s = board.session_online ? 'online' : 'offline';
   // A flat `cursor` on the payload wins nothing over session.cursor — they are
   // the same number; either shape is accepted so older/newer servers both work.
   const flat = num(board.cursor);
-  if (typeof s === 'string') return { online: s !== 'offline', since: null, note: null, cursor: flat };
+  if (typeof s === 'string') {
+    const st = SESSION_STATUSES.includes(s) ? s : (s === 'offline' ? 'offline' : 'online');
+    return { status: st, online: st !== 'offline', since: null, note: null, cursor: flat, waiterSeconds: null };
+  }
   if (s && typeof s === 'object') {
-    const st = s.status || s.state;
-    const online = s.online != null ? !!s.online : (st ? st !== 'offline' : true);
+    const raw = s.status || s.state;
+    // An older server sends only online/offline; a newer one can also say busy.
+    let status = SESSION_STATUSES.includes(raw) ? raw : null;
+    if (status == null) {
+      const online = s.online != null ? !!s.online : (raw ? raw !== 'offline' : true);
+      status = online ? 'online' : 'offline';
+    }
     const cursor = s.cursor != null ? num(s.cursor) : flat;
     return {
-      online,
+      status,
+      online: status !== 'offline',
       since: s.since || s.last_seen || s.last_seen_at || null,
       note: s.note || null,
       cursor: cursor != null ? cursor : null,
+      waiterSeconds: num(s.seconds_since_waiter),
     };
   }
-  return { online: true, since: null, note: null, cursor: flat };
+  return { status: 'online', online: true, since: null, note: null, cursor: flat, waiterSeconds: null };
 }
 
 /** The session drained up to `seq`. Monotonic: a cursor never walks backwards

@@ -35,26 +35,35 @@ export function renderSidebar(threadEl, app) {
   if (atBottom) requestAnimationFrame(() => { threadEl.scrollTop = threadEl.scrollHeight; });
 }
 
+// Three states, three dots, one banner. `busy` is the honest middle: the session
+// is attached and polling, it just has not drained everything yet. That is not
+// worth a banner — it lives on the dot, where it can be ignored.
+const DOT_CLASS = { online: 'on', busy: 'busy', offline: 'off' };
+const DOT_LABEL = { online: 'session live', busy: 'session catching up', offline: 'session offline' };
+
+function pillTitle(status, cursor) {
+  const read = cursor != null ? ` (read up to #${cursor})` : '';
+  if (status === 'busy') return `session is on it — catching up${read}`;
+  if (status === 'offline') return 'the session has not picked anything up lately — what you send waits in the queue';
+  return `the session is keeping up — it is reading what you send${read}`;
+}
+
 export function renderSessionStatus(app) {
-  const online = store.session.online;
+  const status = store.session.status || (store.session.online ? 'online' : 'offline');
   const label = document.getElementById('session-label');
   const pill = document.getElementById('session-pill');
   for (const dot of [document.getElementById('session-dot'), document.getElementById('sidebar-dot')]) {
-    if (dot) dot.className = 'dot ' + (online ? 'on' : 'off');
+    if (dot) dot.className = 'dot ' + (DOT_CLASS[status] || 'on');
   }
-  if (label) label.textContent = online ? 'session live' : 'session offline';
-  if (pill) {
-    // Plain English, same vocabulary as the per-message status below.
-    const cur = store.session.cursor;
-    pill.title = online
-      ? 'the session is keeping up — it is reading what you send' + (cur != null ? ` (read up to #${cur})` : '')
-      : 'the session has not picked anything up lately — what you send waits in the queue';
-  }
+  if (label) label.textContent = DOT_LABEL[status] || DOT_LABEL.online;
+  if (pill) pill.title = pillTitle(status, store.session.cursor);
 
   const slot = document.getElementById('banner-slot');
   const banner = document.getElementById('banner');
   if (!slot || !banner) return;
-  const offline = store.loaded && !online;
+  // Banner ONLY on a real offline. A busy session used to raise this banner and
+  // it read as "the backend restarted" — it never had.
+  const offline = store.loaded && status === 'offline';
   const transportDown = app.transport === 'error';
   if (offline) {
     slot.hidden = false;

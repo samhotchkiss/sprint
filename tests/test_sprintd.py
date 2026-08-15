@@ -47,6 +47,9 @@ class Base(unittest.TestCase):
     SILENCE_SECONDS = 300.0
     SILENCE_TICK = 5.0
     SESSION_OFFLINE = 90.0
+    WAITER_ONLINE = 10.0
+    WAITER_GONE = 30.0
+    WAITER_PERSIST = 5.0
     SSE_HEARTBEAT = 15.0
     START_BACKGROUND = False
 
@@ -64,6 +67,9 @@ class Base(unittest.TestCase):
             silence_seconds=self.SILENCE_SECONDS,
             silence_tick=self.SILENCE_TICK,
             session_offline_seconds=self.SESSION_OFFLINE,
+            waiter_online_seconds=self.WAITER_ONLINE,
+            waiter_gone_seconds=self.WAITER_GONE,
+            waiter_persist_seconds=self.WAITER_PERSIST,
             sse_heartbeat=self.SSE_HEARTBEAT,
         )
         self.httpd = sprintd.make_server(self.app, "127.0.0.1", 0)
@@ -825,6 +831,142 @@ class TestSessionOffline(Base):
         self.post("/api/cursors/orchestrator", {"seq": self.app.max_seq()})
         _, board = self.get("/api/board")
         self.assertEqual(board["session"]["status"], "online")
+
+
+class TestWaiterHeartbeat(Base):
+    """The session's waiter polling /api/events IS the session being attached.
+
+    Before this, liveness came only from the drain cursor, so an orchestrator
+    that was mid-dispatch (cursor legitimately minutes behind, waiter polling the
+    whole time) was reported `offline` and the board raised a banner that read
+    like the backend had restarted. It never had.
+    """
+    SESSION_OFFLINE = 0.4       # cursor counts as "behind" fast
+    WAITER_ONLINE = 0.3
+    WAITER_GONE = 1.5
+    WAITER_PERSIST = 0.0        # persist every hit so the disk path is exercised
+
+    def waiter_poll(self, after=0):
+        return self.get("/api/events?after=%d&limit=1" % after,
+                        headers={sprintd.WAITER_HEADER: "sprintd-wait"})
+
+    def test_waiter_hit_records_a_sighting(self):
+        self.new_card("one")
+        _, board = self.get("/api/board")
+        self.assertIsNone(board["session"]["seconds_since_waiter"],
+                          "no waiter has polled yet -- do not invent one")
+        self.assertFalse(board["session"]["waiter_polling"])
+
+        status, _ = self.waiter_poll()
+        self.assertEqual(status, 200)
+        _, board = self.get("/api/board")
+        self.assertIsNotNone(board["session"]["waiter_seen_at"])
+        self.assertLess(board["session"]["seconds_since_waiter"], 1.0)
+        self.assertTrue(board["session"]["waiter_polling"])
+
+    def test_waiter_sighting_is_persisted_not_just_in_memory(self):
+        """A restarted server must not forget the session was here a second ago."""
+        self.waiter_poll()
+        row = self.app.q1("SELECT * FROM cursors WHERE name=?", (sprintd.WAITER_CURSOR,))
+        self.assertIsNotNone(row, "waiter sighting never reached the db")
+        self.app._waiter_seen_at = None          # simulate a cold start
+        self.assertIsNotNone(self.app.waiter_seen_at())
+
+    def test_a_browser_polling_events_never_fakes_liveness(self):
+        """The board's own UI falls back to polling /api/events. That is a
+        browser, not the session -- counting it would be fake liveness."""
+        self.new_card("queue me")
+        self.get("/api/events?after=0")          # no waiter header: a browser
+        time.sleep(0.6)
+        self.get("/api/events?after=0")
+        _, board = self.get("/api/board")
+        self.assertIsNone(board["session"]["waiter_seen_at"])
+        self.assertEqual(board["session"]["status"], "offline")
+
+    def test_busy_not_offline_while_the_waiter_is_alive(self):
+        """The reported bug, end to end: cursor stalls, waiter keeps polling."""
+        self.new_card("dispatch me")
+        self.waiter_poll()
+        time.sleep(0.6)                          # cursor now stale past SESSION_OFFLINE
+        self.waiter_poll()                       # ...but the waiter is right here
+        _, board = self.get("/api/board")
+        sess = board["session"]
+        self.assertEqual(sess["status"], "busy")
+        self.assertTrue(sess["online"], "busy must not read as offline to the UI")
+        self.assertEqual(sess["note"], "session is on it — catching up")
+        self.assertGreater(sess["pending"], 0)
+        self.assertGreater(sess["seconds_since_cursor_move"], self.SESSION_OFFLINE)
+
+    def test_busy_decays_to_offline_only_once_the_waiter_is_gone(self):
+        self.new_card("dispatch me")
+        self.waiter_poll()
+        time.sleep(0.6)
+        _, board = self.get("/api/board")
+        self.assertEqual(board["session"]["status"], "busy")
+        time.sleep(1.1)                          # total > WAITER_GONE
+        _, board = self.get("/api/board")
+        self.assertEqual(board["session"]["status"], "offline")
+        self.assertFalse(board["session"]["online"])
+        self.assertEqual(board["session"]["note"], "session offline — items will queue")
+
+    def test_a_caught_up_session_is_online_even_with_no_waiter(self):
+        """Nothing pending means nothing is behind: no banner, no busy dot."""
+        self.new_card("one")
+        self.post("/api/cursors/orchestrator", {"seq": self.app.max_seq()})
+        time.sleep(0.6)
+        _, board = self.get("/api/board")
+        self.assertEqual(board["session"]["status"], "online")
+        self.assertEqual(board["session"]["pending"], 0)
+
+    def test_posting_the_drain_cursor_counts_as_a_sighting(self):
+        self.post("/api/cursors/orchestrator", {"seq": 0})
+        _, board = self.get("/api/board")
+        self.assertIsNotNone(board["session"]["waiter_seen_at"])
+
+    def test_waiter_query_param_works_for_plain_curl_drains(self):
+        status, _ = self.get("/api/events?after=0&waiter=1")
+        self.assertEqual(status, 200)
+        _, board = self.get("/api/board")
+        self.assertIsNotNone(board["session"]["waiter_seen_at"])
+
+    def test_an_unauthenticated_hit_cannot_mark_the_session_alive(self):
+        self.new_card("queue me")
+        status, _ = self.get("/api/events?after=0", token=None,
+                             headers={sprintd.WAITER_HEADER: "forged"})
+        self.assertEqual(status, 401)
+        _, board = self.get("/api/board")
+        self.assertIsNone(board["session"]["waiter_seen_at"])
+
+
+class TestWaiterThresholdsAreTunable(Base):
+    """The thresholds are env-tunable so tests (and a slow machine) can move
+    them without editing code."""
+
+    def test_env_overrides_are_read(self):
+        keys = {"SPRINT_SESSION_OFFLINE_SECONDS": "7",
+                "SPRINT_WAITER_ONLINE_SECONDS": "3",
+                "SPRINT_WAITER_GONE_SECONDS": "11"}
+        old = {k: os.environ.get(k) for k in keys}
+        os.environ.update(keys)
+        try:
+            root = os.path.join(self.tmp, "envproj")
+            os.makedirs(root)
+            app = sprintd.App(root, log=self.logfh, token="t")
+            try:
+                self.assertEqual(app.session_offline_seconds, 7.0)
+                self.assertEqual(app.waiter_online_seconds, 3.0)
+                self.assertEqual(app.waiter_gone_seconds, 11.0)
+                live = app.session_liveness()
+                self.assertEqual(live["offline_after_seconds"], 7.0)
+                self.assertEqual(live["waiter_gone_seconds"], 11.0)
+            finally:
+                app.close()
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 class TestSilenceTimer(Base):
@@ -1906,6 +2048,83 @@ class TestStartStopSubprocess(unittest.TestCase):
         status, _ = sprintd.http_get("127.0.0.1", self.port, "/api/board",
                                      "survives-reboot")
         self.assertEqual(status, 200)
+        self.assertEqual(self._run("stop").returncode, 0)
+
+    def test_token_survives_stop_and_start(self):
+        """`stop` deletes server.json -- which used to be the only copy of the
+        token, so every restart logged the browser out and killed the printed
+        URL. The token now lives in its own file and outlives the server."""
+        token_file = os.path.join(self.root, ".sprint", sprintd.TOKEN_FILENAME)
+
+        r = self._run("start", "--port", str(self.port), "--no-tailscale")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        first = sprintd.read_server_json(self.server_json)["token"]
+        self.assertTrue(os.path.exists(token_file))
+        self.assertEqual(oct(os.stat(token_file).st_mode)[-3:], "600")
+        self.assertEqual(sprintd.read_token_file(token_file), first)
+
+        self.assertEqual(self._run("stop").returncode, 0)
+        self.assertFalse(os.path.exists(self.server_json))
+        self.assertTrue(os.path.exists(token_file), "stop must not take the token with it")
+
+        r2 = self._run("start", "--port", str(self.port), "--no-tailscale")
+        self.assertEqual(r2.returncode, 0, r2.stderr.decode())
+        self.assertEqual(sprintd.read_server_json(self.server_json)["token"], first)
+        # the URL printed the first time still works, cookie and all
+        self.assertIn("http://127.0.0.1:%d/?t=%s" % (self.port, first), r2.stdout.decode())
+        status, _ = sprintd.http_get("127.0.0.1", self.port, "/api/board", first)
+        self.assertEqual(status, 200)
+        self.assertEqual(self._run("stop").returncode, 0)
+
+    def test_new_token_rotates_and_invalidates_the_old_one(self):
+        token_file = os.path.join(self.root, ".sprint", sprintd.TOKEN_FILENAME)
+        r = self._run("start", "--port", str(self.port), "--no-tailscale")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        first = sprintd.read_server_json(self.server_json)["token"]
+        self.assertEqual(self._run("stop").returncode, 0)
+
+        r2 = self._run("start", "--port", str(self.port), "--no-tailscale", "--new-token")
+        self.assertEqual(r2.returncode, 0, r2.stderr.decode())
+        second = sprintd.read_server_json(self.server_json)["token"]
+        self.assertNotEqual(second, first)
+        self.assertEqual(sprintd.read_token_file(token_file), second)
+        self.assertEqual(sprintd.http_get("127.0.0.1", self.port, "/api/board", second)[0], 200)
+        self.assertEqual(sprintd.http_get("127.0.0.1", self.port, "/api/board", first)[0], 401)
+        self.assertEqual(self._run("stop").returncode, 0)
+
+    def test_explicit_token_beats_the_stored_one(self):
+        r = self._run("start", "--port", str(self.port), "--no-tailscale",
+                      "--token", "chosen-by-hand")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(sprintd.read_server_json(self.server_json)["token"],
+                         "chosen-by-hand")
+        self.assertEqual(self._run("stop").returncode, 0)
+        # and it is what gets reused on the next plain start
+        r2 = self._run("start", "--port", str(self.port), "--no-tailscale")
+        self.assertEqual(r2.returncode, 0, r2.stderr.decode())
+        self.assertEqual(sprintd.read_server_json(self.server_json)["token"],
+                         "chosen-by-hand")
+        self.assertEqual(self._run("stop").returncode, 0)
+
+    def test_wait_polling_marks_the_session_alive(self):
+        """`sprintd wait` is the session's ingress primitive; its polling is what
+        the board now reads as 'the session is attached'."""
+        r = self._run("start", "--port", str(self.port), "--no-tailscale",
+                      "--token", "cli-token")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+
+        def session(tok):
+            status, raw = sprintd.http_get("127.0.0.1", self.port, "/api/board", tok)
+            self.assertEqual(status, 200)
+            return json.loads(raw.decode())["session"]
+
+        self.assertIsNone(session("cli-token")["waiter_seen_at"])
+        # one wait that times out with nothing pending: still a heartbeat
+        w = self._run("wait", "--after", "0", "--timeout", "0.4", "--poll", "0.1")
+        self.assertIn(w.returncode, (0, 2), w.stderr.decode())
+        sess = session("cli-token")
+        self.assertIsNotNone(sess["waiter_seen_at"])
+        self.assertTrue(sess["waiter_polling"])
         self.assertEqual(self._run("stop").returncode, 0)
 
 

@@ -28,14 +28,18 @@ recovery must be easy. The user always runs claude inside tmux.
 ## Data dir & server lifecycle
 
 - Data dir: `<project-root>/.sprint/` — `sprint.db` (SQLite, WAL mode), `attachments/` (content-addressed
-  `<sha256>.png`), `server.json` (`{pid, port, host, token, project_root, started_at}`), `server.log`.
+  `<sha256>.png`), `server.json` (`{pid, port, host, token, project_root, started_at}`), `token`
+  (the bearer token, 0600, **deliberately outside server.json so it survives `stop`** — a restart
+  that mints a new token logs every open browser out and breaks the printed URL), `server.log`.
 - All paths derived from project root at boot. Zero hardcoded paths. `sprintd doctor` appends
   `.sprint/` to `.git/info/exclude` (not .gitignore — don't dirty shared repos).
 - Bind: `tailscale ip -4` result + `127.0.0.1`, both. If no tailnet IP: bind loopback only and say so
   loudly. **Never 0.0.0.0, never a LAN interface.** Fixed default port **8377** (`--port` overridable);
   same port reused on restart so the URL survives reboots.
-- Auth: random bearer token generated at first start, stored in `server.json`. Browser: `/?t=TOKEN`
-  sets a cookie. API: `Authorization: Bearer` or cookie. Workers get the token via their brief.
+- Auth: random bearer token generated at first start, stored in `.sprint/token` (and mirrored into
+  `server.json` while running). `start` reuses it across stop/start; `--token` forces a value,
+  `--new-token` rotates. Browser: `/?t=TOKEN` sets a cookie. API: `Authorization: Bearer` or cookie.
+  Workers get the token via their brief.
 - `sprintd start` is idempotent: if a live server owns the port (health check + token match), exit 0
   saying so. Handles stale PID files after power loss (PID recycling: verify the process is actually
   sprintd before believing the pidfile; else clean up and start).
@@ -130,10 +134,18 @@ master session should get nudged and it should check on the subagent."
   found to the card as a `note`, and acts: annotate long-running work (set `long_running`), restart a
   wedged agent, or flip to needs_you/failed.
 - Cards show last activity + elapsed; UI ambers a silent card. No spinners anywhere.
-- Session liveness: the session heartbeats by advancing its cursor / a `session` note on drain; if
-  the server hasn't seen the orchestrator cursor move within 90s of pending events, `GET /api/board`
-  reports `session: offline` and the UI shows one banner: "session offline — items will queue".
-  Submissions/answers still accepted and queue.
+- Session liveness — three states, each grounded in something the session actually did:
+  `online` (nothing pending, or the orchestrator cursor moved within 90s), `busy` (the cursor is
+  behind pending events past 90s **but** the session's waiter has polled within 30s — "session is on
+  it — catching up"), `offline` (cursor stale AND the waiter itself gone >30s). The waiter's own
+  polling of `/api/events` is the primary heartbeat: it keeps ticking while the orchestrator
+  legitimately lags minutes mid-dispatch, which the cursor-only rule misread as a dead session.
+  A poll only counts as the waiter when it carries `X-Sprint-Waiter:` (or `?waiter=1`) — a browser
+  falling back to polling `/api/events` is not the session and must never fake liveness. Sightings
+  are in-memory with a throttled write to `cursors('waiter')`. Thresholds env-tunable
+  (`SPRINT_SESSION_OFFLINE_SECONDS`, `SPRINT_WAITER_ONLINE_SECONDS`, `SPRINT_WAITER_GONE_SECONDS`).
+  UI: banner ("session offline — items will queue") ONLY on `offline`; `busy` is the dot + tooltip,
+  never a banner. Submissions/answers still accepted and queue in every state.
 
 ## Evidence gate ("ready")
 
@@ -242,7 +254,8 @@ your assigned worktree; one branch; never push to main; never touch other cards'
   lightbox, live URL), Approve / Bounce-with-notes / Reject.
 - Submit box (top): textarea + paste-to-attach multiple images (thumbnails, removable) +
   `<input type=file multiple accept="image/*">` fallback + Hold toggle. Cmd/Ctrl+Enter submits.
-- Sidebar: session chat thread, `#N` autolinks to cards, session online/offline dot.
+- Sidebar: session chat thread, `#N` autolinks to cards, session dot (green live / amber catching up
+  / red offline; only red raises the banner).
 - SSE-live throughout; optimistic UI with reconciliation; Last-Event-ID reconnect; one tab-title/
   favicon badge + one soft chime on flips to needs_you/ready (no repeat, no unread counters
   anywhere else). Light + dark via `prefers-color-scheme`, both first-class.

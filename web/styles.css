@@ -150,7 +150,11 @@ h1, h2, h3, h4, h5, p, dl, dd, dt { margin: 0; }
 }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3); flex: none; }
 .dot.on { background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 22%, transparent); }
-.dot.off { background: var(--amber); box-shadow: 0 0 0 3px color-mix(in srgb, var(--amber) 22%, transparent); }
+/* busy: attached and polling, cursor behind. A working state, so amber — not the
+   red we keep for a session that is genuinely not there. No spinner: the dot and
+   its tooltip say it. */
+.dot.busy { background: var(--amber); box-shadow: 0 0 0 3px color-mix(in srgb, var(--amber) 22%, transparent); }
+.dot.off { background: var(--red); box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 22%, transparent); }
 
 .banner-slot { grid-area: banner; }
 .banner {

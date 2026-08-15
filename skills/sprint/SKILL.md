@@ -108,13 +108,16 @@ do these in this exact order:**
    silent, and keep retrying — never give up unattended (see the
    project's own recover-and-continue norm: restore, log, move on).
 2. **Then drain**: `GET /api/events?after=$CURSOR&limit=50` in a loop
-   until the response is empty. For each event, act (table below), then
-   advance `$CURSOR` to that event's `seq` and persist it immediately:
-   `POST /api/cursors/orchestrator {"seq": <seq>}`. Persist per-event or
-   in small batches, not once at the very end of a big backlog — the
-   server infers you're alive from the cursor actually moving while
-   there's a backlog to move through; a huge silent catch-up looks
-   identical to a hung session from the outside.
+   until the response is empty. Send the waiter marker on these drains —
+   `-H "X-Sprint-Waiter: session"` (or `&waiter=1`) — so the board counts
+   your poll as proof you're attached. It is what keeps the board from
+   telling the user "session offline" while you're simply busy. For each
+   event, act (table below), then advance `$CURSOR` to that event's `seq`
+   and persist it immediately: `POST /api/cursors/orchestrator {"seq":
+   <seq>}`. Persist per-event or in small batches, not once at the very
+   end of a big backlog — a moving cursor is how the user's messages flip
+   from "landed" to "session is on it", and a long silent catch-up shows
+   the board as **catching up** rather than caught up.
 3. **Only once the page is empty** does step 1 repeat (you already
    relaunched the waiter before draining, so there's no gap where a new
    event could land and go unnoticed — that's the whole point of the
