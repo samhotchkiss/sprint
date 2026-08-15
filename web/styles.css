@@ -1394,9 +1394,15 @@ html.skin-chaos .seg {
   background: #1a1344;
   box-shadow: var(--row-shadow);
 }
+/* --faint is 3.9:1 on the header plate's lightest stop, so the resting label
+   steps up to --dim. `html.skin-chaos .seg-btn` outranks `.seg-btn.is-on`
+   (one type + two classes beats two classes), so the selected label has to
+   restate its own colour or it goes lilac-on-gold at 1.9:1. */
 html.skin-chaos .seg-btn { color: var(--dim); padding: 9px 12px; }
 html.skin-chaos .seg-btn + .seg-btn { border-left: 2px solid var(--border-chip); }
-html.skin-chaos .seg-btn.is-on { text-shadow: none; }
+html.skin-chaos .seg-btn.is-on,
+html.skin-chaos .seg-btn.is-on:hover { color: var(--on-fg); }
+html.skin-chaos .seg-btn:hover { color: var(--ink); }
 
 html.skin-chaos .btn {
   border: 2px solid var(--border-chip);
@@ -1411,12 +1417,30 @@ html.skin-chaos .btn.approve { background: linear-gradient(180deg, #9df0a8, #3fa
 html.skin-chaos .btn.bounce { background: linear-gradient(180deg, #2b2470, #1a1450); }
 html.skin-chaos .btn.reject { background: none; box-shadow: none; }
 
-html.skin-chaos .chat-btn { background: none; box-shadow: none; border-color: transparent; }
-html.skin-chaos .chat-btn:hover { border-color: var(--border-chip); }
-html.skin-chaos .chat-btn.is-open { background: linear-gradient(180deg, #2b2470, #1a1450); border-color: var(--border-chip); box-shadow: var(--row-shadow); }
-html.skin-chaos .chat-btn.is-dim { background: none; box-shadow: none; }
+/* resting and dimmed Chat sit directly on the header plate, where --faint is
+   3.9:1 — the same one-step lift the headline and the seg labels take */
+/* The Chat button has four states and all four sit on the header plate, where
+   --faint is 3.9:1 — the same one-step lift the headline and the seg labels
+   take. Each state is restated because `html.skin-chaos .chat-btn` outranks the
+   two-class state rules it would otherwise inherit from. */
+html.skin-chaos .chat-btn,
+html.skin-chaos .chat-btn.is-dim { color: var(--dim); background: none; box-shadow: none; border-color: transparent; }
+html.skin-chaos .chat-btn .dot,
+html.skin-chaos .chat-btn.is-dim .dot { background: var(--dim); }
+html.skin-chaos .chat-btn:hover { color: var(--ink); border-color: var(--border-chip); }
+html.skin-chaos .chat-btn.is-open {
+  color: var(--ink);
+  background: linear-gradient(180deg, #2b2470, #1a1450);
+  border-color: var(--border-chip);
+  box-shadow: var(--row-shadow);
+}
+html.skin-chaos .chat-btn.is-open .dot { background: var(--good); }
+/* goldFlash paints over this while it runs; these are what reduced-motion sees */
+html.skin-chaos .chat-btn.is-unseen { color: var(--send-fg); background: var(--send-bg); border-color: var(--border-chip); }
+html.skin-chaos .chat-btn.is-unseen .dot { background: var(--send-fg); }
 
 html.skin-chaos .banner { border: 2px solid var(--border); box-shadow: var(--row-shadow); }
+html.skin-chaos .banner.warn { border-color: var(--border); }   /* Calm's #3a3026 reads brown on purple */
 
 /* --- the meter and the list ---------------------------------------------- */
 

@@ -50,11 +50,13 @@ export const COLUMNS = [
 ];
 
 /** The 4px meter, in the design's order and colours. Done is not on it. */
+// Tokens, not hex: the meter is the one place the whole sprint's shape is drawn
+// in colour, and a second skin has to be able to repaint it without touching JS.
 export const METER = [
-  { key: 'needs_you', color: '#d8a45c', word: 'need you' },
-  { key: 'in_motion', color: '#7fa88a', word: 'in motion' },
-  { key: 'blocked', color: '#5c4a4c', word: 'blocked' },
-  { key: 'waiting', color: '#2a2d33', word: 'queued' },
+  { key: 'needs_you', color: 'var(--accent)', word: 'need you' },
+  { key: 'in_motion', color: 'var(--good)', word: 'in motion' },
+  { key: 'blocked', color: 'var(--seg-blocked)', word: 'blocked' },
+  { key: 'waiting', color: 'var(--seg-queued)', word: 'queued' },
 ];
 
 // State → section. The server ships an advisory `column_of`, but its columns are
