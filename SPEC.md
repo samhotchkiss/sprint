@@ -283,6 +283,19 @@ your assigned worktree; one branch; never push to main; never touch other cards'
   The title on the face is the **condensed** title (≤8 words, set by the session at assign time and
   refined by the worker at triage); the user's original submission is never rewritten and shows in
   full in the rail.
+- **Two skins, one toggle** (persisted in `localStorage` under `sprint.skin`, default **Calm**),
+  sitting beside the layout toggle and present at every width including the phone fallback — it is
+  the only way back out. **Calm** is the warm near-black editorial interface. **Chaos** is a 16-bit
+  JRPG skin: pixel display type (Press Start 2P), ink outlines and hard bevels, radius 0 everywhere,
+  gold column plates, a CRT scanline overlay, and one 8-bit blip on every interaction (square wave,
+  660 Hz → ×1.5 at 60 ms, gain .05, ramped to silence over 130 ms). **Identical information
+  architecture and identical copy — only the surface changes**, and the skin is a class on `<html>`
+  over one set of custom properties, never a second component tree. Motion: Calm runs `driftIn` and
+  `softPulse` and nothing else; Chaos adds `goldEdge` on needs-you cards, `plateSheen` on the gold
+  plate and `goldFlash` on the waiting Chat button, and drops all three under
+  `prefers-reduced-motion`. Sound is Chaos-only; Calm's only sound is the needs_you/ready chime.
+  **Both skins hold the same readability floor: no 11–13px text below 4.5:1** (Chaos checks against
+  the worst stop of every gradient it sits on).
 - **Answering**: a question with options answers inline from its row in the List — one tap, no
   navigation. Free text, and every question on the Board layout, answers in the rail: Board cards
   are never interactive surfaces, so a decision is never half on a tile and half in a panel.
@@ -297,8 +310,9 @@ your assigned worktree; one branch; never push to main; never touch other cards'
   removable) + `<input type=file multiple accept="image/*">` fallback + Hold toggle. Return submits,
   Shift+Return makes a new line (Cmd/Ctrl+Enter still submits). Pasting an image anywhere opens it.
 - **Chat button**: the product's single notification surface, with four states — closed, open
-  (sage dot), **gold + pulse when a session line arrived while you were not looking**, and dimmed
-  because a card has taken the rail. No counters anywhere.
+  (sage dot), **gold when a session line arrived while you were not looking** (Chaos pulses it with
+  `goldFlash`; Calm holds the gold steady), and dimmed because a card has taken the rail. No
+  counters anywhere.
 - **Session liveness dot** (header/chat): green live / amber "catching up" / red offline; only red
   raises the "session offline — items will queue" banner.
 - SSE-live throughout; optimistic UI with reconciliation; Last-Event-ID reconnect; one tab-title/
@@ -307,7 +321,8 @@ your assigned worktree; one branch; never push to main; never touch other cards'
 - **Dark only.** This line previously called for light + dark via `prefers-color-scheme`, both
   first-class. The design work in 2026-08 scoped light out and shipped a dark-only Calm palette; a
   light Calm palette has not been designed, and a half-translated one reads worse than an honest
-  single theme. Light is a real open item, not a shipped feature.
+  single theme. Light is a real open item, not a shipped feature — and Calm/Chaos is a *skin*, not
+  a theme: both are dark, and neither is the missing light mode.
 - Aesthetic: calm, dense, plain-English labels. No spinners — the In-motion hairline is *recency*
   (it drains across the five-minute silence window), never invented progress, because nothing on
   the wire knows how far along a job is. No held-count in any header/chrome.
