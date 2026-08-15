@@ -1350,16 +1350,21 @@ class App:
         return {"ok": True, "event": self.event_row(seq),
                 "card": self.card_json(self.card_row(num), brief=True)}
 
-    def sidebar_post(self, text: str, actor: str) -> dict:
+    def sidebar_post(self, text: str, actor: str, detail=None) -> dict:
         text = (text or "").strip()
         if not text:
             raise ApiError(400, "missing_field", "text is required", field="text")
         if actor not in ("user", "session"):
             raise ApiError(400, "bad_actor", "sidebar actor must be user or session")
+        # Same two-part shape as a card event: a line to skim, an optional
+        # expanded version the session can park its working in.
+        payload = {"text": text}
+        if detail is not None:
+            payload["detail"] = detail
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
-                seq = self._append_event(None, actor, "chat", {"text": text})
+                seq = self._append_event(None, actor, "chat", payload)
                 self.conn.execute("COMMIT")
             except Exception:
                 self.conn.execute("ROLLBACK")
@@ -2021,7 +2026,8 @@ def make_handler(app: App):
             if path == "/api/sidebar":
                 return 201, app.sidebar_post(body.get("text"),
                                              actor_hint if actor_hint in ("user", "session")
-                                             else "user")
+                                             else "user",
+                                             detail=body.get("detail"))
 
             if path == "/api/batches":
                 return 201, app.make_batch(body.get("card_nums"), body.get("agent_name"),

@@ -657,8 +657,11 @@ ol.validate li::marker { color: var(--green); font-weight: 600; }
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px; line-height: 1.5; color: var(--ink-2);
   background: var(--sunk); border: 1px solid var(--line); border-radius: 9px;
-  padding: 8px 10px; white-space: pre; tab-size: 2;
-  max-height: 46vh; overflow: auto; overscroll-behavior: contain;
+  padding: 8px 10px; tab-size: 2;
+  /* pre-wrap, not pre: a log keeps its shape and its blank lines, but a wide
+     line wraps instead of hiding off the right edge of a 980px drawer. */
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 46vh; overflow-y: auto; overscroll-behavior: contain;
 }
 .detail-body[hidden] { display: none; }
 .detail.small { margin-left: 10px; }

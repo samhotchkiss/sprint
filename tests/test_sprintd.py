@@ -1785,6 +1785,25 @@ class TestEventDetail(Base):
             self.assertEqual(status, 201, body)
             self.assertEqual(body["event"]["payload"]["detail"], "expanded\n" + kind)
 
+    def test_sidebar_lines_can_carry_detail_too(self):
+        """The session answers in one line and parks the working underneath."""
+        status, body = self.post("/api/sidebar", {
+            "actor": "session",
+            "text": "#12 and #14 are blocked on the same red CI job",
+            "detail": "#12 — waiting on build 4471 (lint)\n#14 — same job, queued behind it",
+        })
+        self.assertEqual(status, 201, body)
+        thread = self.get("/api/board")[1]["sidebar"]
+        line = thread[-1]
+        self.assertEqual(line["payload"]["text"],
+                         "#12 and #14 are blocked on the same red CI job")
+        self.assertIn("build 4471", line["payload"]["detail"])
+
+        status, body = self.post("/api/sidebar", {"actor": "session", "text": "hi",
+                                                  "detail": ["not", "a", "string"]})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "detail")
+
     def test_detail_and_long_running_coexist(self):
         num = self.new_card("long job")["num"]
         self.to_in_progress(num)
