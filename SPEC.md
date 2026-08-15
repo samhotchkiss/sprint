@@ -18,7 +18,7 @@ recovery must be easy. The user always runs claude inside tmux.
 
 | Piece | What |
 |---|---|
-| `bin/sprintd` | Single-file executable Python 3.9+ **stdlib only** (http.server + sqlite3). Subcommands: `start`, `stop`, `status`, `wait`, `doctor`. Owns all state. |
+| `bin/sprintd` | Single-file executable Python 3.9+ **stdlib only** (http.server + sqlite3). Subcommands: `start`, `stop`, `status`, `wait`, `doctor`, `hub`. Owns all state. |
 | `web/` | Vanilla JS/CSS/HTML SPA served by sprintd from disk. No build step, no CDN, no external requests. |
 | `skills/sprint/SKILL.md` | The orchestrator brain: boot, resume, event-drain loop, dispatch, batching, liveness response, evidence gate, verdicts, end-sprint. |
 | `agents/sprint-worker.md` | Worker subagent definition + reporting contract. |
@@ -122,6 +122,37 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 - `sprintd wait --after SEQ [--timeout 60]` — CLI: blocks until events exist past SEQ or timeout;
   exit 0 = events waiting, exit 2 = timeout (relaunch me), nonzero-other = server unreachable.
   This is the session's ingress primitive (background task; its exit re-invokes the session).
+
+## Hub — every sprint on this machine (SHIPPED)
+
+User verbatim: "a landing page I can use if there are multiple sprints running on the same computer
+at the same time to be able to switch between them. And it should be able to show me if there is
+anything stuck in needs me on a different board." One Claude session == one sprint == one project
+root; several run at once in different tmux windows.
+
+- **Registry**: `~/.sprint/registry.json`, keyed by `project_root`, written atomically (tmp + fsync
+  + rename, 0600) under an flock. `sprintd start` writes/updates its row
+  (`{project_root, name (repo basename), host, hosts, port, pid, data_dir, started_at}`); `stop`
+  removes it (pid-guarded, so a slow shutdown can't delete a newer server's row). Restarting the same
+  board updates its row — never a second row for one project. `--registry` / `$SPRINT_REGISTRY`
+  relocates the whole machine-wide state (registry + hub token + hub pidfile); tests use it so the
+  real `~/.sprint` is never touched.
+- **Entries are advisory.** The hub health-checks every row (`/healthz` + `project_root` match, then
+  `GET /api/board` with the token read from that project's `.sprint/token`) and prunes a row only
+  when BOTH proofs land: the pid is gone AND the port has been unreachable past
+  `SPRINT_HUB_PRUNE_SECONDS` (default 15 min). Anything else stays and renders greyed —
+  "unreachable — last seen Xm" — rather than disappearing.
+- **`sprintd hub`**: fixed port **8300**, same tailnet+loopback bind rules as a board, idempotent
+  start (health check + reuse), `--stop`, `--new-token`. Its own bearer token lives in
+  `~/.sprint/hub-token` (0600) with the same `?t=` → cookie handshake, under a DISTINCT cookie name
+  (cookies ignore the port; sharing the board's name would sign every board out). It is never
+  unauthenticated — it is a keyring into token-guarded boards.
+- **The page** is embedded in sprintd (not `web/`): self-contained, no external requests, calm dark,
+  system fonts, deliberately outside the board's design system. One row per sprint: name, "N need
+  you / N ready / N in motion", session dot (online/busy/offline), last activity age, "open board"
+  link carrying that board's token. `needs_you > 0` sorts to the top with an amber left rail and the
+  oldest open question's age ("stuck 22m"); longest wait first. 10s polling of `GET /api/hub`; no SSE.
+- Started once per machine by hand; boards register themselves. No launchd parity yet.
 
 ## Liveness (auto — there is NO manual nudge button)
 

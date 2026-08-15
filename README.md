@@ -74,6 +74,67 @@ difference because the session's waiter polls `/api/events` continuously
 while it's attached — that polling is the proof of life, not the drain
 cursor, which legitimately falls minutes behind during a busy dispatch.
 
+## Multiple sprints on one machine
+
+One Claude Code session is one sprint, and you'll often have several
+going at once in different tmux windows — usually one per repo. Each
+board is its own server on its own port, which means several URLs to
+keep straight and no way to tell, from the board you're looking at,
+that something on a *different* board has been waiting on you for
+twenty minutes.
+
+The hub fixes that. Start it once per machine:
+
+```
+bin/sprintd hub
+```
+
+It prints `http://100.x.x.x:8300/?t=<hub-token>` — bookmark that one
+URL. Every board registers itself when it starts, so the hub lists all
+of them with, per row:
+
+- the project name (the repo folder), and how many cards **need you /
+  are ready / are in motion**
+- the session dot (live / catching up / offline) and how long ago
+  anything happened
+- an **open board** link that carries that board's token, so clicking
+  through lands you already signed in
+- any sprint with something in **Needs you** sorted to the top, with an
+  amber rail and how long the oldest question has been waiting
+  ("stuck 22m")
+
+It refreshes every 10 seconds and never guesses: it health-checks each
+board rather than trusting the registry file, so a board that died
+shows greyed with "unreachable — last seen 4m" instead of quietly
+vanishing or reporting stale counts.
+
+```
+bin/sprintd hub --stop        # stop it
+bin/sprintd hub --new-token   # rotate the hub's own token
+```
+
+Details worth knowing:
+
+- **The hub has its own token**, in `~/.sprint/hub-token` (0600), with
+  the same `?t=…` → cookie handshake the boards use. It links into
+  every board on the machine, so it's effectively a keyring — it is
+  never left unauthenticated. Its cookie name is deliberately different
+  from a board's, so signing into the hub never signs you out of a board.
+- **Boards register themselves.** `sprintd start` writes a row into
+  `~/.sprint/registry.json` (one row per project root, so restarting a
+  board updates its row rather than adding a second one); `sprintd stop`
+  removes it. The file is advisory: the hub health-checks every row, and
+  forgets one only once the process is gone *and* the port has been
+  unreachable for a while.
+- **Nothing about the hub is required.** Don't start it and everything
+  works exactly as before; the registry is just a small JSON file.
+- `SPRINT_REGISTRY=/path/to/registry.json` (or `--registry`) moves the
+  whole machine-wide state — registry, hub token, hub pidfile — somewhere
+  else. That's how the tests run without touching your real `~/.sprint`.
+- The hub is started once per machine, by hand. There's no launchd
+  parity for it yet (`sprintd doctor --install-launchd` covers boards
+  only).
+
 ## Power-outage recovery
 
 The Mac this runs on is online 24/7, but power outages happen. Recovery
