@@ -9,7 +9,7 @@ dispatches, resumes, nudges, batches, merges and escalates. sprintd never runs
 agents and never makes decisions -- it validates transitions, appends to an
 append-only event log, and hands the session a cursor to drain.
 
-Subcommands: start | stop | status | wait | doctor
+Subcommands: start | stop | status | wait | doctor | hub
 """
 
 from __future__ import annotations
@@ -41,7 +41,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # --------------------------------------------------------------------------
 
 DEFAULT_PORT = 8377
+DEFAULT_HUB_PORT = 8300         # one hub per machine, fixed so the URL is memorable
 DATA_DIRNAME = ".sprint"
+HUB_DIRNAME = ".sprint"         # under $HOME: the machine-wide (cross-project) state
+REGISTRY_FILENAME = "registry.json"
+HUB_TOKEN_FILENAME = "hub-token"
+HUB_JSON = "hub.json"
+HUB_LOG = "hub.log"
+HUB_COOKIE_NAME = "sprint_hub_token"   # NOT COOKIE_NAME: cookies ignore the port,
+                                       # so sharing a name would log the boards out
+DEFAULT_HUB_POLL_SECONDS = 10.0        # how often the hub re-reads every board
+DEFAULT_HUB_PRUNE_SECONDS = 900.0      # unreachable + pid gone this long -> forget it
 DB_FILENAME = "sprint.db"
 SERVER_JSON = "server.json"
 TOKEN_FILENAME = "token"       # survives `stop`; server.json does not
@@ -2407,6 +2417,183 @@ def write_server_json(path: str, info: dict):
         pass
 
 
+# --------------------------------------------------------------------------
+# Machine-wide registry (which boards are running on this computer)
+# --------------------------------------------------------------------------
+#
+# One Claude session == one sprint == one project root, and several run at once
+# in different tmux windows. The registry is a single JSON file keyed by
+# project_root, so a restart of the same board updates its row instead of
+# adding a second one. Entries are ADVISORY: the hub health-checks every row
+# and never trusts the file about what is alive.
+
+
+def registry_path(override: str = None) -> str:
+    """`--registry` > $SPRINT_REGISTRY > ~/.sprint/registry.json.
+
+    The env override exists so tests (and a second machine-wide hub) can point
+    the whole thing at a temp dir and never touch the real ~/.sprint.
+    """
+    raw = override or os.environ.get("SPRINT_REGISTRY") or os.path.join(
+        os.path.expanduser("~"), HUB_DIRNAME, REGISTRY_FILENAME)
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+def hub_dir(registry: str = None) -> str:
+    """The hub's own state dir: wherever the registry lives.
+
+    Keeping hub-token/hub.json beside the registry means one override moves
+    the entire machine-wide state, so a test hub cannot read or clobber the
+    real one's token.
+    """
+    return os.path.dirname(registry_path(registry))
+
+
+def hub_token_path(registry: str = None) -> str:
+    return os.path.join(hub_dir(registry), HUB_TOKEN_FILENAME)
+
+
+def hub_json_path(registry: str = None) -> str:
+    return os.path.join(hub_dir(registry), HUB_JSON)
+
+
+class _FileLock:
+    """Best-effort cross-process lock so two boards starting at once cannot
+    lose each other's registry row. Degrades to a no-op where flock is absent."""
+
+    def __init__(self, path: str):
+        self.path = path + ".lock"
+        self.fh = None
+
+    def __enter__(self):
+        try:
+            import fcntl
+        except ImportError:
+            return self
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            self.fh = open(self.path, "a+")
+            fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            if self.fh is not None:
+                try:
+                    self.fh.close()
+                except OSError:
+                    pass
+                self.fh = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.fh is None:
+            return False
+        try:
+            import fcntl
+            fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            pass
+        try:
+            self.fh.close()
+        except OSError:
+            pass
+        self.fh = None
+        return False
+
+
+def read_registry(registry: str = None) -> dict:
+    """-> {project_root: entry}. A missing or corrupt file is an empty registry;
+    the hub must never fail to render because one write got interrupted."""
+    path = registry_path(registry)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    sprints = data.get("sprints") if isinstance(data, dict) else None
+    if not isinstance(sprints, dict):
+        return {}
+    return {k: v for k, v in sprints.items() if isinstance(v, dict)}
+
+
+def write_registry(entries: dict, registry: str = None):
+    """Atomic whole-file replace (tmp + fsync + rename), 0600."""
+    path = registry_path(registry)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp.%d" % os.getpid()
+    payload = {"version": 1, "updated_at": now(), "sprints": entries}
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def registry_entry(project_root: str, port: int, host: str, hosts=None,
+                   data_dir: str = None, pid: int = None,
+                   started_at: float = None) -> dict:
+    root = os.path.realpath(project_root)
+    return {
+        "project_root": root,
+        "name": os.path.basename(root.rstrip("/")) or root,
+        "host": host,
+        "hosts": list(hosts or [host]),
+        "port": int(port),
+        "pid": int(pid if pid is not None else os.getpid()),
+        "data_dir": data_dir or os.path.join(root, DATA_DIRNAME),
+        "started_at": float(started_at if started_at is not None else now()),
+    }
+
+
+def registry_register(entry: dict, registry: str = None) -> dict:
+    """Add/replace this project's row. Keyed by project_root, so restarting the
+    same board never produces a second row for it."""
+    path = registry_path(registry)
+    with _FileLock(path):
+        entries = read_registry(registry)
+        key = os.path.realpath(entry["project_root"])
+        prev = entries.get(key) or {}
+        merged = dict(prev)
+        merged.update(entry)
+        merged.pop("last_seen", None)      # a fresh start re-earns its liveness
+        entries[key] = merged
+        write_registry(entries, registry)
+    return entries[key]
+
+
+def registry_unregister(project_root: str, registry: str = None,
+                        pid: int = None) -> bool:
+    """Drop this project's row. If `pid` is given, only drop the row when it
+    still belongs to that pid -- otherwise a slow shutdown could delete the row
+    a NEWER server just wrote for the same project."""
+    path = registry_path(registry)
+    key = os.path.realpath(project_root)
+    with _FileLock(path):
+        entries = read_registry(registry)
+        row = entries.get(key)
+        if row is None:
+            return False
+        if pid is not None and row.get("pid") not in (None, pid):
+            return False
+        entries.pop(key, None)
+        write_registry(entries, registry)
+    return True
+
+
+def registry_touch(project_root: str, fields: dict, registry: str = None):
+    """Merge a few fields into one row (the hub stamping `last_seen`)."""
+    path = registry_path(registry)
+    key = os.path.realpath(project_root)
+    with _FileLock(path):
+        entries = read_registry(registry)
+        if key not in entries:
+            return
+        entries[key].update(fields)
+        write_registry(entries, registry)
+
+
 def http_get(host: str, port: int, path: str, token: str = None, timeout: float = 3.0,
              extra_headers: dict = None):
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
@@ -2518,6 +2705,16 @@ def cmd_start(args) -> int:
     if info:
         state, _health = probe_server(info)
         if state == "healthy":
+            # Idempotent reuse -- and re-assert the registry row, so a board
+            # that was already up before the hub existed still shows up on it.
+            try:
+                registry_register(registry_entry(
+                    project_root, info.get("port"), info.get("host") or "127.0.0.1",
+                    hosts=info.get("hosts"), data_dir=info.get("data_dir") or p["data_dir"],
+                    pid=info.get("pid"), started_at=info.get("started_at")),
+                    getattr(args, "registry", None))
+            except OSError:
+                pass
             print("sprintd already running (pid %s) -> %s"
                   % (info.get("pid"), board_url(info.get("host") or "127.0.0.1",
                                                 info.get("port"), info["token"])))
@@ -2616,6 +2813,16 @@ def cmd_start(args) -> int:
     except OSError as exc:
         app.log("could not persist token file %s (%s) -- the token will not "
                 "survive a stop/start" % (p["token"], exc))
+    # Announce this board machine-wide so `sprintd hub` can list it. Advisory
+    # only: the hub health-checks every row and never trusts this file.
+    try:
+        registry_register(registry_entry(
+            project_root, actual_port, hosts[0], hosts=hosts,
+            data_dir=p["data_dir"], started_at=app.started_at),
+            getattr(args, "registry", None))
+    except OSError as exc:
+        app.log("could not write the sprint registry (%s) -- this board will "
+                "not appear on the hub page" % exc)
 
     urls = [board_url(h, actual_port, token) for h in hosts]
     app.log("listening on %s (project %s)" % (
@@ -2658,6 +2865,11 @@ def cmd_start(args) -> int:
         except OSError:
             pass
         try:
+            registry_unregister(project_root, getattr(args, "registry", None),
+                                pid=os.getpid())
+        except OSError:
+            pass
+        try:
             logfh.close()
         except OSError:
             pass
@@ -2668,14 +2880,23 @@ def cmd_stop(args) -> int:
     project_root = os.path.realpath(args.project_root or find_project_root())
     p = paths_for(project_root, args.data_dir)
     info = read_server_json(p["server_json"])
+    reg = getattr(args, "registry", None)
     if not info:
         print("sprintd is not running (no %s)" % p["server_json"])
+        try:
+            registry_unregister(project_root, reg)
+        except OSError:
+            pass
         return 0
     pid = info.get("pid")
     if not isinstance(pid, int) or not pid_is_sprintd(pid):
         print("stale server.json (pid %s is gone or recycled); cleaning up" % pid)
         try:
             os.remove(p["server_json"])
+        except OSError:
+            pass
+        try:
+            registry_unregister(project_root, reg)
         except OSError:
             pass
         return 0
@@ -2695,6 +2916,12 @@ def cmd_stop(args) -> int:
             pass
     try:
         os.remove(p["server_json"])
+    except OSError:
+        pass
+    # The server unregisters itself on a clean SIGTERM; do it again here so a
+    # SIGKILLed board still leaves the hub's registry honest.
+    try:
+        registry_unregister(project_root, reg, pid=pid)
     except OSError:
         pass
     print("stopped sprintd (pid %s)" % pid)
@@ -2868,6 +3095,16 @@ def cmd_doctor(args) -> int:
     else:
         note("server not started yet -- run `sprintd start`")
 
+    registered = read_registry(args.registry)
+    hinfo = read_server_json(hub_json_path(args.registry))
+    if hinfo and probe_hub(hinfo, registry_path(args.registry)) == "healthy":
+        ok("hub running (%d board%s registered): %s"
+           % (len(registered), "" if len(registered) == 1 else "s",
+              hub_url(hinfo.get("host") or "127.0.0.1", hinfo["port"], hinfo["token"])))
+    else:
+        note("hub not running -- `sprintd hub` serves one page listing every "
+             "sprint on this machine (%d registered right now)" % len(registered))
+
     if args.install_launchd:
         rc = install_launchd(project_root, p, args)
         problems += rc
@@ -2938,6 +3175,711 @@ def install_launchd(project_root: str, p: dict, args) -> int:
 
 
 # --------------------------------------------------------------------------
+# Hub: one landing page for every sprint running on this machine
+# --------------------------------------------------------------------------
+
+
+def board_token_for(entry: dict):
+    """The board's own bearer token, read off disk.
+
+    Same user, same machine, mode-0600 files -- the hub is effectively a
+    keyring, which is exactly why the hub page itself is token-guarded.
+    """
+    data_dir = entry.get("data_dir") or os.path.join(
+        entry.get("project_root") or "", DATA_DIRNAME)
+    tok = read_token_file(os.path.join(data_dir, TOKEN_FILENAME))
+    if tok:
+        return tok
+    info = read_server_json(os.path.join(data_dir, SERVER_JSON)) or {}
+    return info.get("token")
+
+
+def hub_summarize(entry: dict, timeout: float = 2.5) -> dict:
+    """Poll one registered board and reduce it to a row on the landing page.
+
+    Never raises: an unreachable board is a greyed row, not a broken hub.
+    """
+    root = entry.get("project_root") or ""
+    port = int(entry.get("port") or 0)
+    hosts = entry.get("hosts") or [entry.get("host") or "127.0.0.1"]
+    row = {
+        "project_root": root,
+        "name": entry.get("name") or os.path.basename(root.rstrip("/")) or root,
+        "port": port,
+        "host": hosts[0],
+        "pid": entry.get("pid"),
+        "started_at": entry.get("started_at"),
+        "last_seen": entry.get("last_seen") or entry.get("started_at"),
+        "pid_alive": bool(isinstance(entry.get("pid"), int)
+                          and pid_alive(entry["pid"])),
+        "reachable": False,
+        "status": "unreachable",
+        "needs_you": 0, "ready": 0, "in_motion": 0, "queued": 0, "blocked": 0,
+        "done": 0, "total": 0,
+        "session": None,
+        "sprint_title": None,
+        "last_activity_at": None,
+        "last_activity": None,
+        "stuck_seconds": None,
+        "stuck_card": None,
+        "url": None,
+        "detail": None,
+    }
+    if not port:
+        row["detail"] = "no port recorded"
+        return row
+    try:
+        status, raw = http_get("127.0.0.1", port, "/healthz", timeout=timeout)
+    except (OSError, http.client.HTTPException):
+        return row
+    if status != 200:
+        row["detail"] = "port answered HTTP %s" % status
+        return row
+    health = jload(raw.decode("utf-8", "replace"), {}) or {}
+    if health.get("hub"):
+        row["detail"] = "that port is the hub itself"
+        return row
+    if os.path.realpath(health.get("project_root") or "") != os.path.realpath(root or "/"):
+        # Something else grabbed the port after this board died.
+        row["detail"] = "port taken by another project"
+        return row
+
+    token = board_token_for(entry)
+    if not token:
+        row.update(status="no_token",
+                   detail="no token on disk for this project (.sprint/token)")
+        return row
+    try:
+        status, raw = http_get("127.0.0.1", port, "/api/board", token, timeout=timeout)
+    except (OSError, http.client.HTTPException):
+        return row
+    if status == 401:
+        row.update(status="unauthorized", detail="the stored token was rejected")
+        return row
+    if status != 200:
+        row["detail"] = "board returned HTTP %s" % status
+        return row
+    board = jload(raw.decode("utf-8", "replace"), {}) or {}
+    cards = board.get("cards") or []
+    column_of = board.get("column_of") or COLUMN_OF
+    ts = now()
+    counts = {}
+    last_at, last_text, stuck_at, stuck_card = None, None, None, None
+    for c in cards:
+        col = column_of.get(c.get("state"), "queued")
+        counts[col] = counts.get(col, 0) + 1
+        at = c.get("last_activity_at")
+        if isinstance(at, (int, float)) and (last_at is None or at > last_at):
+            last_at = at
+            ev = c.get("last_event") or {}
+            text = (ev.get("payload") or {}).get("text") or ev.get("kind") or ""
+            last_text = "#%s %s" % (c.get("num"), one_line(str(text), 70)) if text \
+                else "#%s" % c.get("num")
+        if col == "needs_you":
+            q = c.get("question") or c.get("open_question") or {}
+            asked = q.get("created_at") or c.get("state_since") or c.get("updated_at")
+            if isinstance(asked, (int, float)) and (stuck_at is None or asked < stuck_at):
+                stuck_at, stuck_card = asked, c.get("num")
+    sprint = board.get("sprint") or {}
+    row.update({
+        "reachable": True,
+        "status": "live",
+        "needs_you": counts.get("needs_you", 0),
+        "ready": counts.get("ready", 0),
+        "in_motion": counts.get("in_progress", 0),
+        "queued": counts.get("queued", 0) + counts.get("held", 0),
+        "blocked": counts.get("blocked", 0),
+        "done": counts.get("done", 0),
+        "total": len(cards),
+        "session": (board.get("session") or {}).get("status"),
+        "sprint_title": sprint.get("title"),
+        "last_activity_at": last_at,
+        "last_activity": last_text,
+        "stuck_seconds": None if stuck_at is None else max(0.0, ts - stuck_at),
+        "stuck_card": stuck_card,
+        "last_seen": ts,
+        "url": board_url(hosts[0], port, token),
+        "detail": None,
+    })
+    return row
+
+
+def hub_sort_key(row: dict):
+    """Anything waiting on the user floats to the top, longest wait first;
+    unreachable boards sink to the bottom but never disappear."""
+    if not row.get("reachable"):
+        tier = 2
+    elif row.get("needs_you"):
+        tier = 0
+    else:
+        tier = 1
+    return (tier, -(row.get("stuck_seconds") or 0), -(row.get("needs_you") or 0),
+            (row.get("name") or "").lower())
+
+
+class HubApp:
+    """Reads the registry, polls every board, keeps one cached snapshot."""
+
+    def __init__(self, registry: str = None, token: str = None, log=None,
+                 poll_seconds: float = None, prune_seconds: float = None,
+                 timeout: float = 2.5):
+        self.registry = registry
+        self.registry_file = registry_path(registry)
+        self.token = token or secrets.token_urlsafe(24)
+        self.logfh = log
+        self.poll_seconds = poll_seconds if poll_seconds is not None else env_float(
+            "SPRINT_HUB_POLL_SECONDS", DEFAULT_HUB_POLL_SECONDS)
+        self.prune_seconds = prune_seconds if prune_seconds is not None else env_float(
+            "SPRINT_HUB_PRUNE_SECONDS", DEFAULT_HUB_PRUNE_SECONDS)
+        self.timeout = timeout
+        self.started_at = now()
+        self.lock = threading.Lock()
+        self.snapshot = None
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def log(self, msg: str):
+        if not self.logfh:
+            return
+        try:
+            self.logfh.write("[%s] %s\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+            self.logfh.flush()
+        except (OSError, ValueError):
+            pass
+
+    def refresh(self) -> dict:
+        entries = read_registry(self.registry)
+        rows, pruned = [], []
+        for key, entry in entries.items():
+            entry = dict(entry)
+            entry.setdefault("project_root", key)
+            row = hub_summarize(entry, timeout=self.timeout)
+            if not row["reachable"]:
+                # Advisory file, health-checked truth: forget a row only once
+                # the process is really gone AND it has been quiet a long time.
+                seen = row.get("last_seen") or row.get("started_at") or 0
+                if not row["pid_alive"] and (now() - float(seen or 0)) > self.prune_seconds:
+                    pruned.append(key)
+                    continue
+            else:
+                try:
+                    registry_touch(key, {"last_seen": row["last_seen"]}, self.registry)
+                except OSError:
+                    pass
+            rows.append(row)
+        for key in pruned:
+            try:
+                registry_unregister(key, self.registry)
+                self.log("pruned dead registry entry %s" % key)
+            except OSError:
+                pass
+        rows.sort(key=hub_sort_key)
+        snap = {
+            "sprints": rows,
+            "count": len(rows),
+            "needs_you_total": sum(r["needs_you"] for r in rows),
+            "registry": self.registry_file,
+            "server_time": now(),
+            "poll_seconds": self.poll_seconds,
+        }
+        with self.lock:
+            self.snapshot = snap
+        return snap
+
+    def get(self, max_age: float = None) -> dict:
+        if max_age is None:
+            max_age = self.poll_seconds
+        with self.lock:
+            snap = self.snapshot
+        if snap and (now() - snap["server_time"]) <= max_age:
+            return snap
+        return self.refresh()
+
+    def _loop(self):
+        while not self.stop_event.is_set():
+            try:
+                self.refresh()
+            except Exception:
+                self.log("hub poll failed: %s" % traceback.format_exc())
+            self.stop_event.wait(self.poll_seconds)
+
+    def start_background(self):
+        if self.thread is not None:
+            return
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.stop_event.set()
+
+
+HUB_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sprint — boards on this machine</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel-2:#1c222b; --line:#262d38;
+    --ink:#e6edf3; --dim:#8b98a8; --faint:#5c6773;
+    --amber:#e0a33e; --green:#3fb27f; --red:#e05252;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,
+            "Helvetica Neue",Arial,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:880px;margin:0 auto;padding:32px 20px 64px}
+  header{display:flex;align-items:baseline;justify-content:space-between;
+         gap:16px;flex-wrap:wrap;margin-bottom:6px}
+  h1{font-size:19px;font-weight:600;margin:0;letter-spacing:.2px}
+  .sub{color:var(--dim);font-size:13px;margin:0 0 22px}
+  .updated{color:var(--faint);font-size:12px;font-variant-numeric:tabular-nums}
+  ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:10px}
+  li{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+     border-left:3px solid transparent;padding:14px 16px;
+     display:flex;gap:16px;align-items:center;justify-content:space-between}
+  li.attn{border-left-color:var(--amber);background:var(--panel-2)}
+  li.dead{opacity:.5}
+  .left{min-width:0;display:flex;flex-direction:column;gap:5px}
+  .name{font-size:16px;font-weight:600;display:flex;align-items:center;gap:9px;
+        flex-wrap:wrap}
+  .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:var(--faint)}
+  .dot.online{background:var(--green)}
+  .dot.busy{background:var(--amber)}
+  .dot.offline{background:var(--red)}
+  .stuck{color:#241a05;background:var(--amber);border-radius:20px;
+         padding:1px 9px;font-size:12px;font-weight:600;letter-spacing:.2px}
+  .counts{color:var(--dim);font-size:13.5px}
+  .counts b{color:var(--ink);font-weight:600}
+  .counts .hot{color:var(--amber)}
+  .meta{color:var(--faint);font-size:12.5px;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap;max-width:52ch}
+  .right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;
+         flex:0 0 auto}
+  a.open{color:#8ab4f8;text-decoration:none;font-size:13.5px;
+         border:1px solid var(--line);border-radius:7px;padding:6px 12px;
+         background:#11161d}
+  a.open:hover{border-color:#3d4a5c;color:#a9c8ff}
+  .gone{color:var(--faint);font-size:12.5px;text-align:right}
+  .empty{color:var(--dim);border:1px dashed var(--line);border-radius:10px;
+         padding:28px 20px;text-align:center}
+  .empty code{color:var(--ink);background:#11161d;padding:2px 6px;border-radius:4px}
+  footer{color:var(--faint);font-size:12px;margin-top:26px}
+  @media (max-width:700px){
+    li{flex-direction:column;align-items:flex-start;gap:10px}
+    .right{align-items:flex-start;flex-direction:row}
+    .meta{max-width:100%}
+  }
+</style>
+</head><body>
+<div class="wrap">
+  <header>
+    <h1>sprint boards on this machine</h1>
+    <span class="updated" id="updated"></span>
+  </header>
+  <p class="sub" id="sub">loading…</p>
+  <ul id="rows"></ul>
+  <footer>Refreshes every 10s. Boards register themselves when you start a
+  sprint; this page never guesses — it health-checks each one.</footer>
+</div>
+<script>
+function age(sec){
+  if(sec===null||sec===undefined) return "";
+  sec=Math.max(0,Math.round(sec));
+  if(sec<60) return sec+"s";
+  if(sec<3600) return Math.round(sec/60)+"m";
+  if(sec<86400) return (sec/3600).toFixed(1).replace(/\\.0$/,"")+"h";
+  return Math.round(sec/86400)+"d";
+}
+function esc(s){var d=document.createElement("div");d.textContent=s==null?"":s;
+  return d.innerHTML;}
+function sessionLabel(s){
+  if(s==="online") return "session live";
+  if(s==="busy") return "session catching up";
+  if(s==="offline") return "session offline";
+  return "session unknown";
+}
+function render(data){
+  var t=data.server_time, rows=data.sprints||[];
+  var ul=document.getElementById("rows");
+  var live=rows.filter(function(r){return r.reachable;}).length;
+  var need=data.needs_you_total||0;
+  document.getElementById("sub").textContent =
+    rows.length===0 ? "" :
+    (live+" running"+(rows.length>live?" · "+(rows.length-live)+" unreachable":"")+
+     " · "+(need? need+" waiting on you" : "nothing waiting on you"));
+  document.getElementById("updated").textContent="updated just now";
+  if(!rows.length){
+    ul.innerHTML='<div class="empty">No sprints are running on this machine.'+
+      '<br>Start one by saying <code>start a sprint</code> in a Claude Code '+
+      'session inside any project.</div>';
+    return;
+  }
+  ul.innerHTML=rows.map(function(r){
+    var cls=[]; if(!r.reachable) cls.push("dead"); else if(r.needs_you) cls.push("attn");
+    var stuck = (r.needs_you && r.stuck_seconds!=null)
+      ? '<span class="stuck">stuck '+age(r.stuck_seconds)+'</span>' : '';
+    var counts = r.reachable
+      ? '<span class="'+(r.needs_you?'hot':'')+'"><b>'+r.needs_you+'</b> need you</span>'+
+        ' / <b>'+r.ready+'</b> ready / <b>'+r.in_motion+'</b> in motion'
+      : (r.detail? esc(r.detail) : 'not answering on port '+r.port);
+    var actAge = r.last_activity_at!=null ? age(t-r.last_activity_at) : null;
+    var meta = r.reachable
+      ? (r.last_activity? esc(r.last_activity)+" · "+actAge+" ago"
+                        : "no activity yet")
+      : "unreachable — last seen "+age(t-(r.last_seen||r.started_at||t))+" ago";
+    var right = r.reachable && r.url
+      ? '<a class="open" href="'+esc(r.url)+'">open board</a>'
+      : '<span class="gone">port '+r.port+'</span>';
+    return '<li class="'+cls.join(" ")+'">'+
+      '<span class="left">'+
+        '<span class="name"><span class="dot '+(r.reachable?esc(r.session||""):"")+
+          '"></span>'+esc(r.name)+stuck+'</span>'+
+        '<span class="counts">'+counts+'</span>'+
+        '<span class="meta">'+meta+'</span>'+
+      '</span>'+
+      '<span class="right">'+right+
+        '<span class="gone">'+(r.reachable? esc(sessionLabel(r.session))
+                                          : 'offline')+'</span>'+
+      '</span></li>';
+  }).join("");
+}
+var lastAt=0;
+function tick(){
+  fetch("/api/hub",{headers:{"Accept":"application/json"}})
+    .then(function(res){
+      if(res.status===401){throw new Error("unauthorized");}
+      return res.json();})
+    .then(function(d){lastAt=Date.now();render(d);})
+    .catch(function(e){
+      document.getElementById("updated").textContent =
+        e.message==="unauthorized" ? "signed out — reopen your hub link"
+                                   : "hub unreachable";
+    });
+}
+setInterval(tick,10000);
+setInterval(function(){
+  if(!lastAt) return;
+  var s=Math.round((Date.now()-lastAt)/1000);
+  document.getElementById("updated").textContent =
+    s<5? "updated just now" : "updated "+age(s)+" ago";
+},1000);
+tick();
+</script>
+</body></html>
+"""
+
+
+def make_hub_handler(hub: HubApp):
+
+    class HubHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "sprintd-hub/1.0"
+
+        def log_message(self, fmt, *args):  # noqa: A003
+            hub.log("%s %s" % (self.address_string(), fmt % args))
+
+        def _send(self, status, body: bytes, ctype: str, extra_headers=None):
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            for k, v in (extra_headers or []):
+                self.send_header(k, v)
+            self.end_headers()
+            if self.command != "HEAD":
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        def json_out(self, status, obj, extra_headers=None):
+            self._send(status, jdump(obj).encode("utf-8"),
+                       "application/json; charset=utf-8", extra_headers)
+
+        def cookie_token(self):
+            raw = self.headers.get("Cookie") or ""
+            for part in raw.split(";"):
+                name, _, val = part.strip().partition("=")
+                if name == HUB_COOKIE_NAME:
+                    return urllib.parse.unquote(val)
+            return None
+
+        def authed(self, query) -> bool:
+            given = None
+            auth = self.headers.get("Authorization") or ""
+            if auth.lower().startswith("bearer "):
+                given = auth[7:].strip()
+            if given is None:
+                given = self.cookie_token()
+            if given is None:
+                qt = query.get("t")
+                given = qt[0] if qt else None
+            if not given:
+                return False
+            return secrets.compare_digest(str(given), hub.token)
+
+        def do_GET(self):  # noqa: N802
+            self._route()
+
+        def do_HEAD(self):  # noqa: N802
+            self._route()
+
+        def _route(self):
+            try:
+                parsed = urllib.parse.urlsplit(self.path)
+                path = urllib.parse.unquote(parsed.path)
+                query = urllib.parse.parse_qs(parsed.query)
+
+                if path == "/healthz":
+                    return self.json_out(200, {
+                        "ok": True, "hub": True, "pid": os.getpid(),
+                        "registry": hub.registry_file,
+                        "started_at": hub.started_at})
+
+                if not self.authed(query):
+                    return self.json_out(401, {
+                        "error": "unauthorized",
+                        "message": "the hub has its own token: see "
+                                   "~/.sprint/hub-token, or run `sprintd hub` "
+                                   "again to print the URL"})
+
+                if path == "/" and query.get("t"):
+                    cookie = "%s=%s; Path=/; SameSite=Lax; Max-Age=31536000; HttpOnly" % (
+                        HUB_COOKIE_NAME, urllib.parse.quote(hub.token))
+                    rest = [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query)
+                            if k != "t"]
+                    location = "/" + ("?" + urllib.parse.urlencode(rest) if rest else "")
+                    return self._send(302, b"", "text/plain",
+                                      [("Set-Cookie", cookie), ("Location", location)])
+
+                if path in ("/", "/index.html"):
+                    return self._send(200, HUB_HTML.encode("utf-8"),
+                                      "text/html; charset=utf-8")
+                if path == "/api/hub":
+                    fresh = (query.get("fresh") or ["0"])[0] in ("1", "true", "yes")
+                    return self.json_out(200, hub.get(max_age=0 if fresh else None))
+                return self.json_out(404, {"error": "not_found", "message": path})
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception:
+                hub.log("unhandled: %s" % traceback.format_exc())
+                try:
+                    return self.json_out(500, {"error": "internal",
+                                               "message": "internal error"})
+                except Exception:
+                    return
+
+    return HubHandler
+
+
+class HubServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def make_hub_server(hub: HubApp, host: str, port: int) -> HubServer:
+    return HubServer((host, port), make_hub_handler(hub))
+
+
+def hub_url(host: str, port: int, token: str) -> str:
+    return "http://%s:%d/?t=%s" % (host, port, urllib.parse.quote(token))
+
+
+def probe_hub(info: dict, registry_file: str, timeout: float = 3.0) -> str:
+    """-> healthy | dead | foreign (someone else owns the port)."""
+    if not info:
+        return "dead"
+    port = info.get("port") or DEFAULT_HUB_PORT
+    try:
+        status, raw = http_get("127.0.0.1", port, "/healthz", timeout=timeout)
+    except (OSError, http.client.HTTPException):
+        return "dead"
+    if status != 200:
+        return "foreign"
+    health = jload(raw.decode("utf-8", "replace"), {}) or {}
+    if not health.get("hub"):
+        return "foreign"
+    if os.path.realpath(health.get("registry") or "") != os.path.realpath(registry_file):
+        return "foreign"
+    return "healthy"
+
+
+def cmd_hub(args) -> int:
+    reg_file = registry_path(args.registry)
+    d = hub_dir(args.registry)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as exc:
+        print("error: cannot create %s (%s)" % (d, exc), file=sys.stderr)
+        return 1
+    hj = hub_json_path(args.registry)
+    info = read_server_json(hj)
+
+    if args.stop:
+        if not info:
+            print("hub is not running (no %s)" % hj)
+            return 0
+        pid = info.get("pid")
+        if isinstance(pid, int) and pid_is_sprintd(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError as exc:
+                print("error: could not signal pid %s: %s" % (pid, exc), file=sys.stderr)
+                return 1
+            for _ in range(60):
+                if not pid_alive(pid):
+                    break
+                time.sleep(0.1)
+            if pid_alive(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            print("stopped hub (pid %s)" % pid)
+        else:
+            print("stale %s (pid %s is gone); cleaning up" % (hj, pid))
+        try:
+            os.remove(hj)
+        except OSError:
+            pass
+        return 0
+
+    if info:
+        state = probe_hub(info, reg_file)
+        if state == "healthy":
+            print("hub already running (pid %s) -> %s"
+                  % (info.get("pid"), hub_url(info.get("host") or "127.0.0.1",
+                                              info.get("port"), info["token"])))
+            return 0
+        if state == "foreign":
+            print("error: port %s is held by something else (not this hub). "
+                  "Free it or use --port." % info.get("port"), file=sys.stderr)
+            return 1
+        pid = info.get("pid")
+        if isinstance(pid, int) and pid_is_sprintd(pid) and pid != os.getpid():
+            try:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.5)
+            except OSError:
+                pass
+        try:
+            os.remove(hj)
+        except OSError:
+            pass
+
+    port = args.port if args.port is not None else (
+        (info or {}).get("port") or DEFAULT_HUB_PORT)
+    tok_path = hub_token_path(args.registry)
+    if args.token:
+        token = args.token
+    elif args.new_token:
+        token = secrets.token_urlsafe(24)
+    else:
+        token = ((info or {}).get("token") or read_token_file(tok_path)
+                 or secrets.token_urlsafe(24))
+
+    ts_ip = "" if args.no_tailscale else tailscale_ip()
+    if not ts_ip:
+        print("NOTICE: no tailscale IPv4 address found -- binding 127.0.0.1 ONLY.",
+              file=sys.stderr)
+
+    logpath = os.path.join(d, HUB_LOG)
+    ready_fd = None
+    if not args.foreground:
+        ready_fd = daemonize(logpath)
+
+    def report(ok: bool, **kw):
+        if ready_fd is None:
+            return
+        try:
+            os.write(ready_fd, (jdump(dict(ok=ok, **kw)) + "\n").encode("utf-8"))
+            os.close(ready_fd)
+        except OSError:
+            pass
+
+    logfh = open(logpath, "a", encoding="utf-8")
+    hub = HubApp(registry=args.registry, token=token, log=logfh,
+                 poll_seconds=args.poll_seconds)
+
+    servers, hosts = [], []
+    try:
+        loop = make_hub_server(hub, "127.0.0.1", port)
+    except OSError as exc:
+        msg = "cannot bind 127.0.0.1:%s (%s)" % (port, exc)
+        hub.log(msg)
+        report(False, error=msg)
+        print("error: " + msg, file=sys.stderr)
+        return 1
+    servers.append(loop)
+    hosts.append("127.0.0.1")
+    actual_port = loop.server_address[1]
+    if ts_ip:
+        try:
+            servers.insert(0, make_hub_server(hub, ts_ip, actual_port))
+            hosts.insert(0, ts_ip)
+        except OSError as exc:
+            hub.log("could not bind tailnet ip %s:%s (%s) -- loopback only"
+                    % (ts_ip, actual_port, exc))
+
+    try:
+        write_token_file(tok_path, token)
+    except OSError as exc:
+        hub.log("could not persist %s (%s)" % (tok_path, exc))
+    write_server_json(hj, {
+        "pid": os.getpid(), "port": actual_port, "host": hosts[0], "hosts": hosts,
+        "token": token, "registry": reg_file, "started_at": hub.started_at,
+    })
+    hub.start_background()
+
+    urls = [hub_url(h, actual_port, token) for h in hosts]
+    hub.log("hub listening on %s (registry %s)" % (
+        ", ".join("%s:%d" % (h, actual_port) for h in hosts), reg_file))
+    report(True, urls=urls, pid=os.getpid(), port=actual_port)
+    if ready_fd is None:
+        for u in urls:
+            print(u)
+        sys.stdout.flush()
+
+    stop = threading.Event()
+
+    def handle_sig(_signo, _frame):
+        stop.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, handle_sig)
+        except (ValueError, OSError):
+            pass
+
+    for s in servers:
+        threading.Thread(target=s.serve_forever, kwargs={"poll_interval": 0.2},
+                         daemon=True).start()
+    try:
+        while not stop.is_set():
+            stop.wait(0.5)
+    finally:
+        for s in servers:
+            s.shutdown()
+            s.server_close()
+        hub.close()
+        try:
+            cur = read_server_json(hj)
+            if cur and cur.get("pid") == os.getpid():
+                os.remove(hj)
+        except OSError:
+            pass
+        try:
+            logfh.close()
+        except OSError:
+            pass
+    return 0
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -2948,6 +3890,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="project root (default: git toplevel of cwd)")
     ap.add_argument("--data-dir", default=None,
                     help="state dir (default: <project-root>/.sprint)")
+    ap.add_argument("--registry", default=None,
+                    help="machine-wide registry file (default: $SPRINT_REGISTRY or "
+                         "~/.sprint/registry.json); the hub's token and pidfile live "
+                         "beside it")
     sub = ap.add_subparsers(dest="cmd")
 
     s = sub.add_parser("start", help="start the board server (idempotent)")
@@ -2984,6 +3930,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="write + load a KeepAlive LaunchAgent (macOS)")
     s.add_argument("--port", type=int, default=None)
     s.set_defaults(func=cmd_doctor)
+
+    s = sub.add_parser("hub", help="one landing page for every sprint on this machine")
+    s.add_argument("--port", type=int, default=None,
+                   help="port (default %d)" % DEFAULT_HUB_PORT)
+    s.add_argument("--stop", action="store_true", help="stop the running hub")
+    s.add_argument("--token", default=None, help="force the hub's bearer token")
+    s.add_argument("--new-token", action="store_true",
+                   help="mint a fresh hub token (default: reuse ~/.sprint/hub-token)")
+    s.add_argument("--foreground", action="store_true", help="do not daemonize")
+    s.add_argument("--no-tailscale", action="store_true",
+                   help="skip tailscale lookup; bind loopback only")
+    s.add_argument("--poll-seconds", type=float, default=None,
+                   help="how often to re-poll every board (default %d)"
+                        % DEFAULT_HUB_POLL_SECONDS)
+    s.set_defaults(func=cmd_hub)
     return ap
 
 
