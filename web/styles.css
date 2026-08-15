@@ -9,6 +9,11 @@
    Dark only, deliberately: the design was scoped dark and a light Calm palette
    has not been designed. There is no prefers-color-scheme override here — a
    half-translated light theme reads worse than an honest single one.
+
+   The second skin (Chaos) lives at the bottom of this file: its token block sits
+   directly under Calm's, and the handful of rules that need a different SHAPE
+   rather than a different colour are collected in one clearly-marked section at
+   the end. Nothing between here and there knows which skin is on.
    =========================================================================== */
 
 :root,
@@ -76,8 +81,9 @@ html.skin-calm {
   --radius-pill: 99px;
   --panel-shadow: none;
   --row-shadow: none;
-  --plate: none;
-  --glow: none;
+  --plate: none;    /* the sheen crawling across a gold column plate */
+  --glow: none;     /* the pulse around anything that needs you */
+  --flash: none;    /* the Chat button when the session said something */
 
   /* type */
   --font-display: 'Instrument Serif', Georgia, 'Times New Roman', serif;
@@ -89,6 +95,104 @@ html.skin-calm {
   --size-claim: 19px;
   --label-size: 11.5px;
   --label-space: .06em;
+  --display-case: none;
+  --display-weight: 400;
+}
+
+/* ===========================================================================
+   sprint — the Chaos skin.
+
+   The same interface in a 16-bit JRPG costume: hard bevels over an ink outline,
+   pixel display type, a purple dungeon canvas, gold plates for the things that
+   want you. Same information, same words, same order — only the surface moves.
+
+   Every name below already exists above. Anything that needs a different SHAPE
+   (rows becoming a card grid, plates on the column heads) is at the bottom of
+   the file under "Chaos — shape", because it is structure, not palette.
+   =========================================================================== */
+
+html.skin-chaos {
+  /* surfaces */
+  --canvas: radial-gradient(120% 90% at 50% 0%, #1a1140 0%, #0d0820 70%);
+  --canvas-flat: #0d0820;   /* where a gradient cannot go (borders) */
+  --aside-bg: linear-gradient(180deg, #191340, #110c2a);
+  --head-bg: linear-gradient(180deg, #3a2f86 0%, #251d5e 55%, #1a1344 100%);
+  --panel: linear-gradient(180deg, #1e1846, #161132);
+  --panel-thread: linear-gradient(180deg, #191340, #110c2a);
+  --input: #100a26;
+  --chip: #100a26;
+  --hover: #241c52;
+  --scrim: rgba(6, 3, 20, .72);
+
+  /* lines — one ink outline, everywhere */
+  --rule: #0a0618;
+  --rule-row: #0a0618;
+  --border: #0a0618;
+  --border-chip: #0a0618;
+
+  /* ink */
+  --ink: #f0edfb;
+  --body-ink: #e6e1f7;
+  --dim: #b9b1e0;
+  --faint: #9c93d0;         /* 6.5:1 on the panel — the floor for 11–13px */
+  --meta: #9c93d0;          /* Calm can afford a third step down here; on purple
+                               it lands under 4.5:1, so Chaos stops at faint. */
+
+  /* meaning */
+  --accent: #f5c542;
+  --accent-hi: #ffe08a;
+  --good: #6ee07a;
+  --bad: #e2919e;
+  --approve: #9df0a8;
+  --approve-hi: #b8f7c0;
+  --warn: #ffb03a;
+  --info: #8fb4ff;
+  --alt: #c79cff;
+  --rail-needs: #f5c542;
+  --rail-signoff: #3fae5a;
+  --seg-blocked: #4a3f8e;
+  --seg-queued: #2b2470;
+
+  /* voices in a thread */
+  --you-tint: #9db4ff;
+  --you-bg: linear-gradient(180deg, #2b2470, #1a1450);
+  --you-line: #0a0618;
+  --session-tint: #f5c542;
+  --session-bg: linear-gradient(180deg, #2e2a55, #1e1b3c);
+  --session-line: #0a0618;
+  --agent-tint: #6ee07a;
+  --agent-bg: linear-gradient(180deg, #1e1846, #161132);
+  --agent-line: #0a0618;
+
+  /* controls */
+  --send-bg: linear-gradient(180deg, #ffd964, #c9971f);
+  --send-fg: #2a1c02;
+  --send-hi: linear-gradient(180deg, #ffe58c, #e0aa25);
+  --on-bg: linear-gradient(180deg, #ffd964, #c9971f);
+  --on-fg: #2a1c02;
+
+  /* shape — nothing is round in a 16-bit game */
+  --radius: 0;
+  --radius-ctl: 0;
+  --radius-pill: 0;
+  --panel-shadow: inset 1px 1px 0 #524691, inset -1px -1px 0 #100b26, 0 3px 0 #0b0720;
+  --row-shadow: inset 1px 1px 0 #4a3f8e, inset -1px -1px 0 #100b26, 0 3px 0 #0b0720;
+  --plate: plateSheen 5s linear infinite;
+  --glow: goldEdge 2.6s ease-in-out infinite;
+  --flash: goldFlash 1.6s ease-in-out infinite;
+
+  /* type */
+  --font-display: 'Press Start 2P', 'Courier New', ui-monospace, monospace;
+  --font-body: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-label: var(--font-display);
+  --size-h1: 14px;
+  --size-h2: 11px;
+  --size-claim: 15px;
+  --label-size: 8px;
+  --label-space: .5px;
+  /* Press Start 2P is loud enough without shouting; the sprint's own title and
+     the section heads stay in the case the user wrote them in. */
   --display-case: none;
   --display-weight: 400;
 }
@@ -131,13 +235,39 @@ a:hover { color: var(--accent-hi); }
 
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
+/* Both skins */
 @keyframes driftIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 @keyframes softPulse { 0%, 100% { opacity: .32; } 50% { opacity: .9; } }
-@keyframes goldFlash { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 @keyframes slideOver { from { transform: translateX(30px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* Chaos only — reached through --glow / --plate / --flash, which are `none` in
+   Calm. Calm's whole motion vocabulary is the two above it. */
+@keyframes goldEdge {
+  0%, 100% { box-shadow: inset 0 0 0 1px #f5c542, 0 0 14px rgba(245, 197, 66, .22); }
+  50%      { box-shadow: inset 0 0 0 1px #ffe08a, 0 0 20px rgba(245, 197, 66, .42); }
+}
+@keyframes plateSheen {
+  0%   { background-position: -220% 0; }
+  100% { background-position: 220% 0; }
+}
+@keyframes goldFlash {
+  0%, 100% {
+    background: linear-gradient(180deg, #463aa0, #2b2270);
+    color: #e8e4f5;
+    box-shadow: inset 1px 1px 0 #8b7ce0, inset -1px -1px 0 #150e33, 0 3px 0 #0a0618;
+  }
+  50% {
+    background: linear-gradient(180deg, #ffd964, #c9971f);
+    color: #2a1c02;
+    box-shadow: inset 1px 1px 0 #fff3c4, inset -1px -1px 0 #8a6510, 0 3px 0 #0a0618, 0 0 18px rgba(245, 197, 66, .55);
+  }
+}
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+  /* A frozen sheen parks the plate at 220% (i.e. blank) and a frozen goldFlash
+     leaves the Chat button mid-swap. Chaos drops its three loops outright. */
+  html.skin-chaos { --plate: none; --glow: none; --flash: none; }
 }
 
 .grow { flex: 1; }
@@ -243,7 +373,7 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
 
 /* the one notification surface in the product */
 .chat-btn { border-color: transparent; color: var(--faint); background: none; }
-.chat-btn .dot { width: 6px; height: 6px; border-radius: 99px; background: var(--faint); display: block; }
+.chat-btn .dot { width: 6px; height: 6px; border-radius: var(--radius-pill); background: var(--faint); display: block; }
 .chat-btn:hover { color: var(--ink); border-color: var(--border-chip); }
 .chat-btn.is-open { background: var(--chip); border-color: var(--border-chip); color: var(--ink); font-weight: 500; }
 .chat-btn.is-open .dot { background: var(--good); }
@@ -252,7 +382,7 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
   color: var(--send-fg);
   border-color: var(--accent);
   font-weight: 500;
-  animation: goldFlash 1.6s ease-in-out infinite;
+  animation: var(--flash);
 }
 .chat-btn.is-unseen .dot { background: var(--send-fg); }
 /* a card owns the rail — the chat button steps back on its own */
@@ -290,7 +420,7 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
 .meter-seg { height: 4px; border-radius: var(--radius-pill); }
 .legend { display: flex; gap: 26px; flex-wrap: wrap; padding-bottom: 30px; }
 .legend-item { display: flex; align-items: center; gap: 8px; }
-.legend-dot { width: 5px; height: 5px; border-radius: 99px; display: block; }
+.legend-dot { width: 5px; height: 5px; border-radius: var(--radius-pill); display: block; }
 .legend-label { font-size: 12.5px; color: var(--faint); }
 
 /* --------------------------------------------------------------------------
@@ -518,7 +648,7 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
   border-radius: var(--radius);
   background: var(--panel);
 }
-.col-dot { width: 6px; height: 6px; border-radius: 99px; display: block; }
+.col-dot { width: 6px; height: 6px; border-radius: var(--radius-pill); display: block; }
 .col-name {
   font-family: var(--font-label);
   font-size: var(--label-size);
@@ -549,10 +679,10 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
   border-radius: var(--radius);
   box-shadow: var(--panel-shadow);
   cursor: pointer;
-  animation: var(--glow);
 }
 .card:hover { filter: brightness(1.14); }
-.card.is-needs { border-color: var(--accent); }
+/* the pulse belongs to the cards that want something, not to every card */
+.card.is-needs { border-color: var(--accent); animation: var(--glow); }
 .card-top { display: flex; align-items: center; gap: 8px; }
 .card-num { font-family: var(--font-mono); font-size: 11.5px; color: var(--faint); }
 .card-tag {
@@ -616,7 +746,7 @@ body.rail-open .rail { display: flex; }
 .session-dot {
   width: 5px;
   height: 5px;
-  border-radius: 99px;
+  border-radius: var(--radius-pill);
   background: var(--good);
   display: block;
   animation: softPulse 3s ease-in-out infinite;
@@ -656,7 +786,7 @@ body.rail-open .rail { display: flex; }
   padding: 2px 0;
   text-align: center;
 }
-.status-dot { width: 4px; height: 4px; border-radius: 99px; display: block; background: var(--meta); }
+.status-dot { width: 4px; height: 4px; border-radius: var(--radius-pill); display: block; background: var(--meta); }
 .status-label {
   font-family: var(--font-label);
   font-size: var(--label-size);
@@ -1154,8 +1284,10 @@ body.rail-open .rail { display: flex; }
   #app { grid-template-rows: auto auto 1fr; }
   .topbar { height: auto; padding: 12px; flex-wrap: wrap; gap: 10px; }
   .sprint-name { font-size: 19px; max-width: 100%; }
-  /* List vs Board is a desktop choice; a phone gets one column either way. */
-  .seg { display: none; }
+  /* List vs Board is a desktop choice; a phone gets one column either way. The
+     skin control stays — it is the only way back out of Chaos. */
+  #view-seg { display: none; }
+  #skin-seg .seg-btn { padding: 0 12px; }
   .drop-btn { flex: 1; }
   .chat-btn { border-color: var(--border-chip); }
 
@@ -1209,4 +1341,198 @@ body.rail-open .rail { display: flex; }
   .verdicts .btn.reject { flex: 1 0 100%; order: 3; min-height: 44px; }
   .sheet { border-radius: var(--radius) var(--radius) 0 0; }
   .sheet-wrap { align-items: flex-end; padding-top: 0; }
+}
+
+/* ===========================================================================
+   Chaos — shape
+
+   Everything above is skin-agnostic; these are the places where Chaos is not a
+   different colour but a different construction. Two things drive all of it:
+
+     1. A JRPG menu is a PLATE — an ink outline, a bevel, no radius. The bevel
+        is already a token (--panel-shadow / --row-shadow); what these rules add
+        is the 2px outline, which is a border width and cannot be a colour.
+     2. The List layout stops being a reading column and becomes a tile grid,
+        because a 16-bit interface reads in boxes, not in rows. Same DOM, same
+        order, same words — the grid template changes and the rows stack.
+   =========================================================================== */
+
+/* the CRT — a fixed overlay above everything, never in the way of a click */
+.scanlines { display: none; }
+html.skin-chaos .scanlines {
+  display: block;
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  pointer-events: none;
+  background: repeating-linear-gradient(180deg, rgba(0, 0, 0, .16) 0 1px, rgba(0, 0, 0, 0) 1px 3px);
+  mix-blend-mode: multiply;
+}
+
+html.skin-chaos ::-webkit-scrollbar-thumb { background: #4a3f8e; border-radius: 0; border: 2px solid var(--canvas-flat); }
+html.skin-chaos ::-webkit-scrollbar-thumb:hover { background: #6455b8; }
+
+/* --- chrome --------------------------------------------------------------- */
+
+html.skin-chaos .topbar {
+  border-bottom: 3px solid var(--rule);
+  box-shadow: inset 0 2px 0 #8b7ce0, inset 0 -2px 0 #120c30;
+}
+/* Press Start 2P has no descender room to spare; a pixel face needs the extra
+   leading or two lines of a long sprint title collide. */
+html.skin-chaos .sprint-name {
+  line-height: 1.65;
+  white-space: normal;
+  max-width: 26ch;
+}
+/* #9c93d0 on the header plate's lightest stop is 3.9:1 — one step up for the
+   14px headline, which is the readability floor, not a mood. */
+html.skin-chaos .headline { color: var(--dim); }
+
+html.skin-chaos .seg {
+  border: 2px solid var(--border-chip);
+  background: #1a1344;
+  box-shadow: var(--row-shadow);
+}
+html.skin-chaos .seg-btn { color: var(--dim); padding: 9px 12px; }
+html.skin-chaos .seg-btn + .seg-btn { border-left: 2px solid var(--border-chip); }
+html.skin-chaos .seg-btn.is-on { text-shadow: none; }
+
+html.skin-chaos .btn {
+  border: 2px solid var(--border-chip);
+  background: linear-gradient(180deg, #2b2470, #1a1450);
+  box-shadow: var(--row-shadow);
+}
+html.skin-chaos .btn:hover { filter: brightness(1.18); border-color: var(--border-chip); }
+html.skin-chaos .btn.ghost { background: none; box-shadow: none; border-color: transparent; }
+html.skin-chaos .btn.ghost:hover { border-color: var(--border-chip); }
+html.skin-chaos .btn.send { background: var(--send-bg); box-shadow: inset 1px 1px 0 #fff3c4, inset -1px -1px 0 #8a6510, 0 3px 0 #0a0618; }
+html.skin-chaos .btn.approve { background: linear-gradient(180deg, #9df0a8, #3fae5a); color: #06210f; box-shadow: inset 1px 1px 0 #d6ffdd, inset -1px -1px 0 #1c6b31, 0 3px 0 #0a0618; }
+html.skin-chaos .btn.bounce { background: linear-gradient(180deg, #2b2470, #1a1450); }
+html.skin-chaos .btn.reject { background: none; box-shadow: none; }
+
+html.skin-chaos .chat-btn { background: none; box-shadow: none; border-color: transparent; }
+html.skin-chaos .chat-btn:hover { border-color: var(--border-chip); }
+html.skin-chaos .chat-btn.is-open { background: linear-gradient(180deg, #2b2470, #1a1450); border-color: var(--border-chip); box-shadow: var(--row-shadow); }
+html.skin-chaos .chat-btn.is-dim { background: none; box-shadow: none; }
+
+html.skin-chaos .banner { border: 2px solid var(--border); box-shadow: var(--row-shadow); }
+
+/* --- the meter and the list ---------------------------------------------- */
+
+html.skin-chaos .meter-seg { height: 6px; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .25), inset 0 -1px 0 rgba(0, 0, 0, .45); }
+html.skin-chaos .section-rule { background: linear-gradient(90deg, #4a3f8e, transparent); }
+html.skin-chaos .section-head h2 { line-height: 1.7; }
+html.skin-chaos .section-head { gap: 12px; }
+
+/* The reading column becomes a tile grid. Everything inside a row stacks,
+   because the row is now one column wide. */
+html.skin-chaos .rows {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(268px, 1fr));
+  gap: 9px;
+}
+html.skin-chaos .row {
+  grid-template-columns: 1fr;
+  gap: 8px;
+  align-items: start;
+  padding: 11px 12px;
+  background: linear-gradient(180deg, #211a48, #181233);
+  border: 2px solid var(--border);
+  border-left: 3px solid var(--border);
+  box-shadow: var(--row-shadow);
+}
+html.skin-chaos .needs-row { grid-template-columns: 1fr; gap: 8px; padding: 11px 12px; animation: var(--glow); }
+html.skin-chaos .needs-row .row-num { padding-top: 0; }
+html.skin-chaos .needs-row .row-right { padding-top: 0; }
+html.skin-chaos .needs-row .row-title { font-size: 15px; }
+html.skin-chaos .needs-row.is-signoff .row-ask { color: #8fd9a0; }
+html.skin-chaos .work-row,
+html.skin-chaos .blocked-row { grid-template-columns: 1fr; }
+html.skin-chaos .row-prog { flex-direction: row; align-items: center; gap: 10px; }
+html.skin-chaos .row-prog .prog-track { flex: 1; }
+html.skin-chaos .row-agent,
+html.skin-chaos .row-age { text-align: left; }
+html.skin-chaos .prog-track { height: 4px; border: 1px solid var(--border); background: #100a26; }
+
+html.skin-chaos .chip-btn { border: 2px solid var(--border); background: linear-gradient(180deg, #2b2470, #1a1450); box-shadow: var(--row-shadow); padding: 6px 11px; }
+html.skin-chaos .pill { border: 2px solid var(--border); box-shadow: var(--row-shadow); }
+html.skin-chaos .pill.is-held { background: none; box-shadow: none; }
+html.skin-chaos .done-toggle { line-height: 1.7; }
+
+/* --- board columns: the plates ------------------------------------------- */
+
+html.skin-chaos .col-head { border: 2px solid var(--border); box-shadow: var(--row-shadow); padding: 10px 12px; }
+html.skin-chaos .col-name { line-height: 1.7; }
+
+/* The gold plate. The handoff's stops (#7a5c10 → #c9971f) put its 8px pixel
+   label at 2.7:1 against the dark end of the sheen, so the whole plate is
+   raised a step — same gradient, same sheen, legible label. */
+html.skin-chaos .col-needs_you .col-head {
+  background: linear-gradient(90deg, #b8890f, #e0ad28 40%, #b8890f);
+  background-size: 220% 100%;
+  animation: var(--plate);
+  border-color: var(--border);
+}
+html.skin-chaos .col-needs_you .col-name,
+html.skin-chaos .col-needs_you .col-count { color: #1f1500; }
+/* the column dot is coloured inline from state.js, so ink on gold needs the
+   one !important in this file to reach it */
+html.skin-chaos .col-needs_you .col-dot { background: #1f1500 !important; }
+
+html.skin-chaos .col-in_motion .col-head { background: linear-gradient(180deg, #1f5c3a, #123d26); border-color: var(--border); }
+html.skin-chaos .col-blocked .col-head { background: linear-gradient(180deg, #2e2a55, #1e1b3c); border-color: var(--border); }
+html.skin-chaos .col-blocked .col-name, html.skin-chaos .col-blocked .col-count,
+html.skin-chaos .col-queued .col-name, html.skin-chaos .col-queued .col-count { color: var(--dim); }
+html.skin-chaos .col-queued .col-head { background: linear-gradient(180deg, #2b2470, #1a1450); border-color: var(--border); }
+
+html.skin-chaos .card { border: 2px solid var(--border); }
+html.skin-chaos .card.is-needs { border-color: var(--accent); }
+html.skin-chaos .col-empty, html.skin-chaos .section-empty { color: var(--faint); }
+
+/* --- rail and thread ------------------------------------------------------ */
+
+html.skin-chaos .rail { border-left: 3px solid var(--rule); }
+html.skin-chaos .rail-head { border-bottom: 2px solid var(--rule); }
+html.skin-chaos .composer { border-top: 2px solid var(--rule); }
+html.skin-chaos .bubble { border: 2px solid var(--agent-line); border-radius: 0; box-shadow: var(--row-shadow); }
+html.skin-chaos .item.from-you .bubble { border-radius: 0; border-color: var(--you-line); }
+html.skin-chaos .status-label { line-height: 1.7; }
+
+html.skin-chaos .ask { border: 2px solid var(--border); box-shadow: var(--row-shadow); }
+html.skin-chaos .ask-opt { border: 2px solid var(--border); box-shadow: var(--row-shadow); }
+html.skin-chaos .ask-opt:hover { background: var(--hover); border-color: var(--accent); }
+html.skin-chaos .packet { border: 2px solid var(--border); box-shadow: var(--panel-shadow); }
+html.skin-chaos .packet-claim { line-height: 1.7; }
+html.skin-chaos .step-n { border: 2px solid var(--border); background: #100a26; }
+html.skin-chaos .shot-frame { border: 2px solid var(--border); box-shadow: var(--row-shadow); }
+html.skin-chaos .composer textarea,
+html.skin-chaos .bounce-notes,
+html.skin-chaos .sheet textarea { border: 2px solid var(--border); }
+html.skin-chaos .sheet { border: 2px solid var(--border); box-shadow: var(--panel-shadow); }
+html.skin-chaos .menu { border: 2px solid var(--border); box-shadow: var(--panel-shadow); }
+html.skin-chaos .menu-item { border-radius: 0; }
+html.skin-chaos .thumb { border-radius: 0; border: 2px solid var(--border); }
+html.skin-chaos .toast { border: 2px solid var(--border); box-shadow: var(--panel-shadow); }
+html.skin-chaos .switch-track { border: 2px solid var(--border); }
+html.skin-chaos .switch-knob { border-radius: 0; }
+html.skin-chaos .detail-body { border-top: 2px solid #4a3f8e; }
+
+/* --- Fold and phone ------------------------------------------------------- */
+
+@media (max-width: 1199px) {
+  /* 54px of header cannot hold a 17px pixel face, and it does not have to:
+     the title is the one thing that can shrink without losing meaning. */
+  html.skin-chaos .sprint-name { font-size: 10px; line-height: 1.6; white-space: nowrap; max-width: 190px; }
+  html.skin-chaos .topbar { border-bottom-width: 3px; }
+  html.skin-chaos .fold-cols { gap: 2px; }
+  html.skin-chaos .fold-cols .card { border-radius: 0; }
+  html.skin-chaos .fold-cols .col-head { border: none; border-bottom: 2px solid var(--rule); }
+  html.skin-chaos .elsewhere { border-top: 2px solid var(--rule); }
+}
+
+@media (max-width: 600px) {
+  html.skin-chaos .sprint-name { font-size: 11px; max-width: 100%; white-space: normal; }
+  /* the list is one tile wide on a phone — 268px minima would overflow */
+  html.skin-chaos .rows { grid-template-columns: 1fr; }
 }

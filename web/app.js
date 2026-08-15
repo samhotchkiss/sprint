@@ -12,6 +12,7 @@ import { renderPhone } from './phone.js';
 import { renderRail, openLightbox, closeLightbox } from './rail.js';
 import { initCompose, toBase64List } from './compose.js';
 import { installNotifications, attention, armNotifications, clearBadge } from './notify.js';
+import { loadSkin, installSkinToggle, installBlip } from './skin.js';
 
 const el = {};
 let compose = null;
@@ -484,6 +485,9 @@ async function boot() {
 
   initAuth();
   installNotifications();
+  installBlip();
+  // Before the first paint, so the page never flashes Calm on its way to Chaos.
+  loadSkin();
   loadView();
 
   el.main = $('#main');
@@ -499,7 +503,8 @@ async function boot() {
   el.bannerSlot = $('#banner-slot');
   el.banner = $('#banner');
   el.composeWrap = $('#compose-wrap');
-  el.viewBtns = Array.from(document.querySelectorAll('.seg-btn'));
+  // scoped to the layout control — the skin control is a second .seg beside it
+  el.viewBtns = Array.from(document.querySelectorAll('#view-seg .seg-btn'));
 
   compose = initCompose({
     form: $('#compose'),
@@ -525,6 +530,9 @@ async function boot() {
   for (const btn of el.viewBtns) {
     btn.addEventListener('click', () => { if (setView(btn.dataset.view)) render(); });
   }
+  // The skin is pure CSS, but a re-paint costs nothing and keeps anything that
+  // reads a computed colour honest.
+  installSkinToggle($('#skin-seg'), render);
   el.chatBtn.addEventListener('click', () => toggleChat());
   $('#drop-btn').addEventListener('click', () => openCompose());
   $('#compose-cancel').addEventListener('click', () => closeCompose());

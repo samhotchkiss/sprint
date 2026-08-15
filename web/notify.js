@@ -39,6 +39,10 @@ function audio() {
   return ctx;
 }
 
+/** One AudioContext for the whole page — the Chaos blip borrows this one rather
+ *  than opening a second, which browsers count against the same gesture unlock. */
+export function audioContext() { return audio(); }
+
 /** Two soft sine notes, ~0.5s, quiet. Browsers need a prior gesture; we unlock on first click. */
 export function chime() {
   const now = Date.now();
