@@ -1355,6 +1355,141 @@ class TestRetryAction(Base):
         self.assertIn("retry", body["message"])
 
 
+class TestAssignStartsTheWork(Base):
+    """Assignment is the start of work, not a label on a queued card."""
+
+    LONG = ("once it's assigned, it should move to in progress, right?  and then "
+            "the card title should get updated to a nice condensed version")
+
+    def assign(self, num, **extra):
+        body = {"agent_name": "sprint-card-%d" % num,
+                "worktree": "/tmp/wt-%d" % num, "branch": "sprint/card-%d" % num}
+        body.update(extra)
+        return self.post("/api/cards/%d/assign" % num, body)
+
+    def states_of(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return [e["payload"]["to"] for e in detail["timeline"] if e["kind"] == "state"]
+
+    def notes_of(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return [e["payload"]["text"] for e in detail["timeline"] if e["kind"] == "note"]
+
+    def test_assign_flips_a_queued_card_to_triaging(self):
+        num = self.new_card()["num"]
+        self.assertEqual(self.state_of(num), "queued")
+        status, body = self.assign(num)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["card"]["state"], "triaging")
+        self.assertEqual(self.state_of(num), "triaging")
+
+    def test_assign_emits_a_plain_english_state_event(self):
+        num = self.new_card()["num"]
+        self.assign(num)
+        _, detail = self.get("/api/cards/%d" % num)
+        st = [e for e in detail["timeline"] if e["kind"] == "state"][-1]
+        self.assertEqual(st["payload"]["from"], "queued")
+        self.assertEqual(st["payload"]["to"], "triaging")
+        self.assertIn("assigned to sprint-card-%d" % num, st["payload"]["text"])
+        self.assertIn("picking it up", st["payload"]["text"])
+        # the assignment note is still there too
+        self.assertIn("assigned to sprint-card-%d" % num, self.notes_of(num))
+        # and the card lands in the In progress column, not Queued
+        self.assertEqual(detail["card"]["column"], "in_progress")
+
+    def test_assign_does_not_regress_a_card_already_moving(self):
+        num = self.new_card()["num"]
+        self.to_in_progress(num)
+        before = self.states_of(num)
+        status, body = self.assign(num)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["card"]["state"], "in_progress")
+        self.assertEqual(self.states_of(num), before,
+                         "assign must not append a state event to a moving card")
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["agent_name"], "sprint-card-%d" % num)
+
+    def test_assign_on_a_held_card_records_but_leaves_it_held(self):
+        num = self.new_card(hold=True)["num"]
+        self.assertEqual(self.state_of(num), "held")
+        status, body = self.assign(num)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "held")
+        self.assertEqual(body["card"]["worktree"], "/tmp/wt-%d" % num)
+
+    def test_title_at_assign_renames_the_face_not_the_submission(self):
+        num = self.new_card(self.LONG)["num"]
+        status, body = self.assign(num, title="Assign should start the work")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["card"]["title"], "Assign should start the work")
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["title"], "Assign should start the work")
+        self.assertEqual(detail["card"]["body"], self.LONG)
+        self.assertIn("titled: Assign should start the work", self.notes_of(num))
+        sub = [e for e in detail["timeline"] if e["kind"] == "submitted"][0]
+        self.assertEqual(sub["payload"]["text"], self.LONG,
+                         "the user's own words are append-only")
+
+    def test_title_at_state_renames_the_face_not_the_submission(self):
+        num = self.new_card(self.LONG)["num"]
+        raw = self.get("/api/cards/%d" % num)[1]["card"]["title"]
+        status, body = self.post("/api/cards/%d/state" % num,
+                                 {"state": "triaging",
+                                  "title": "Condense card titles at triage"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["card"]["state"], "triaging")
+        self.assertEqual(body["card"]["title"], "Condense card titles at triage")
+        self.assertNotEqual(body["card"]["title"], raw)
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["body"], self.LONG)
+        self.assertIn("titled: Condense card titles at triage", self.notes_of(num))
+
+    def test_title_is_optional_everywhere(self):
+        num = self.new_card(self.LONG)["num"]
+        raw = self.get("/api/cards/%d" % num)[1]["card"]["title"]
+        self.assign(num)
+        self.post("/api/cards/%d/state" % num, {"state": "in_progress"})
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["title"], raw)
+        self.assertEqual([n for n in self.notes_of(num) if n.startswith("titled:")], [])
+
+    def test_title_is_one_line_collapsed_and_capped(self):
+        num = self.new_card()["num"]
+        self.post("/api/cards/%d/state" % num,
+                  {"state": "triaging", "title": "  two   lines\nbecome one  "})
+        self.assertEqual(self.get("/api/cards/%d" % num)[1]["card"]["title"],
+                         "two lines become one")
+        self.post("/api/cards/%d/state" % num,
+                  {"state": "in_progress", "title": "x" * 200})
+        title = self.get("/api/cards/%d" % num)[1]["card"]["title"]
+        self.assertEqual(len(title), 90)
+        self.assertTrue(title.endswith("…"))
+
+    def test_an_empty_title_is_refused_and_the_state_does_not_move(self):
+        num = self.new_card()["num"]
+        for bad in ("", "   ", 17):
+            status, body = self.post("/api/cards/%d/state" % num,
+                                     {"state": "triaging", "title": bad})
+            self.assertEqual(status, 400, body)
+            self.assertEqual(body["error"], "bad_title")
+            self.assertEqual(body["field"], "title")
+            self.assertEqual(self.state_of(num), "queued",
+                             "a bad title must not half-apply the transition")
+        status, body = self.assign(num, title="")
+        self.assertEqual(status, 400, body)
+        self.assertEqual(self.state_of(num), "queued")
+        self.assertIsNone(self.get("/api/cards/%d" % num)[1]["card"]["agent_name"])
+
+    def test_retitling_to_the_same_words_is_a_no_op(self):
+        num = self.new_card(self.LONG)["num"]
+        self.assign(num, title="Assign should start the work")
+        self.post("/api/cards/%d/state" % num,
+                  {"state": "in_progress", "title": "Assign should start the work"})
+        self.assertEqual(
+            [n for n in self.notes_of(num) if n.startswith("titled:")],
+            ["titled: Assign should start the work"])
+
+
 class TestPinIsExplicit(Base):
     def test_pin_takes_an_explicit_value(self):
         num = self.new_card()["num"]

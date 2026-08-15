@@ -101,10 +101,13 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 - Worker surface (bearer token): `POST /api/cards/:num/events` `{kind: progress|chat|note|error,
   payload}`; `POST /api/cards/:num/question` `{text, options?}` (→needs_you);
   `POST /api/cards/:num/ready` `{packet}` (the gate); `POST /api/cards/:num/state`
-  `{state: triaging|in_progress|blocked, reason?}`; `{long_running: true, note}` flag via events to
-  suppress the silence timer during legit long jobs.
+  `{state: triaging|in_progress|blocked, reason?, title?}`; `{long_running: true, note}` flag via
+  events to suppress the silence timer during legit long jobs.
 - Session surface: `POST /api/sidebar` `{text, actor: user|session}`; `POST /api/batches`
-  `{card_nums[], agent_name, branch}`; `POST /api/cards/:num/assign` `{agent_name, worktree, branch}`;
+  `{card_nums[], agent_name, branch}`; `POST /api/cards/:num/assign`
+  `{agent_name, worktree, branch, title?}` — assigning a **queued** card also flips it
+  queued→triaging in the same transaction (state event reads "assigned to sprint-card-N — picking
+  it up"); assigning a card in any other state only records the agent and never regresses state;
   `POST /api/sprint` `{action: open|close|set_hold_mode, ...}`; `POST /api/cursors/orchestrator` `{seq}`.
 - `GET /api/events?after=SEQ&limit=N` — the drain endpoint. `GET /api/stream` — SSE (browser),
   heartbeat comment every 15s, browsers auto-reconnect with Last-Event-ID.
@@ -213,7 +216,7 @@ be able to freeze the session; treat "would prompt" as: post a `blocked` event a
 via helpers: `sprint-post <num> progress "one-liner"` after each meaningful step; `sprint-ask <num>
 "question" [--options json]` then END YOUR TURN; `sprint-ready <num> packet.json` (client-side
 validates, then POSTs; on 422 fix and retry). First act on pickup: state→triaging + one-line
-restatement ("I read this as: X"). Long jobs: set `long_running` with a note first. Work only in
+restatement ("I read this as: X") + a condensed ≤8-word `title` on that same state POST. Long jobs: set `long_running` with a note first. Work only in
 your assigned worktree; one branch; never push to main; never touch other cards' files.
 
 ## UI (web/)
@@ -227,6 +230,9 @@ your assigned worktree; one branch; never push to main; never touch other cards'
   (Done collapses to a count + list). Card face: `#num`, title, state age, agent badge (batch
   shared), last activity one-liner, amber-on-silence. needs_you cards render the question + inline
   answer box + quick-reply buttons (when options supplied) ON the card face.
+  The title on the face is the **condensed** title (≤8 words, set by the session at assign time and
+  refined by the worker at triage); the user's original submission is never rewritten and shows in
+  full in the drawer.
 - Card drawer: one interleaved timeline (status changes are system lines in the chat), chat input,
   evidence packet above the fold when ready (claim, diffstat, test counts, screenshot thumbs →
   lightbox, live URL), Approve / Bounce-with-notes / Reject.

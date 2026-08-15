@@ -47,8 +47,12 @@ export function renderDrawer(root, detail, app) {
       h('p.panel-line', card.error),
       h('button.btn', { type: 'button', onclick: () => app.retryCard(card) }, 'Retry with a fresh agent')));
   }
+  // The face carries a condensed title; the drawer always carries the user's
+  // own words, verbatim and in full.
   if (card.body && card.body !== card.title) {
-    body.appendChild(h('div.panel.body-panel', h('p.card-body-text', richText(card.body, app.openCard))));
+    body.appendChild(h('div.panel.body-panel',
+      h('h4.panel-title', 'What you submitted'),
+      h('p.card-body-text', richText(card.body, app.openCard))));
   }
   body.appendChild(timeline(detail, app));
   root.appendChild(body);

@@ -338,6 +338,22 @@ class ApiError(Exception):
         return out
 
 
+def clean_title(value, limit: int = 90) -> str:
+    """Normalize a condensed card title: one line, collapsed whitespace, capped.
+
+    Card titles are the FACE of a card. The user's own words live in
+    cards.body and the `submitted` event and are never rewritten -- this
+    only ever changes what the board renders on the card face."""
+    if not isinstance(value, str):
+        raise ApiError(400, "bad_title", "title must be a string", field="title")
+    text = " ".join(value.split())
+    if not text:
+        raise ApiError(400, "bad_title", "title cannot be empty", field="title")
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "…"
+    return text
+
+
 # --------------------------------------------------------------------------
 # App: all state, no decisions
 # --------------------------------------------------------------------------
@@ -824,19 +840,24 @@ class App:
         """Transaction: state event + denormalized cards.state, together."""
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            # Every payload carries a human `text`; state also carries from/to.
-            payload = {"from": frm, "to": to_state, "reason": reason,
-                       "text": ("%s → %s — %s" % (frm or "new", to_state, reason))
-                               if reason else ("%s → %s" % (frm or "new", to_state))}
-            if extra:
-                payload.update(extra)
-            self._append_event(num, actor, "state", payload)
-            self.conn.execute("UPDATE cards SET state=?, updated_at=? WHERE num=?",
-                              (to_state, now(), num))
+            self._write_transition(num, frm, to_state, actor, reason, extra)
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
+
+    def _write_transition(self, num, frm, to_state, actor, reason, extra=None):
+        """State event + denormalized cards.state. Caller owns the transaction,
+        so a transition can ride along with other writes (see `assign`)."""
+        # Every payload carries a human `text`; state also carries from/to.
+        payload = {"from": frm, "to": to_state, "reason": reason,
+                   "text": ("%s → %s — %s" % (frm or "new", to_state, reason))
+                           if reason else ("%s → %s" % (frm or "new", to_state))}
+        if extra:
+            payload.update(extra)
+        self._append_event(num, actor, "state", payload)
+        self.conn.execute("UPDATE cards SET state=?, updated_at=? WHERE num=?",
+                          (to_state, now(), num))
 
     # -- liveness ---------------------------------------------------------
 
@@ -1391,9 +1412,37 @@ class App:
                 "branch": row["branch"], "created_at": row["created_at"],
                 "cards": self.batch_members(row["id"])}
 
-    def assign(self, num: int, agent_name, worktree, branch,
-               actor: str = "session") -> dict:
+    def _write_title(self, num, title: str, actor: str):
+        """Retitle the card face. Caller owns the transaction. cards.body --
+        what the user actually typed -- is never touched; the note event keeps
+        the rename itself append-only and visible in the timeline."""
+        row = self.q1("SELECT title FROM cards WHERE num=?", (num,))
+        if row is not None and row["title"] == title:
+            return title          # idempotent: no event for a no-op rename
+        self.conn.execute("UPDATE cards SET title=?, updated_at=? WHERE num=?",
+                          (title, now(), num))
+        self._append_event(num, actor, "note",
+                           {"text": "titled: " + title, "title": title})
+        return title
+
+    def set_title(self, num: int, title, actor: str = "worker") -> str:
         self.card_row(num)
+        title = clean_title(title)
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._write_title(num, title, actor)
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.notify()
+        return title
+
+    def assign(self, num: int, agent_name, worktree, branch,
+               title=None, actor: str = "session") -> dict:
+        self.card_row(num)
+        title = clean_title(title) if title is not None else None
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1405,6 +1454,18 @@ class App:
                 self._append_event(num, actor, "note", {
                     "text": "assigned to %s" % (agent_name or "(unchanged)"),
                     "agent_name": agent_name, "worktree": worktree, "branch": branch})
+                if title is not None:
+                    self._write_title(num, title, actor)
+                # Handing a card to an agent IS the start of work, so a queued
+                # card flips to triaging in the same breath -- the board never
+                # shows an assigned card sitting in Queued. Any other state
+                # stays put: assignment must never regress a moving card.
+                frm = self.q1("SELECT state FROM cards WHERE num=?", (num,))["state"]
+                if frm == "queued":
+                    self._write_transition(
+                        num, frm, "triaging", actor,
+                        "assigned to %s — picking it up"
+                        % (agent_name or "an agent"))
                 self.conn.execute("COMMIT")
             except Exception:
                 self.conn.execute("ROLLBACK")
@@ -2046,7 +2107,18 @@ def make_handler(app: App):
                     raise ApiError(400, "missing_field",
                                    "%s requires a machine-named reason" % state,
                                    field="reason")
-                return 200, {"ok": True, "card": app.transition(num, state, actor, reason)}
+                # Optional condensed title: the worker's triage restatement is
+                # where a raw first-line title becomes something readable.
+                # Validate it BEFORE the transition so a bad title can't leave
+                # the card half-moved.
+                title = body.get("title")
+                if title is not None:
+                    clean_title(title)
+                card = app.transition(num, state, actor, reason)
+                if title is not None:
+                    app.set_title(num, title, actor)
+                    card = app.card_json(app.card_row(num), brief=True)
+                return 200, {"ok": True, "card": card}
             if verb == "integrated":
                 return 200, app.integrated(
                     num, body.get("ok"), body.get("reason") or "",
@@ -2054,7 +2126,7 @@ def make_handler(app: App):
                     actor=actor_hint if actor_hint in ACTORS else "session")
             if verb == "assign":
                 return 200, app.assign(num, body.get("agent_name"), body.get("worktree"),
-                                       body.get("branch"))
+                                       body.get("branch"), title=body.get("title"))
             raise ApiError(404, "no_such_route", "no route for %s" % path)
 
     return Handler

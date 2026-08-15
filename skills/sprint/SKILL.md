@@ -216,9 +216,23 @@ git -C "$PROJECT_ROOT" worktree add -b <branch> \
 - `<branch>` = the same string as `<agent-name>` unless the user's repo
   conventions demand otherwise.
 - Record the assignment: `POST /api/cards/:num/assign
-  {"agent_name":..., "worktree":..., "branch":...}` for a single card,
-  or `POST /api/batches {"card_nums":[...], "agent_name":..., "branch":...}`
-  followed by an `assign` per member card for a batch.
+  {"agent_name":..., "worktree":..., "branch":..., "title":...}` for a
+  single card, or `POST /api/batches {"card_nums":[...],
+  "agent_name":..., "branch":...}` followed by an `assign` per member
+  card for a batch.
+  - Assigning a **queued** card flips it to `triaging` right there and
+    then, with a state event the user reads as "assigned to
+    sprint-card-42 — picking it up". No card sits in Queued wearing an
+    agent's name. Assigning a card that's already moving (in_progress,
+    needs_you, …) only records the agent/worktree/branch — assignment
+    never regresses state.
+  - `title` is optional and is your **title guess**: a short
+    (≤8 words) plain-English version of what the card is, replacing the
+    raw first line of the submission on the card face. Guess from the
+    submission when you dispatch; the worker refines it at triage via
+    `POST /api/cards/:num/state {"state":"triaging","title":"…"}`. The
+    user's original text is never rewritten — it stays on the card body
+    and in the `submitted` event, and the drawer shows it in full.
 
 **Reap orphans on boot** (and it's cheap enough to also do here): list
 worktrees under `.sprint/worktrees/` via `git -C "$PROJECT_ROOT"

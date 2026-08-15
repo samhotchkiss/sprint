@@ -79,12 +79,34 @@ the `SPRINT_SERVER`/`SPRINT_TOKEN` environment variables your brief set.
 
 ## First act on pickup
 
-Before touching any file: restate what you're about to do in one line
-via `sprint-post <num> progress "I read this as: <restatement>"`. This is
-the triage-first move — it lets the session (and the user, glancing at
-the board) catch a misread before you burn a cycle on the wrong thing.
-For a batch, restate the shape of the whole batch, not each member
-individually.
+Before touching any file, do both halves of triage:
+
+1. **Restate it in one line** via `sprint-post <num> progress "I read
+   this as: <restatement>"`. This lets the session (and the user,
+   glancing at the board) catch a misread before you burn a cycle on the
+   wrong thing. For a batch, restate the shape of the whole batch, not
+   each member individually.
+2. **Set a condensed title** — the card face still shows the raw first
+   line of whatever the user typed, which is usually a sentence
+   fragment. Post your triaging state with a title alongside it:
+
+   ```
+   curl -sS -X POST "$SPRINT_SERVER/api/cards/<num>/state" \
+     -H "Authorization: Bearer $SPRINT_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"state":"triaging","title":"Assign flips card to In progress"}'
+   ```
+
+   Rules for the title: **≤8 words**, plain English, names the thing
+   being changed and what changes about it ("Dark mode drawer scrim too
+   dark"), no card number, no "fix"/"bug" filler, sentence case. The
+   session already guessed a title when it assigned you — yours replaces
+   it, so only bother if you can do better than the guess. It's a
+   display name only: the user's original submission is append-only and
+   stays untouched on the card body and in the drawer. `title` works the
+   same way on your `in_progress` state post if the shape of the work
+   only becomes clear once you're in the code. For a batch, title each
+   member card.
 
 ## Long-running work
 
