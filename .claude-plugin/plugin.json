@@ -1,0 +1,8 @@
+{
+  "name": "sprint",
+  "version": "0.1.0",
+  "description": "A kanban board that sits on top of a live Claude Code session: dump feedback or work items at a tailnet URL, the session dispatches subagents to work them, and every board interaction passes straight through to the session that's already running.",
+  "author": {
+    "name": "Sam Hotchkiss"
+  }
+}

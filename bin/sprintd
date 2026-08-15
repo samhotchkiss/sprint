@@ -1,0 +1,2654 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""sprintd — the state server behind the `sprint` Claude Code plugin.
+
+Single file, Python 3.9+, standard library only.
+
+The server owns STATE only. The Claude Code session is the only brain: it
+dispatches, resumes, nudges, batches, merges and escalates. sprintd never runs
+agents and never makes decisions -- it validates transitions, appends to an
+append-only event log, and hands the session a cursor to drain.
+
+Subcommands: start | stop | status | wait | doctor
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import errno
+import hashlib
+import http.client
+import json
+import mimetypes
+import os
+import re
+import secrets
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+
+DEFAULT_PORT = 8377
+DATA_DIRNAME = ".sprint"
+DB_FILENAME = "sprint.db"
+SERVER_JSON = "server.json"
+SERVER_LOG = "server.log"
+ATTACH_DIRNAME = "attachments"
+COOKIE_NAME = "sprint_token"
+
+DEFAULT_MAX_UPLOAD = 25 * 1024 * 1024          # 25 MB, per spec
+DEFAULT_SILENCE_SECONDS = 300.0                 # 5 minutes, per spec
+DEFAULT_SILENCE_TICK = 5.0
+DEFAULT_SESSION_OFFLINE_SECONDS = 90.0          # per spec
+DEFAULT_SSE_HEARTBEAT = 15.0                    # per spec
+
+ACTORS = ("user", "session", "worker", "server")
+EVENT_KINDS = (
+    "submitted", "state", "chat", "question", "answer", "progress",
+    "evidence", "verdict", "agent_silent", "note", "error",
+)
+
+STATES = (
+    "held", "queued", "triaging", "in_progress", "needs_you", "blocked",
+    "ready", "integrating", "completed", "rejected", "failed", "stale",
+    "duplicate", "canceled",
+)
+
+# Legal transitions. `ready` is never reachable here from a plain state POST --
+# only the evidence gate writes it (see App.card_ready).
+TRANSITIONS = {
+    "held": {"queued", "canceled", "rejected", "duplicate"},
+    "queued": {"held", "triaging", "in_progress", "blocked", "canceled",
+               "rejected", "duplicate", "failed", "stale"},
+    "triaging": {"in_progress", "needs_you", "blocked", "queued", "canceled",
+                 "rejected", "duplicate", "failed", "stale"},
+    "in_progress": {"needs_you", "blocked", "ready", "triaging", "canceled",
+                    "rejected", "duplicate", "failed", "stale"},
+    "needs_you": {"in_progress", "blocked", "triaging", "canceled", "rejected",
+                  "duplicate", "failed", "stale"},
+    "blocked": {"in_progress", "needs_you", "queued", "triaging", "canceled",
+                "rejected", "duplicate", "failed", "stale"},
+    # approve flips ready -> integrating; `completed` is reachable ONLY from
+    # integrating, so Done means the branch actually landed.
+    "ready": {"integrating", "in_progress", "rejected", "canceled", "failed"},
+    "integrating": {"completed", "in_progress", "canceled", "rejected", "failed"},
+    "completed": set(),
+    "rejected": set(),
+    "failed": {"queued", "in_progress", "triaging", "canceled", "rejected",
+               "duplicate", "stale"},
+    "stale": {"queued", "in_progress", "triaging", "canceled", "rejected",
+              "duplicate", "failed"},
+    "duplicate": {"queued"},
+    "canceled": {"queued"},
+}
+
+TERMINAL_STATES = {"completed", "rejected", "duplicate", "canceled"}
+
+# Which board column a state renders in. `integrating` is NOT its own column:
+# it sits in Ready showing "merging…" until the branch actually lands.
+COLUMN_OF = {
+    "held": "held", "queued": "queued", "triaging": "in_progress",
+    "in_progress": "in_progress", "needs_you": "needs_you", "blocked": "blocked",
+    "ready": "ready", "integrating": "ready", "completed": "done",
+    "rejected": "done", "failed": "in_progress", "stale": "queued",
+    "duplicate": "done", "canceled": "done",
+}
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS sprints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  opened_at REAL NOT NULL,
+  closed_at REAL,
+  title TEXT,
+  hold_mode INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sprint_id INTEGER,
+  agent_name TEXT,
+  worktree TEXT,
+  branch TEXT,
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cards (
+  num INTEGER PRIMARY KEY AUTOINCREMENT,
+  sprint_id INTEGER,
+  state TEXT NOT NULL,
+  title TEXT,
+  body TEXT,
+  batch_id INTEGER,
+  agent_name TEXT,
+  worktree TEXT,
+  branch TEXT,
+  bounce_count INTEGER NOT NULL DEFAULT 0,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  dup_of INTEGER,
+  long_running INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  card_num INTEGER,
+  ts REAL NOT NULL,
+  actor TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS events_card ON events(card_num, seq);
+
+CREATE TABLE IF NOT EXISTS evidence (
+  card_num INTEGER NOT NULL,
+  packet TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS evidence_card ON evidence(card_num, created_at);
+
+CREATE TABLE IF NOT EXISTS cursors (
+  name TEXT PRIMARY KEY,
+  seq INTEGER NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS questions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  card_num INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  options TEXT,
+  answered_at REAL,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS questions_card ON questions(card_num, id);
+
+CREATE TABLE IF NOT EXISTS idempotency (
+  key TEXT PRIMARY KEY,
+  method TEXT NOT NULL,
+  path TEXT NOT NULL,
+  status INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
+"""
+
+ATTACH_NAME_RE = re.compile(r"^([0-9a-f]{64})\.(png|jpe?g)$")
+ATTACH_URL_RE = re.compile(r"^/api/attachments/([0-9a-f]{64})\.(png|jpe?g)$")
+
+FRONTEND_HINT_RE = re.compile(
+    r"(^|/)(web|frontend|ui|src/components|assets)/|\.(css|scss|html|tsx|jsx|vue|svelte)\b"
+)
+PASS_RE = re.compile(r"(\d+)\s*(?:pass|passed|passing|ok)\b", re.I)
+FAIL_RE = re.compile(r"(\d+)\s*(?:fail|failed|failing|error)", re.I)
+
+PLACEHOLDER_HTML = (
+    "<!-- sprintd placeholder --><h1>sprint</h1>"
+    "<p>web/ is not installed next to this sprintd. The API is live at /api/board.</p>"
+)
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+
+
+def now() -> float:
+    return time.time()
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def env_int(name: str, default: int) -> int:
+    return int(env_float(name, float(default)))
+
+
+def jdump(obj) -> str:
+    return json.dumps(obj, separators=(",", ":"), sort_keys=False, default=str)
+
+
+def jload(raw, default=None):
+    if raw is None:
+        return default
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return default
+
+
+def find_project_root(start: str = None) -> str:
+    start = os.path.realpath(start or os.getcwd())
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=start, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        if out.returncode == 0:
+            top = out.stdout.decode("utf-8", "replace").strip()
+            if top:
+                return os.path.realpath(top)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return start
+
+
+def plugin_root() -> str:
+    """Root of the plugin checkout, resolved from this script's real path.
+
+    Works when bin/ is on PATH or the script is symlinked.
+    """
+    return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def web_dir() -> str:
+    return os.path.join(plugin_root(), "web")
+
+
+def tailscale_ip(timeout: float = 5.0) -> str:
+    exe = shutil.which("tailscale")
+    if not exe:
+        return ""
+    try:
+        out = subprocess.run([exe, "ip", "-4"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if out.returncode != 0:
+        return ""
+    for line in out.stdout.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line and re.match(r"^\d+\.\d+\.\d+\.\d+$", line):
+            return line
+    return ""
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+    return True
+
+
+def pid_is_sprintd(pid: int) -> bool:
+    """Guard against PID recycling after a power loss."""
+    if not pid_alive(pid):
+        return False
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    cmd = out.stdout.decode("utf-8", "replace").strip()
+    return "sprintd" in cmd
+
+
+def first_line_title(text: str, limit: int = 90) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    line = text.splitlines()[0].strip()
+    if len(line) > limit:
+        line = line[: limit - 1].rstrip() + "…"
+    return line
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, code: str, message: str = "", **extra):
+        super().__init__(message or code)
+        self.status = status
+        self.code = code
+        self.message = message or code
+        self.extra = extra
+
+    def body(self) -> dict:
+        out = {"error": self.code, "message": self.message}
+        out.update(self.extra)
+        return out
+
+
+# --------------------------------------------------------------------------
+# App: all state, no decisions
+# --------------------------------------------------------------------------
+
+
+class App:
+    def __init__(self, project_root: str, data_dir: str = None, token: str = None,
+                 silence_seconds: float = None, silence_tick: float = None,
+                 session_offline_seconds: float = None,
+                 sse_heartbeat: float = None, max_upload: int = None,
+                 log=None):
+        self.project_root = os.path.realpath(project_root)
+        self.data_dir = os.path.realpath(data_dir or os.path.join(self.project_root, DATA_DIRNAME))
+        self.attach_dir = os.path.join(self.data_dir, ATTACH_DIRNAME)
+        os.makedirs(self.attach_dir, exist_ok=True)
+        self.db_path = os.path.join(self.data_dir, DB_FILENAME)
+        self.started_at = now()
+        self.token = token or secrets.token_urlsafe(24)
+
+        self.silence_seconds = (
+            silence_seconds if silence_seconds is not None
+            else env_float("SPRINT_SILENCE_SECONDS", DEFAULT_SILENCE_SECONDS))
+        self.silence_tick = (
+            silence_tick if silence_tick is not None
+            else env_float("SPRINT_SILENCE_TICK", DEFAULT_SILENCE_TICK))
+        self.session_offline_seconds = (
+            session_offline_seconds if session_offline_seconds is not None
+            else env_float("SPRINT_SESSION_OFFLINE_SECONDS", DEFAULT_SESSION_OFFLINE_SECONDS))
+        self.sse_heartbeat = (
+            sse_heartbeat if sse_heartbeat is not None
+            else env_float("SPRINT_SSE_HEARTBEAT", DEFAULT_SSE_HEARTBEAT))
+        self.max_upload = (
+            max_upload if max_upload is not None
+            else env_int("SPRINT_MAX_UPLOAD", DEFAULT_MAX_UPLOAD))
+
+        self._log = log
+        self.lock = threading.RLock()
+        self.cond = threading.Condition()
+        self.stopping = threading.Event()
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False,
+                                    timeout=30.0, isolation_level=None)
+        self.conn.row_factory = sqlite3.Row
+        with self.lock:
+            self.conn.executescript(SCHEMA)
+        self._silence_thread = None
+
+    # -- infra ------------------------------------------------------------
+
+    def log(self, msg: str):
+        line = "%s sprintd %s" % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg)
+        if self._log:
+            try:
+                self._log.write(line + "\n")
+                self._log.flush()
+            except (OSError, ValueError):
+                pass
+        else:
+            sys.stderr.write(line + "\n")
+
+    def close(self):
+        self.stopping.set()
+        with self.cond:
+            self.cond.notify_all()
+        if self._silence_thread is not None:
+            self._silence_thread.join(timeout=5)
+        with self.lock:
+            try:
+                self.conn.close()
+            except sqlite3.Error:
+                pass
+
+    def start_background(self):
+        if self._silence_thread is None:
+            t = threading.Thread(target=self._silence_loop, name="silence",
+                                 daemon=True)
+            self._silence_thread = t
+            t.start()
+
+    def q(self, sql, params=()):
+        with self.lock:
+            return self.conn.execute(sql, params).fetchall()
+
+    def q1(self, sql, params=()):
+        rows = self.q(sql, params)
+        return rows[0] if rows else None
+
+    def notify(self):
+        with self.cond:
+            self.cond.notify_all()
+
+    # -- events -----------------------------------------------------------
+
+    # ONE payload contract, so every reader (UI, session, tests) needs one field:
+    #   text   -- the human one-liner, on EVERY event
+    #   state events additionally carry from/to (+reason)
+    #   attachment refs always carry a ready-to-use `url`
+    TEXT_ALIASES = ("text", "message", "note", "summary", "detail", "claim",
+                    "reason", "error")
+
+    def normalize_payload(self, payload):
+        if payload is None:
+            return {}
+        if not isinstance(payload, dict):
+            return {"text": payload if isinstance(payload, str) else jdump(payload)}
+        out = dict(payload)
+        if not (isinstance(out.get("text"), str) and out["text"].strip()):
+            for key in self.TEXT_ALIASES:
+                val = out.get(key)
+                if isinstance(val, str) and val.strip():
+                    out["text"] = val.strip()
+                    break
+        for key in ("attachments", "images", "screenshots"):
+            if isinstance(out.get(key), list) and out[key]:
+                out[key] = self.ingest_refs(out[key])
+        return out
+
+    def _append_event(self, card_num, actor: str, kind: str, payload: dict) -> int:
+        """Append to the log. MUST be called with self.lock held."""
+        if actor not in ACTORS:
+            raise ApiError(400, "bad_actor", "actor must be one of %s" % (ACTORS,))
+        if kind not in EVENT_KINDS:
+            raise ApiError(400, "bad_kind", "kind must be one of %s" % (EVENT_KINDS,))
+        payload = self.normalize_payload(payload)
+        ts = now()
+        cur = self.conn.execute(
+            "INSERT INTO events(card_num, ts, actor, kind, payload) VALUES(?,?,?,?,?)",
+            (card_num, ts, actor, kind, jdump(payload or {})))
+        return int(cur.lastrowid)
+
+    def event_row(self, seq: int) -> dict:
+        row = self.q1("SELECT * FROM events WHERE seq=?", (seq,))
+        return self.event_json(row) if row else None
+
+    @staticmethod
+    def event_json(row) -> dict:
+        return {
+            "seq": row["seq"],
+            "card_num": row["card_num"],
+            "ts": row["ts"],
+            "actor": row["actor"],
+            "kind": row["kind"],
+            "payload": jload(row["payload"], {}),
+        }
+
+    def events_after(self, after: int, limit: int = 500, card_num=None) -> list:
+        if card_num is None:
+            rows = self.q("SELECT * FROM events WHERE seq>? ORDER BY seq LIMIT ?",
+                          (after, limit))
+        else:
+            rows = self.q(
+                "SELECT * FROM events WHERE seq>? AND card_num=? ORDER BY seq LIMIT ?",
+                (after, card_num, limit))
+        return [self.event_json(r) for r in rows]
+
+    def max_seq(self) -> int:
+        row = self.q1("SELECT COALESCE(MAX(seq),0) AS s FROM events")
+        return int(row["s"])
+
+    # -- sprints ----------------------------------------------------------
+
+    def open_sprint(self, create: bool = True, title: str = None):
+        row = self.q1("SELECT * FROM sprints WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1")
+        if row is not None or not create:
+            return row
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM sprints WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row is not None:
+                return row
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO sprints(opened_at, closed_at, title, hold_mode) VALUES(?,NULL,?,0)",
+                    (now(), title or "sprint"))
+                sid = int(cur.lastrowid)
+                self._append_event(None, "server", "note",
+                                   {"text": "sprint opened", "sprint_id": sid})
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.notify()
+        return self.q1("SELECT * FROM sprints WHERE id=?", (sid,))
+
+    @staticmethod
+    def sprint_json(row) -> dict:
+        if row is None:
+            return None
+        return {
+            "id": row["id"], "opened_at": row["opened_at"],
+            "closed_at": row["closed_at"], "title": row["title"],
+            "hold_mode": bool(row["hold_mode"]),
+        }
+
+    # -- cards ------------------------------------------------------------
+
+    def card_row(self, num: int):
+        row = self.q1("SELECT * FROM cards WHERE num=?", (num,))
+        if row is None:
+            raise ApiError(404, "no_such_card", "card #%s does not exist" % num)
+        return row
+
+    def card_json(self, row, brief: bool = False) -> dict:
+        num = row["num"]
+        out = {
+            "num": num,
+            "sprint_id": row["sprint_id"],
+            "state": row["state"],
+            "title": row["title"],
+            "body": row["body"],
+            "batch_id": row["batch_id"],
+            "agent_name": row["agent_name"],
+            "worktree": row["worktree"],
+            "branch": row["branch"],
+            "bounce_count": row["bounce_count"],
+            "pinned": bool(row["pinned"]),
+            "dup_of": row["dup_of"],
+            "long_running": bool(row["long_running"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        last = self.q1(
+            "SELECT * FROM events WHERE card_num=? ORDER BY seq DESC LIMIT 1", (num,))
+        out["last_event"] = self.event_json(last) if last else None
+        out["last_activity_at"] = last["ts"] if last else row["updated_at"]
+        out["silent"] = self.card_is_silent(num, row)
+        oq = self.q1(
+            "SELECT * FROM questions WHERE card_num=? AND answered_at IS NULL "
+            "ORDER BY id DESC LIMIT 1", (num,))
+        q = self.question_json(oq) if oq else None
+        out["open_question"] = q
+        out["question"] = q          # the board face renders this inline
+        out["column"] = COLUMN_OF.get(row["state"], "queued")
+        # Everything the card FACE needs, on every payload: a blocked card's
+        # machine-named reason, a failed card's last error, and the evidence a
+        # ready card is asking the user to check.
+        st = self.q1("SELECT * FROM events WHERE card_num=? AND kind='state' "
+                     "ORDER BY seq DESC LIMIT 1", (num,))
+        stp = jload(st["payload"], {}) if st else {}
+        out["state_since"] = st["ts"] if st else row["updated_at"]
+        out["reason"] = stp.get("reason") if stp.get("to") == row["state"] else None
+        err = self.q1("SELECT * FROM events WHERE card_num=? AND kind='error' "
+                      "ORDER BY seq DESC LIMIT 1", (num,))
+        out["error"] = (jload(err["payload"], {}) or {}).get("text") if err else None
+        ev = self.latest_evidence(num)
+        out["evidence"] = ev
+        if not brief:
+            out["attachments"] = self.card_attachments(num)
+        return out
+
+    def card_attachments(self, num: int) -> list:
+        seen, out = set(), []
+        for row in self.q("SELECT payload FROM events WHERE card_num=? ORDER BY seq", (num,)):
+            payload = jload(row["payload"], {}) or {}
+            for att in (payload.get("attachments") or []):
+                if isinstance(att, dict) and att.get("sha256") not in seen:
+                    seen.add(att.get("sha256"))
+                    out.append(att)
+        return out
+
+    def latest_evidence(self, num: int):
+        row = self.q1(
+            "SELECT * FROM evidence WHERE card_num=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (num,))
+        if row is None:
+            return None
+        return {"card_num": row["card_num"], "packet": jload(row["packet"], {}),
+                "created_at": row["created_at"]}
+
+    @staticmethod
+    def question_json(row) -> dict:
+        return {
+            "id": row["id"], "card_num": row["card_num"], "text": row["text"],
+            "options": jload(row["options"], None),
+            "answered_at": row["answered_at"], "created_at": row["created_at"],
+        }
+
+    def create_card(self, text: str, images: list, hold: bool, actor: str = "user") -> dict:
+        text = (text or "").strip()
+        images = images or []
+        if not text and not images:
+            raise ApiError(400, "empty_submission",
+                           "at least one of text or images is required")
+        sprint = self.open_sprint(create=True)
+        hold_mode = bool(sprint["hold_mode"]) if sprint else False
+        state = "held" if (hold or hold_mode) else "queued"
+
+        # Attachments are content-addressed and written to disk BEFORE the
+        # event that references them.
+        attachments = [self.store_attachment(img) for img in images]
+
+        title = first_line_title(text) or "(image only)"
+        ts = now()
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO cards(sprint_id, state, title, body, created_at, updated_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (sprint["id"] if sprint else None, state, title, text, ts, ts))
+                num = int(cur.lastrowid)
+                self._append_event(num, actor, "submitted", {
+                    "text": text or ("%d image(s)" % len(attachments)),
+                    "attachments": attachments,
+                    "hold": bool(hold or hold_mode)})
+                self._append_event(num, "server", "state", {
+                    "from": None, "to": state,
+                    "reason": "hold_mode" if (hold or hold_mode) else None,
+                    "text": "new → %s" % state})
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.notify()
+        return self.card_json(self.card_row(num))
+
+    @staticmethod
+    def attach_url(sha: str, ext: str) -> str:
+        """The ONE url shape the browser uses; the GET route parses exactly this."""
+        return "/api/attachments/%s.%s" % (sha, "jpg" if ext in ("jpg", "jpeg") else ext)
+
+    def store_blob(self, blob: bytes, name: str = None) -> dict:
+        """Content-address one image blob to disk and return a ready-to-use ref."""
+        if not blob:
+            raise ApiError(400, "bad_image", "image is empty")
+        if len(blob) > self.max_upload:
+            raise ApiError(413, "too_large",
+                           "attachment exceeds %d bytes" % self.max_upload)
+        if blob[:8] == b"\x89PNG\r\n\x1a\n":
+            ext, mime = "png", "image/png"
+        elif blob[:3] == b"\xff\xd8\xff":
+            ext, mime = "jpg", "image/jpeg"
+        else:
+            raise ApiError(400, "bad_image", "only png or jpeg attachments are supported")
+        sha = hashlib.sha256(blob).hexdigest()
+        path = os.path.join(self.attach_dir, "%s.%s" % (sha, ext))
+        if not os.path.exists(path):
+            tmp = path + ".part-%s" % secrets.token_hex(6)
+            with open(tmp, "wb") as fh:
+                fh.write(blob)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        return {"sha256": sha, "path": path, "mime": mime, "bytes": len(blob),
+                "name": name, "url": self.attach_url(sha, ext)}
+
+    def store_attachment(self, img) -> dict:
+        """Accept `<base64>`, `data:image/png;base64,<...>` or {data|b64, name}."""
+        if isinstance(img, dict):
+            data_s = img.get("data") or img.get("b64") or ""
+            name = img.get("name")
+        else:
+            data_s = img or ""
+            name = None
+        if not isinstance(data_s, str) or not data_s.strip():
+            raise ApiError(400, "bad_image", "image entry is empty")
+        if data_s.startswith("data:"):
+            head, _, data_s = data_s.partition(",")
+            if "base64" not in head:
+                raise ApiError(400, "bad_image", "data: URLs must be base64")
+        data_s = re.sub(r"\s+", "", data_s)
+        try:
+            blob = base64.b64decode(data_s, validate=True)
+        except (binascii.Error, ValueError):
+            raise ApiError(400, "bad_image", "image is not valid base64")
+        return self.store_blob(blob, name)
+
+    def ingest_ref(self, ref):
+        """Turn any attachment/screenshot reference into one the browser can load.
+
+        Workers hand us absolute file paths (`sprint-ready` packets); the board
+        needs a URL. Accepts: an absolute/relative path on disk, a data: URL, a
+        bare `<sha>.<ext>`, an `/api/attachments/...` url, an http(s) url, or an
+        already-shaped dict. Anything unresolvable comes back untouched (as a
+        name) rather than as a broken <img>.
+        """
+        if isinstance(ref, dict):
+            out = dict(ref)
+            sha, ext = out.get("sha256"), None
+            if isinstance(out.get("url"), str) and out["url"]:
+                return out
+            if isinstance(sha, str) and re.match(r"^[0-9a-f]{64}$", sha):
+                for cand in ("png", "jpg"):
+                    if os.path.isfile(os.path.join(self.attach_dir, "%s.%s" % (sha, cand))):
+                        ext = cand
+                        break
+                out["url"] = self.attach_url(sha, ext or "png")
+                return out
+            src = out.get("path") or out.get("file") or out.get("src")
+            if isinstance(src, str) and src:
+                merged = self.ingest_ref(src)
+                if isinstance(merged, dict):
+                    merged = dict(merged)
+                    if out.get("caption"):
+                        merged["caption"] = out["caption"]
+                    if out.get("name"):
+                        merged["name"] = out["name"]
+                    return merged
+            return out
+        if not isinstance(ref, str) or not ref.strip():
+            return ref
+        s = ref.strip()
+        m = ATTACH_URL_RE.match(s) or ATTACH_NAME_RE.match(s)
+        if m:
+            return {"sha256": m.group(1), "name": os.path.basename(s),
+                    "url": self.attach_url(m.group(1), m.group(2))}
+        if s.startswith("data:"):
+            try:
+                return self.store_attachment(s)
+            except ApiError:
+                return {"name": "attachment"}
+        if re.match(r"^https?://", s):
+            return {"url": s, "name": s}
+        try:
+            if os.path.isfile(s) and os.path.getsize(s) <= self.max_upload:
+                with open(s, "rb") as fh:
+                    blob = fh.read()
+                stored = self.store_blob(blob, os.path.basename(s))
+                stored["source_path"] = os.path.realpath(s)
+                return stored
+        except (OSError, ApiError):
+            pass
+        return {"name": os.path.basename(s) or s}
+
+    def ingest_refs(self, refs):
+        if not isinstance(refs, list):
+            return refs
+        return [self.ingest_ref(r) for r in refs]
+
+    def ingest_packet(self, packet):
+        """Rewrite every screenshot ref in an evidence packet into a URL ref."""
+        if not isinstance(packet, dict):
+            return packet
+        out = dict(packet)
+        if isinstance(out.get("screenshots"), list):
+            out["screenshots"] = self.ingest_refs(out["screenshots"])
+        if isinstance(out.get("per_card"), list):
+            per = []
+            for entry in out["per_card"]:
+                if isinstance(entry, dict):
+                    entry = dict(entry)
+                    if isinstance(entry.get("screenshots"), list):
+                        entry["screenshots"] = self.ingest_refs(entry["screenshots"])
+                per.append(entry)
+            out["per_card"] = per
+        return out
+
+    # -- state machine ----------------------------------------------------
+
+    def transition(self, num: int, to_state: str, actor: str, reason=None,
+                   extra: dict = None, _conn_open: bool = False) -> dict:
+        if to_state not in STATES:
+            raise ApiError(400, "bad_state", "unknown state %r" % to_state)
+        with self.lock:
+            row = self.conn.execute("SELECT * FROM cards WHERE num=?", (num,)).fetchone()
+            if row is None:
+                raise ApiError(404, "no_such_card", "card #%s does not exist" % num)
+            frm = row["state"]
+            if frm == to_state:
+                # Idempotent no-op; still surfaces as success.
+                return self.card_json(row, brief=True)
+            if to_state not in TRANSITIONS.get(frm, set()):
+                raise ApiError(
+                    409, "illegal_transition",
+                    "cannot move #%s from %s to %s" % (num, frm, to_state),
+                    from_state=frm, to_state=to_state,
+                    allowed=sorted(TRANSITIONS.get(frm, set())))
+            self._apply_transition(num, frm, to_state, actor, reason, extra)
+        self.notify()
+        return self.card_json(self.card_row(num), brief=True)
+
+    def _apply_transition(self, num, frm, to_state, actor, reason, extra):
+        """Transaction: state event + denormalized cards.state, together."""
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Every payload carries a human `text`; state also carries from/to.
+            payload = {"from": frm, "to": to_state, "reason": reason,
+                       "text": ("%s → %s — %s" % (frm or "new", to_state, reason))
+                               if reason else ("%s → %s" % (frm or "new", to_state))}
+            if extra:
+                payload.update(extra)
+            self._append_event(num, actor, "state", payload)
+            self.conn.execute("UPDATE cards SET state=?, updated_at=? WHERE num=?",
+                              (to_state, now(), num))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    # -- liveness ---------------------------------------------------------
+
+    def card_baseline(self, num: int):
+        """(ts, seq) of the last thing that counts as agent activity."""
+        row = self.q1(
+            "SELECT seq, ts FROM events WHERE card_num=? AND actor='worker' "
+            "ORDER BY seq DESC LIMIT 1", (num,))
+        if row is not None:
+            return row["ts"], row["seq"]
+        row = self.q1(
+            "SELECT seq, ts FROM events WHERE card_num=? AND kind='state' "
+            "ORDER BY seq DESC LIMIT 1", (num,))
+        if row is not None:
+            return row["ts"], row["seq"]
+        crow = self.q1("SELECT updated_at FROM cards WHERE num=?", (num,))
+        return (crow["updated_at"] if crow else now()), 0
+
+    def silence_notified(self, num: int, baseline_seq: int) -> bool:
+        row = self.q1(
+            "SELECT seq FROM events WHERE card_num=? AND kind='agent_silent' "
+            "ORDER BY seq DESC LIMIT 1", (num,))
+        return row is not None and row["seq"] > baseline_seq
+
+    def card_is_silent(self, num: int, row=None) -> bool:
+        row = row or self.q1("SELECT * FROM cards WHERE num=?", (num,))
+        if row is None or row["state"] != "in_progress" or row["long_running"]:
+            return False
+        ts, _seq = self.card_baseline(num)
+        return (now() - ts) >= self.silence_seconds
+
+    def _silence_loop(self):
+        while not self.stopping.wait(self.silence_tick):
+            try:
+                self.sweep_silence()
+            except Exception:  # never let the timer thread die
+                self.log("silence sweep failed: %s" % traceback.format_exc())
+
+    def sweep_silence(self) -> int:
+        rows = self.q("SELECT num FROM cards WHERE state='in_progress' AND long_running=0")
+        fired = 0
+        for row in rows:
+            num = row["num"]
+            ts, seq = self.card_baseline(num)
+            elapsed = now() - ts
+            if elapsed < self.silence_seconds:
+                continue
+            if self.silence_notified(num, seq):
+                continue  # one event per silence episode
+            with self.lock:
+                # re-check under lock (a worker event may have just landed)
+                ts2, seq2 = self.card_baseline(num)
+                if (now() - ts2) < self.silence_seconds or self.silence_notified(num, seq2):
+                    continue
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._append_event(num, "server", "agent_silent", {
+                        "card_num": num,
+                        "silent_for_seconds": round(now() - ts2, 1),
+                        "threshold_seconds": self.silence_seconds,
+                        "last_activity_at": ts2,
+                        "text": "no worker activity on #%s for %.0fs" % (num, now() - ts2),
+                    })
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+            fired += 1
+        if fired:
+            self.notify()
+        return fired
+
+    def session_liveness(self) -> dict:
+        row = self.q1("SELECT * FROM cursors WHERE name='orchestrator'")
+        cursor_seq = int(row["seq"]) if row else 0
+        last_seen = float(row["updated_at"]) if row else self.started_at
+        head = self.max_seq()
+        pending = max(0, head - cursor_seq)
+        stale_for = now() - last_seen
+        online = not (pending > 0 and stale_for > self.session_offline_seconds)
+        return {
+            "status": "online" if online else "offline",
+            "cursor": cursor_seq,
+            "head": head,
+            "pending": pending,
+            "last_cursor_move_at": last_seen,
+            "seconds_since_cursor_move": round(stale_for, 1),
+            "offline_after_seconds": self.session_offline_seconds,
+        }
+
+    # -- evidence gate ----------------------------------------------------
+
+    def batch_members(self, batch_id) -> list:
+        if not batch_id:
+            return []
+        return [r["num"] for r in
+                self.q("SELECT num FROM cards WHERE batch_id=? ORDER BY num", (batch_id,))]
+
+    def validate_packet(self, card_row, packet) -> list:
+        missing = []
+        if not isinstance(packet, dict):
+            return ["packet"]
+
+        def blank(key):
+            val = packet.get(key)
+            return not (isinstance(val, str) and val.strip())
+
+        for field in ("claim", "diffstat", "branch", "test_cmd", "test_result"):
+            if blank(field):
+                missing.append(field)
+
+        tr = packet.get("test_result")
+        if isinstance(tr, str) and tr.strip() and "test_result" not in missing:
+            if not (PASS_RE.search(tr) and FAIL_RE.search(tr)):
+                missing.append("test_result")  # counts required, never "tests pass"
+
+        # "we need to make sure there's a way for the human to easily validate
+        # the fix without having to read the code" -- required, always.
+        val = packet.get("validate")
+        if isinstance(val, str):
+            if not val.strip():
+                missing.append("validate")
+        elif isinstance(val, list):
+            good = [s for s in val if isinstance(s, str) and s.strip()]
+            if not good or len(good) != len(val):
+                missing.append("validate")
+        else:
+            missing.append("validate")
+
+        ui = packet.get("ui_change")
+        if not isinstance(ui, bool):
+            missing.append("ui_change")
+        elif ui and not (packet.get("screenshots") or []):
+            missing.append("screenshots")
+
+        if not isinstance(ui, bool):
+            diff = packet.get("diffstat")
+            if isinstance(diff, str) and FRONTEND_HINT_RE.search(diff) and \
+                    not (packet.get("screenshots") or []):
+                if "screenshots" not in missing:
+                    missing.append("screenshots")
+
+        members = self.batch_members(card_row["batch_id"])
+        if len(members) > 1:
+            per = packet.get("per_card")
+            if not isinstance(per, list) or not per:
+                missing.append("per_card")
+            else:
+                seen = {}
+                for entry in per:
+                    if not isinstance(entry, dict):
+                        missing.append("per_card")
+                        break
+                    cn = entry.get("card_num")
+                    try:
+                        cn = int(cn)
+                    except (TypeError, ValueError):
+                        missing.append("per_card[].card_num")
+                        continue
+                    seen[cn] = entry
+                    claim = entry.get("claim")
+                    if not (isinstance(claim, str) and claim.strip()):
+                        missing.append("per_card[#%d].claim" % cn)
+                for cn in members:
+                    if cn not in seen:
+                        missing.append("per_card[#%d]" % cn)
+        # stable, de-duplicated
+        out, seen_f = [], set()
+        for f in missing:
+            if f not in seen_f:
+                seen_f.add(f)
+                out.append(f)
+        return out
+
+    def card_ready(self, num: int, packet, actor: str = "worker") -> dict:
+        row = self.card_row(num)
+        missing = self.validate_packet(row, packet)
+        if missing:
+            with self.lock:
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._append_event(num, "server", "evidence", {
+                        "ok": False, "missing": missing,
+                        "text": "evidence rejected: missing " + ", ".join(missing),
+                    })
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+            self.notify()
+            raise ApiError(422, "evidence_incomplete",
+                           "missing or invalid: " + ", ".join(missing),
+                           missing=missing)
+
+        # Screenshots arrive as absolute worktree paths; store them so the board
+        # can actually show them (the whole point of the gate).
+        packet = self.ingest_packet(packet)
+
+        members = self.batch_members(row["batch_id"]) or [num]
+        if num not in members:
+            members.append(num)
+        for cn in members:
+            crow = self.card_row(cn)
+            if "ready" not in TRANSITIONS.get(crow["state"], set()) and crow["state"] != "ready":
+                raise ApiError(409, "illegal_transition",
+                               "cannot move #%s from %s to ready" % (cn, crow["state"]),
+                               from_state=crow["state"], to_state="ready")
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute(
+                    "INSERT INTO evidence(card_num, packet, created_at) VALUES(?,?,?)",
+                    (num, jdump(packet), now()))
+                claim = packet.get("claim") if isinstance(packet, dict) else None
+                self._append_event(num, actor, "evidence", {
+                    "ok": True, "packet": packet, "cards": members,
+                    "text": ("evidence posted: %s" % claim) if claim
+                            else "evidence posted"})
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        flipped = []
+        for cn in members:
+            crow = self.card_row(cn)
+            if crow["state"] == "ready":
+                flipped.append(cn)
+                continue
+            with self.lock:
+                self._apply_transition(cn, crow["state"], "ready", actor,
+                                       "evidence accepted",
+                                       {"evidence_card": num})
+            flipped.append(cn)
+        self.notify()
+        return {"ok": True, "cards": flipped, "card": self.card_json(self.card_row(num))}
+
+    # -- verdicts ---------------------------------------------------------
+
+    def verdict(self, num: int, verdict: str, notes: str = "", scope: str = "card",
+                actor: str = "user") -> dict:
+        if verdict not in ("approve", "bounce", "reject"):
+            raise ApiError(400, "bad_verdict",
+                           "verdict must be approve, bounce or reject")
+        row = self.card_row(num)
+        targets = [num]
+        if scope == "batch":
+            members = self.batch_members(row["batch_id"])
+            if not members:
+                raise ApiError(400, "not_batched", "#%s is not in a batch" % num)
+            if verdict == "bounce":
+                raise ApiError(400, "bad_scope",
+                               "bounce is per-card; bounced cards stay with the agent")
+            targets = members
+        elif scope != "card":
+            raise ApiError(400, "bad_scope", "scope must be card or batch")
+
+        # Validate every target BEFORE touching any of them: a batch verdict is
+        # all-or-nothing, never half-applied.
+        plan = []
+        for cn in targets:
+            crow = self.card_row(cn)
+            if verdict == "approve":
+                # approve hands the card to the session's git work; only
+                # POST /integrated {ok:true} can mark it done.
+                to_state, escalate, bounce = "integrating", False, crow["bounce_count"]
+            elif verdict == "reject":
+                to_state, escalate, bounce = "rejected", False, crow["bounce_count"]
+            else:
+                bounce = int(crow["bounce_count"]) + 1
+                to_state, escalate = "in_progress", bounce >= 2
+            if to_state not in TRANSITIONS.get(crow["state"], set()):
+                raise ApiError(409, "illegal_transition",
+                               "cannot %s #%s from %s" % (verdict, cn, crow["state"]),
+                               from_state=crow["state"], to_state=to_state, card=cn)
+            plan.append((cn, crow["state"], to_state, escalate, bounce))
+
+        results = []
+        for cn, from_state, to_state, escalate, bounce in plan:
+            with self.lock:
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    label = {"approve": "approved", "bounce": "bounced back",
+                             "reject": "rejected"}[verdict]
+                    payload = {"verdict": verdict, "notes": notes or "",
+                               "scope": scope, "bounce_count": bounce,
+                               "text": ("%s — %s" % (label, notes)) if notes else label}
+                    if escalate:
+                        payload["escalate"] = True
+                        payload["text"] = (
+                            "%s (second bounce on #%s -- stop retrying, co-design "
+                            "with the user)" % (payload["text"], cn))
+                    self._append_event(cn, actor, "verdict", payload)
+                    if verdict == "bounce":
+                        self.conn.execute(
+                            "UPDATE cards SET bounce_count=?, updated_at=? WHERE num=?",
+                            (bounce, now(), cn))
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+                self._apply_transition(cn, from_state, to_state, actor,
+                                       "verdict:%s" % verdict, None)
+            results.append({"num": cn, "state": to_state, "bounce_count": bounce,
+                            "escalate": escalate})
+        self.notify()
+        return {"ok": True, "verdict": verdict, "cards": results}
+
+    def integrated(self, num: int, ok: bool, reason: str = "", card_nums=None,
+                   actor: str = "session") -> dict:
+        """The session reports the outcome of the real git work.
+
+        ok      -> completed (the branch actually landed)
+        not ok  -> in_progress + an `error` event carrying the reason.
+                   Integration failure is NOT a review bounce: bounce_count
+                   is left alone.
+        """
+        if not isinstance(ok, bool):
+            raise ApiError(400, "missing_field", "ok must be a bool", field="ok")
+        reason = (reason or "").strip()
+        if not ok and not reason:
+            raise ApiError(400, "missing_field",
+                           "a failed integration needs a reason", field="reason")
+
+        targets = [num]
+        if card_nums is not None:
+            if not isinstance(card_nums, list) or not card_nums:
+                raise ApiError(400, "bad_card_nums", "card_nums must be a non-empty list")
+            targets = []
+            for n in card_nums:
+                try:
+                    targets.append(int(n))
+                except (TypeError, ValueError):
+                    raise ApiError(400, "bad_card_num", "bad card number %r" % n)
+            if num not in targets:
+                targets.insert(0, num)
+
+        to_state = "completed" if ok else "in_progress"
+        plan = []
+        for cn in targets:
+            crow = self.card_row(cn)
+            if crow["state"] != "integrating":
+                raise ApiError(409, "not_integrating",
+                               "#%s is %s, not integrating" % (cn, crow["state"]),
+                               from_state=crow["state"], to_state=to_state, card=cn)
+            plan.append((cn, crow["state"]))
+
+        results = []
+        for cn, from_state in plan:
+            with self.lock:
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if ok:
+                        self._append_event(cn, actor, "note", {
+                            "text": "branch landed", "integrated": True,
+                            "reason": reason or None})
+                    else:
+                        self._append_event(cn, actor, "error", {
+                            "text": "integration failed: %s" % reason,
+                            "integrated": False, "reason": reason,
+                            "bounce_count_unchanged": True})
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+                self._apply_transition(
+                    cn, from_state, to_state, actor,
+                    "integrated" if ok else "integration_failed",
+                    {"integrated": ok, "reason": reason or None})
+            row = self.card_row(cn)
+            results.append({"num": cn, "state": row["state"],
+                            "bounce_count": row["bounce_count"]})
+        self.notify()
+        return {"ok": True, "integrated": ok, "cards": results}
+
+    # -- questions / answers ----------------------------------------------
+
+    def ask(self, num: int, text: str, options=None, actor: str = "worker") -> dict:
+        text = (text or "").strip()
+        if not text:
+            raise ApiError(400, "missing_field", "question text is required", field="text")
+        row = self.card_row(num)
+        if row["state"] in TERMINAL_STATES:
+            raise ApiError(409, "terminal_card",
+                           "#%s is %s; cannot ask" % (num, row["state"]))
+        if row["state"] != "needs_you" and \
+                "needs_you" not in TRANSITIONS.get(row["state"], set()):
+            raise ApiError(409, "illegal_transition",
+                           "cannot move #%s from %s to needs_you" % (num, row["state"]),
+                           from_state=row["state"], to_state="needs_you")
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO questions(card_num, text, options, answered_at, created_at) "
+                    "VALUES(?,?,?,NULL,?)",
+                    (num, text, jdump(options) if options else None, now()))
+                qid = int(cur.lastrowid)
+                self._append_event(num, actor, "question",
+                                   {"question_id": qid, "text": text, "options": options})
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        if row["state"] != "needs_you":
+            self.transition(num, "needs_you", actor, reason="question asked")
+        self.notify()
+        qrow = self.q1("SELECT * FROM questions WHERE id=?", (qid,))
+        return {"ok": True, "question": self.question_json(qrow),
+                "card": self.card_json(self.card_row(num), brief=True)}
+
+    def answer(self, num: int, question_id: int, text: str, actor: str = "user") -> dict:
+        text = (text or "").strip()
+        if not text:
+            raise ApiError(400, "missing_field", "answer text is required", field="text")
+        self.card_row(num)
+        with self.lock:
+            qrow = self.conn.execute(
+                "SELECT * FROM questions WHERE id=?", (question_id,)).fetchone()
+            if qrow is None or qrow["card_num"] != num:
+                raise ApiError(404, "no_such_question",
+                               "question %s not found on #%s" % (question_id, num))
+            if qrow["answered_at"] is not None:
+                raise ApiError(409, "already_answered",
+                               "question %s was already answered" % question_id,
+                               question_id=question_id,
+                               answered_at=qrow["answered_at"])
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self.conn.execute(
+                    "UPDATE questions SET answered_at=? WHERE id=? AND answered_at IS NULL",
+                    (now(), question_id))
+                if cur.rowcount != 1:
+                    self.conn.execute("ROLLBACK")
+                    raise ApiError(409, "already_answered",
+                                   "question %s was already answered" % question_id,
+                                   question_id=question_id)
+                self._append_event(num, actor, "answer",
+                                   {"question_id": question_id, "text": text})
+                self.conn.execute("COMMIT")
+            except ApiError:
+                raise
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        row = self.card_row(num)
+        if row["state"] == "needs_you":
+            self.transition(num, "in_progress", actor, reason="answered")
+        self.notify()
+        return {"ok": True, "question_id": question_id,
+                "card": self.card_json(self.card_row(num), brief=True)}
+
+    # -- misc writes ------------------------------------------------------
+
+    def card_event(self, num: int, kind: str, payload, actor: str = "worker",
+                   long_running=None) -> dict:
+        if kind not in ("progress", "chat", "note", "error"):
+            raise ApiError(400, "bad_kind",
+                           "worker events must be progress, chat, note or error")
+        self.card_row(num)
+        if not isinstance(payload, dict):
+            payload = {"text": payload if isinstance(payload, str) else jdump(payload)}
+        if long_running is None:
+            long_running = payload.get("long_running")
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                if isinstance(long_running, bool):
+                    payload = dict(payload)
+                    payload["long_running"] = long_running
+                    self.conn.execute(
+                        "UPDATE cards SET long_running=?, updated_at=? WHERE num=?",
+                        (1 if long_running else 0, now(), num))
+                seq = self._append_event(num, actor, kind, payload)
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.notify()
+        return {"ok": True, "event": self.event_row(seq),
+                "card": self.card_json(self.card_row(num), brief=True)}
+
+    def sidebar_post(self, text: str, actor: str) -> dict:
+        text = (text or "").strip()
+        if not text:
+            raise ApiError(400, "missing_field", "text is required", field="text")
+        if actor not in ("user", "session"):
+            raise ApiError(400, "bad_actor", "sidebar actor must be user or session")
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                seq = self._append_event(None, actor, "chat", {"text": text})
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.notify()
+        return {"ok": True, "event": self.event_row(seq)}
+
+    def sidebar_thread(self, after: int = 0, limit: int = 500) -> list:
+        """Sprint-level user/session lines only -- never worker telemetry."""
+        rows = self.q(
+            "SELECT * FROM events WHERE card_num IS NULL AND kind IN ('chat','note','answer') "
+            "AND actor IN ('user','session') AND seq>? ORDER BY seq LIMIT ?",
+            (after, limit))
+        return [self.event_json(r) for r in rows]
+
+    def make_batch(self, card_nums, agent_name, branch, worktree=None,
+                   actor: str = "session") -> dict:
+        if not isinstance(card_nums, list) or not card_nums:
+            raise ApiError(400, "missing_field", "card_nums is required", field="card_nums")
+        nums = []
+        for n in card_nums:
+            try:
+                nums.append(int(n))
+            except (TypeError, ValueError):
+                raise ApiError(400, "bad_card_num", "bad card number %r" % n)
+        for n in nums:
+            self.card_row(n)
+        sprint = self.open_sprint(create=True)
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO batches(sprint_id, agent_name, worktree, branch, created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (sprint["id"] if sprint else None, agent_name, worktree, branch, now()))
+                bid = int(cur.lastrowid)
+                name = agent_name or ("sprint-batch-%d" % bid)
+                self.conn.execute("UPDATE batches SET agent_name=? WHERE id=?", (name, bid))
+                for n in nums:
+                    self.conn.execute(
+                        "UPDATE cards SET batch_id=?, agent_name=?, branch=COALESCE(?,branch), "
+                        "worktree=COALESCE(?,worktree), updated_at=? WHERE num=?",
+                        (bid, name, branch, worktree, now(), n))
+                    self._append_event(n, actor, "note", {
+                        "text": "batched into #b%d with %s" % (bid, name),
+                        "batch_id": bid, "agent_name": name, "branch": branch,
+                        "worktree": worktree})
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.notify()
+        return {"ok": True, "batch": self.batch_json(bid), "cards": nums}
+
+    def batch_json(self, bid) -> dict:
+        row = self.q1("SELECT * FROM batches WHERE id=?", (bid,))
+        if row is None:
+            return None
+        return {"id": row["id"], "sprint_id": row["sprint_id"],
+                "agent_name": row["agent_name"], "worktree": row["worktree"],
+                "branch": row["branch"], "created_at": row["created_at"],
+                "cards": self.batch_members(row["id"])}
+
+    def assign(self, num: int, agent_name, worktree, branch,
+               actor: str = "session") -> dict:
+        self.card_row(num)
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute(
+                    "UPDATE cards SET agent_name=COALESCE(?,agent_name), "
+                    "worktree=COALESCE(?,worktree), branch=COALESCE(?,branch), "
+                    "updated_at=? WHERE num=?",
+                    (agent_name, worktree, branch, now(), num))
+                self._append_event(num, actor, "note", {
+                    "text": "assigned to %s" % (agent_name or "(unchanged)"),
+                    "agent_name": agent_name, "worktree": worktree, "branch": branch})
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.notify()
+        return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
+
+    def action(self, num: int, action: str, body: dict, actor: str = "user") -> dict:
+        row = self.card_row(num)
+        if action in ("pin", "unpin"):
+            value = body.get("value")
+            if not isinstance(value, bool):
+                value = body.get("pinned")
+            if action == "unpin" and not isinstance(value, bool):
+                value = False
+            newval = (not row["pinned"]) if not isinstance(value, bool) else value
+            with self.lock:
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self.conn.execute("UPDATE cards SET pinned=?, updated_at=? WHERE num=?",
+                                      (1 if newval else 0, now(), num))
+                    self._append_event(num, actor, "note", {
+                        "text": "pinned" if newval else "unpinned", "pinned": bool(newval)})
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+            self.notify()
+        elif action == "cancel":
+            self.transition(num, "canceled", actor, reason=body.get("reason"))
+        elif action == "hold":
+            self.transition(num, "held", actor, reason="hold")
+        elif action == "release":
+            self.transition(num, "queued", actor, reason="released")
+        elif action == "duplicate_of":
+            target = body.get("dup_of", body.get("card_num"))
+            try:
+                target = int(target)
+            except (TypeError, ValueError):
+                raise ApiError(400, "missing_field",
+                               "duplicate_of needs dup_of", field="dup_of")
+            if target == num:
+                raise ApiError(400, "bad_dup", "a card cannot duplicate itself")
+            self.card_row(target)
+            with self.lock:
+                self.conn.execute("UPDATE cards SET dup_of=?, updated_at=? WHERE num=?",
+                                  (target, now(), num))
+            self.transition(num, "duplicate", actor, reason="duplicate of #%d" % target,
+                            extra={"dup_of": target})
+        elif action == "retry":
+            # A dead agent's card goes back in the queue; the session picks it up
+            # and dispatches a FRESH agent with the full timeline as its brief.
+            if row["state"] not in ("failed", "stale"):
+                raise ApiError(409, "not_retryable",
+                               "#%s is %s; only failed or stale cards can be retried"
+                               % (num, row["state"]),
+                               from_state=row["state"], to_state="queued")
+            with self.lock:
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._append_event(num, actor, "note", {
+                        "text": "retry requested -- dispatch a fresh agent for #%s with the "
+                                "full timeline as its brief (say it is a new agent)" % num,
+                        "retry": True, "from_state": row["state"],
+                        "previous_agent": row["agent_name"]})
+                    # Drop the dead agent so nobody SendMessages a pruned worktree.
+                    self.conn.execute(
+                        "UPDATE cards SET agent_name=NULL, worktree=NULL, long_running=0, "
+                        "updated_at=? WHERE num=?", (now(), num))
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+            self.transition(num, "queued", actor, reason="retry")
+        else:
+            raise ApiError(400, "bad_action",
+                           "action must be pin, unpin, cancel, hold, release, "
+                           "duplicate_of or retry")
+        return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
+
+    def set_cursor(self, name: str, seq: int) -> dict:
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO cursors(name, seq, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET seq=excluded.seq, updated_at=excluded.updated_at",
+                (name, int(seq), now()))
+        return {"ok": True, "name": name, "seq": int(seq)}
+
+    def sprint_action(self, action: str, body: dict, actor: str = "session") -> dict:
+        if action == "open":
+            row = self.q1("SELECT * FROM sprints WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1")
+            if row is not None:
+                return {"ok": True, "sprint": self.sprint_json(row), "created": False}
+            row = self.open_sprint(create=True, title=body.get("title"))
+            if body.get("title"):
+                with self.lock:
+                    self.conn.execute("UPDATE sprints SET title=? WHERE id=?",
+                                      (body["title"], row["id"]))
+                row = self.q1("SELECT * FROM sprints WHERE id=?", (row["id"],))
+            return {"ok": True, "sprint": self.sprint_json(row), "created": True}
+        if action == "close":
+            row = self.q1("SELECT * FROM sprints WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1")
+            if row is None:
+                raise ApiError(409, "no_open_sprint", "no sprint is open")
+            with self.lock:
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self.conn.execute("UPDATE sprints SET closed_at=? WHERE id=?",
+                                      (now(), row["id"]))
+                    self._append_event(None, actor, "note",
+                                       {"text": "sprint closed", "sprint_id": row["id"]})
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+            self.notify()
+            return {"ok": True, "sprint": self.sprint_json(
+                self.q1("SELECT * FROM sprints WHERE id=?", (row["id"],)))}
+        if action == "set_hold_mode":
+            val = body.get("hold_mode", body.get("value"))
+            if not isinstance(val, bool):
+                raise ApiError(400, "missing_field", "hold_mode must be a bool",
+                               field="hold_mode")
+            row = self.open_sprint(create=True)
+            with self.lock:
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self.conn.execute("UPDATE sprints SET hold_mode=? WHERE id=?",
+                                      (1 if val else 0, row["id"]))
+                    self._append_event(None, actor, "note", {
+                        "text": "hold mode on -- new cards will wait" if val
+                                else "hold mode off -- new cards queue",
+                        "hold_mode": val})
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+            self.notify()
+            return {"ok": True, "sprint": self.sprint_json(
+                self.q1("SELECT * FROM sprints WHERE id=?", (row["id"],)))}
+        raise ApiError(400, "bad_action", "action must be open, close or set_hold_mode")
+
+    # -- board ------------------------------------------------------------
+
+    def board(self) -> dict:
+        sprint = self.open_sprint(create=True)
+        rows = self.q("SELECT * FROM cards WHERE sprint_id=? ORDER BY num",
+                      (sprint["id"],)) if sprint else []
+        cards = [self.card_json(r, brief=True) for r in rows]
+        pos, n = {}, 0
+        for c in cards:
+            if c["state"] == "queued":
+                n += 1
+                pos[c["num"]] = n
+        for c in cards:
+            c["queue_position"] = pos.get(c["num"])
+        batch_ids = sorted({c["batch_id"] for c in cards if c["batch_id"]})
+        counts = {}
+        for c in cards:
+            counts[c["state"]] = counts.get(c["state"], 0) + 1
+        return {
+            "sprint": self.sprint_json(sprint),
+            "hold_mode": bool(sprint["hold_mode"]) if sprint else False,
+            "cards": cards,
+            "counts": counts,
+            # The sidebar thread ships with the board so the UI never has to
+            # reconstruct it by scanning the whole event log.
+            "sidebar": self.sidebar_thread(limit=200),
+            "batches": [self.batch_json(b) for b in batch_ids],
+            "session": self.session_liveness(),
+            "states": list(STATES),
+            # `integrating` stays in the Ready column with a "merging…" note --
+            # a card only reaches Done once its branch actually landed.
+            "column_of": dict(COLUMN_OF),
+            "seq": self.max_seq(),
+            "server_time": now(),
+        }
+
+    def card_detail(self, num: int) -> dict:
+        """{card, timeline, evidence, attachments, ...} -- the drawer's whole payload."""
+        row = self.card_row(num)
+        card = self.card_json(row)
+        timeline = self.events_after(0, limit=5000, card_num=num)
+        return {
+            "num": num,
+            "card": card,
+            "timeline": timeline,
+            "events": timeline,               # alias: same list, one fetch
+            "evidence": card.get("evidence"),
+            "attachments": card.get("attachments") or [],
+            "questions": [self.question_json(r) for r in
+                          self.q("SELECT * FROM questions WHERE card_num=? ORDER BY id", (num,))],
+            "evidence_history": [
+                {"packet": jload(r["packet"], {}), "created_at": r["created_at"]}
+                for r in self.q(
+                    "SELECT * FROM evidence WHERE card_num=? ORDER BY created_at", (num,))],
+            "batch": self.batch_json(row["batch_id"]) if row["batch_id"] else None,
+            "column_of": dict(COLUMN_OF),
+            "seq": self.max_seq(),
+        }
+
+    # -- idempotency ------------------------------------------------------
+
+    def idem_get(self, key: str):
+        row = self.q1("SELECT * FROM idempotency WHERE key=?", (key,))
+        if row is None:
+            return None
+        return int(row["status"]), row["body"]
+
+    def idem_put(self, key: str, method: str, path: str, status: int, body: str):
+        with self.lock:
+            try:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO idempotency(key, method, path, status, body, created_at) "
+                    "VALUES(?,?,?,?,?,?)", (key, method, path, status, body, now()))
+            except sqlite3.Error:
+                pass
+
+
+# --------------------------------------------------------------------------
+# HTTP layer
+# --------------------------------------------------------------------------
+
+
+def make_handler(app: App):
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "sprintd/1.0"
+
+        # -- plumbing ---------------------------------------------------
+
+        def log_message(self, fmt, *args):  # noqa: A003
+            app.log("%s %s" % (self.address_string(), fmt % args))
+
+        def _send(self, status: int, body: bytes, ctype: str, extra_headers=None):
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            for k, v in (extra_headers or []):
+                self.send_header(k, v)
+            self.end_headers()
+            if self.command != "HEAD":
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        def json_out(self, status: int, obj, extra_headers=None):
+            body = jdump(obj).encode("utf-8")
+            self._send(status, body, "application/json; charset=utf-8", extra_headers)
+
+        def fail(self, err: ApiError):
+            self.json_out(err.status, err.body())
+
+        def read_body(self) -> bytes:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                raise ApiError(400, "bad_length", "invalid Content-Length")
+            if length > app.max_upload:
+                # Drain (bounded) so the client sees a clean 413 instead of a
+                # broken pipe mid-upload.
+                remaining, budget = length, 512 * 1024 * 1024
+                while remaining > 0 and budget > 0:
+                    chunk = self.rfile.read(min(262144, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    budget -= len(chunk)
+                if remaining > 0:
+                    self.close_connection = True
+                raise ApiError(413, "too_large",
+                               "request body exceeds %d bytes" % app.max_upload)
+            if length <= 0:
+                return b""
+            chunks, remaining = [], length
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+        def drain_body(self):
+            """Discard an unread request body so keep-alive stays coherent."""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self.close_connection = True
+                return
+            if length <= 0:
+                return
+            if length > app.max_upload:
+                self.close_connection = True
+                return
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+
+        def json_body(self) -> dict:
+            raw = self.read_body()
+            if not raw:
+                return {}
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                raise ApiError(400, "bad_json", "body is not valid JSON")
+            if not isinstance(obj, dict):
+                raise ApiError(400, "bad_json", "body must be a JSON object")
+            return obj
+
+        def cookie_token(self):
+            raw = self.headers.get("Cookie") or ""
+            for part in raw.split(";"):
+                name, _, val = part.strip().partition("=")
+                if name == COOKIE_NAME:
+                    return urllib.parse.unquote(val)
+            return None
+
+        def authed(self, query) -> bool:
+            given = None
+            auth = self.headers.get("Authorization") or ""
+            if auth.lower().startswith("bearer "):
+                given = auth[7:].strip()
+            if given is None:
+                given = self.cookie_token()
+            if given is None:
+                qt = query.get("t")
+                given = qt[0] if qt else None
+            if not given:
+                return False
+            return secrets.compare_digest(str(given), app.token)
+
+        # -- routing ----------------------------------------------------
+
+        def do_GET(self):  # noqa: N802
+            self._route("GET")
+
+        def do_HEAD(self):  # noqa: N802
+            self._route("GET")
+
+        def do_POST(self):  # noqa: N802
+            self._route("POST")
+
+        def _route(self, method: str):
+            try:
+                parsed = urllib.parse.urlsplit(self.path)
+                path = urllib.parse.unquote(parsed.path)
+                query = urllib.parse.parse_qs(parsed.query)
+
+                if path == "/healthz":
+                    return self.json_out(200, {
+                        "ok": True, "pid": os.getpid(),
+                        "project_root": app.project_root,
+                        "data_dir": app.data_dir,
+                        "started_at": app.started_at,
+                        "seq": app.max_seq()})
+
+                if not self.authed(query):
+                    self.drain_body()
+                    return self.json_out(401, {"error": "unauthorized",
+                                               "message": "bearer token required"})
+
+                # Cookie handshake: /?t=TOKEN
+                if method == "GET" and path == "/" and query.get("t"):
+                    cookie = "%s=%s; Path=/; SameSite=Lax; Max-Age=31536000; HttpOnly" % (
+                        COOKIE_NAME, urllib.parse.quote(app.token))
+                    return self._send(302, b"", "text/plain",
+                                      [("Set-Cookie", cookie), ("Location", "/")])
+
+                if method == "POST":
+                    return self._post(path, query)
+                return self._get(path, query)
+
+            except ApiError as err:
+                return self.fail(err)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception:
+                app.log("unhandled: %s" % traceback.format_exc())
+                try:
+                    return self.json_out(500, {"error": "internal",
+                                               "message": "internal error"})
+                except Exception:
+                    return
+
+        # -- GET --------------------------------------------------------
+
+        def _get(self, path, query):
+            if path == "/api/board":
+                return self.json_out(200, app.board())
+            if path == "/api/events":
+                after = int((query.get("after") or ["0"])[0] or 0)
+                limit = max(1, min(2000, int((query.get("limit") or ["500"])[0] or 500)))
+                events = app.events_after(after, limit)
+                return self.json_out(200, {"events": events, "after": after,
+                                           "head": app.max_seq(),
+                                           "next": events[-1]["seq"] if events else after})
+            if path == "/api/stream":
+                return self._stream(query)
+            if path == "/api/sidebar":
+                after = int((query.get("after") or ["0"])[0] or 0)
+                return self.json_out(200, {"events": app.sidebar_thread(after)})
+            if path == "/api/sprints":
+                rows = app.q("SELECT * FROM sprints ORDER BY id DESC")
+                return self.json_out(200, {"sprints": [app.sprint_json(r) for r in rows]})
+            if path == "/api/cursors/orchestrator":
+                row = app.q1("SELECT * FROM cursors WHERE name='orchestrator'")
+                return self.json_out(200, {
+                    "name": "orchestrator",
+                    "seq": int(row["seq"]) if row else 0,
+                    "updated_at": row["updated_at"] if row else None})
+
+            m = re.match(r"^/api/cards/(\d+)$", path)
+            if m:
+                return self.json_out(200, app.card_detail(int(m.group(1))))
+
+            m = re.match(r"^/api/attachments/([0-9a-f]{64})\.(png|jpg|jpeg)$", path)
+            if m:
+                fname = "%s.%s" % (m.group(1), m.group(2))
+                fpath = os.path.join(app.attach_dir, fname)
+                if not os.path.isfile(fpath):
+                    raise ApiError(404, "no_such_attachment", "unknown attachment")
+                with open(fpath, "rb") as fh:
+                    blob = fh.read()
+                mime = "image/png" if m.group(2) == "png" else "image/jpeg"
+                return self._send(200, blob, mime)
+
+            if path.startswith("/api/"):
+                raise ApiError(404, "no_such_route", "no route for %s" % path)
+            return self._static(path)
+
+        def _static(self, path):
+            root = web_dir()
+            rel = path.lstrip("/") or "index.html"
+            if not os.path.isdir(root):
+                if rel in ("index.html", ""):
+                    return self._send(200, PLACEHOLDER_HTML.encode("utf-8"),
+                                      "text/html; charset=utf-8")
+                raise ApiError(404, "no_web_dir", "web/ is not installed")
+            target = os.path.realpath(os.path.join(root, rel))
+            if target != os.path.realpath(root) and \
+                    not target.startswith(os.path.realpath(root) + os.sep):
+                raise ApiError(403, "forbidden", "path escapes web/")
+            if os.path.isdir(target):
+                target = os.path.join(target, "index.html")
+            if not os.path.isfile(target):
+                index = os.path.join(root, "index.html")
+                if os.path.isfile(index):
+                    target = index
+                else:
+                    return self._send(200, PLACEHOLDER_HTML.encode("utf-8"),
+                                      "text/html; charset=utf-8")
+            ctype = mimetypes.guess_type(target)[0] or "application/octet-stream"
+            if ctype.startswith("text/") or ctype in ("application/javascript",
+                                                      "application/json"):
+                ctype += "; charset=utf-8"
+            with open(target, "rb") as fh:
+                return self._send(200, fh.read(), ctype)
+
+        def _stream(self, query):
+            after = 0
+            lei = self.headers.get("Last-Event-ID")
+            if lei and str(lei).strip().isdigit():
+                after = int(str(lei).strip())
+            elif query.get("after"):
+                try:
+                    after = int(query["after"][0])
+                except ValueError:
+                    after = 0
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                self.wfile.write(b": connected\n\nretry: 2000\n\n")
+                self.wfile.flush()
+                last_beat = now()
+                while not app.stopping.is_set():
+                    # Hold cond across the read so a concurrent write cannot
+                    # slip its notify() between the query and the wait.
+                    with app.cond:
+                        events = app.events_after(after, 200)
+                        if not events:
+                            app.cond.wait(timeout=min(app.sse_heartbeat, 1.0))
+                    if events:
+                        buf = []
+                        for ev in events:
+                            # One frame per event: `id:` is the seq (Last-Event-ID
+                            # resume), `data:` is the whole event JSON. No `event:`
+                            # line -- everything lands on the default message
+                            # handler, which is what the browser listens on.
+                            buf.append("id: %d\ndata: %s\n\n" % (ev["seq"], jdump(ev)))
+                            after = ev["seq"]
+                        self.wfile.write("".join(buf).encode("utf-8"))
+                        self.wfile.flush()
+                        continue
+                    if now() - last_beat >= app.sse_heartbeat:
+                        self.wfile.write(b": heartbeat\n\n")
+                        self.wfile.flush()
+                        last_beat = now()
+            except (BrokenPipeError, ConnectionResetError, ValueError, OSError):
+                return
+
+        # -- POST -------------------------------------------------------
+
+        def _post(self, path, query):
+            key = self.headers.get("Idempotency-Key")
+            if key:
+                hit = app.idem_get(key)
+                if hit:
+                    status, body = hit
+                    self.drain_body()
+                    return self._send(status, body.encode("utf-8"),
+                                      "application/json; charset=utf-8",
+                                      [("Idempotent-Replay", "true")])
+            status, obj = self._dispatch_post(path, query)
+            body = jdump(obj)
+            if key:
+                app.idem_put(key, "POST", path, status, body)
+            return self._send(status, body.encode("utf-8"),
+                              "application/json; charset=utf-8")
+
+        def _dispatch_post(self, path, query):
+            body = self.json_body()
+            actor_hint = body.get("actor")
+
+            if path == "/api/cards":
+                card = app.create_card(body.get("text"), body.get("images") or [],
+                                       bool(body.get("hold")),
+                                       actor=actor_hint if actor_hint in ACTORS else "user")
+                return 201, card
+
+            if path == "/api/sidebar":
+                return 201, app.sidebar_post(body.get("text"),
+                                             actor_hint if actor_hint in ("user", "session")
+                                             else "user")
+
+            if path == "/api/batches":
+                return 201, app.make_batch(body.get("card_nums"), body.get("agent_name"),
+                                           body.get("branch"), body.get("worktree"))
+
+            if path == "/api/sprint":
+                return 200, app.sprint_action(body.get("action"), body)
+
+            if path == "/api/cursors/orchestrator":
+                seq = body.get("seq")
+                try:
+                    seq = int(seq)
+                except (TypeError, ValueError):
+                    raise ApiError(400, "missing_field", "seq is required", field="seq")
+                return 200, app.set_cursor("orchestrator", seq)
+
+            m = re.match(r"^/api/cards/(\d+)/([a-z_]+)$", path)
+            if not m:
+                raise ApiError(404, "no_such_route", "no route for %s" % path)
+            num, verb = int(m.group(1)), m.group(2)
+
+            if verb == "chat":
+                return 201, app.card_event(num, "chat", {"text": body.get("text")},
+                                           actor=actor_hint if actor_hint in ACTORS else "user")
+            if verb == "answer":
+                qid = body.get("question_id")
+                if qid is None:
+                    row = app.q1("SELECT id FROM questions WHERE card_num=? AND "
+                                 "answered_at IS NULL ORDER BY id DESC LIMIT 1", (num,))
+                    if row is None:
+                        raise ApiError(400, "missing_field",
+                                       "question_id is required", field="question_id")
+                    qid = row["id"]
+                try:
+                    qid = int(qid)
+                except (TypeError, ValueError):
+                    raise ApiError(400, "missing_field",
+                                   "question_id must be an integer", field="question_id")
+                return 200, app.answer(num, qid, body.get("text"),
+                                       actor=actor_hint if actor_hint in ACTORS else "user")
+            if verb == "action":
+                return 200, app.action(num, body.get("action"), body,
+                                       actor=actor_hint if actor_hint in ACTORS else "user")
+            if verb == "verdict":
+                return 200, app.verdict(num, body.get("verdict"), body.get("notes") or "",
+                                        body.get("scope") or "card",
+                                        actor=actor_hint if actor_hint in ACTORS else "user")
+            if verb == "events":
+                kind = body.get("kind")
+                payload = body.get("payload")
+                if payload is None:
+                    payload = {k: v for k, v in body.items()
+                               if k not in ("kind", "actor")}
+                return 201, app.card_event(num, kind, payload,
+                                           actor=actor_hint if actor_hint in ACTORS else "worker",
+                                           long_running=body.get("long_running"))
+            if verb == "question":
+                return 201, app.ask(num, body.get("text"), body.get("options"),
+                                    actor=actor_hint if actor_hint in ACTORS else "worker")
+            if verb == "ready":
+                packet = body.get("packet", body)
+                return 200, app.card_ready(num, packet,
+                                           actor=actor_hint if actor_hint in ACTORS else "worker")
+            if verb == "state":
+                state = body.get("state")
+                actor = actor_hint if actor_hint in ACTORS else "worker"
+                if state == "ready":
+                    raise ApiError(422, "evidence_required",
+                                   "ready is only reachable via POST /api/cards/%d/ready"
+                                   % num, missing=["packet"])
+                # Workers report their own progress. Only the session -- the brain
+                # that actually knows an agent died or a sprint gap happened --
+                # may declare a card failed or stale.
+                allowed = ["triaging", "in_progress", "blocked"]
+                if actor == "session":
+                    allowed += ["failed", "stale", "queued", "needs_you"]
+                if state not in allowed:
+                    raise ApiError(400, "bad_state",
+                                   "state must be one of %s" % ", ".join(allowed))
+                reason = body.get("reason")
+                if state in ("blocked", "failed") and \
+                        not (isinstance(reason, str) and reason.strip()):
+                    raise ApiError(400, "missing_field",
+                                   "%s requires a machine-named reason" % state,
+                                   field="reason")
+                return 200, {"ok": True, "card": app.transition(num, state, actor, reason)}
+            if verb == "integrated":
+                return 200, app.integrated(
+                    num, body.get("ok"), body.get("reason") or "",
+                    body.get("card_nums"),
+                    actor=actor_hint if actor_hint in ACTORS else "session")
+            if verb == "assign":
+                return 200, app.assign(num, body.get("agent_name"), body.get("worktree"),
+                                       body.get("branch"))
+            raise ApiError(404, "no_such_route", "no route for %s" % path)
+
+    return Handler
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 64
+
+
+def make_server(app: App, host: str, port: int) -> Server:
+    handler = make_handler(app)
+    return Server((host, port), handler)
+
+
+# --------------------------------------------------------------------------
+# Server lifecycle (CLI)
+# --------------------------------------------------------------------------
+
+
+def paths_for(project_root: str, data_dir: str = None) -> dict:
+    data = os.path.realpath(data_dir or os.path.join(project_root, DATA_DIRNAME))
+    return {
+        "data_dir": data,
+        "server_json": os.path.join(data, SERVER_JSON),
+        "log": os.path.join(data, SERVER_LOG),
+        "db": os.path.join(data, DB_FILENAME),
+    }
+
+
+def read_server_json(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def write_server_json(path: str, info: dict):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(info, fh, indent=2, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def http_get(host: str, port: int, path: str, token: str = None, timeout: float = 3.0):
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        headers = {"Accept": "application/json"}
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        conn.request("GET", path, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, raw
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def probe_server(info: dict, timeout: float = 3.0):
+    """-> (state, detail). state in: dead | healthy | foreign | wrong_token"""
+    if not info:
+        return "dead", None
+    port = info.get("port") or DEFAULT_PORT
+    try:
+        status, raw = http_get("127.0.0.1", port, "/healthz", timeout=timeout)
+    except (OSError, http.client.HTTPException):
+        return "dead", None
+    if status != 200:
+        return "foreign", None
+    health = jload(raw.decode("utf-8", "replace"), {}) or {}
+    if os.path.realpath(health.get("project_root") or "") != \
+            os.path.realpath(info.get("project_root") or ""):
+        return "foreign", health
+    try:
+        status, _ = http_get("127.0.0.1", port, "/api/board", info.get("token"),
+                             timeout=timeout)
+    except (OSError, http.client.HTTPException):
+        return "dead", health
+    if status == 200:
+        return "healthy", health
+    return "wrong_token", health
+
+
+def board_url(host: str, port: int, token: str) -> str:
+    return "http://%s:%d/?t=%s" % (host, port, urllib.parse.quote(token))
+
+
+def daemonize(logpath: str) -> int:
+    """Double-fork into the background.
+
+    Returns a write fd in the grandchild; the original process blocks until the
+    grandchild reports readiness, so `sprintd start` never exits 0 on a server
+    that failed to bind.
+    """
+    import select
+
+    read_fd, write_fd = os.pipe()
+    if os.fork() > 0:
+        os.close(write_fd)
+        buf = b""
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            ready, _, _ = select.select([read_fd], [], [], deadline - time.time())
+            if not ready:
+                break
+            chunk = os.read(read_fd, 4096)
+            if not chunk:
+                break
+            buf += chunk
+            if b"\n" in buf:
+                break
+        os.close(read_fd)
+        msg = jload(buf.decode("utf-8", "replace").strip(), None)
+        if not msg:
+            sys.stderr.write("sprintd: background server did not report readiness; "
+                             "see %s\n" % logpath)
+            os._exit(1)
+        if not msg.get("ok"):
+            sys.stderr.write("sprintd: %s\n" % msg.get("error", "failed to start"))
+            os._exit(1)
+        for url in msg.get("urls", []):
+            sys.stdout.write(url + "\n")
+        sys.stdout.flush()
+        os._exit(0)
+    os.close(read_fd)
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    fd_null = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(fd_null, 0)
+    os.close(fd_null)
+    fd_log = os.open(logpath, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.dup2(fd_log, 1)
+    os.dup2(fd_log, 2)
+    os.close(fd_log)
+    return write_fd
+
+
+def cmd_start(args) -> int:
+    project_root = os.path.realpath(args.project_root or find_project_root())
+    p = paths_for(project_root, args.data_dir)
+    os.makedirs(p["data_dir"], exist_ok=True)
+    info = read_server_json(p["server_json"])
+
+    if info:
+        state, _health = probe_server(info)
+        if state == "healthy":
+            print("sprintd already running (pid %s) -> %s"
+                  % (info.get("pid"), board_url(info.get("host") or "127.0.0.1",
+                                                info.get("port"), info["token"])))
+            return 0
+        if state == "wrong_token":
+            print("error: something is listening on port %s for this project but the token "
+                  "in %s does not match. Run: sprintd stop" % (info.get("port"), p["server_json"]),
+                  file=sys.stderr)
+            return 1
+        if state == "foreign":
+            print("error: port %s is held by another process (not this project's sprintd). "
+                  "Free it or start with --port." % info.get("port"), file=sys.stderr)
+            return 1
+        pid = info.get("pid")
+        if isinstance(pid, int) and pid_is_sprintd(pid) and pid != os.getpid():
+            print("warning: stale sprintd pid %s is alive but not serving; killing it" % pid,
+                  file=sys.stderr)
+            try:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.5)
+            except OSError:
+                pass
+        # stale pidfile (power loss / PID recycling): clean up and continue
+        try:
+            os.remove(p["server_json"])
+        except OSError:
+            pass
+
+    port = args.port if args.port is not None else (
+        (info or {}).get("port") or DEFAULT_PORT)
+    token = args.token or (info or {}).get("token") or secrets.token_urlsafe(24)
+
+    ts_ip = "" if args.no_tailscale else tailscale_ip()
+    if not ts_ip:
+        print("NOTICE: no tailscale IPv4 address found -- binding 127.0.0.1 ONLY. "
+              "The board will not be reachable from your phone/tablet until tailscale is up. "
+              "(never binding 0.0.0.0 or a LAN interface)", file=sys.stderr)
+
+    ready_fd = None
+    if not args.foreground:
+        ready_fd = daemonize(p["log"])
+
+    def report(ok: bool, **kw):
+        if ready_fd is None:
+            return
+        try:
+            os.write(ready_fd, (jdump(dict(ok=ok, **kw)) + "\n").encode("utf-8"))
+            os.close(ready_fd)
+        except OSError:
+            pass
+
+    logfh = open(p["log"], "a", encoding="utf-8")
+    app = App(project_root, data_dir=p["data_dir"], token=token, log=logfh,
+              silence_seconds=args.silence_seconds)
+
+    # Loopback is mandatory; the tailnet address is best-effort so a flapping
+    # tailscale can never keep the board down on this machine.
+    servers, hosts = [], []
+    try:
+        loop = make_server(app, "127.0.0.1", port)
+    except OSError as exc:
+        msg = "cannot bind 127.0.0.1:%s (%s)" % (port, exc)
+        app.log(msg)
+        report(False, error=msg)
+        print("error: " + msg, file=sys.stderr)
+        app.close()
+        return 1
+    servers.append(loop)
+    hosts.append("127.0.0.1")
+    actual_port = loop.server_address[1]
+    if ts_ip:
+        try:
+            servers.insert(0, make_server(app, ts_ip, actual_port))
+            hosts.insert(0, ts_ip)
+        except OSError as exc:
+            app.log("could not bind tailnet ip %s:%s (%s) -- loopback only"
+                    % (ts_ip, actual_port, exc))
+
+    app.open_sprint(create=True)
+    app.start_background()
+    write_server_json(p["server_json"], {
+        "pid": os.getpid(), "port": actual_port, "host": hosts[0],
+        "hosts": hosts, "token": token, "project_root": project_root,
+        "started_at": app.started_at, "data_dir": p["data_dir"],
+    })
+
+    urls = [board_url(h, actual_port, token) for h in hosts]
+    app.log("listening on %s (project %s)" % (
+        ", ".join("%s:%d" % (h, actual_port) for h in hosts), project_root))
+    report(True, urls=urls, pid=os.getpid(), port=actual_port)
+    if ready_fd is None:
+        for u in urls:
+            print(u)
+        sys.stdout.flush()
+
+    stop = threading.Event()
+
+    def handle_sig(_signo, _frame):
+        stop.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, handle_sig)
+        except (ValueError, OSError):
+            pass
+
+    threads = []
+    for s in servers:
+        t = threading.Thread(target=s.serve_forever, kwargs={"poll_interval": 0.2},
+                             daemon=True)
+        t.start()
+        threads.append(t)
+    try:
+        while not stop.is_set():
+            stop.wait(0.5)
+    finally:
+        for s in servers:
+            s.shutdown()
+            s.server_close()
+        app.close()
+        try:
+            cur = read_server_json(p["server_json"])
+            if cur and cur.get("pid") == os.getpid():
+                os.remove(p["server_json"])
+        except OSError:
+            pass
+        try:
+            logfh.close()
+        except OSError:
+            pass
+    return 0
+
+
+def cmd_stop(args) -> int:
+    project_root = os.path.realpath(args.project_root or find_project_root())
+    p = paths_for(project_root, args.data_dir)
+    info = read_server_json(p["server_json"])
+    if not info:
+        print("sprintd is not running (no %s)" % p["server_json"])
+        return 0
+    pid = info.get("pid")
+    if not isinstance(pid, int) or not pid_is_sprintd(pid):
+        print("stale server.json (pid %s is gone or recycled); cleaning up" % pid)
+        try:
+            os.remove(p["server_json"])
+        except OSError:
+            pass
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        print("error: could not signal pid %s: %s" % (pid, exc), file=sys.stderr)
+        return 1
+    for _ in range(60):
+        if not pid_alive(pid):
+            break
+        time.sleep(0.1)
+    if pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.remove(p["server_json"])
+    except OSError:
+        pass
+    print("stopped sprintd (pid %s)" % pid)
+    return 0
+
+
+def cmd_status(args) -> int:
+    project_root = os.path.realpath(args.project_root or find_project_root())
+    p = paths_for(project_root, args.data_dir)
+    info = read_server_json(p["server_json"])
+    state, _health = probe_server(info) if info else ("dead", None)
+    out = {"running": state == "healthy", "state": state,
+           "project_root": project_root, "data_dir": p["data_dir"]}
+    if info:
+        out.update({"pid": info.get("pid"), "port": info.get("port"),
+                    "host": info.get("host"), "hosts": info.get("hosts"),
+                    "started_at": info.get("started_at")})
+        if state == "healthy":
+            out["url"] = board_url(info.get("host") or "127.0.0.1", info["port"],
+                                   info["token"])
+            try:
+                status, raw = http_get("127.0.0.1", info["port"], "/api/board",
+                                       info.get("token"))
+                if status == 200:
+                    board = jload(raw.decode("utf-8", "replace"), {}) or {}
+                    out["seq"] = board.get("seq")
+                    out["session"] = board.get("session")
+                    out["counts"] = board.get("counts")
+            except (OSError, http.client.HTTPException):
+                pass
+    if args.json:
+        print(jdump(out))
+    else:
+        if state == "healthy":
+            print("running  pid=%s  %s" % (out.get("pid"), out.get("url")))
+            if out.get("session"):
+                print("session: %s (cursor %s of %s)" % (
+                    out["session"].get("status"), out["session"].get("cursor"),
+                    out["session"].get("head")))
+        else:
+            print("not running (%s)" % state)
+    return 0 if state == "healthy" else 1
+
+
+def cmd_wait(args) -> int:
+    """exit 0 = events waiting, 2 = timeout, 3 = server unreachable."""
+    project_root = os.path.realpath(args.project_root or find_project_root())
+    p = paths_for(project_root, args.data_dir)
+    info = read_server_json(p["server_json"])
+    if not info:
+        print("sprintd is not running (no %s)" % p["server_json"], file=sys.stderr)
+        return 3
+    port = args.port or info.get("port") or DEFAULT_PORT
+    token = args.token or info.get("token")
+    after = args.after
+    deadline = now() + float(args.timeout)
+    poll = max(0.05, float(args.poll))
+    while True:
+        try:
+            status, raw = http_get("127.0.0.1", port,
+                                   "/api/events?after=%d&limit=1" % after, token,
+                                   timeout=5.0)
+        except (OSError, http.client.HTTPException) as exc:
+            print("sprintd unreachable on 127.0.0.1:%s (%s)" % (port, exc), file=sys.stderr)
+            return 3
+        if status == 401:
+            print("sprintd rejected the token", file=sys.stderr)
+            return 3
+        if status != 200:
+            print("sprintd returned HTTP %s" % status, file=sys.stderr)
+            return 3
+        data = jload(raw.decode("utf-8", "replace"), {}) or {}
+        events = data.get("events") or []
+        if events:
+            print(jdump({"after": after, "next": data.get("next"),
+                         "head": data.get("head"), "count": len(events)}))
+            return 0
+        remaining = deadline - now()
+        if remaining <= 0:
+            print(jdump({"after": after, "head": data.get("head"), "timeout": True}))
+            return 2
+        time.sleep(min(poll, remaining))
+
+
+def cmd_doctor(args) -> int:
+    project_root = os.path.realpath(args.project_root or find_project_root())
+    p = paths_for(project_root, args.data_dir)
+    problems = 0
+
+    def ok(msg):
+        print("ok    %s" % msg)
+
+    def bad(msg):
+        nonlocal problems
+        problems += 1
+        print("FIX   %s" % msg)
+
+    def note(msg):
+        print("note  %s" % msg)
+
+    if sys.version_info >= (3, 9):
+        ok("python %d.%d.%d" % sys.version_info[:3])
+    else:
+        bad("python is %d.%d -- sprintd needs 3.9+. Install a newer python3."
+            % sys.version_info[:2])
+
+    if shutil.which("git"):
+        ok("git found")
+    else:
+        bad("git not found on PATH -- worktree dispatch will fail. Install git.")
+
+    ip = tailscale_ip()
+    if ip:
+        ok("tailscale ip %s" % ip)
+    else:
+        note("no tailscale IPv4 -- the board will bind 127.0.0.1 only "
+             "(reachable on this Mac, not from your phone). Start tailscale to fix.")
+
+    try:
+        os.makedirs(p["data_dir"], exist_ok=True)
+        probe = os.path.join(p["data_dir"], ".writeprobe")
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        os.remove(probe)
+        ok("data dir writable: %s" % p["data_dir"])
+    except OSError as exc:
+        bad("cannot write %s (%s) -- fix permissions." % (p["data_dir"], exc))
+
+    git_dir = os.path.join(project_root, ".git")
+    if os.path.isdir(git_dir):
+        exclude = os.path.join(git_dir, "info", "exclude")
+        try:
+            os.makedirs(os.path.dirname(exclude), exist_ok=True)
+            existing = ""
+            if os.path.isfile(exclude):
+                with open(exclude, "r", encoding="utf-8") as fh:
+                    existing = fh.read()
+            if not re.search(r"^\.sprint/?\s*$", existing, re.M):
+                with open(exclude, "a", encoding="utf-8") as fh:
+                    if existing and not existing.endswith("\n"):
+                        fh.write("\n")
+                    fh.write(".sprint/\n")
+                ok("added .sprint/ to .git/info/exclude")
+            else:
+                ok(".sprint/ already in .git/info/exclude")
+        except OSError as exc:
+            bad("could not update .git/info/exclude (%s)" % exc)
+    elif os.path.isfile(git_dir):
+        note("%s is a worktree/submodule gitfile -- skipping info/exclude" % git_dir)
+    else:
+        note("%s is not a git repo -- nothing to exclude" % project_root)
+
+    info = read_server_json(p["server_json"])
+    if info:
+        state, _ = probe_server(info)
+        if state == "healthy":
+            ok("server running: %s" % board_url(info.get("host") or "127.0.0.1",
+                                                info["port"], info["token"]))
+        elif state == "dead":
+            note("stale %s (server not responding) -- `sprintd start` will clean it up"
+                 % p["server_json"])
+        else:
+            bad("port %s is %s -- run `sprintd stop`" % (info.get("port"), state))
+    else:
+        note("server not started yet -- run `sprintd start`")
+
+    if args.install_launchd:
+        rc = install_launchd(project_root, p, args)
+        problems += rc
+    return 1 if problems else 0
+
+
+def install_launchd(project_root: str, p: dict, args) -> int:
+    if sys.platform != "darwin":
+        print("note  --install-launchd is macOS only; skipping on %s" % sys.platform)
+        return 0
+    digest = hashlib.sha256(project_root.encode("utf-8")).hexdigest()[:12]
+    label = "com.sprint.%s" % digest
+    agents = os.path.expanduser("~/Library/LaunchAgents")
+    plist_path = os.path.join(agents, "%s.plist" % label)
+    script = os.path.realpath(__file__)
+    argv = [sys.executable, script, "start", "--foreground",
+            "--project-root", project_root]
+    if args.port:
+        argv += ["--port", str(args.port)]
+
+    def xml_escape(s):
+        return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    args_xml = "\n".join("      <string>%s</string>" % xml_escape(a) for a in argv)
+    plist = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key><string>%s</string>
+    <key>ProgramArguments</key>
+    <array>
+%s
+    </array>
+    <key>WorkingDirectory</key><string>%s</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>%s</string>
+    <key>StandardErrorPath</key><string>%s</string>
+  </dict>
+</plist>
+""" % (label, args_xml, xml_escape(project_root), xml_escape(p["log"]),
+       xml_escape(p["log"]))
+    try:
+        os.makedirs(agents, exist_ok=True)
+        with open(plist_path, "w", encoding="utf-8") as fh:
+            fh.write(plist)
+    except OSError as exc:
+        print("FIX   could not write %s (%s)" % (plist_path, exc))
+        return 1
+    print("ok    wrote %s (KeepAlive)" % plist_path)
+    uid = os.getuid()
+    loaded = False
+    try:
+        r = subprocess.run(["launchctl", "bootstrap", "gui/%d" % uid, plist_path],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        loaded = r.returncode == 0
+        if not loaded:
+            r = subprocess.run(["launchctl", "load", "-w", plist_path],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            loaded = r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        loaded = False
+    if loaded:
+        print("ok    launchd job %s loaded (survives reboots/power loss)" % label)
+    else:
+        print("note  load it yourself: launchctl bootstrap gui/%d %s" % (uid, plist_path))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="sprintd", description=__doc__.splitlines()[0])
+    ap.add_argument("--project-root", default=None,
+                    help="project root (default: git toplevel of cwd)")
+    ap.add_argument("--data-dir", default=None,
+                    help="state dir (default: <project-root>/.sprint)")
+    sub = ap.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("start", help="start the board server (idempotent)")
+    s.add_argument("--port", type=int, default=None,
+                   help="port (default %d, reused across restarts)" % DEFAULT_PORT)
+    s.add_argument("--token", default=None, help="force a bearer token")
+    s.add_argument("--foreground", action="store_true", help="do not daemonize")
+    s.add_argument("--no-tailscale", action="store_true",
+                   help="skip tailscale lookup; bind loopback only")
+    s.add_argument("--silence-seconds", type=float, default=None,
+                   help="agent_silent threshold (default %d)" % DEFAULT_SILENCE_SECONDS)
+    s.set_defaults(func=cmd_start)
+
+    s = sub.add_parser("stop", help="stop the board server")
+    s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("status", help="is it running, and where")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("wait", help="block until events exist past --after")
+    s.add_argument("--after", type=int, required=True)
+    s.add_argument("--timeout", type=float, default=60.0)
+    s.add_argument("--poll", type=float, default=0.5)
+    s.add_argument("--port", type=int, default=None)
+    s.add_argument("--token", default=None)
+    s.set_defaults(func=cmd_wait)
+
+    s = sub.add_parser("doctor", help="check the environment; fix what is safe to fix")
+    s.add_argument("--install-launchd", action="store_true",
+                   help="write + load a KeepAlive LaunchAgent (macOS)")
+    s.add_argument("--port", type=int, default=None)
+    s.set_defaults(func=cmd_doctor)
+    return ap
+
+
+def main(argv=None) -> int:
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        ap.print_help()
+        return 1
+    try:
+        return int(args.func(args) or 0)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
