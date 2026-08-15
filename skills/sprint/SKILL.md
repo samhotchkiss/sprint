@@ -132,13 +132,14 @@ re-dispatch a card that already has a live `agent_name`).
 | user | `chat` (card_num set) | User talked to a specific card. If it has a live (non-terminal) agent, `SendMessage` the agent by name with the user's text as context. If terminal, post a `note` explaining you can't reach that agent anymore and, if the message calls for it, dispatch fresh work referencing the old timeline. |
 | user | `chat` (card_num NULL) | Sidebar message. This is the same conversation as your terminal — answer it, and if it asks you to act (unblock, re-batch, approve, "why has #123 been blocked so long") actually do that, don't just answer in prose. Reply via `POST /api/sidebar {"text":..., "actor":"session"}`. |
 | user | `answer` | An answer to a worker's question. Server already flipped `needs_you`→`in_progress`; your job is to relay the answer to the agent: `SendMessage` it by name with the answer text. |
+| user | `note` with `retry: true` (then `state`→`queued`) | The user hit **Retry** on a failed/stale card. The server already cleared the dead `agent_name`/`worktree` and re-queued it. Dispatch a **fresh** agent (step 3) with the card's full timeline as its brief, and have it say plainly that it is a new agent picking up where the last one died — never `SendMessage` the old name. |
 | user | `action` results (pin/cancel/hold/release/duplicate_of) | Mostly informational — no action needed beyond noticing state changed, unless `release` just moved held cards to queued (then consider dispatch) or `cancel` hit a card with a live agent (then tell that agent to stop: `SendMessage` "this card was canceled, wrap up and stop"). |
 | user | `verdict` (approve) | See step 6 — the card already flipped `ready`→`integrating` on the board (UI shows "merging…", no spinner). Do the actual git integration now, then call `POST /api/cards/:num/integrated` yourself to land it in `completed` or bounce it back with a real failure. |
 | user | `verdict` (bounce) | See step 6 — `SendMessage` notes to the agent. Card is already back in `in_progress` server-side. |
 | user | `verdict` (reject) | Card is terminal (`rejected`). Kill its preview server (step 6), prune its worktree, post a closing `note`, done — no git work. |
 | session | `integrated` (ok: true) | Your own echo from step 6 — card is now `completed`. No further action beyond the cleanup you already did as part of calling it (kill preview server, prune worktree). |
 | session | `integrated` (ok: false) | Your own echo from step 6 — card is back in `in_progress` with an `error` note. You already told the agent what failed when you posted it; nothing further here. |
-| worker | `progress`/`note`/`error` | Telemetry. No action required (the board shows it); read it if you're specifically checking on a card (step 5) or if `error` looks fatal, in which case consider flipping to `failed` yourself via the card's state — but prefer letting the worker self-report via its own tools first. |
+| worker | `progress`/`note`/`error` | Telemetry. No action required (the board shows it); read it if you're specifically checking on a card (step 5) or if `error` looks fatal, in which case flip it to `failed` yourself: `POST /api/cards/:num/state {"state":"failed","actor":"session","reason":"<machine-named>"}`. **`failed` and `stale` are session-only states** — a worker's own state route can only reach `triaging`/`in_progress`/`blocked`, so a dead agent can only be declared dead by you. |
 | worker | `question` | Server already flipped to `needs_you`. Nothing to do — the card face shows the question; you'll see the `answer` event when the user responds. |
 | worker | `evidence` (ready) | Card (or whole batch) just entered `ready`. Nothing required from you — it's now waiting on the user's verdict. Optional: a short sidebar note if the user seems to be waiting on it. |
 | server | `agent_silent` | See step 5 — go investigate. |
@@ -404,7 +405,7 @@ differently.
 ## Hold mode & batching
 
 Hold mode is a sprint-level toggle (`POST /api/sprint
-{"action":"set_hold_mode", "on": true|false}`) the user flips from the
+{"action":"set_hold_mode", "hold_mode": true|false}`) the user flips from the
 sidebar or the UI switch. While on, new submissions land `held` and you
 dispatch nothing from that column.
 

@@ -64,7 +64,7 @@ export function age(ts, now = Date.now()) {
   if (t == null) return '';
   let s = Math.max(0, Math.round((now - t) / 1000));
   if (s < 45) return 'just now';
-  const m = Math.floor(s / 60);
+  const m = Math.max(1, Math.floor(s / 60));   // never render "0m"
   if (m < 60) return m + 'm';
   const hrs = Math.floor(m / 60), rem = m % 60;
   if (hrs < 24) return rem ? `${hrs}h ${rem}m` : `${hrs}h`;

@@ -96,6 +96,10 @@ TRANSITIONS = {
 
 TERMINAL_STATES = {"completed", "rejected", "duplicate", "canceled"}
 
+# Card faces show the transition reason verbatim, so these are English.
+VERDICT_REASON = {"approve": "approved -- merging", "bounce": "bounced back with your notes",
+                  "reject": "rejected"}
+
 # Which board column a state renders in. `integrating` is NOT its own column:
 # it sits in Ready showing "merging…" until the branch actually lands.
 COLUMN_OF = {
@@ -579,8 +583,7 @@ class App:
         err = self.q1("SELECT * FROM events WHERE card_num=? AND kind='error' "
                       "ORDER BY seq DESC LIMIT 1", (num,))
         out["error"] = (jload(err["payload"], {}) or {}).get("text") if err else None
-        ev = self.latest_evidence(num)
-        out["evidence"] = ev
+        out["evidence"] = self.latest_evidence(num, card_row=row)
         if not brief:
             out["attachments"] = self.card_attachments(num)
         return out
@@ -595,14 +598,25 @@ class App:
                     out.append(att)
         return out
 
-    def latest_evidence(self, num: int):
+    def latest_evidence(self, num: int, card_row=None):
         row = self.q1(
             "SELECT * FROM evidence WHERE card_num=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (num,))
         if row is None:
+            # A batch posts ONE packet on whichever member ran the gate; every
+            # member is asking the user for a verdict, so every member shows it.
+            crow = card_row or self.q1("SELECT * FROM cards WHERE num=?", (num,))
+            bid = crow["batch_id"] if crow is not None else None
+            if bid:
+                row = self.q1(
+                    "SELECT e.* FROM evidence e JOIN cards c ON c.num = e.card_num "
+                    "WHERE c.batch_id=? ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1",
+                    (bid,))
+        if row is None:
             return None
         return {"card_num": row["card_num"], "packet": jload(row["packet"], {}),
-                "created_at": row["created_at"]}
+                "created_at": row["created_at"],
+                "shared": row["card_num"] != num}
 
     @staticmethod
     def question_json(row) -> dict:
@@ -642,7 +656,7 @@ class App:
                     "hold": bool(hold or hold_mode)})
                 self._append_event(num, "server", "state", {
                     "from": None, "to": state,
-                    "reason": "hold_mode" if (hold or hold_mode) else None,
+                    "reason": "hold mode is on" if (hold or hold_mode) else None,
                     "text": "new → %s" % state})
                 self.conn.execute("COMMIT")
             except Exception:
@@ -1124,7 +1138,7 @@ class App:
                     self.conn.execute("ROLLBACK")
                     raise
                 self._apply_transition(cn, from_state, to_state, actor,
-                                       "verdict:%s" % verdict, None)
+                                       VERDICT_REASON[verdict], None)
             results.append({"num": cn, "state": to_state, "bounce_count": bounce,
                             "escalate": escalate})
         self.notify()
@@ -1424,7 +1438,7 @@ class App:
         elif action == "hold":
             self.transition(num, "held", actor, reason="hold")
         elif action == "release":
-            self.transition(num, "queued", actor, reason="released")
+            self.transition(num, "queued", actor, reason="released — work can start")
         elif action == "duplicate_of":
             target = body.get("dup_of", body.get("card_num"))
             try:
@@ -1464,7 +1478,7 @@ class App:
                 except Exception:
                     self.conn.execute("ROLLBACK")
                     raise
-            self.transition(num, "queued", actor, reason="retry")
+            self.transition(num, "queued", actor, reason="retry with a fresh agent")
         else:
             raise ApiError(400, "bad_action",
                            "action must be pin, unpin, cancel, hold, release, "
@@ -1510,7 +1524,11 @@ class App:
             return {"ok": True, "sprint": self.sprint_json(
                 self.q1("SELECT * FROM sprints WHERE id=?", (row["id"],)))}
         if action == "set_hold_mode":
-            val = body.get("hold_mode", body.get("value"))
+            val = body.get("hold_mode")
+            if not isinstance(val, bool):
+                val = body.get("value")
+            if not isinstance(val, bool):
+                val = body.get("on")
             if not isinstance(val, bool):
                 raise ApiError(400, "missing_field", "hold_mode must be a bool",
                                field="hold_mode")
@@ -1521,8 +1539,8 @@ class App:
                     self.conn.execute("UPDATE sprints SET hold_mode=? WHERE id=?",
                                       (1 if val else 0, row["id"]))
                     self._append_event(None, actor, "note", {
-                        "text": "hold mode on -- new cards will wait" if val
-                                else "hold mode off -- new cards queue",
+                        "text": "hold mode on — new cards will wait" if val
+                                else "hold mode off — new cards queue",
                         "hold_mode": val})
                     self.conn.execute("COMMIT")
                 except Exception:
@@ -1765,8 +1783,13 @@ def make_handler(app: App):
                 if method == "GET" and path == "/" and query.get("t"):
                     cookie = "%s=%s; Path=/; SameSite=Lax; Max-Age=31536000; HttpOnly" % (
                         COOKIE_NAME, urllib.parse.quote(app.token))
+                    # Keep every OTHER query param (?theme=, ?mock=) -- only the
+                    # token is consumed here.
+                    rest = [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query)
+                            if k != "t"]
+                    location = "/" + ("?" + urllib.parse.urlencode(rest) if rest else "")
                     return self._send(302, b"", "text/plain",
-                                      [("Set-Cookie", cookie), ("Location", "/")])
+                                      [("Set-Cookie", cookie), ("Location", location)])
 
                 if method == "POST":
                     return self._post(path, query)

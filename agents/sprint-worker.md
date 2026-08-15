@@ -176,6 +176,12 @@ worktree root — not committed) shaped like:
   card's "See it live" button on the board links straight to it. Don't
   stop the server yourself — the session kills it once the card reaches
   a terminal state.
+  Pass screenshots as **absolute file paths**. The board copies each one
+  into its own attachment store when it accepts your packet and serves it
+  back to the user's browser — you don't upload anything, and a file you
+  delete later is still visible on the card. A path that doesn't exist
+  when you post is silently unviewable, so post the packet while the
+  files are still on disk.
 - If you were dispatched as a batch, add `per_card`: one entry per
   member card, `{"card_num": N, "claim": "...", "screenshots": [...]}`.
   Call `sprint-ready` once (any one member card number) with the full

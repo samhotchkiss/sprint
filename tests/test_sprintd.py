@@ -170,6 +170,21 @@ class TestAuthAndHealth(Base):
                              headers={"Cookie": "%s=test-token" % sprintd.COOKIE_NAME})
         self.assertEqual(status, 200)
 
+    def test_handshake_keeps_the_other_query_params(self):
+        """?t= is consumed by the cookie handshake; ?theme=/?mock= must survive."""
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        try:
+            conn.request("GET", "/?t=test-token&theme=dark&mock=1")
+            resp = conn.getresponse()
+            resp.read()
+            self.assertEqual(resp.status, 302)
+            loc = resp.getheader("Location")
+            self.assertNotIn("t=test-token", loc)
+            self.assertIn("theme=dark", loc)
+            self.assertIn("mock=1", loc)
+        finally:
+            conn.close()
+
     def test_placeholder_page_when_web_missing(self):
         status, body = self.get("/")
         self.assertEqual(status, 200)
@@ -1150,6 +1165,28 @@ class TestBoardPayloadForTheUI(Base):
             self.assertIn(state, board["column_of"])
         self.assertEqual(board["column_of"]["integrating"], "ready")
         self.assertEqual(board["column_of"]["completed"], "done")
+
+    def test_every_batch_member_shows_the_shared_packet(self):
+        """One batch, one packet -- but each member card is asking for its own
+        verdict, so each one has to show the user what to check."""
+        nums = [self.new_card("m%d" % i)["num"] for i in range(3)]
+        self.post("/api/batches", {"card_nums": nums, "agent_name": "sprint-batch-1",
+                                   "branch": "sprint/batch-1"})
+        for n in nums:
+            self.to_in_progress(n)
+        packet = dict(GOOD_PACKET, per_card=[
+            {"card_num": n, "claim": "member %d fixed" % n} for n in nums])
+        status, _ = self.post("/api/cards/%d/ready" % nums[0], {"packet": packet})
+        self.assertEqual(status, 200)
+        for n in nums:
+            card = [c for c in self.get("/api/board")[1]["cards"] if c["num"] == n][0]
+            self.assertIsNotNone(card["evidence"], "#%d has nothing to review" % n)
+            self.assertEqual(card["evidence"]["packet"]["claim"], GOOD_PACKET["claim"])
+            _, detail = self.get("/api/cards/%d" % n)
+            self.assertEqual(len(detail["evidence"]["packet"]["per_card"]), 3)
+        self.assertFalse(self.get("/api/cards/%d" % nums[0])[1]["evidence"]["shared"])
+        self.assertTrue(self.get("/api/cards/%d" % nums[1])[1]["evidence"]["shared"],
+                        "a member flags that the packet came from a sibling")
 
     def test_card_detail_shape(self):
         num = self.new_card("shape me", images=[PNG_B64])["num"]
