@@ -177,6 +177,17 @@ Dispatch order: pinned cards first, then oldest-queued-first. Don't
 dispatch `held` cards — those wait for hold mode to release or an
 explicit per-card `release`.
 
+**A "queued behind X" promise is a trigger, not a note.** Every time ANY
+card changes state — a merge lands, a card flips ready, an agent frees a
+slot — re-walk every `queued` and `blocked` card and ask: does its
+stated reason still hold? If the blocker cleared, dispatch (or unblock)
+in that same wakeup, and say so on the card. Never leave a card waiting
+on a condition that already resolved; the user has caught this exact
+failure live ("#5 was 'queued behind #1' but it never actually got
+pulled in once #1 was ready"). If a card must wait on another card's
+files, prefer STACKING its branch on the blocker's branch over waiting —
+stacking waits on nobody, and you absorb the rebase if the base bounces.
+
 **Never close a card instead of dispatching it.** A card you think needs
 no work is not yours to cancel or complete — see "Closing a card is the
 user's verb" in step 6. Dispatch it, or answer it into `ready`, or say
