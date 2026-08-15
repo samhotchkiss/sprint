@@ -56,6 +56,10 @@ function paint() {
   document.body.classList.toggle('hold-on', !!(store.sprint && store.sprint.hold_mode));
 
   for (const btn of el.viewBtns) btn.classList.toggle('is-on', btn.dataset.view === store.view);
+  // "Unseen" means exactly that: the moment the session chat is the thing in the
+  // rail, you have seen it. Closing a card back onto an already-open chat counts
+  // just as much as clicking the button does.
+  if (store.unseen && store.chatOpen && !store.detail) store.unseen = false;
   paintChatButton();
 
   clear(el.main);

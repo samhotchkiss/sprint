@@ -51,18 +51,24 @@ export function renderThread(root, detail, app) {
     }, app));
   }
 
-  for (const ev of items) {
+  // The question the card is actually waiting on renders as a panel at the
+  // bottom, so its event would otherwise say the same words twice in a row.
+  const liveQuestion = (state === 'needs_you' && card && card.question)
+    ? lastIndexOfKind(items, 'question') : -1;
+
+  items.forEach((ev, i) => {
+    if (i === liveQuestion) return;
     if (SYSTEM_KINDS.has(ev.kind) && ev.kind !== 'submitted' && ev.kind !== 'evidence') {
       root.appendChild(statusChange(ev, app));
-      continue;
+      return;
     }
-    if (ev.kind === 'evidence') continue;      // the packet itself renders below
+    if (ev.kind === 'evidence') return;        // the packet itself renders below
     root.appendChild(message(ev, app));
     const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
     if (Array.isArray(atts) && atts.length) {
       root.appendChild(shotRow(atts, app, ev.actor === 'user'));
     }
-  }
+  });
 
   if (Array.isArray(card && card.attachments) && card.attachments.length) {
     root.appendChild(shotRow(card.attachments, app, true, 'you attached this'));
@@ -81,6 +87,11 @@ export function renderThread(root, detail, app) {
     }
     root.appendChild(evidencePacket(packet, card, state, app));
   }
+}
+
+function lastIndexOfKind(items, kind) {
+  for (let i = items.length - 1; i >= 0; i -= 1) if (items[i].kind === kind) return i;
+  return -1;
 }
 
 /** The session chat: same bubbles, no card machinery. */

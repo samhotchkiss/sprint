@@ -1146,8 +1146,10 @@ body.rail-open .rail { display: flex; }
   #app { grid-template-rows: auto auto 1fr; }
   .topbar { height: auto; padding: 12px; flex-wrap: wrap; gap: 10px; }
   .sprint-name { font-size: 19px; max-width: 100%; }
+  /* List vs Board is a desktop choice; a phone gets one column either way. */
   .seg { display: none; }
-  .drop-btn { display: none; }
+  .drop-btn { flex: 1; }
+  .chat-btn { border-color: var(--border-chip); }
 
   .main { padding: 0; }
   .fold-cols { display: block; background: none; overflow-y: auto; }
@@ -1157,14 +1159,22 @@ body.rail-open .rail { display: flex; }
 
   /* needs-you keeps full rows with tappable chips; the rest compresses */
   .phone-needs .needs-row {
-    grid-template-columns: 1fr;
-    gap: 0;
+    grid-template-columns: auto 1fr;
+    grid-template-areas: "num meta" "main main";
+    gap: 0 9px;
     padding: 14px 16px;
     border-left-width: 3px;
   }
-  .phone-needs .needs-row .row-right { text-align: left; display: flex; align-items: center; gap: 9px; padding: 0 0 8px 0; }
-  .phone-needs .needs-row .row-meta { margin-top: 0; }
-  .phone-needs .needs-row .row-num { padding-top: 0; }
+  .phone-needs .needs-row .row-num { grid-area: num; padding-top: 0; }
+  .phone-needs .needs-row .row-right {
+    grid-area: meta;
+    text-align: left;
+    display: flex;
+    align-items: baseline;
+    gap: 9px;
+  }
+  .phone-needs .needs-row .row-main { grid-area: main; margin-top: 8px; }
+  .phone-needs .needs-row .row-meta { margin-top: 0; margin-left: auto; }
   .phone-needs .row-title { font-size: 15px; }
   .phone-needs .chip-btn { min-height: 44px; display: flex; align-items: center; padding: 0 15px; font-size: 13.5px; font-family: var(--font-body); color: var(--ink); }
 
