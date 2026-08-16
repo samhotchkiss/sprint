@@ -10787,5 +10787,896 @@ class TestSwitcherSquare(Base):
         board.pop("chat_unread", None)
         self.assertEqual(sprintd.board_rollup(board)["chat_unread"], 0)
 
+
+# --------------------------------------------------------------------------
+# Dead-session autoheal (card #68)
+#
+# The outage this exists for, twice in one day: a session is killed at a
+# provider limit, its board keeps serving, and cards the user already approved
+# sit in `integrating` for six hours because there is no brain left to merge
+# them. These tests hold the three halves apart -- the board deciding it is
+# dead, the crash-loop guard around waking it, and the hub actually reaching
+# for tmux-send -- because each of them fails differently.
+# --------------------------------------------------------------------------
+
+
+class AutohealBase(Base):
+    """A board with the autoheal clocks turned down, and a clock you can rewind.
+
+    `go_quiet` is the whole fixture: it makes the board believe nothing the
+    session could do has happened for N seconds, by moving the three proofs of
+    life (drain cursor, waiter sighting, the session's own last word) into the
+    past. Nothing here sleeps.
+    """
+
+    DEAD_AFTER = 60.0
+
+    def setUp(self):
+        super().setUp()
+        self.app.session_dead_seconds = self.DEAD_AFTER
+        self.app.revive_min_interval = 600.0
+        self.app.revive_max_burst = 3
+        self.app.revive_burst_window = 3600.0
+        self.app.revive_grace_seconds = 180.0
+        self.register("test-window")
+
+    # -- fixtures -------------------------------------------------------
+
+    def register(self, window):
+        status, body = self.req("PUT", "/api/settings",
+                                {"session_tmux_window": window, "actor": "session"})
+        self.assertEqual(status, 200, body)
+        return body
+
+    def touch_session(self, seconds_ago=0.0, seq=None):
+        """The session drained the log `seconds_ago`. The strongest proof of life."""
+        ts = time.time() - seconds_ago
+        seq = self.app.max_seq() if seq is None else seq
+        with self.app.lock:
+            self.app.conn.execute(
+                "INSERT INTO cursors(name, seq, updated_at) VALUES('orchestrator',?,?) "
+                "ON CONFLICT(name) DO UPDATE SET seq=excluded.seq, "
+                "updated_at=excluded.updated_at", (seq, ts))
+
+    def go_quiet(self, seconds=None):
+        """Nothing the session could have done has happened for `seconds`."""
+        seconds = self.DEAD_AFTER + 30 if seconds is None else seconds
+        self.touch_session(seconds_ago=seconds)
+        self.app._waiter_seen_at = None
+        self.app._waiter_persisted_at = 0.0
+        with self.app.lock:
+            self.app.conn.execute("DELETE FROM cursors WHERE name=?",
+                                  (sprintd.WAITER_CURSOR,))
+            # A session line in the log is proof of life on its own, so a
+            # fixture that leaves one behind would silently un-kill the board.
+            self.app.conn.execute("UPDATE events SET ts=? WHERE actor='session'",
+                                  (time.time() - seconds,))
+
+    def rewind(self, seconds):
+        """Move the WHOLE board that far into the past -- every event and every
+        cursor. The only honest way to test a ten-minute rule without waiting
+        ten minutes: nothing is special-cased, so the relationships between the
+        timestamps (which is what every guard reads) survive intact."""
+        with self.app.lock:
+            self.app.conn.execute("UPDATE events SET ts = ts - ?", (seconds,))
+            self.app.conn.execute("UPDATE cursors SET updated_at = updated_at - ?",
+                                  (seconds,))
+        if self.app._waiter_seen_at is not None:
+            self.app._waiter_seen_at -= seconds
+
+    def owed_card(self, state="integrating"):
+        """One card the SESSION owes an action on."""
+        num = self.new_card("something owed")["num"]
+        if state == "queued":
+            return num
+        self.to_in_progress(num)
+        if state == "in_progress":
+            return num
+        packet = dict(GOOD_PACKET)
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": packet})
+        self.assertEqual(status, 200, body)
+        status, body = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "integrating")
+        return num
+
+    # -- readers --------------------------------------------------------
+
+    def events_of(self, kind):
+        rows = self.app.q("SELECT * FROM events WHERE card_num IS NULL AND kind=? "
+                          "ORDER BY seq", (kind,))
+        return [sprintd.App.event_json(r) for r in rows]
+
+    def sweep(self, times=1):
+        return sum(self.app.sweep_session_dead() for _ in range(times))
+
+
+class TestSessionDeadDetection(AutohealBase):
+    def test_a_quiet_session_with_owed_cards_is_dead_and_says_so_once(self):
+        self.owed_card("integrating")
+        self.go_quiet()
+        state = self.app.session_dead_state()
+        self.assertTrue(state["dead"], state)
+        self.assertIsNone(state["reason"])
+        self.sweep(4)
+        deaths = self.events_of("session_dead")
+        self.assertEqual(len(deaths), 1, "one event per death episode, not one per tick")
+        self.assertEqual(deaths[0]["actor"], "server")
+
+    def test_the_event_names_what_is_stranded(self):
+        a = self.owed_card("integrating")
+        b = self.owed_card("in_progress")
+        c = self.owed_card("queued")
+        self.go_quiet()
+        self.sweep()
+        payload = self.events_of("session_dead")[0]["payload"]
+        self.assertEqual(payload["owed"]["integrating"], [a])
+        self.assertEqual(payload["owed"]["in_progress"], [b])
+        self.assertEqual(payload["owed"]["queued"], [c])
+        self.assertEqual(payload["owed_count"], 3)
+        self.assertIn("3 cards waiting on it", payload["text"])
+        self.assertEqual(payload["tmux_window"], "test-window")
+
+    def test_a_session_that_moved_its_cursor_is_not_dead(self):
+        self.owed_card("integrating")
+        self.go_quiet()
+        self.touch_session(seconds_ago=1.0)       # it just drained the log
+        state = self.app.session_dead_state()
+        self.assertFalse(state["dead"])
+        self.assertEqual(state["reason"], "alive")
+        self.assertEqual(state["last_seen_by"], "cursor")
+        self.assertEqual(self.sweep(3), 0)
+        self.assertEqual(self.events_of("session_dead"), [])
+
+    def test_the_waiter_polling_is_proof_of_life_on_its_own(self):
+        """The long-poll keeps ticking while the orchestrator legitimately lags
+        minutes mid-dispatch. That is the exact case the offline banner learned
+        not to cry about, and this rule inherits it."""
+        self.owed_card("integrating")
+        self.go_quiet()
+        self.app.note_waiter_seen()
+        state = self.app.session_dead_state()
+        self.assertFalse(state["dead"])
+        self.assertEqual(state["last_seen_by"], "waiter")
+        self.assertEqual(self.sweep(2), 0)
+
+    def test_the_session_speaking_is_proof_of_life_on_its_own(self):
+        self.owed_card("integrating")
+        self.go_quiet()
+        status, body = self.post("/api/sidebar",
+                                 {"text": "still here", "actor": "session"})
+        self.assertIn(status, (200, 201), body)
+        state = self.app.session_dead_state()
+        self.assertFalse(state["dead"])
+        self.assertEqual(state["last_seen_by"], "spoke")
+        self.assertEqual(self.sweep(2), 0)
+
+    def test_the_USER_typing_is_not_proof_the_session_is_alive(self):
+        """The russ outage had the user still posting to a board whose session
+        had been dead for five hours. A user event must never resurrect it."""
+        self.owed_card("integrating")
+        self.go_quiet()
+        status, body = self.post("/api/sidebar", {"text": "hello?"})
+        self.assertIn(status, (200, 201), body)
+        self.assertTrue(self.app.session_dead_state()["dead"])
+        self.assertEqual(self.sweep(), 1)
+
+    def test_a_board_that_only_needs_the_USER_is_not_a_dead_session(self):
+        """needs_you and ready are the human's court. Waking a session to look
+        at them would achieve nothing, so the rule stays quiet."""
+        stuck = self.new_card("a question")["num"]
+        self.to_in_progress(stuck)
+        status, body = self.post("/api/cards/%d/question" % stuck,
+                                 {"text": "which one?"})
+        self.assertIn(status, (200, 201), body)
+        done = self.new_card("done")["num"]
+        self.to_in_progress(done)
+        status, body = self.post("/api/cards/%d/ready" % done,
+                                 {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200, body)
+        self.go_quiet()
+        state = self.app.session_dead_state()
+        self.assertFalse(state["dead"])
+        self.assertEqual(state["reason"], "no_work")
+        self.assertEqual(self.sweep(3), 0)
+
+    def test_an_account_limit_means_parked_and_never_dead(self):
+        """#47 owns this case. A session under an account limit cannot run, so
+        it is not dead -- and poking it is exactly the wrong act."""
+        self.owed_card("integrating")
+        self.go_quiet()
+        status, body = self.post("/api/limits",
+                                 {"kind": "account",
+                                  "resets_at": time.time() + 7200})
+        self.assertIn(status, (200, 201), body)
+        state = self.app.session_dead_state()
+        self.assertFalse(state["dead"])
+        self.assertEqual(state["reason"], "account_limited")
+        self.assertTrue(state["account_limited"])
+        self.assertEqual(self.sweep(3), 0)
+        self.assertEqual(self.events_of("session_dead"), [])
+
+    def test_the_limit_lifting_lets_the_rule_run_again(self):
+        self.owed_card("integrating")
+        status, body = self.post("/api/limits",
+                                 {"kind": "account", "resets_at": time.time() + 7200})
+        self.assertIn(status, (200, 201), body)
+        limit_id = body["limit"]["id"]
+        self.go_quiet()
+        self.assertEqual(self.sweep(2), 0)
+        status, body = self.post("/api/limits/%d/clear" % limit_id)
+        self.assertEqual(status, 200, body)
+        self.go_quiet()
+        self.assertEqual(self.sweep(), 1)
+
+    def test_a_second_death_after_a_recovery_fires_again(self):
+        """An episode runs from the session's last proof of life, exactly the
+        way a card's stuck episode runs from its last transition (#67)."""
+        self.owed_card("integrating")
+        self.go_quiet()
+        self.sweep(2)
+        self.assertEqual(len(self.events_of("session_dead")), 1)
+        self.touch_session(seconds_ago=0.0)                  # it came back
+        self.assertEqual(self.sweep(2), 0)
+        # ...and died again. The whole board moves into the past together, so
+        # the coming-back still sits AFTER the first death event -- which is
+        # what makes this a second episode rather than the same one.
+        self.rewind(self.DEAD_AFTER + 30)
+        self.sweep(2)
+        self.assertEqual(len(self.events_of("session_dead")), 2)
+
+    def test_a_board_with_no_registered_window_still_says_it_died(self):
+        """Detection is the board's own honesty about itself; revivability is a
+        separate question. A board nobody can wake still says so out loud, and
+        the detail names the reason nothing will happen."""
+        self.register("")
+        self.owed_card("integrating")
+        self.go_quiet()
+        self.assertEqual(self.sweep(), 1)
+        payload = self.events_of("session_dead")[0]["payload"]
+        self.assertIsNone(payload["tmux_window"])
+        self.assertIn("no tmux window", payload["detail"])
+
+    def test_the_board_payload_carries_the_verdict(self):
+        self.owed_card("integrating")
+        self.go_quiet()
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        auto = board["autoheal"]
+        self.assertTrue(auto["dead"])
+        self.assertTrue(auto["registered"])
+        self.assertEqual(auto["tmux_window"], "test-window")
+        self.assertTrue(auto["revive_wanted"])
+        self.assertEqual(auto["attempts"], 0)
+
+
+class TestReviveClaimAndCaps(AutohealBase):
+    """The crash-loop guard, mirrored from self-restart (#62): a board that
+    cannot be woken must never become a board that is poked forever."""
+
+    def dead_board(self):
+        num = self.owed_card("integrating")
+        self.go_quiet()
+        return num
+
+    def claim(self, expect=200):
+        status, body = self.post("/api/autoheal/revive", {"by": "hub"})
+        self.assertEqual(status, expect, body)
+        return body
+
+    def test_the_first_claim_is_granted_and_spends_one_slot(self):
+        self.dead_board()
+        out = self.claim()
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["attempt"], 1)
+        self.assertEqual(out["max_attempts"], 3)
+        self.assertEqual(out["tmux_window"], "test-window")
+        attempts = self.events_of("revive_attempted")
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["payload"]["attempt"], 1)
+        self.assertEqual(attempts[0]["seq"], out["attempt_seq"])
+
+    def test_the_claim_is_written_before_the_message_is_sent(self):
+        """Same ordering as the self-restart stamp, for the same reason: the
+        case this guard exists for is the one where what happens next never
+        comes back. The claim alone has to spend the slot."""
+        self.dead_board()
+        out = self.claim()
+        self.assertEqual(len(self.events_of("revive_attempted")), 1)
+        # ...and no result has been reported yet
+        self.assertIsNone(self.app.revive_result_for(out["attempt_seq"]))
+
+    def test_a_second_claim_inside_ten_minutes_is_held(self):
+        self.dead_board()
+        self.claim()
+        out = self.claim(expect=409)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["reason"], "held")
+        self.assertIn("woken", out["detail"])
+        self.assertEqual(len(self.events_of("revive_attempted")), 1)
+
+    def test_the_interval_passing_lets_the_next_one_through(self):
+        self.dead_board()
+        self.claim()
+        self.rewind(self.app.revive_min_interval + 30)
+        out = self.claim()
+        self.assertEqual(out["attempt"], 2)
+        self.assertEqual(len(self.events_of("revive_attempted")), 2)
+
+    def test_three_wake_ups_and_autoheal_gives_up(self):
+        self.dead_board()
+        for expected in (1, 2, 3):
+            out = self.claim()
+            self.assertEqual(out["attempt"], expected)
+            self.rewind(self.app.revive_min_interval + 30)
+        out = self.claim(expect=409)
+        self.assertEqual(out["reason"], "gave_up")
+        self.assertEqual(len(self.events_of("revive_attempted")), 3)
+
+    def test_the_give_up_event_names_the_blocked_terminal_case(self):
+        """The second outage of the day: the process was alive with a /status
+        dialog open, tmux-send verified delivery, and nothing happened. The
+        give-up line has to say the thing the user can physically do."""
+        self.dead_board()
+        for _ in range(3):
+            out = self.claim()
+            self.post("/api/autoheal/revive",
+                      {"attempt_seq": out["attempt_seq"], "sent": True})
+            self.rewind(self.app.revive_min_interval + 30)
+        self.sweep(3)
+        gave_up = self.events_of("revive_gave_up")
+        self.assertEqual(len(gave_up), 1, "one give-up per episode")
+        text = gave_up[0]["payload"]["text"]
+        self.assertIn("delivered", text)
+        self.assertIn("never stirred", text)
+        self.assertIn("blocked by an open dialog", text)
+        self.assertIn("Check the window by hand", text)
+        self.assertTrue(gave_up[0]["payload"]["delivered_but_silent"])
+
+    def test_a_delivery_failure_gets_the_other_give_up_sentence(self):
+        """"The message never landed" and "the message landed and nothing
+        happened" are different problems with different next acts."""
+        self.dead_board()
+        for _ in range(3):
+            out = self.claim()
+            self.post("/api/autoheal/revive",
+                      {"attempt_seq": out["attempt_seq"], "sent": False,
+                       "detail": "tmux-send exited 3: no such window"})
+            self.rewind(self.app.revive_min_interval + 30)
+        self.sweep(2)
+        text = self.events_of("revive_gave_up")[0]["payload"]["text"]
+        self.assertIn("could not be delivered", text)
+        self.assertNotIn("open dialog", text)
+
+    def test_a_wake_up_that_worked_ends_the_episode_and_frees_the_budget(self):
+        self.dead_board()
+        self.claim()
+        self.touch_session(seconds_ago=0.0)          # the session woke up
+        state = self.app.session_dead_state()
+        self.assertFalse(state["dead"])
+        rev = self.app.revive_state(dead=state)
+        self.assertTrue(rev["stirred"])
+        self.assertEqual(rev["attempts_this_episode"], 0)
+
+    def test_a_delivered_message_that_never_stirs_it_is_a_failed_attempt(self):
+        """Submission is not revival. Delivery proves delivery and nothing else."""
+        self.dead_board()
+        out = self.claim()
+        self.post("/api/autoheal/revive",
+                  {"attempt_seq": out["attempt_seq"], "sent": True})
+        self.rewind(self.app.revive_grace_seconds + 5)
+        rev = self.app.revive_state()
+        self.assertFalse(rev["stirred"])
+        self.assertTrue(rev["delivered_but_silent"])
+        self.assertEqual(rev["attempts_this_episode"], 1)
+
+    def test_a_live_session_is_never_claimable(self):
+        self.owed_card("integrating")
+        self.touch_session(seconds_ago=0.0)
+        out = self.claim(expect=409)
+        self.assertEqual(out["reason"], "alive")
+        self.assertEqual(self.events_of("revive_attempted"), [])
+
+    def test_a_board_with_no_window_is_never_claimable(self):
+        self.register("")
+        self.dead_board()
+        out = self.claim(expect=409)
+        self.assertEqual(out["reason"], "no_tmux_window")
+        self.assertEqual(self.events_of("revive_attempted"), [])
+
+    def test_an_account_limit_refuses_the_claim(self):
+        self.dead_board()
+        status, body = self.post("/api/limits",
+                                 {"kind": "account", "resets_at": time.time() + 7200})
+        self.assertIn(status, (200, 201), body)
+        out = self.claim(expect=409)
+        self.assertEqual(out["reason"], "account_limited")
+        self.assertEqual(self.events_of("revive_attempted"), [])
+
+    def test_reporting_a_result_never_spends_a_slot(self):
+        self.dead_board()
+        out = self.claim()
+        for _ in range(4):
+            status, body = self.post("/api/autoheal/revive",
+                                     {"attempt_seq": out["attempt_seq"], "sent": True})
+            self.assertEqual(status, 200, body)
+        self.assertEqual(len(self.events_of("revive_attempted")), 1)
+
+    def test_a_result_for_an_attempt_that_does_not_exist_is_a_404(self):
+        self.dead_board()
+        status, body = self.post("/api/autoheal/revive",
+                                 {"attempt_seq": 999999, "sent": True})
+        self.assertEqual(status, 404, body)
+
+
+class TestReviveBrief(AutohealBase):
+    def brief(self):
+        status, body = self.get("/api/autoheal?brief=1")
+        self.assertEqual(status, 200, body)
+        return body["brief"]
+
+    def test_the_brief_names_the_stranded_cards_by_number(self):
+        a = self.owed_card("integrating")
+        b = self.owed_card("integrating")
+        c = self.owed_card("in_progress")
+        self.go_quiet()
+        text = self.brief()
+        self.assertIn("#%d" % a, text)
+        self.assertIn("#%d" % b, text)
+        self.assertIn("#%d" % c, text)
+        self.assertIn("approved by the user but never merged", text)
+        self.assertIn("Land the approved branches one at a time", text)
+
+    def test_the_brief_says_do_not_dispatch_first(self):
+        """The order of operations is the whole point: the recovery that worked
+        by hand landed the approved branches BEFORE dispatching anything."""
+        self.owed_card("integrating")
+        self.go_quiet()
+        text = self.brief()
+        self.assertIn("do NOT dispatch anything first", text)
+        self.assertLess(text.index("Land the approved branches"),
+                        text.index("Re-dispatch"))
+
+    def test_the_brief_makes_the_session_prove_it_owns_this_board(self):
+        """The other half of the outage: the wrong window was guessed, and a
+        session that did not own that board started posting to it."""
+        self.owed_card("integrating")
+        self.go_quiet()
+        text = self.brief()
+        self.assertIn(self.app.project_root, text)
+        self.assertIn("check this is your board", text)
+        self.assertIn("wrong session", text)
+
+    def test_the_brief_carries_the_cursor_gap(self):
+        self.owed_card("integrating")
+        self.touch_session(seconds_ago=self.DEAD_AFTER + 30, seq=1)
+        self.app._waiter_seen_at = None
+        with self.app.lock:
+            self.app.conn.execute("DELETE FROM cursors WHERE name=?",
+                                  (sprintd.WAITER_CURSOR,))
+            self.app.conn.execute("UPDATE events SET ts=? WHERE actor='session'",
+                                  (time.time() - self.DEAD_AFTER - 30,))
+        text = self.brief()
+        self.assertIn("cursor: 1 of %d" % self.app.max_seq(), text)
+        self.assertIn("Read the event log from seq 1", text)
+
+    def test_the_brief_counts_the_attempt_it_belongs_to(self):
+        self.owed_card("integrating")
+        self.go_quiet()
+        out = self.post("/api/autoheal/revive", {"by": "hub"})[1]
+        self.assertIn("attempt 1 of 3", out["brief"])
+        self.rewind(self.app.revive_min_interval + 30)
+        out = self.post("/api/autoheal/revive", {"by": "hub"})[1]
+        self.assertIn("attempt 2 of 3", out["brief"])
+
+    def test_a_long_queue_is_summarised_not_listed_forever(self):
+        for _ in range(20):
+            self.owed_card("queued")
+        self.go_quiet()
+        text = self.brief()
+        self.assertIn("queued and never dispatched: 20 cards", text)
+        self.assertIn("more)", text)
+
+
+class TestTmuxWindowRegistration(Base):
+    """Piece one: the session says where it can be reached."""
+
+    def settings(self):
+        status, body = self.get("/api/settings")
+        self.assertEqual(status, 200, body)
+        return body
+
+    def test_a_window_round_trips_through_settings(self):
+        self.assertEqual(self.settings()["session_tmux_window"], "")
+        status, body = self.req("PUT", "/api/settings",
+                                {"session_tmux_window": "russ-machine",
+                                 "actor": "session"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["session_tmux_window"], "russ-machine")
+        self.assertEqual(self.settings()["session_tmux_window"], "russ-machine")
+        self.assertEqual(self.app.session_tmux_window(), "russ-machine")
+        status, board = self.get("/api/board")
+        self.assertEqual(board["autoheal"]["tmux_window"], "russ-machine")
+        self.assertTrue(board["autoheal"]["registered"])
+
+    def test_it_survives_a_restart_because_it_is_a_file(self):
+        self.req("PUT", "/api/settings", {"session_tmux_window": "sess:1"})
+        reopened = sprintd.App(self.project_root, log=self.logfh, token="test-token")
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.session_tmux_window(), "sess:1")
+
+    def test_last_write_wins_because_a_window_is_an_address(self):
+        """The opposite of `agent_name`, deliberately. A session that came back
+        in a different window must be able to correct it, or the hub types a
+        wake-up brief into whatever is in the old one now."""
+        self.req("PUT", "/api/settings", {"session_tmux_window": "old-window"})
+        status, body = self.req("PUT", "/api/settings",
+                                {"session_tmux_window": "new-window"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.app.session_tmux_window(), "new-window")
+
+    def test_an_empty_string_unregisters(self):
+        self.req("PUT", "/api/settings", {"session_tmux_window": "somewhere"})
+        status, body = self.req("PUT", "/api/settings", {"session_tmux_window": ""})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.app.session_tmux_window(), "")
+        status, board = self.get("/api/board")
+        self.assertFalse(board["autoheal"]["registered"])
+        self.assertIsNone(board["autoheal"]["tmux_window"])
+
+    def test_a_window_with_a_space_is_refused_by_name(self):
+        """It becomes argv. Anything that could be read as a second argument is
+        refused at the door rather than quoted at the call site."""
+        for bad in ("two words", "-dash-leading", "semi;colon", "back`tick",
+                    "$(whoami)", "a" * 200):
+            status, body = self.req("PUT", "/api/settings",
+                                    {"session_tmux_window": bad})
+            self.assertEqual(status, 400, (bad, body))
+            self.assertEqual(body["field"], "session_tmux_window")
+        self.assertEqual(self.app.session_tmux_window(), "")
+
+    def test_real_tmux_targets_are_accepted(self):
+        for good in ("russ-machine", "sess:1", "sess:1.0", "%5", "a_b.c-d"):
+            status, body = self.req("PUT", "/api/settings",
+                                    {"session_tmux_window": good})
+            self.assertEqual(status, 200, (good, body))
+            self.assertEqual(self.app.session_tmux_window(), good)
+
+    def test_registering_writes_one_quiet_line_in_the_log(self):
+        self.req("PUT", "/api/settings",
+                 {"session_tmux_window": "russ-machine", "actor": "session"})
+        notes = [sprintd.App.event_json(r) for r in self.app.q(
+            "SELECT * FROM events WHERE card_num IS NULL AND kind='note' ORDER BY seq")]
+        hit = [n for n in notes if n["payload"].get("session_tmux_window")]
+        self.assertEqual(len(hit), 1)
+        self.assertIn("russ-machine", hit[0]["payload"]["text"])
+        self.assertEqual(hit[0]["actor"], "server")
+
+    def test_a_hand_edited_config_with_a_broken_window_falls_back_to_none(self):
+        """A config.json somebody typed into must never be able to point the
+        hub at a target that is not one."""
+        with open(self.app.config_path, "w", encoding="utf-8") as fh:
+            json.dump({"session_tmux_window": "not a window at all"}, fh)
+        self.assertEqual(self.app.session_tmux_window(), "")
+
+    def test_an_unknown_settings_key_is_still_refused(self):
+        status, body = self.req("PUT", "/api/settings", {"tmux_window": "x"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "tmux_window")
+
+
+class TestTmuxWindowAtLaunch(unittest.TestCase):
+    """`sprintd start --tmux-window` — how a session registers at boot."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-tmux-launch-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "project")
+        os.makedirs(self.root)
+        self.registry = os.path.join(self.tmp, "registry.json")
+
+    def start(self, *extra):
+        argv = ["--project-root", self.root, "--registry", self.registry,
+                "start", "--foreground", "--no-tailscale", "--port", "0",
+                "--token", "launch-token"] + list(extra)
+        args = sprintd.build_parser().parse_args(argv)
+        return args
+
+    def test_the_flag_registers_the_window_on_a_fresh_board(self):
+        args = self.start("--tmux-window", "russ-machine")
+        self.assertEqual(args.tmux_window, "russ-machine")
+        app = sprintd.App(self.root, token="launch-token")
+        self.addCleanup(app.close)
+        app.claim_tmux_window(args.tmux_window, actor="session")
+        self.assertEqual(app.session_tmux_window(), "russ-machine")
+
+    def test_no_flag_registers_nothing_at_all(self):
+        """A session outside tmux passes nothing, and autoheal does not apply."""
+        args = self.start()
+        self.assertIsNone(args.tmux_window)
+        app = sprintd.App(self.root, token="launch-token")
+        self.addCleanup(app.close)
+        self.assertEqual(app.session_tmux_window(), "")
+        self.assertFalse(app.autoheal_json()["registered"])
+
+
+# --------------------------------------------------------------------------
+# The hub's half: the one hand on this machine that can type into a terminal
+# --------------------------------------------------------------------------
+
+
+class ReviverBase(HubBase):
+    """A real board, a real HubApp, and a FAKE tmux-send.
+
+    `_run` is the one seam, and every test swaps it for a recorder. A test that
+    really ran tmux-send would type a wake-up brief into whatever window the
+    developer happened to have open.
+    """
+
+    DEAD_AFTER = 60.0
+
+    def setUp(self):
+        super().setUp()
+        self.sends = []
+        # An executable that exists, so `tmux_send_ready` is happy, and which
+        # is never actually run because `_run` is replaced.
+        self.fake_send = os.path.join(self.tmp, "fake-tmux-send")
+        with open(self.fake_send, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(self.fake_send, 0o755)
+
+    def hub(self, **kw):
+        kw.setdefault("token", "hub-token")
+        kw.setdefault("tmux_send", self.fake_send)
+        hub = sprintd.HubApp(**kw)
+        hub._run = self.record
+        return hub
+
+    def record(self, argv, **kw):
+        self.sends.append(list(argv))
+        return _FakeProc(0)
+
+    def dead_board(self, name="alpha", window="alpha-window", owed="integrating"):
+        b = self.board(name)
+        app = b["app"]
+        app.session_dead_seconds = self.DEAD_AFTER
+        app.revive_min_interval = 600.0
+        app.revive_max_burst = 3
+        app.revive_burst_window = 3600.0
+        app.revive_grace_seconds = 180.0
+        if window:
+            app.claim_tmux_window(window, actor="session")
+        b["cards"] = [self.owe(b, owed)]
+        self.go_quiet(b)
+        return b
+
+    def owe(self, b, state="integrating"):
+        num = self.card(b, "owed work")
+        if state == "queued":
+            return num
+        self.bpost(b, "/api/cards/%d/state" % num, {"state": "triaging"})
+        self.bpost(b, "/api/cards/%d/state" % num, {"state": "in_progress"})
+        if state == "in_progress":
+            return num
+        self.bpost(b, "/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.bpost(b, "/api/cards/%d/verdict" % num, {"verdict": "approve"})
+        return num
+
+    def go_quiet(self, b, seconds=None):
+        app = b["app"]
+        seconds = (self.DEAD_AFTER + 30) if seconds is None else seconds
+        ts = time.time() - seconds
+        with app.lock:
+            app.conn.execute(
+                "INSERT INTO cursors(name, seq, updated_at) VALUES('orchestrator',?,?) "
+                "ON CONFLICT(name) DO UPDATE SET seq=excluded.seq, "
+                "updated_at=excluded.updated_at", (app.max_seq(), ts))
+            app.conn.execute("DELETE FROM cursors WHERE name=?", (sprintd.WAITER_CURSOR,))
+            app.conn.execute("UPDATE events SET ts=? WHERE actor='session'", (ts,))
+        app._waiter_seen_at = None
+        app._waiter_persisted_at = 0.0
+
+    def rewind(self, b, seconds):
+        app = b["app"]
+        with app.lock:
+            app.conn.execute("UPDATE events SET ts = ts - ?", (seconds,))
+            app.conn.execute("UPDATE cursors SET updated_at = updated_at - ?", (seconds,))
+        if app._waiter_seen_at is not None:
+            app._waiter_seen_at -= seconds
+
+    def attempts(self, b):
+        return b["app"].q("SELECT * FROM events WHERE card_num IS NULL "
+                          "AND kind='revive_attempted' ORDER BY seq")
+
+    def gave_up(self, b):
+        return [sprintd.App.event_json(r) for r in
+                b["app"].q("SELECT * FROM events WHERE card_num IS NULL "
+                           "AND kind='revive_gave_up' ORDER BY seq")]
+
+
+class _FakeProc:
+    def __init__(self, returncode, stderr=b""):
+        self.returncode = returncode
+        self.stdout = b""
+        self.stderr = stderr
+
+
+class TestHubReviver(ReviverBase):
+    def test_it_runs_tmux_send_with_a_brief_naming_the_stuck_cards(self):
+        b = self.dead_board()
+        hub = self.hub()
+        hub.refresh()
+        self.assertEqual(len(self.sends), 1, self.sends)
+        argv = self.sends[0]
+        self.assertEqual(argv[0], self.fake_send)
+        self.assertEqual(argv[1], "alpha-window")
+        brief = argv[2]
+        self.assertIn("#%d" % b["cards"][0], brief)
+        self.assertIn("approved by the user but never merged", brief)
+        self.assertIn(os.path.realpath(b["root"]), brief)
+        self.assertIn("attempt 1 of 3", brief)
+
+    def test_the_attempt_and_its_result_are_written_on_the_board(self):
+        b = self.dead_board()
+        self.hub().refresh()
+        rows = self.attempts(b)
+        self.assertEqual(len(rows), 1)
+        payload = json.loads(rows[0]["payload"])
+        self.assertEqual(payload["by"], "hub")
+        self.assertEqual(payload["tmux_window"], "alpha-window")
+        result = b["app"].revive_result_for(rows[0]["seq"])
+        self.assertIsNotNone(result)
+        self.assertTrue(result["sent"])
+
+    def test_a_live_board_is_never_woken(self):
+        b = self.board("beta")
+        b["app"].session_dead_seconds = self.DEAD_AFTER
+        b["app"].claim_tmux_window("beta-window", actor="session")
+        self.card(b, "queued work")
+        self.hub().refresh()
+        self.assertEqual(self.sends, [])
+
+    def test_a_board_with_no_registered_window_is_skipped(self):
+        b = self.dead_board(window=None)
+        hub = self.hub()
+        hub.refresh()
+        self.assertEqual(self.sends, [])
+        self.assertEqual(len(self.attempts(b)), 0)
+
+    def test_a_missing_tmux_send_logs_and_skips_without_crashing(self):
+        """The correct degrade on a machine that never installed the skill."""
+        b = self.dead_board()
+        hub = self.hub(tmux_send=os.path.join(self.tmp, "not-installed"))
+        snap = hub.refresh()
+        self.assertEqual(hub.maybe_revive(
+            {"project_root": b["root"], "port": b["port"]},
+            {"autoheal": b["app"].autoheal_json(), "name": "alpha"}), "no_tmux_send")
+        self.assertEqual(self.sends, [])
+        # No slot spent: a wake-up nobody could ever have sent must not burn
+        # one of this board's three.
+        self.assertEqual(len(self.attempts(b)), 0)
+        # ...and the hub still rendered its page.
+        self.assertEqual(len(snap["sprints"]), 1)
+
+    def test_a_tmux_send_that_fails_is_recorded_as_not_delivered(self):
+        b = self.dead_board()
+        hub = self.hub()
+        hub._run = lambda argv, **kw: _FakeProc(3, b"no such window: alpha-window")
+        hub.refresh()
+        rows = self.attempts(b)
+        self.assertEqual(len(rows), 1, "a failed send still spends its slot")
+        result = b["app"].revive_result_for(rows[0]["seq"])
+        self.assertFalse(result["sent"])
+        self.assertIn("no such window", result["detail"])
+
+    def test_a_tmux_send_that_raises_does_not_take_the_hub_down(self):
+        b = self.dead_board()
+        hub = self.hub()
+
+        def boom(argv, **kw):
+            raise OSError("exec format error")
+
+        hub._run = boom
+        snap = hub.refresh()
+        self.assertEqual(len(snap["sprints"]), 1)
+        result = b["app"].revive_result_for(self.attempts(b)[0]["seq"])
+        self.assertFalse(result["sent"])
+        self.assertIn("could not run", result["detail"])
+
+    def test_the_caps_hold_under_repeated_sweeps(self):
+        """Ten hub ticks in ten minutes is one wake-up, not ten."""
+        self.dead_board()
+        hub = self.hub()
+        for _ in range(10):
+            hub.refresh()
+        self.assertEqual(len(self.sends), 1, self.sends)
+
+    def test_three_wake_ups_an_hour_and_then_it_gives_up_out_loud(self):
+        """The full arc of the incident this card is about: the session never
+        stirs, autoheal spends its budget, and the board says the sentence a
+        person can act on -- which the OTHER boards' hub row then shows."""
+        b = self.dead_board()
+        hub = self.hub()
+        for _ in range(3):
+            hub.refresh()
+            self.rewind(b, b["app"].revive_min_interval + 30)
+        self.assertEqual(len(self.sends), 3, self.sends)
+        hub.refresh()
+        self.assertEqual(len(self.sends), 3, "the fourth tick sends nothing")
+        b["app"].sweep_session_dead()
+        rows = self.gave_up(b)
+        self.assertEqual(len(rows), 1)
+        text = rows[0]["payload"]["text"]
+        self.assertIn("never stirred", text)
+        self.assertIn("blocked by an open dialog", text)
+
+    def test_a_session_that_wakes_up_stops_the_wake_ups(self):
+        b = self.dead_board()
+        hub = self.hub()
+        hub.refresh()
+        self.assertEqual(len(self.sends), 1)
+        # The ten-minute hold passes...
+        self.rewind(b, b["app"].revive_min_interval + 30)
+        # ...and in the meantime it woke up and drained the log.
+        with b["app"].lock:
+            b["app"].conn.execute(
+                "UPDATE cursors SET updated_at=? WHERE name='orchestrator'",
+                (time.time(),))
+        hub.refresh()
+        self.assertEqual(len(self.sends), 1, "an awake session is never poked again")
+
+    def test_an_account_limit_holds_the_reviver(self):
+        """#47 owns the parked case: the reviver waits for the reset or Resume
+        instead of poking a session that could not answer anyway."""
+        b = self.dead_board()
+        status, body = self.bpost(b, "/api/limits",
+                                  {"kind": "account", "resets_at": time.time() + 7200})
+        self.assertIn(status, (200, 201), body)
+        hub = self.hub()
+        hub.refresh()
+        self.assertEqual(self.sends, [])
+        self.assertEqual(len(self.attempts(b)), 0)
+        # ...and the Resume flow re-arms it
+        status, body = self.bpost(b, "/api/limits/%d/clear" % body["limit"]["id"])
+        self.assertEqual(status, 200, body)
+        self.go_quiet(b)
+        hub.refresh()
+        self.assertEqual(len(self.sends), 1)
+
+    def test_autoheal_can_be_turned_off_wholesale(self):
+        self.dead_board()
+        hub = self.hub(autoheal=False)
+        hub.refresh()
+        self.assertEqual(self.sends, [])
+
+    def test_one_dead_board_does_not_stop_the_others_from_rendering(self):
+        self.dead_board("alpha")
+        self.board("beta")
+        hub = self.hub()
+
+        def boom(argv, **kw):
+            raise RuntimeError("everything is on fire")
+
+        hub._run = boom
+        snap = hub.refresh()
+        self.assertEqual({r["name"] for r in snap["sprints"]}, {"alpha", "beta"})
+
+    def test_the_hub_row_carries_the_boards_own_verdict(self):
+        b = self.dead_board()
+        rows = self.rows(self.hub(autoheal=False))
+        auto = rows["alpha"]["autoheal"]
+        self.assertTrue(auto["dead"])
+        self.assertTrue(auto["revive_wanted"])
+        self.assertEqual(auto["tmux_window"], "alpha-window")
+
+    def test_a_board_answering_an_older_payload_is_never_read_as_dead(self):
+        """`autoheal` absent means no opinion. The reviver must read that as
+        "do nothing", never as "dead"."""
+        hub = self.hub()
+        self.assertEqual(hub.maybe_revive({"project_root": "/x", "port": 1},
+                                          {"name": "old"}), "not_wanted")
+        self.assertEqual(self.sends, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

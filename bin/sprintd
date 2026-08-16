@@ -140,6 +140,13 @@ EVENT_KINDS = (
     # ACTS on: it means the model is available again and whatever was
     # downgraded for that window can go back.
     "limit_declared", "limit_cleared",
+    # Dead-session autoheal (#68). All four are sprint-level and written only
+    # by the board itself. `session_dead` is the diagnosis (once per death
+    # episode); `revive_attempted` is one spent slot of the crash-loop budget;
+    # `revive_result` is whether the message got out, which is NOT whether the
+    # session woke up; `revive_gave_up` is the ending, and the one line that
+    # tells a person what to physically go and do.
+    "session_dead", "revive_attempted", "revive_result", "revive_gave_up",
 )
 
 # Headers page JavaScript is FORBIDDEN to set or remove on `fetch` (the fetch
