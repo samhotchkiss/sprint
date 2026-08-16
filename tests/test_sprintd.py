@@ -6781,6 +6781,14 @@ class TestConversationHighlight(ConversationBase):
         num = self.new_conversation()["num"]
         self.assertEqual(self.conv_state(num), "clear")
 
+    def test_a_conversation_the_SESSION_started_is_unseen_from_the_off(self):
+        """The point of the whole thing: "the session must be able to start one
+        -- that's how I'll ask you things that aren't a work item." A thread it
+        opened is a thing it said, so it wants your eyes immediately."""
+        num = self.new_conversation("a question that is not a work item",
+                                    actor="session")["num"]
+        self.assertEqual(self.conv_state(num), "unseen")
+
     def test_a_message_from_the_session_makes_it_unseen(self):
         num = self.new_conversation()["num"]
         self.say(num, "here is what I found", "session")
@@ -7018,6 +7026,152 @@ class TestConversationMigration(unittest.TestCase):
         app._columns = {"cards": {c for c in app.columns("cards") if c != "kind"}}
         self.assertEqual(app.card_kind(row), "work")
         self.assertFalse(app.is_conversation(row))
+
+
+class TestSidebarReadReceipt(Base):
+    """What the switcher's GOLD half is derived from on a board nobody has open.
+
+    User's ruling, verbatim: "gold for needs you or a new message from the
+    session chat, green for needs review". A tab that is not open cannot hold
+    "you have read the manager channel", so the board writes it down: one
+    cursor, and the count derived from the log against it.
+    """
+
+    def say(self, text, actor="session"):
+        status, out = self.post("/api/sidebar", {"text": text, "actor": actor})
+        self.assertEqual(status, 201, out)
+        return out
+
+    def unread(self):
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        return board["chat_unread"]
+
+    def test_a_fresh_board_has_nothing_unread(self):
+        self.assertEqual(self.unread(), 0)
+
+    def test_a_session_line_is_unread_until_it_is_seen(self):
+        self.say("three agents running, cap is 3")
+        self.assertEqual(self.unread(), 1)
+        self.say("and #12 just landed")
+        self.assertEqual(self.unread(), 2)
+        status, out = self.post("/api/sidebar/seen", {"seq": self.get("/api/board")[1]["seq"]})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["chat_unread"], 0)
+        self.assertEqual(self.unread(), 0)
+
+    def test_your_own_messages_are_never_unread_to_you(self):
+        self.say("keep the order. but batch the css ones.", actor="user")
+        self.assertEqual(self.unread(), 0)
+
+    def test_worker_telemetry_never_reaches_the_manager_channel(self):
+        num = self.new_card("some work")["num"]
+        self.to_in_progress(num)
+        self.post("/api/cards/%d/events" % num,
+                  {"kind": "progress", "payload": {"text": "reading"}})
+        self.assertEqual(self.unread(), 0)
+
+    def test_the_receipt_never_walks_backwards(self):
+        self.say("first")
+        top = self.get("/api/board")[1]["seq"]
+        self.post("/api/sidebar/seen", {"seq": top})
+        self.post("/api/sidebar/seen", {"seq": 1})
+        self.assertEqual(self.unread(), 0)
+
+    def test_a_line_after_the_receipt_is_unread_again(self):
+        self.say("first")
+        self.post("/api/sidebar/seen", {"seq": self.get("/api/board")[1]["seq"]})
+        self.assertEqual(self.unread(), 0)
+        self.say("one more thing")
+        self.assertEqual(self.unread(), 1)
+
+    def test_a_junk_seq_is_a_named_400(self):
+        for bad in ("banana", -3):
+            status, body = self.post("/api/sidebar/seen", {"seq": bad})
+            self.assertEqual(status, 400, (bad, body))
+            self.assertEqual(body.get("field"), "seq")
+
+
+class TestSwitcherSquare(Base):
+    """The two halves of the square, as the board reports them.
+
+    The bug, from the user's own machine: a board sitting at needs_you 0 and
+    ready 8 -- eight finished branches waiting on his verdict -- and the
+    switcher showed nothing at all, because the indicator only ever read
+    needs_you.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # /api/siblings reads the machine-wide registry. Point it at an empty
+        # temp one: a test must never health-check the boards actually running
+        # on this machine, and its answers must not depend on them.
+        self.app.registry = os.path.join(self.tmp, "registry.json")
+        self.app._siblings_snap = None
+
+    def ready_card(self):
+        num = self.new_card("a finished branch")["num"]
+        self.to_in_progress(num)
+        packet = dict(GOOD_PACKET)
+        packet["branch"] = "sprint/card-%d" % num
+        status, out = self.post("/api/cards/%d/ready" % num, {"packet": packet})
+        self.assertEqual(status, 200, out)
+        return num
+
+    def rollup(self):
+        return sprintd.board_rollup(self.app.board())
+
+    def test_the_rollup_reports_both_halves(self):
+        r = self.rollup()
+        self.assertEqual(r["needs_you"], 0)
+        self.assertEqual(r["ready"], 0)
+        self.assertEqual(r["chat_unread"], 0)
+
+    def test_ready_alone_is_a_signal_the_rollup_carries(self):
+        for _ in range(8):
+            self.ready_card()
+        r = self.rollup()
+        # The exact shape of the reported bug.
+        self.assertEqual(r["needs_you"], 0)
+        self.assertEqual(r["ready"], 8)
+        self.assertEqual(r["chat_unread"], 0)
+
+    def test_an_unread_session_line_is_a_signal_too(self):
+        self.post("/api/sidebar", {"text": "want me to hold?", "actor": "session"})
+        r = self.rollup()
+        self.assertEqual(r["needs_you"], 0)
+        self.assertEqual(r["ready"], 0)
+        self.assertEqual(r["chat_unread"], 1)
+
+    def test_a_sibling_row_carries_chat_unread(self):
+        self.post("/api/sidebar", {"text": "want me to hold?", "actor": "session"})
+        self.ready_card()
+        row = sprintd.self_sibling_row(self.app)
+        self.assertEqual(row["chat_unread"], 1)
+        self.assertEqual(row["ready"], 1)
+        self.assertTrue(row["self"])
+
+    def test_the_siblings_payload_splits_asking_from_review(self):
+        status, body = self.get("/api/siblings")
+        self.assertEqual(status, 200, body)
+        # This board is always `self`, and the two "elsewhere" numbers are
+        # about everyone BUT this board -- so on a one-board machine they are
+        # zero no matter what is piled up here.
+        self.assertIn("asking_elsewhere", body)
+        self.assertIn("review_elsewhere", body)
+        self.assertEqual(body["asking_elsewhere"], 0)
+        self.assertEqual(body["review_elsewhere"], 0)
+        self.assertEqual([r["self"] for r in body["sprints"]], [True])
+
+    def test_a_board_payload_from_an_older_server_reports_no_unread(self):
+        """`board_rollup` is fed a payload fetched over HTTP from a sibling.
+
+        A board too old to publish `chat_unread` must produce a missing half,
+        never a wrong one -- the square loses its gold, it does not invent it.
+        """
+        board = self.app.board()
+        board.pop("chat_unread", None)
+        self.assertEqual(sprintd.board_rollup(board)["chat_unread"], 0)
 
 
 if __name__ == "__main__":

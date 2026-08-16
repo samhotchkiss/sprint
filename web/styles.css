@@ -2866,3 +2866,51 @@ html.skin-chaos {
    stop at), so the two things it would otherwise pass in front of are lifted
    above it. Nothing about how they look changes. */
 .topbar, .banner-slot { position: relative; z-index: 40; }
+
+/* --------------------------------------------------------------------------
+   #56 — the switcher's square: gold, green, or split
+
+   User's ruling, verbatim: "gold for needs you or a new message from the
+   session chat, green for needs review", and "half and half if both — split
+   the square diagonally". A square, because you cannot honestly split a circle
+   along a diagonal.
+
+   The bug: the indicator only ever read `needs_you`, so a board at
+   needs_you 0 / ready 8 — eight branches waiting on a verdict — said nothing.
+   -------------------------------------------------------------------------- */
+
+.si-slot { width: 10px; flex: none; display: flex; }
+.si-mark {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  border-radius: 2px;
+  display: block;
+}
+.si-mark.is-gold { background: var(--accent); }
+.si-mark.is-green { background: var(--good); }
+/* One square, one diagonal, two halves — never two dots. */
+.si-mark.is-split {
+  background: linear-gradient(135deg,
+    var(--accent) 0 calc(50% - .5px),
+    var(--rule) calc(50% - .5px) calc(50% + .5px),
+    var(--good) calc(50% + .5px) 100%);
+}
+/* The title carries the same square, summarising every OTHER board. */
+.title-btn .si-mark { width: 9px; height: 9px; }
+
+/* Chaos has no soft corners anywhere; the square is already a square. */
+html.skin-chaos .si-mark { border-radius: 0; box-shadow: 0 0 0 1px var(--border); }
+html.skin-chaos .si-mark.is-split {
+  background: linear-gradient(135deg,
+    var(--accent) 0 calc(50% - 1px),
+    var(--border) calc(50% - 1px) calc(50% + 1px),
+    var(--good) calc(50% + 1px) 100%);
+}
+
+/* On the Fold the menu rows are 44px targets already; the square just needs to
+   stay legible next to a 12px name. */
+@media (max-width: 1199px) {
+  .si-slot, .si-mark { width: 11px; }
+  .si-mark { height: 11px; }
+}

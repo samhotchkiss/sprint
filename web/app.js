@@ -94,6 +94,10 @@ function paint() {
   // rail, you have seen it. Closing a card back onto an already-open chat counts
   // just as much as clicking the button does.
   if (store.unseen && store.chatOpen && !store.detail) store.unseen = false;
+  // …and the same fact, written down where the OTHER boards' switchers can
+  // read it. `store.unseen` is this tab's gold Chat button; the receipt is what
+  // makes a second board's square go out.
+  if (store.chatOpen && !store.detail) markSidebarSeen();
   paintChatButton();
 
   clear(el.main);
@@ -285,6 +289,34 @@ async function markConversationSeen(num, timeline) {
     // A receipt that didn't land is not worth a word to the user: the card
     // stays highlighted, which is the honest state, and the next open retries.
     handleError(err, null);
+  }
+}
+
+/**
+ * "I have read the manager channel up to here."
+ *
+ * The switcher square on every OTHER board is derived against this, and the tab
+ * that would otherwise hold the fact is not open over there — so it is written
+ * down. Only ever forward, and only when there is something new to record: this
+ * runs on a paint, and a POST per frame would be absurd.
+ */
+let sidebarSeenAt = 0;
+let sidebarSeenInFlight = false;
+async function markSidebarSeen() {
+  if (!store.loaded || sidebarSeenInFlight) return;
+  const seq = store.seq;
+  if (!seq || seq <= sidebarSeenAt) return;
+  sidebarSeenInFlight = true;
+  const want = seq;
+  try {
+    await api.sidebarSeen(want);
+    sidebarSeenAt = Math.max(sidebarSeenAt, want);
+  } catch (err) {
+    // Nothing to say: the square stays lit, which is the honest state, and the
+    // next paint with the chat open tries again.
+    handleError(err, null);
+  } finally {
+    sidebarSeenInFlight = false;
   }
 }
 

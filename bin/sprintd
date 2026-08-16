@@ -55,7 +55,9 @@ DEFAULT_HUB_PORT = 8300         # one hub per machine, fixed so the URL is memor
 #   2 — phases (/api/board carries phase, phase_since, phase_expected_seconds)
 #   3 — conversation cards (cards carry `kind` + `conversation`; POST
 #       /api/cards/<n>/seen records the read receipt the highlight is derived from)
-API_VERSION = 3
+#   4 — the switcher's square (`chat_unread` on /api/board and on every siblings
+#       row; POST /api/sidebar/seen records the manager channel's read receipt)
+API_VERSION = 4
 DATA_DIRNAME = ".sprint"
 HUB_DIRNAME = ".sprint"         # under $HOME: the machine-wide (cross-project) state
 REGISTRY_FILENAME = "registry.json"
@@ -3384,6 +3386,43 @@ class App:
             (after, limit))
         return [self.event_json(r) for r in rows]
 
+    # -- the session channel's own read receipt -----------------------------
+    #
+    # The title switcher has to answer "does that OTHER board want me", and one
+    # of the two things that means is "the session said something over there
+    # that nobody has read". That is not a client flag -- the tab that would
+    # hold it is not open -- so it is the same shape as a conversation's
+    # receipt: one cursor, and a count derived from the log against it.
+
+    SIDEBAR_SEEN_CURSOR = "seen:sidebar"
+
+    def mark_sidebar_seen(self, seq=None) -> dict:
+        if seq is None:
+            seq = self.max_seq()
+        try:
+            seq = int(seq)
+        except (TypeError, ValueError):
+            raise ApiError(400, "missing_field", "seq must be an integer", field="seq")
+        if seq < 0:
+            raise ApiError(400, "missing_field", "seq must be an integer", field="seq")
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO cursors(name, seq, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET seq=MAX(cursors.seq, excluded.seq), "
+                "updated_at=excluded.updated_at",
+                (self.SIDEBAR_SEEN_CURSOR, seq, now()))
+        return {"ok": True, "last_seen_seq": self.cursor_seq(self.SIDEBAR_SEEN_CURSOR),
+                "chat_unread": self.sidebar_unread()}
+
+    def sidebar_unread(self) -> int:
+        """Lines the SESSION has said in the manager channel that nobody has
+        opened. Your own messages are never unread to you."""
+        seen = self.cursor_seq(self.SIDEBAR_SEEN_CURSOR)
+        row = self.q1(
+            "SELECT COUNT(*) AS n FROM events WHERE card_num IS NULL "
+            "AND kind IN ('chat','note') AND actor='session' AND seq>?", (seen,))
+        return int(row["n"]) if row is not None else 0
+
     def make_batch(self, card_nums, agent_name, branch, worktree=None,
                    actor: str = "session") -> dict:
         if not isinstance(card_nums, list) or not card_nums:
@@ -3795,6 +3834,11 @@ class App:
             # The sidebar thread ships with the board so the UI never has to
             # reconstruct it by scanning the whole event log.
             "sidebar": self.sidebar_thread(limit=200),
+            # How many session lines in the manager channel nobody has opened.
+            # The switcher's gold reads this the same way it reads needs_you --
+            # a question you have not seen is a question either way.
+            "chat_unread": self.sidebar_unread(),
+            "chat_seen_seq": self.cursor_seq(self.SIDEBAR_SEEN_CURSOR),
             "batches": [self.batch_json(b) for b in batch_ids],
             # How many report documents THIS sprint has. The header's Reports
             # link exists only when this is > 0 -- user, verbatim: "link should
@@ -4415,6 +4459,11 @@ def make_handler(app: App):
                 return 200, app.bulk_action(body.get("card_nums"),
                                             body.get("action"), body,
                                             actor=self.actor_or(body, "user"))
+
+            if path == "/api/sidebar/seen":
+                # "I have read the manager channel up to here." The switcher's
+                # gold on OTHER boards is derived against this.
+                return 200, app.mark_sidebar_seen(body.get("seq"))
 
             if path == "/api/sidebar":
                 # The sidebar is the user and the session talking; a worker has
@@ -5712,6 +5761,10 @@ def board_rollup(board: dict) -> dict:
     return {
         "needs_you": counts.get("needs_you", 0),
         "ready": counts.get("ready", 0),
+        # Session lines in that board's manager channel that nobody opened.
+        # A board older than this field simply reports none, which is the
+        # honest degrade: no claim rather than a wrong one.
+        "chat_unread": int(board.get("chat_unread") or 0),
         "in_motion": counts.get("in_progress", 0),
         "queued": counts.get("queued", 0) + counts.get("held", 0),
         "blocked": counts.get("blocked", 0),
@@ -5845,6 +5898,10 @@ def sibling_row(row: dict, is_self: bool = False) -> dict:
         "alive": bool(row.get("reachable")),
         "needs_you": int(row.get("needs_you") or 0),
         "ready": int(row.get("ready") or 0),
+        # The switcher's square is gold for needs_you OR an unread session
+        # line, green for ready, and split when both -- so the row carries
+        # both halves and the tab decides how to draw them.
+        "chat_unread": int(row.get("chat_unread") or 0),
         "in_motion": int(row.get("in_motion") or 0),
         "blocked": int(row.get("blocked") or 0),
         "queued": int(row.get("queued") or 0),
@@ -5896,9 +5953,18 @@ def siblings_snapshot(app, registry: str = None, timeout: float = 1.5) -> dict:
     return {
         "sprints": rows,
         "count": len(rows),
-        # The one number the title dot reads: needs_you ANYWHERE BUT HERE.
-        # This board's own needs-you pile is already on the page behind it.
+        # What the title's square reads, and it is only ever about ELSEWHERE:
+        # this board's own piles are already on the page behind it. Two
+        # numbers, because the square has two halves -- gold for a board that
+        # wants an answer (a question, or a session line nobody opened), green
+        # for a board that wants a verdict.
+        #
+        # The bug this fixes, in the user's own board: needs_you 0, ready 8 --
+        # eight branches waiting on him and the switcher said nothing at all.
         "needs_you_elsewhere": sum(r["needs_you"] for r in others),
+        "asking_elsewhere": sum(r["needs_you"] + r.get("chat_unread", 0)
+                                for r in others),
+        "review_elsewhere": sum(r["ready"] for r in others),
         "server_time": now(),
     }
 

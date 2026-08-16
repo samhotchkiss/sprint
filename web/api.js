@@ -115,7 +115,7 @@ function noteGeneration(payload) {
 //
 // Bump BOTH numbers in the same commit whenever web/ starts requiring an
 // endpoint or field a running server might not have.
-export const UI_API_VERSION = 3;
+export const UI_API_VERSION = 4;
 
 let serverApi = null;                // null = nothing has answered yet
 const staleListeners = new Set();
@@ -225,6 +225,10 @@ export const api = {
   sidebar: (text, images, key) => req('POST', '/api/sidebar',
     images && images.length ? { text, images, actor: 'user' } : { text, actor: 'user' },
     { idempotencyKey: key }),
+  // "I have read the manager channel up to here." What the OTHER boards'
+  // switcher squares are derived against — a tab that is not open cannot hold
+  // that fact, so the board does.
+  sidebarSeen: (seq) => req('POST', '/api/sidebar/seen', { seq }),
   holdMode: (on) => req('POST', '/api/sprint', { action: 'set_hold_mode', hold_mode: !!on }),
 
   // The report library. `scope` defaults to the OPEN sprint server-side — the
