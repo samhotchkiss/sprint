@@ -2566,6 +2566,41 @@ html.skin-chaos .page-sub, html.skin-chaos .page-empty { line-height: 1.8; }
 }
 
 /* ==========================================================================
+   APPENDED — model tag (card #41)
+   Which model an agent is running on, shown ONLY when it isn't the sprint
+   default. The user reads it after a provider limit killed an agent and the
+   card was re-dispatched a model down; on an ordinary dispatch it is not
+   drawn at all, so this must stay quiet enough to be invisible when it IS
+   drawn on one card out of twelve.
+   ========================================================================== */
+
+.model-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 15px;
+  letter-spacing: .02em;
+  color: var(--dim);
+  background: transparent;
+  white-space: nowrap;
+  vertical-align: baseline;
+}
+.row-agent .model-tag { margin-left: 5px; }
+
+/* Chaos: no radius anywhere, and the same ink outline everything else wears. */
+html.skin-chaos .model-tag {
+  border: 2px solid var(--border);
+  border-radius: 0;
+  font-size: 8px;
+  line-height: 14px;
+  padding: 0 4px;
+}
+
+/* ==========================================================================
    Appended: ops evidence readback (card #38)
    Non-code work proves itself with observed output — a log excerpt, a command
    result — not a diff. It is EVIDENCE, so it renders verbatim: monospace,

@@ -193,6 +193,12 @@ export function normCard(c) {
     pinned: !!c.pinned,
     dup_of: c.dup_of != null ? num(c.dup_of) : null,
     long_running: !!c.long_running,
+    // Which model the agent was dispatched on, and what the sprint's default
+    // is, so `modelTag` can decide whether it is worth drawing. This
+    // normalizer builds an explicit shape — a field it doesn't name does not
+    // exist in the tab, which is exactly how the tag silently didn't render.
+    model: c.model || null,
+    default_model: c.default_model || null,
     created_at: c.created_at || null,
     updated_at: c.updated_at || null,
     queue_position: c.queue_position != null ? num(c.queue_position)
@@ -794,6 +800,22 @@ export function isStuck(card) {
 }
 
 export const STUCK_HINT = 'parked here longer than it should be — the board said so on the card';
+
+/**
+ * Which model this card's agent is running on, but ONLY when that is worth
+ * saying: a badge that is on every card is decoration, and the thing the user
+ * actually needs to see is the exception — "this one is on opus because fable
+ * hit its usage limit and the first agent was killed."
+ *
+ * The server tells the tab what the default is (`default_model`, on the card
+ * and on the board), so the tab never has to hold a copy of that list.
+ */
+export function modelTag(card) {
+  if (!card || !card.model) return null;
+  return card.model === card.default_model ? null : card.model;
+}
+
+export const MODEL_HINT = 'not the sprint default — this card was dispatched on a fallback model';
 
 // ---- what happened to the message I just sent ---------------------------
 //

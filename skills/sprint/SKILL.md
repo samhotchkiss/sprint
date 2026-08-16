@@ -38,7 +38,9 @@ port).
 All of your own (session-level) API calls use `curl` with
 `-H "Authorization: Bearer $SPRINT_TOKEN"`. The three worker helpers
 (`sprint-post`, `sprint-ask`, `sprint-ready`) are for workers, not you —
-you have the full API, they get the narrow card-scoped slice.
+you have the full API, they get the narrow card-scoped slice. There is
+one helper that is yours and not theirs: `bin/sprint-recover <num…>`,
+which prints the recovery brief for a card whose agent died (step 5b).
 
 ## Card state machine (reference)
 
@@ -297,6 +299,13 @@ on `state`, not on the wording:
 | `needs_you` (>30 min) | Re-surface the question to the user: a sidebar line with the card number and the question in one sentence. The UI chimed once when the card flipped; this is your cue to ask again in words. Do NOT answer it yourself. |
 | `ready` (>24 h) | A gentle reminder, at most **once a day**: mention it in the sidebar alongside anything else waiting on a verdict. One line, no repetition — the sweep's own backoff assumes you aren't adding noise of your own. |
 
+One `stuck` payload does not carry a parked state at all: `payload.rule
+== "worker_gone"` is the **killed-agent** notice (see step 5b). It means
+a card in `triaging`/`in_progress`/`needs_you` has had no word from its
+agent for 20 minutes and the board will move it to `failed` at 40 unless
+something changes. Act on it like an `agent_silent` you are already late
+for — the clock is running and its end is a state change.
+
 The sweep repeats on a backoff (10m → 30m → 90m) and then goes quiet
 after three reminders, re-arming only when the card actually changes
 state. So a second `stuck` on the same card means your first reaction
@@ -476,6 +485,13 @@ git -C "$PROJECT_ROOT" worktree add -b <branch> \
     `POST /api/cards/:num/state {"state":"triaging","title":"…"}`. The
     user's original text is never rewritten — it stays on the card body
     and in the `submitted` event, and the drawer shows it in full.
+  - `model` is optional and records **which model you actually
+    dispatched on**. Send it whenever it isn't the sprint default —
+    which in practice means every fallback re-dispatch after a provider
+    limit (step 5b). The face shows it only when it differs from the
+    default, so it costs nothing to always send and everything to
+    forget: without it, "why is this one slower/different" has no
+    answer on the board.
 
 **Reap orphans on boot** (and it's cheap enough to also do here): list
 worktrees under `.sprint/worktrees/` via `git -C "$PROJECT_ROOT"
@@ -571,6 +587,9 @@ claimed) — by the time you see this event, act:
      why, rather than leaving it silently stalled.
    - Unrecoverable → `failed`, with the note explaining what happened;
      the card shows a Retry the user can trigger.
+   - **Killed by a provider usage limit** → that is its own procedure,
+     and it is not "investigate", it is "re-dispatch now on the next
+     model down". See step 5b.
 
 There is no manual nudge button by design — this procedure is what
 replaces it. If you find yourself wanting the user to manually check on
@@ -606,6 +625,85 @@ POST /api/cards/:num/action {"action":"external_agent","actor":"session",
 - Both are session-only. A request from the browser gets a `403
   session_only` — the user has no way to know whether an agent is
   legitimately quiet, so turning the alarm off is not their switch.
+
+---
+
+## 5b. When an agent DIES — model fallback
+
+This is not `agent_silent`. A silent agent is working and not saying so;
+a dead one is never coming back, and waiting for it is the failure mode
+that cost the user a whole evening: **three workers were killed
+mid-flight when the session hit a provider usage limit, nothing
+recovered them, and their cards sat in In motion for hours until he
+counted nine open cards and asked why.**
+
+### Recognising it
+
+You find out one of three ways, and any one of them is enough:
+
+1. **The task notification.** The agent terminated early with a
+   session/usage limit error — wording varies ("usage limit reached",
+   "session limit", "model capacity"), but the shape is always: the
+   agent ended without ever calling `sprint-ready`, and the reason names
+   a limit rather than a task outcome. **That is not a normal finish.**
+2. **A `stuck` event with `payload.rule == "worker_gone"`.** The board's
+   own killed-agent rule: no word from the agent for 20 minutes on a
+   card that is supposed to be in flight. It names the agent and tells
+   you when the card fails.
+3. **A card that reached `failed` with a reason starting `worker gone:`.**
+   The board waited 40 minutes and stopped guessing. The card is now
+   sitting there with a Retry on it.
+
+If you hit a provider limit dispatching one agent, assume it hit the
+others too. **Check every live card, not just the one you noticed.**
+
+### The required response
+
+**Re-dispatch the same card(s) immediately, on the next model down.**
+Do not wait for the user, do not ask, do not leave the card sitting
+open. The order is:
+
+```
+fable → opus → sonnet
+```
+
+The `model` parameter on the Agent tool takes the override; the card
+records it (below). One step down per kill: if opus dies the same way,
+go to sonnet — never back up to a model that just refused you.
+
+For each card:
+
+1. **Get the recovery brief**: `bin/sprint-recover <num> [<num>…]`. It
+   prints, per card, the state, the last 10 timeline lines, the worktree
+   path and whether it still exists, the branch and how many commits it
+   is ahead of main (with their subjects), and exactly what is dirty in
+   the worktree. This is the "inspect before you redo anything" step as
+   one command instead of five.
+2. **Dispatch a fresh agent** (step 3's normal procedure, same worktree
+   and branch if they still exist) with `model:` set to the next one
+   down, and put three things in its brief **explicitly**:
+   - the card timeline (paste `sprint-recover`'s output);
+   - that **a previous agent was killed by a provider limit** — it is a
+     new agent picking up after a death, not a continuation;
+   - that the dead agent **may have left committed or uncommitted work
+     in the worktree, and it must inspect that before redoing anything.**
+     `git log origin/main..HEAD` and `git status` first, always. Redoing
+     work on top of a half-finished commit is how a recoverable mess
+     becomes a conflicted one.
+3. **Record the model** on the assign call so the user can see it:
+   `POST /api/cards/:num/assign {"agent_name":…, "worktree":…,
+   "branch":…, "model":"opus"}`. The card face shows the model **only
+   when it differs from the sprint default**, so an ordinary dispatch
+   stays quiet and a fallback is visible at a glance. The timeline note
+   reads "assigned to sprint-card-42 on opus".
+4. **Say it in the sidebar, once, for the batch**: which cards were
+   killed, what limit did it, and what they are now running on. One
+   line. The user should never be the one who notices that agents died.
+
+If a card was already moved to `failed` by the board, the same procedure
+applies — the user's Retry and your re-dispatch are the same act; you do
+not need to wait for them to click it. `failed` preserves the timeline,
+the evidence, the branch and the worktree precisely so this works.
 
 ---
 

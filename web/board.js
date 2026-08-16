@@ -17,6 +17,7 @@ import { h, timeEl, firstLine } from './util.js';
 import {
   boardColumns, cardState, needsKind, motionState, blockedReason, waitingMark,
   meterSegments, sections, isSilent, isStuck, STUCK_HINT, STATE_LABEL,
+  modelTag, MODEL_HINT,
 } from './state.js';
 import { phaseChip } from './phase.js';
 import { renderMeter } from './meter.js';
@@ -130,8 +131,13 @@ export function renderCardFace(card, app) {
 
   // The age is the only thing on the face that can say "this has been sitting
   // here too long", so that is where the sweep's amber goes. No new chrome.
+  // The agent's name, and — only when it isn't the sprint default — what it is
+  // running on. A fallback after a killed agent should be readable off the
+  // face; an ordinary dispatch says nothing.
+  const model = modelTag(card);
   face.appendChild(h('div.card-foot',
     h('span', shortAgent(card.agent_name)),
+    model ? h('span.model-tag', { title: MODEL_HINT }, model) : null,
     h('span.grow'),
     h('span', { class: isStuck(card) ? 'is-stuck-age' : null,
       title: isStuck(card) ? STUCK_HINT : null },
