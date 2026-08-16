@@ -1,5 +1,5 @@
 // Wiring: boot, live transport, optimistic actions, render loop.
-import { h, clear, $, debounce, tickTimes, uid, firstLine } from './util.js';
+import { h, clear, $, debounce, tickTimes, uid, firstLine, reconcile } from './util.js';
 import {
   api, ApiError, NetworkError, initAuth, onServerGeneration, onServerStale, serverIsStale,
 } from './api.js';
@@ -7,6 +7,7 @@ import { Live } from './live.js';
 import {
   store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
   sections, headline, loadView, setView, setChatOpen, bounceComposing,
+  activeLimits, limitLine, accountLimit,
 } from './state.js';
 import { renderList } from './list.js';
 import { renderBoard, renderFold } from './board.js';
@@ -153,8 +154,10 @@ function renderSessionBanner() {
   // was that it was not. Lowest priority of the three: a board nobody is home
   // at is more urgent news than a board that is merely behind.
   const stale = serverIsStale();
-  if (!offline && !transportDown && !stale) { el.bannerSlot.hidden = true; return; }
-  el.bannerSlot.hidden = false;
+  const limits = renderLimitBanners();
+  el.banner.hidden = !(offline || transportDown || stale);
+  el.bannerSlot.hidden = el.banner.hidden && !limits;
+  if (el.banner.hidden) return;
   const cls = offline ? 'banner warn' : 'banner dim';
   const text = offline ? 'session offline — items will queue'
     : transportDown ? 'lost the board connection — retrying'
@@ -166,6 +169,100 @@ function renderSessionBanner() {
   if (el.banner.textContent !== text) {
     clear(el.banner);
     el.banner.appendChild(h('span', text));
+  }
+}
+
+/**
+ * One quiet line per open provider limit window, in the same slot and the same
+ * register as the session-offline banner. The user asked for exactly this and
+ * ruled out the alternatives by shape: not a modal, not a toast, and no new
+ * per-card chrome (a downgraded card already wears its model tag).
+ *
+ * It disappears on its own. `activeLimits` re-checks the clock on every paint
+ * and the page repaints every 30s, so a window that ends while nobody is
+ * looking takes its line with it whether or not an event arrived.
+ *
+ * Returns how many lines are showing, so the slot knows whether to exist.
+ */
+function renderLimitBanners() {
+  const account = store.loaded ? accountLimit() : null;
+  const live = store.loaded ? activeLimits() : [];
+  const rows = [];
+  // The account banner goes FIRST and loud: while it is up nothing on this
+  // machine can run, so it is the only thing on the page that is news. It is
+  // still a banner and not a modal — the user said so: he has to be able to
+  // read cards and type while it is showing. The two kinds coexist happily;
+  // a model window under an account window is simply the smaller fact.
+  if (account) rows.push(accountBannerSpec(account));
+  // Keyed, so a repaint that changes nothing changes no DOM — the banner slot
+  // sits above the whole board and a flicker there is a flicker everywhere.
+  for (const lim of live) {
+    const text = limitLine(lim);
+    rows.push({
+      key: 'limit:' + (lim.id == null ? lim.model : lim.id),
+      ver: text,
+      make: () => h('div.banner.limit', { title: lim.note || lim.source || '' },
+        h('span', text)),
+    });
+  }
+  reconcile(el.limitBanners, rows);
+  el.limitBanners.hidden = !rows.length;
+  return rows.length;
+}
+
+/**
+ * The account-limit banner: what happened, when it lifts, what to do, and the
+ * button that does the last step.
+ *
+ * The words come from the server (`account_limit.headline/detail/action`) so
+ * the banner, the event log and `sprint-limit` cannot drift; the fallbacks
+ * exist only for a board answering an older payload. Nothing here needs a
+ * session: the banner is drawn from `/api/board` and Resume is one POST, which
+ * is the whole point — when the account is out, the session is dead.
+ */
+function accountBannerSpec(lim) {
+  const until = lim.label || '';
+  const headline = lim.headline || 'Claude account limit reached — nothing can run';
+  const detail = lim.detail
+    || (until ? `Every sprint board on this machine is stopped until ${until}.`
+      : 'Every sprint board on this machine is stopped.');
+  const action = lim.action
+    || 'Log out of Claude, sign in with another Claude session, then press Resume.';
+  return {
+    key: 'account-limit:' + (lim.id == null ? 'x' : lim.id),
+    ver: [headline, detail, action, lim.resumeLabel].join('|'),
+    make: () => h('div.banner.account', { role: 'status' },
+      h('div.account-words',
+        h('div.account-headline', headline),
+        h('div.account-detail', detail),
+        h('div.account-action', action)),
+      h('button.btn.send.account-resume', {
+        type: 'button',
+        onclick: (e) => resumeAccount(lim, e.currentTarget),
+      }, lim.resumeLabel || 'Resume')),
+  };
+}
+
+/**
+ * Resume: clear the account window, then re-read the board.
+ *
+ * The clear is the server's single-writer one, so a double-press cannot fire
+ * two `limit_cleared` events — and one event is what the session re-dispatches
+ * off, so a second would be a second agent on the same card.
+ */
+async function resumeAccount(lim, btn) {
+  if (lim.id == null) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Resuming…'; }
+  try {
+    await api.clearLimit(lim.id);
+    store.accountLimit = null;
+    store.limits = store.limits.filter((l) => l.kind !== 'account');
+    render();
+    refreshBoard();
+    toast('account limit cleared — parked work can go back out');
+  } catch (err) {
+    if (btn) { btn.disabled = false; btn.textContent = lim.resumeLabel || 'Resume'; }
+    handleError(err, null);
   }
 }
 
@@ -938,6 +1035,7 @@ async function boot() {
   el.chatBtn = $('#chat-btn');
   el.bannerSlot = $('#banner-slot');
   el.banner = $('#banner');
+  el.limitBanners = $('#limit-banners');
   el.composeWrap = $('#compose-wrap');
   el.reportsLink = $('#reports-link');
   // scoped to the layout control — the skin control is a second .seg beside it

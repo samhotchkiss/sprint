@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import datetime
 import errno
 import hashlib
 import http.client
@@ -106,6 +107,11 @@ CLIENT_ACTORS = ("user", "session", "worker")
 EVENT_KINDS = (
     "submitted", "state", "chat", "question", "answer", "progress",
     "evidence", "verdict", "agent_silent", "stuck", "note", "error",
+    # A provider limit window opened / ended. Sprint-level (card_num NULL),
+    # written only by the board itself. `limit_cleared` is the one the session
+    # ACTS on: it means the model is available again and whatever was
+    # downgraded for that window can go back.
+    "limit_declared", "limit_cleared",
 )
 
 # Headers page JavaScript is FORBIDDEN to set or remove on `fetch` (the fetch
@@ -252,6 +258,79 @@ WORKER_GONE_STATES = ("triaging", "in_progress", "needs_you")
 # a badge that is on every card says nothing.
 DEFAULT_MODEL = "fable"
 MODEL_MAX = 40
+# Why this card is not on the default model, in the session's own words
+# ("fable limited until 23:50"). Free text, one line, read by a human -- and by
+# the session, which uses its presence to know which cards to restore when the
+# limit window ends.
+MODEL_REASON_MAX = 140
+
+# --------------------------------------------------------------------------
+# Provider limit windows
+#
+# The incident this exists for, verbatim from the board: three workers were
+# killed at once by a provider usage limit, and the kill message SAID when it
+# would end -- "You've hit your session limit · resets 11:50pm (America/Denver)".
+# Nothing captured that sentence, so the cards sat open for hours until the user
+# counted them himself.
+#
+# A limit window is that sentence, made into a fact the board holds: which model
+# is unavailable and until when. Two things fall out of it -- a quiet line on
+# the board while the window is open, and exactly ONE `limit_cleared` event when
+# it ends, which is the session's cue to put the downgraded work back on the
+# model it was supposed to be on.
+#
+# Activeness is COMPUTED (`cleared_at IS NULL AND resets_at > now`), never
+# stored: a board that was asleep across 11:50pm must come back up knowing the
+# window is over, and a cleanup job that did not run is not an excuse for
+# telling the user that fable is still limited at noon the next day.
+LIMIT_SOURCE_MAX = 80          # where the reset time came from ("kill message")
+LIMIT_NOTE_MAX = 280
+LIMIT_RECENT_MAX = 20          # how many finished windows GET /api/limits shows
+
+# Two kinds of window, because two different things happen to the user.
+#
+#   "model"   — one model is unavailable and the work moves down a tier. The
+#               board says so in a quiet dashed line and everything keeps
+#               running. This is the original card.
+#   "account" — the whole Claude account hit its weekly limit. NOTHING can run,
+#               on any board, and the fix is not waiting: log out, sign in with
+#               another Claude session, then press Resume. That needs a big
+#               banner on every board and a button, not a quiet line.
+#
+# Why an account window is MACHINE-WIDE, and how:
+#
+# The limit belongs to the account, not to a project, so a board that did not
+# declare it is just as dead as the one that did — and the board the user is
+# looking at when it happens is whichever tab is in front of him. Two ways to
+# get it everywhere: push the declaration to every sibling over HTTP, or write
+# it to one machine-wide file every board already knows how to find. We write
+# the file (`account-limit.json`, beside the registry the hub already uses),
+# because push needs each sibling's bearer token — which no board holds for
+# another — and because push is only as good as the moment it ran: a board
+# started AFTER the declaration would never hear about it, which is exactly the
+# case that happens when the user restarts a wedged project mid-limit. Reading
+# a file is also the only version of this that works with NO session attached,
+# which is the whole point: when the account is out, the orchestrating session
+# is dead, and the only things still moving are the board server and a browser.
+#
+# Each board mirrors the shared state into its OWN `limits` row, so every
+# guarantee already proved for model windows holds unchanged per board:
+# activeness stays computed, and each board emits its own single
+# `limit_cleared` — which is right, because each board has its own parked cards
+# to re-dispatch when the session comes back.
+LIMIT_KIND_MODEL = "model"
+LIMIT_KIND_ACCOUNT = "account"
+LIMIT_KINDS = (LIMIT_KIND_MODEL, LIMIT_KIND_ACCOUNT)
+ACCOUNT_LIMIT_FILENAME = "account-limit.json"   # machine-wide, beside registry.json
+
+# The banner's words, composed here so the server, the event log and the
+# browser cannot drift into three different accounts of the same fact. Three
+# parts, in the order a person needs them: what happened, when it lifts, and
+# what to DO about it — which is not "wait", it is "swap sessions".
+ACCOUNT_LIMIT_HEADLINE = "Claude account limit reached — nothing can run"
+ACCOUNT_LIMIT_ACTION = ("Log out of Claude, sign in with another Claude "
+                        "session, then press Resume.")
+ACCOUNT_RESUME_LABEL = "Resume"
 
 STATES = (
     "held", "queued", "triaging", "in_progress", "needs_you", "blocked",
@@ -347,6 +426,7 @@ CREATE TABLE IF NOT EXISTS cards (
   -- defaults were" -- the card face only tags a choice that differs.
   executor TEXT,
   model TEXT,
+  model_reason TEXT,
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL
 );
@@ -384,6 +464,22 @@ CREATE TABLE IF NOT EXISTS questions (
   created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS questions_card ON questions(card_num, id);
+
+-- A provider usage limit with a known end. `cleared_at` is bookkeeping for the
+-- one-shot `limit_cleared` event, NOT the definition of active: a window whose
+-- `resets_at` has passed is over whether or not anything got round to writing
+-- that down.
+CREATE TABLE IF NOT EXISTS limits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL DEFAULT 'model',
+  model TEXT NOT NULL,
+  resets_at REAL NOT NULL,
+  declared_at REAL NOT NULL,
+  cleared_at REAL,
+  source TEXT,
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS limits_open ON limits(cleared_at, resets_at);
 
 CREATE TABLE IF NOT EXISTS idempotency (
   key TEXT PRIMARY KEY,
@@ -1017,6 +1113,172 @@ def clean_model(value):
     return text[:MODEL_MAX]
 
 
+def clean_limit_kind(value):
+    """Which kind of limit window: "model" (default) or "account".
+
+    Closed set on purpose — unlike `model`, which the board never adjudicates,
+    the kind decides whether the user sees a quiet line or a banner that says
+    everything has stopped, and a typo must not silently pick the quiet one.
+    """
+    if value is None:
+        return LIMIT_KIND_MODEL
+    if not isinstance(value, str):
+        raise ApiError(400, "bad_kind", "kind must be a string", field="kind")
+    text = value.strip().lower()
+    if not text:
+        return LIMIT_KIND_MODEL
+    if text not in LIMIT_KINDS:
+        raise ApiError(400, "bad_kind",
+                       "kind must be one of: %s" % ", ".join(LIMIT_KINDS),
+                       field="kind")
+    return text
+
+
+def clean_model_reason(value, field: str = "model_reason"):
+    """Why this card is not on the default model. One line, capped, free text.
+
+    An EMPTY string is meaningful and is not the same as omitting the field:
+    omitting leaves whatever is on the card alone, "" clears it. That is what
+    the session sends when it puts a card back on its original model.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApiError(400, "bad_model_reason", "%s must be a string" % field,
+                       field=field)
+    text = " ".join(value.split())
+    if not text:
+        return ""
+    return text[:MODEL_REASON_MAX]
+
+
+def clean_short_text(value, field: str, limit: int):
+    """A free-text one-liner or None (`source`, `note` on a limit window)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApiError(400, "bad_" + field, "%s must be a string" % field, field=field)
+    text = " ".join(value.split())
+    return text[:limit] if text else None
+
+
+# `11:50pm`, `11:50 PM`, `23:50`, `9pm`, and any of those with the provider's
+# own parenthetical zone on the end: `11:50pm (America/Denver)`.
+CLOCK_RE = re.compile(r"^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?$", re.I)
+CLOCK24_RE = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$")
+TZ_PAREN_RE = re.compile(r"^(.*?)\s*\(\s*([A-Za-z][A-Za-z0-9_+\-/]*)\s*\)\s*$")
+EPOCH_RE = re.compile(r"^\d{9,14}(?:\.\d+)?$")
+# Anything past this is milliseconds, not seconds: 1e11 seconds is the year 5138
+# and 1e11 milliseconds is 1973. Nobody means the year 5138.
+EPOCH_MS_CUTOFF = 1e11
+
+
+def _zone(name: str):
+    """A tzinfo for a provider's zone name, or a 400 that says why not."""
+    try:
+        from zoneinfo import ZoneInfo          # stdlib 3.9+
+    except ImportError:
+        raise ApiError(400, "bad_resets_at",
+                       "this python has no zoneinfo — pass an ISO 8601 time "
+                       "with an offset instead of a zone name",
+                       field="resets_at")
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        raise ApiError(400, "bad_resets_at",
+                       "unknown timezone %r — pass an ISO 8601 time with an "
+                       "offset instead" % name, field="resets_at")
+
+
+def parse_reset_time(value, ref: float = None) -> float:
+    """When a limit window ends, as epoch seconds.
+
+    Accepts, in this order:
+
+      * a number — epoch seconds (or milliseconds, if it is absurdly large);
+      * an ISO 8601 timestamp, with or without an offset (naive = local);
+      * a HUMAN CLOCK TIME — `11:50pm`, `9pm`, `23:50` — meaning the **next
+        occurrence** of that time. This is the shape a provider's kill message
+        actually uses, and it is the whole reason a human ever types one of
+        these: at 11:52pm, "11:50pm" means tomorrow, not two minutes ago.
+
+    Any of the string forms may carry the provider's own zone in parentheses
+    (`11:50pm (America/Denver)`), so the kill message can be pasted verbatim
+    instead of being converted in someone's head. Without one, local time.
+    """
+    ref = now() if ref is None else float(ref)
+    if isinstance(value, bool):
+        raise ApiError(400, "bad_resets_at", "resets_at must be a time",
+                       field="resets_at")
+    if isinstance(value, (int, float)):
+        secs = float(value)
+        return secs / 1000.0 if secs > EPOCH_MS_CUTOFF else secs
+    if not isinstance(value, str):
+        raise ApiError(400, "missing_field", "resets_at is required",
+                       field="resets_at")
+    text = value.strip()
+    if not text:
+        raise ApiError(400, "missing_field", "resets_at is required",
+                       field="resets_at")
+
+    tz = None
+    m = TZ_PAREN_RE.match(text)
+    if m and m.group(1).strip():
+        text, tz = m.group(1).strip(), _zone(m.group(2))
+
+    if EPOCH_RE.match(text):
+        secs = float(text)
+        return secs / 1000.0 if secs > EPOCH_MS_CUTOFF else secs
+
+    iso = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        dt = None
+    if dt is not None:
+        if dt.tzinfo is None and tz is not None:
+            dt = dt.replace(tzinfo=tz)
+        # A naive datetime with no zone named is local time -- `.timestamp()`
+        # already means exactly that.
+        return dt.timestamp()
+
+    hour = minute = None
+    m = CLOCK_RE.match(text)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2) or 0)
+        if not (1 <= hour <= 12) or minute > 59:
+            raise ApiError(400, "bad_resets_at",
+                           "%r is not a clock time" % value, field="resets_at")
+        half = m.group(3).lower()
+        hour = (hour % 12) + (12 if half == "p" else 0)
+    else:
+        m = CLOCK24_RE.match(text)
+        if m:
+            hour, minute = int(m.group(1)), int(m.group(2))
+            if hour > 23 or minute > 59:
+                raise ApiError(400, "bad_resets_at",
+                               "%r is not a clock time" % value, field="resets_at")
+    if hour is None:
+        raise ApiError(400, "bad_resets_at",
+                       "could not read %r as a time — use ISO 8601, an epoch, "
+                       "or a clock time like 11:50pm" % value, field="resets_at")
+
+    # The next occurrence, in whichever zone we were told to read it in.
+    base = datetime.datetime.fromtimestamp(ref, tz) if tz is not None \
+        else datetime.datetime.fromtimestamp(ref)
+    target = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target.timestamp() <= ref:
+        target += datetime.timedelta(days=1)
+    return target.timestamp()
+
+
+def clock_label(ts: float) -> str:
+    """`11:50pm` — a reset time in the words the board says it in. Local."""
+    lt = time.localtime(ts)
+    hour = lt.tm_hour % 12 or 12
+    return "%d:%02d%s" % (hour, lt.tm_min, "am" if lt.tm_hour < 12 else "pm")
+
+
 # --------------------------------------------------------------------------
 # Settings validation
 #
@@ -1371,6 +1633,15 @@ class App:
         # screenshots, and a short note. NULL for a plain question, which is
         # every question a board created before this landed.
         ("questions", "artifacts", "TEXT"),
+        # WHY it is on that model, in the session's words ("fable limited until
+        # 23:50"). Without this, "downgraded because of a limit" is not a fact
+        # anyone can query when the window ends -- it is a thing the session
+        # would have to remember across a restart, which is exactly what it
+        # failed to do the night this card was written.
+        ("cards", "model_reason", "TEXT"),
+        # Account-wide windows landed after the first limits table shipped, so
+        # a board that ran the earlier version has a `limits` table without it.
+        ("limits", "kind", "TEXT NOT NULL DEFAULT 'model'"),
     )
 
     def _add_missing_columns(self):
@@ -1747,6 +2018,10 @@ class App:
             # is worth saying out loud. NULL model or the sprint default means
             # the face shows nothing: a badge on every card is decoration.
             "model": c_model,
+            # Why it is on that model. Rides the board payload so the session
+            # can find every card downgraded for a limit when the window ends,
+            # without a filter endpoint nobody else would ever call.
+            "model_reason": (row["model_reason"] if "model_reason" in have else None),
             "default_model": self.default_model,
             # An assignee that emits no worker telemetry (an ordinary background
             # agent, a human, a cron). The silence timer cannot watch it, so it
@@ -2742,6 +3017,13 @@ class App:
                 self.sweep_worker_gone()
             except Exception:  # ...and one rule's bug must not silence the other
                 self.log("worker-gone sweep failed: %s" % traceback.format_exc())
+            try:
+                self.sweep_limits()
+            except Exception:
+                self.log("limit sweep failed: %s" % traceback.format_exc())
+            # An account limit somebody else declared, and its end: the sweep is
+            # how a board with nobody looking at it stays in step.
+            self.reconcile_account_limit()
 
     def sweep_stuck(self) -> int:
         placeholders = ",".join("?" * len(STUCK_STATES))
@@ -2926,6 +3208,329 @@ class App:
         if fired:
             self.notify()
         return fired
+
+    # -- provider limit windows -------------------------------------------
+    #
+    # See the module-level note. Three moving parts and no more: declare one,
+    # read them, and end one -- either because the clock got there or because
+    # somebody said so early. The only rule that matters for correctness is
+    # that ending a window emits `limit_cleared` EXACTLY once, because the
+    # session's reaction to that event is to re-dispatch work: a duplicate
+    # storm is not a duplicate line in a log, it is duplicate agents on the
+    # same cards.
+
+    def limit_json(self, row, at: float = None) -> dict:
+        at = now() if at is None else at
+        resets_at = float(row["resets_at"])
+        cleared_at = row["cleared_at"]
+        # Computed, never read off a column: a board that was down across the
+        # reset time must come back up knowing the window is over.
+        active = cleared_at is None and resets_at > at
+        try:
+            kind = row["kind"] or LIMIT_KIND_MODEL
+        except (IndexError, KeyError):       # a row read before the ALTER ran
+            kind = LIMIT_KIND_MODEL
+        return {
+            "id": row["id"],
+            "kind": kind,
+            # An account window is not about a model, and saying one would be a
+            # lie the banner then has to repeat.
+            "model": (row["model"] or None) if kind == LIMIT_KIND_ACCOUNT
+                     else row["model"],
+            "resets_at": resets_at,
+            "resets_at_label": clock_label(resets_at),
+            "resets_in_seconds": round(resets_at - at, 1),
+            "declared_at": row["declared_at"],
+            "cleared_at": cleared_at,
+            "source": row["source"],
+            "note": row["note"],
+            "active": active,
+        }
+
+    def limit_row(self, limit_id: int):
+        row = self.q1("SELECT * FROM limits WHERE id=?", (limit_id,))
+        if row is None:
+            raise ApiError(404, "no_such_limit", "no limit window #%s" % limit_id)
+        return row
+
+    def active_limits(self, at: float = None) -> list:
+        at = now() if at is None else at
+        rows = self.q("SELECT * FROM limits WHERE cleared_at IS NULL AND resets_at > ? "
+                      "ORDER BY resets_at", (at,))
+        return [self.limit_json(r, at) for r in rows]
+
+    def limits_index(self) -> dict:
+        self.reconcile_account_limit()
+        at = now()
+        recent = self.q(
+            "SELECT * FROM limits WHERE cleared_at IS NOT NULL OR resets_at <= ? "
+            "ORDER BY COALESCE(cleared_at, resets_at) DESC LIMIT ?",
+            (at, LIMIT_RECENT_MAX))
+        return {
+            "active": self.active_limits(at),
+            "recent": [self.limit_json(r, at) for r in recent],
+            "server_time": at,
+        }
+
+    def declare_limit(self, model, resets_at, source=None, note=None,
+                      kind=LIMIT_KIND_MODEL, mirror=False) -> dict:
+        """Record that `model` (or, for an account window, everything) is
+        unavailable until `resets_at`.
+
+        One ACTIVE window per model, always — and exactly one active ACCOUNT
+        window, keyed on the kind alone, because there is only one account.
+        Re-declaring the same window (the session sees the same kill message on
+        the second and third dead agent) updates the one that is already there
+        instead of stacking three identical lines on the board, and a corrected
+        reset time moves the window it corrects rather than opening a rival one.
+
+        `mirror=True` is the reconciler's door in: it means this declaration
+        CAME from the machine-wide file, so it must not be written back to it.
+        """
+        kind = clean_limit_kind(kind)
+        account = kind == LIMIT_KIND_ACCOUNT
+        model = clean_model(model)
+        if account:
+            # The account is not a model. Anything passed here would only end
+            # up in a banner claiming one model is at fault when none is.
+            model = ""
+        elif not model:
+            raise ApiError(400, "missing_field", "model is required", field="model")
+        if resets_at is None:
+            raise ApiError(400, "missing_field", "resets_at is required",
+                           field="resets_at")
+        at = now()
+        resets = parse_reset_time(resets_at, ref=at)
+        source = clean_short_text(source, "source", LIMIT_SOURCE_MAX)
+        note = clean_short_text(note, "note", LIMIT_NOTE_MAX)
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                if account:
+                    row = self.conn.execute(
+                        "SELECT * FROM limits WHERE kind='account' "
+                        "AND cleared_at IS NULL AND resets_at > ? "
+                        "ORDER BY id DESC LIMIT 1", (at,)).fetchone()
+                else:
+                    row = self.conn.execute(
+                        "SELECT * FROM limits WHERE kind='model' AND model=? "
+                        "AND cleared_at IS NULL AND resets_at > ? "
+                        "ORDER BY id DESC LIMIT 1", (model, at)).fetchone()
+                if row is not None:
+                    changed = abs(float(row["resets_at"]) - resets) >= 1.0
+                    self.conn.execute(
+                        "UPDATE limits SET resets_at=?, source=COALESCE(?,source), "
+                        "note=COALESCE(?,note) WHERE id=?",
+                        (resets, source, note, row["id"]))
+                    limit_id, created = row["id"], False
+                else:
+                    cur = self.conn.execute(
+                        "INSERT INTO limits(kind, model, resets_at, declared_at,"
+                        " cleared_at, source, note) VALUES(?,?,?,?,NULL,?,?)",
+                        (kind, model, resets, at, source, note))
+                    limit_id, created, changed = cur.lastrowid, True, True
+                if created or changed:
+                    self._append_event(None, "server", "limit_declared", {
+                        "limit_id": limit_id, "kind": kind, "model": model or None,
+                        "resets_at": resets, "source": source, "note": note,
+                        "text": (ACCOUNT_LIMIT_HEADLINE + " until %s"
+                                 % clock_label(resets)) if account
+                                else "%s is rate-limited until %s"
+                                     % (model, clock_label(resets))})
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        if account and not mirror:
+            # Everybody else on this machine is just as limited. Publishing is
+            # best-effort by construction: a board that cannot write the shared
+            # file is still right about ITSELF, and must not fail the declare.
+            self.publish_account_limit(resets, at, source, note)
+        self.notify()
+        return {"ok": True, "created": created,
+                "limit": self.limit_json(self.limit_row(limit_id))}
+
+    def end_limit(self, limit_id: int, at: float = None, publish=True) -> bool:
+        """End one window and emit `limit_cleared` — at most once, ever.
+
+        The single-writer guarantee is the conditional UPDATE: whoever wins
+        `cleared_at IS NULL` writes the event, and everybody else -- a second
+        sweep tick, a manual clear racing the clock, another thread -- sees
+        rowcount 0 and says nothing. Returns whether THIS call was the one.
+        """
+        at = now() if at is None else at
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.conn.execute("SELECT * FROM limits WHERE id=?",
+                                        (limit_id,)).fetchone()
+                if row is None:
+                    self.conn.execute("ROLLBACK")
+                    return False
+                cur = self.conn.execute(
+                    "UPDATE limits SET cleared_at=? WHERE id=? AND cleared_at IS NULL",
+                    (at, limit_id))
+                if cur.rowcount != 1:
+                    self.conn.execute("ROLLBACK")
+                    return False
+                resets = float(row["resets_at"])
+                passed = at >= resets
+                try:
+                    kind = row["kind"] or LIMIT_KIND_MODEL
+                except (IndexError, KeyError):
+                    kind = LIMIT_KIND_MODEL
+                self._append_event(None, "server", "limit_cleared", {
+                    "limit_id": limit_id, "kind": kind,
+                    "model": (row["model"] or None)
+                             if kind == LIMIT_KIND_ACCOUNT else row["model"],
+                    "resets_at": resets, "declared_at": row["declared_at"],
+                    "cleared_at": at,
+                    "reason": "window_passed" if passed else "cleared_early",
+                    "text": ("the account limit is over — re-dispatch everything "
+                             "parked or killed while it was on")
+                            if kind == LIMIT_KIND_ACCOUNT else
+                            "%s's limit window is over — anything downgraded for "
+                            "it can go back on %s" % (row["model"], row["model"])})
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        if kind == LIMIT_KIND_ACCOUNT and publish:
+            self.publish_account_cleared(float(row["declared_at"]), at)
+        self.notify()
+        return True
+
+    def clear_limit(self, limit_id: int) -> dict:
+        """`POST /api/limits/:id/clear` — the limit lifted early. Idempotent:
+        clearing an already-finished window is a 200 and no second event."""
+        self.limit_row(limit_id)
+        cleared = self.end_limit(limit_id)
+        return {"ok": True, "cleared": cleared,
+                "limit": self.limit_json(self.limit_row(limit_id))}
+
+    # -- the account limit, machine-wide -----------------------------------
+    #
+    # See the module note for WHY it is a file and not a push. Three calls:
+    # publish (this board declared one), publish-cleared (somebody pressed
+    # Resume here), and reconcile (pull the shared state into this board's own
+    # limits table). Reconcile runs on the sweep tick AND on every read of the
+    # board, so a board with no session attached — the only kind there is while
+    # the account is out — converges on the next browser poll.
+
+    def account_origin(self) -> dict:
+        return {"project": self.default_sprint_title(),
+                "project_root": self.project_root,
+                "port": self.port}
+
+    def publish_account_limit(self, resets_at: float, declared_at: float,
+                              source=None, note=None):
+        """Tell the rest of the machine. Best-effort, always: this board is
+        already right about itself, and a shared-state write must never be able
+        to fail a declare."""
+        try:
+            with _FileLock(account_limit_path(self.registry)):
+                write_account_limit({
+                    "resets_at": float(resets_at),
+                    "declared_at": float(declared_at),
+                    "cleared_at": None,
+                    "source": source,
+                    "note": note,
+                    "origin": self.account_origin(),
+                }, self.registry)
+            return True
+        except OSError:
+            self.log("could not publish the account limit to %s"
+                     % account_limit_path(self.registry))
+            return False
+
+    def publish_account_cleared(self, declared_at: float, cleared_at: float):
+        """Resume was pressed (here, or the window simply passed). Siblings
+        pick this up and end their own mirrored window on their next tick."""
+        try:
+            with _FileLock(account_limit_path(self.registry)):
+                shared = read_account_limit(self.registry)
+                state = dict(shared or {})
+                state.setdefault("resets_at", cleared_at)
+                state["declared_at"] = float(
+                    state.get("declared_at") or declared_at)
+                state["cleared_at"] = float(cleared_at)
+                state["origin"] = state.get("origin") or self.account_origin()
+                write_account_limit(state, self.registry)
+            return True
+        except OSError:
+            self.log("could not publish the account clear to %s"
+                     % account_limit_path(self.registry))
+            return False
+
+    def reconcile_account_limit(self) -> bool:
+        """Pull machine-wide account state into this board's own window.
+
+        Mirroring rather than rendering someone else's row is what keeps every
+        guarantee local: this board's `limits` row is computed-active like any
+        other, and it emits its OWN single `limit_cleared` — which is what its
+        session needs, because it has its own parked cards to re-dispatch.
+
+        Returns whether anything changed. Never raises: it runs inside a board
+        read, and a machine-wide file must not be able to 500 a board.
+        """
+        try:
+            shared = read_account_limit(self.registry)
+            at = now()
+            live = (shared is not None and shared["cleared_at"] is None
+                    and shared["resets_at"] > at)
+            row = self.q1(
+                "SELECT * FROM limits WHERE kind='account' AND cleared_at IS NULL "
+                "AND resets_at > ? ORDER BY id DESC LIMIT 1", (at,))
+            if live:
+                if row is not None and abs(float(row["resets_at"])
+                                           - shared["resets_at"]) < 1.0:
+                    return False
+                origin = (shared.get("origin") or {}).get("project")
+                self.declare_limit(
+                    None, shared["resets_at"], kind=LIMIT_KIND_ACCOUNT,
+                    source=shared.get("source")
+                    or ("declared on %s" % origin if origin else None),
+                    note=shared.get("note"), mirror=True)
+                return True
+            if row is not None:
+                # The shared state says it is over (cleared, or its time came)
+                # and this board still thinks it is on. `publish=False`: we are
+                # following the file, not writing to it.
+                return self.end_limit(row["id"], publish=False)
+            return False
+        except Exception:
+            self.log("account-limit reconcile failed: %s" % traceback.format_exc())
+            return False
+
+    def account_limit_banner(self):
+        """The banner data `/api/board` carries: the active account window plus
+        the exact words. Composed here so the browser has nothing to invent —
+        and so a board being read with no session attached still ships the full
+        message and the id the Resume button posts to."""
+        row = self.q1(
+            "SELECT * FROM limits WHERE kind='account' AND cleared_at IS NULL "
+            "AND resets_at > ? ORDER BY id DESC LIMIT 1", (now(),))
+        if row is None:
+            return None
+        lim = self.limit_json(row)
+        until = lim["resets_at_label"]
+        lim.update({
+            "headline": ACCOUNT_LIMIT_HEADLINE,
+            "detail": "Every sprint board on this machine is stopped until %s."
+                      % until,
+            "action": ACCOUNT_LIMIT_ACTION,
+            "resume_label": ACCOUNT_RESUME_LABEL,
+            "resume_url": "/api/limits/%d/clear" % lim["id"],
+        })
+        return lim
+
+    def sweep_limits(self) -> int:
+        """Windows whose reset time has arrived. Runs on the sweep tick beside
+        the other two rules; `end_limit` is what makes it safe to run often."""
+        at = now()
+        rows = self.q("SELECT id FROM limits WHERE cleared_at IS NULL AND resets_at <= ?",
+                      (at,))
+        return sum(1 for r in rows if self.end_limit(r["id"]))
 
     def cursor_seq(self, name: str = "orchestrator") -> int:
         """How far the session has actually drained. A user message with seq <= this
@@ -3705,7 +4310,7 @@ class App:
     def assign(self, num: int, agent_name, worktree, branch,
                title=None, executor=None, model=None,
                actor: str = "session", work_kind=None,
-               external_agent=None) -> dict:
+               external_agent=None, model_reason=None) -> dict:
         self.card_row(num)
         title = clean_title(title) if title is not None else None
         # NOTE: the model is validated further down, strictly, alongside the
@@ -3713,6 +4318,11 @@ class App:
         # named 400, not something quietly recorded as "no model". (The lenient
         # `clean_model` still normalizes the board-wide default, where the input
         # is an env var and there is nobody to hand a 400 to.)
+        #
+        # "" is how the session says "this is no longer a downgrade" when it
+        # puts the card back on its original model, so it is not the same as
+        # leaving the field out.
+        model_reason = clean_model_reason(model_reason)
         # Ops work has no worktree and no branch to give -- assigning it means
         # naming who is doing it and saying what shape of evidence to expect.
         if work_kind is not None:
@@ -3746,11 +4356,14 @@ class App:
                 self.conn.execute(
                     "UPDATE cards SET agent_name=COALESCE(?,agent_name), "
                     "worktree=COALESCE(?,worktree), branch=COALESCE(?,branch), "
+                    "model_reason=CASE WHEN ? IS NULL THEN model_reason "
+                    "                  WHEN ?='' THEN NULL ELSE ? END, "
                     "work_kind=COALESCE(?,work_kind), "
                     "external_agent=COALESCE(?,external_agent), "
                     "executor=COALESCE(?,executor), model=COALESCE(?,model), "
                     "updated_at=? WHERE num=?",
-                    (agent_name, worktree, branch, work_kind,
+                    (agent_name, worktree, branch,
+                     model_reason, model_reason, model_reason, work_kind,
                      None if external_agent is None else (1 if external_agent else 0),
                      executor, model, now(), num))
                 how = self.dispatch_label(executor, model)
@@ -3761,6 +4374,13 @@ class App:
                     "executor": executor}
                 if model:
                     note["model"] = model
+                # ...and the reason says WHICH fable ran out, so the line reads
+                # as a sentence: "assigned to sprint-card-42 on opus — fable
+                # limited until 11:50pm".
+                if model_reason:
+                    note["text"] += " — %s" % model_reason
+                if model_reason is not None:
+                    note["model_reason"] = model_reason
                 self._append_event(num, actor, "note", note)
                 if title is not None:
                     self._write_title(num, title, actor)
@@ -3985,6 +4605,10 @@ class App:
     # -- board ------------------------------------------------------------
 
     def board(self) -> dict:
+        # An account limit declared on ANOTHER project's board has to reach
+        # this one, and while it is on there is no session here to carry it:
+        # the browser's own poll is the tick. Cheap — one small file read.
+        self.reconcile_account_limit()
         sprint = self.open_sprint(create=True)
         rows = self.q("SELECT * FROM cards WHERE sprint_id=? ORDER BY num",
                       (sprint["id"],)) if sprint else []
@@ -4023,6 +4647,15 @@ class App:
             "states": list(STATES),
             # What "no badge" means on a card face.
             "default_model": self.default_model,
+            # Provider limit windows that are open RIGHT NOW (computed off the
+            # clock, so an expired one is simply not here). The board draws one
+            # quiet line per window; `GET /api/limits` has the finished ones.
+            "limits": self.active_limits(),
+            # The account window, if one is on, with the words and the id the
+            # Resume button posts to. Present in `limits` too (kind "account");
+            # this is the same fact hoisted so the banner needs no filtering,
+            # and it is what a board with NO session attached still serves.
+            "account_limit": self.account_limit_banner(),
             # `integrating` stays in the Ready column with a "merging…" note --
             # a card only reaches Done once its branch actually landed.
             "column_of": dict(COLUMN_OF),
@@ -4411,6 +5044,11 @@ def make_handler(app: App):
                 # one flagged `self`. `?fresh=1` skips the 10s cache (tests).
                 fresh = (query.get("fresh") or ["0"])[0] in ("1", "true", "yes")
                 return self.json_out(200, app.siblings(max_age=0 if fresh else None))
+            if path == "/api/limits":
+                # Active windows plus the recently finished ones. Active is a
+                # computation, not a column: nothing here depends on a sweep
+                # having run.
+                return self.json_out(200, app.limits_index())
             if path == "/api/sprints":
                 rows = app.q("SELECT * FROM sprints ORDER BY id DESC")
                 return self.json_out(200, {"sprints": [app.sprint_json(r) for r in rows]})
@@ -4691,6 +5329,21 @@ def make_handler(app: App):
                 return 201, app.make_batch(body.get("card_nums"), body.get("agent_name"),
                                            body.get("branch"), body.get("worktree"))
 
+            # A provider said when it would let us back in. Session surface:
+            # `bin/sprint-limit declare --model fable --resets 11:50pm`.
+            if path == "/api/limits":
+                # `kind: "account"` is the whole-account one: no model, banner
+                # on every board on the machine, cleared by the Resume button.
+                out = app.declare_limit(body.get("model"), body.get("resets_at"),
+                                        source=body.get("source"),
+                                        note=body.get("note"),
+                                        kind=body.get("kind"))
+                return (201 if out.get("created") else 200), out
+
+            m = re.match(r"^/api/limits/(\d+)/clear$", path)
+            if m:
+                return 200, app.clear_limit(int(m.group(1)))
+
             if path == "/api/sprint":
                 return 200, app.sprint_action(body.get("action"), body)
 
@@ -4800,6 +5453,7 @@ def make_handler(app: App):
                 # worktree/branch are optional on purpose: ops work has neither.
                 return 200, app.assign(num, body.get("agent_name"), body.get("worktree"),
                                        body.get("branch"), title=body.get("title"),
+                                       model_reason=body.get("model_reason"),
                                        work_kind=body.get("work_kind"),
                                        external_agent=body.get("external_agent"),
                                        executor=body.get("executor"),
@@ -5059,6 +5713,69 @@ class _FileLock:
             pass
         self.fh = None
         return False
+
+
+def account_limit_path(registry: str = None) -> str:
+    """The one file every board on this machine reads to learn that the whole
+    account is out. Beside the registry, so a single `--registry`/$SPRINT_REGISTRY
+    override moves ALL machine-wide state — a test can never touch the real one."""
+    return os.path.join(hub_dir(registry), ACCOUNT_LIMIT_FILENAME)
+
+
+def read_account_limit(registry: str = None):
+    """-> the shared account-limit state, or None.
+
+    Anything unreadable, corrupt or shaped wrong is None: a board must never
+    fail to serve because another board's write got interrupted, and "I cannot
+    read the file" has to mean "no account limit", never a banner nobody can
+    dismiss.
+    """
+    try:
+        with open(account_limit_path(registry), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        resets_at = float(data.get("resets_at"))
+        declared_at = float(data.get("declared_at"))
+    except (TypeError, ValueError):
+        return None
+    cleared_at = data.get("cleared_at")
+    try:
+        cleared_at = None if cleared_at is None else float(cleared_at)
+    except (TypeError, ValueError):
+        cleared_at = None
+    return {
+        "resets_at": resets_at,
+        "declared_at": declared_at,
+        "cleared_at": cleared_at,
+        "source": data.get("source") or None,
+        "note": data.get("note") or None,
+        "origin": data.get("origin") if isinstance(data.get("origin"), dict) else None,
+    }
+
+
+def write_account_limit(state: dict, registry: str = None):
+    """Atomic whole-file replace (tmp + fsync + rename), 0600 — same shape as
+    the registry write, for the same reason: a half-written file here would be
+    read by every board on the machine."""
+    path = account_limit_path(registry)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp.%d" % os.getpid()
+    payload = dict(state)
+    payload["version"] = 1
+    payload["updated_at"] = now()
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def read_registry(registry: str = None) -> dict:
