@@ -55,6 +55,13 @@ try {
 
   <main class="main" id="main" aria-label="board"></main>
 
+  <!-- The rail's drag handle. It sits in the grid cell the rail occupies, not
+       INSIDE the rail: the rail is torn down and rebuilt whenever a different
+       card takes it, and a handle in there would go with it. Hidden below the
+       Fold breakpoint, where the rail is a fixed slide-over and there is
+       nothing to trade width against. -->
+  <div class="rail-grip" id="rail-grip"></div>
+
   <aside class="rail" id="rail" aria-label="session chat or card thread"></aside>
 
 </div>

@@ -115,7 +115,7 @@ function noteGeneration(payload) {
 //
 // Bump BOTH numbers in the same commit whenever web/ starts requiring an
 // endpoint or field a running server might not have.
-export const UI_API_VERSION = 2;
+export const UI_API_VERSION = 3;
 
 let serverApi = null;                // null = nothing has answered yet
 const staleListeners = new Set();
@@ -208,6 +208,12 @@ export const api = {
     images && images.length ? { text, images } : { text }, { idempotencyKey: key }),
   answer: (num, question_id, text, key) =>
     req('POST', `/api/cards/${num}/answer`, { question_id, text }, { idempotencyKey: key }),
+  // The read receipt behind a conversation card's highlight. `seq` is what this
+  // tab had actually rendered when you looked at it; the server keeps the
+  // highest one it has been told about, so a stale tab can never un-read a
+  // message.
+  seen: (num, seq, key) =>
+    req('POST', `/api/cards/${num}/seen`, { seq }, { idempotencyKey: key }),
   action: (num, action, extra, key) =>
     req('POST', `/api/cards/${num}/action`, { action, ...(extra || {}) }, { idempotencyKey: key }),
   retry: (num, key) =>

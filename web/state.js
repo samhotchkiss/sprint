@@ -111,6 +111,10 @@ export const store = {
   attached: new Map(),    // composer key -> images pasted but not sent yet
   expanded: new Set(),    // event keys whose long version you opened (see detail.js)
   doneOpen: false,
+  // Whether the closed list is showing everything or just the newest 20. One
+  // flag for both surfaces: the List's Done and the Board's Complete are never
+  // on screen at the same time.
+  doneMore: false,
   loaded: false,
   // How many report documents THIS sprint has. The header's Reports link exists
   // only when this is > 0 — user, verbatim: "link should only appear once
@@ -193,6 +197,15 @@ export function normCard(c) {
     pinned: !!c.pinned,
     dup_of: c.dup_of != null ? num(c.dup_of) : null,
     long_running: !!c.long_running,
+    // What SHAPE of card this is. Anything a server we don't recognise sends is
+    // work — the kind that has always existed — so an old board degrades to the
+    // board it already was rather than losing cards off the page.
+    kind: c.kind === 'conversation' ? 'conversation' : 'work',
+    // The derived highlight, straight off the server: {state, last_seen_seq,
+    // latest_incoming_seq, latest_user_seq, unread}. Never computed here — the
+    // whole point is that one place owns the rule.
+    conversation: c.conversation && typeof c.conversation === 'object'
+      ? { ...c.conversation } : null,
     // Which model the agent was dispatched on, and what the sprint's default
     // is, so `modelTag` can decide whether it is worth drawing. This
     // normalizer builds an explicit shape — a field it doesn't name does not
@@ -460,9 +473,64 @@ export function isSilent(card, now = Date.now()) {
   return now - t > SILENT_MS;
 }
 
+// ---- conversations -------------------------------------------------------
+//
+// User, verbatim: "we're discovering we need another card type for an ongoing
+// conversation thread. I think it's a lower section in the 'needs you' column
+// where the card gets highlighted if there's an unread and unseen message. once
+// I see the message, the highlighting dims, and once I respond the highlight
+// goes away completely. with russ, this lets me have distinct conversations on
+// specific needs".
+//
+// A conversation is not work: it has no queue position, no agent, no packet and
+// no verdict, so it is kept OUT of the four work sections entirely rather than
+// filtered back out of each of them. It has one home, at the bottom of Needs
+// you, in both layouts.
+
+export function isConversation(card) {
+  return !!(card && card.kind === 'conversation');
+}
+
+/**
+ * unseen — they spoke after you last looked (strong highlight)
+ * seen   — you have looked since, but you have not replied (dimmed)
+ * clear  — your own message is the latest (nothing)
+ *
+ * Derived server-side from the log and one read receipt; the tab only reports
+ * it. A card whose server never heard of conversations reads `clear`, which is
+ * the state that asks for nothing.
+ */
+export function conversationState(card) {
+  const c = card && card.conversation;
+  const s = c && c.state;
+  return s === 'unseen' || s === 'seen' ? s : 'clear';
+}
+
+export const CONVERSATION_HINT = {
+  unseen: 'a new message you have not opened yet',
+  seen: 'you have read it — it is waiting on your reply',
+  clear: 'you spoke last — nothing is waiting on you',
+};
+
+/** Every open conversation, loudest first, then by most recent word. */
+export function conversations() {
+  const rank = { unseen: 0, seen: 1, clear: 2 };
+  const out = [];
+  for (const card of store.cards.values()) {
+    if (isConversation(card) && cardState(card) === 'conversation') out.push(card);
+  }
+  out.sort((a, b) => (rank[conversationState(a)] - rank[conversationState(b)])
+    || ((ms(b.last_activity_at) || 0) - (ms(a.last_activity_at) || 0))
+    || (a.num || 0) - (b.num || 0));
+  return out;
+}
+
 export function columns() {
   const buckets = new Map(COLUMNS.map((c) => [c.key, []]));
   for (const card of store.cards.values()) {
+    // A live conversation has its own section and is in none of these; a
+    // CLOSED one is an ordinary closed card and falls into Done like any other.
+    if (isConversation(card) && cardState(card) === 'conversation') continue;
     buckets.get(columnOf(cardState(card))).push(card);
   }
   // A card you just dropped is on the board before the server has confirmed it.
@@ -566,7 +634,12 @@ export function boardColumns() {
     const at = BOARD_COL_OF[state] || ['waiting', 'queued'];
     buckets.get(at[0] + '/' + at[1]).push(card);
   };
-  for (const card of store.cards.values()) put(card, cardState(card));
+  for (const card of store.cards.values()) {
+    // Live conversations render in their own section under Needs you; a closed
+    // one is an ordinary closed card and goes to Complete like any other.
+    if (isConversation(card) && cardState(card) === 'conversation') continue;
+    put(card, cardState(card));
+  }
   // A card you just dropped is on the board before the server has confirmed it.
   for (const p of store.pending) buckets.get('waiting/queued').unshift(p);
 

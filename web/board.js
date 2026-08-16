@@ -21,8 +21,9 @@ import {
 } from './state.js';
 import { phaseChip } from './phase.js';
 import { renderMeter } from './meter.js';
-import { shortAgent } from './list.js';
+import { shortAgent, conversationBlock } from './list.js';
 import { reviewBlock } from './review.js';
+import { completeList } from './done.js';
 
 const scrollMemo = new Map();
 
@@ -58,7 +59,10 @@ function boardGrid(app, { fold }) {
     const prev = scrollMemo.get(col.key);
 
     const body = h('div.col-body', { 'data-col': col.key });
-    if (!col.count) body.appendChild(h('p.col-empty', col.empty));
+    // The Needs-you column's lower section: ongoing threads, below the
+    // questions, in the same place the List puts them.
+    const convo = col.key === 'needs_you' ? conversationBlock(app, { compact: true }) : null;
+    if (!col.count && !convo) body.appendChild(h('p.col-empty', col.empty));
     // Sections appear only when they have something in them — an empty "Held"
     // heading is a promise of a pile that isn't there.
     for (const sec of col.sections) {
@@ -78,10 +82,20 @@ function boardGrid(app, { fold }) {
         body.appendChild(reviewBlock(sec.cards, app, { compact: true }));
         continue;
       }
+      // Complete is a compact list, not a stack of tiles. User, verbatim: "we
+      // need completed to just be a compact list. you can click each item to
+      // open the card. and, beyond 20 completed, they're hidden and you can
+      // expand that list." Finished work is history — it should read like an
+      // index, not compete with the work that is still live.
+      if (col.key === 'review' && sec.key === 'complete') {
+        body.appendChild(completeList(sec.cards, app));
+        continue;
+      }
       const group = h('div.col-group', { class: sec.quiet ? 'col-group is-quiet' : 'col-group' });
       for (const card of sec.cards) group.appendChild(renderCardFace(card, app));
       body.appendChild(group);
     }
+    if (convo) body.appendChild(convo);
     if (prev) requestAnimationFrame(() => { body.scrollTop = prev; });
     body.addEventListener('scroll', () => scrollMemo.set(col.key, body.scrollTop), { passive: true });
 
