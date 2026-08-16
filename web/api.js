@@ -115,7 +115,7 @@ function noteGeneration(payload) {
 //
 // Bump BOTH numbers in the same commit whenever web/ starts requiring an
 // endpoint or field a running server might not have.
-export const UI_API_VERSION = 2;
+export const UI_API_VERSION = 3;
 
 let serverApi = null;                // null = nothing has answered yet
 const staleListeners = new Set();

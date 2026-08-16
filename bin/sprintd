@@ -53,7 +53,8 @@ DEFAULT_HUB_PORT = 8300         # one hub per machine, fixed so the URL is memor
 # number exists to turn into a sentence ("this board needs a restart").
 #   1 — the board through the hub/siblings work
 #   2 — phases (/api/board carries phase, phase_since, phase_expected_seconds)
-API_VERSION = 2
+#   3 — decision requests (a question carries `artifacts`: url, attachments, notes)
+API_VERSION = 3
 DATA_DIRNAME = ".sprint"
 HUB_DIRNAME = ".sprint"         # under $HOME: the machine-wide (cross-project) state
 REGISTRY_FILENAME = "registry.json"
@@ -378,6 +379,7 @@ CREATE TABLE IF NOT EXISTS questions (
   card_num INTEGER NOT NULL,
   text TEXT NOT NULL,
   options TEXT,
+  artifacts TEXT,
   answered_at REAL,
   created_at REAL NOT NULL
 );
@@ -760,6 +762,23 @@ def render_inline(text: str) -> str:
                        % (safe_url(m.group(2)), m.group(1)))
         if safe_url(m.group(2)) else m.group(1),
         out)
+    # A bare URL is a link too. Card #54, user verbatim: "make links clickable
+    # and should auto open in a new tab". Everything that was ALREADY a link (or
+    # inline code) is a \x00N\x00 placeholder by now, so whatever still reads as
+    # http(s) here is plain prose -- there is no way to double-wrap an anchor.
+    def bare_link(m):
+        url = m.group(0)
+        while url and url[-1] in ".,;:!?)":
+            if url[-1] == ")" and url.count("(") > url.count(")"):
+                break
+            url = url[:-1]
+        safe = safe_url(url)
+        if not safe:
+            return m.group(0)
+        return keep('<a href="%s" rel="noreferrer noopener nofollow" target="_blank">%s</a>'
+                    % (safe, url)) + m.group(0)[len(url):]
+
+    out = re.sub(r"https?://[^\s<>\"'`\]]+", bare_link, out)
     out = re.sub(r"~~(.+?)~~", r"<del>\1</del>", out)
     out = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", out)
     out = re.sub(r"__(.+?)__", r"<strong>\1</strong>", out)
@@ -1348,6 +1367,10 @@ class App:
         # Which model the agent on this card was dispatched on. NULL means
         # "the sprint default" -- the face only ever shows the exception.
         ("cards", "model", "TEXT"),
+        # What a DECISION REQUEST hands over with its question: a live URL,
+        # screenshots, and a short note. NULL for a plain question, which is
+        # every question a board created before this landed.
+        ("questions", "artifacts", "TEXT"),
     )
 
     def _add_missing_columns(self):
@@ -1819,9 +1842,13 @@ class App:
 
     @staticmethod
     def question_json(row) -> dict:
+        keys = row.keys()
         return {
             "id": row["id"], "card_num": row["card_num"], "text": row["text"],
             "options": jload(row["options"], None),
+            # A board whose questions table predates decision requests has no
+            # such column; a question with nothing attached is the same shape.
+            "artifacts": jload(row["artifacts"], None) if "artifacts" in keys else None,
             "answered_at": row["answered_at"], "created_at": row["created_at"],
         }
 
@@ -3340,10 +3367,66 @@ class App:
 
     # -- questions / answers ----------------------------------------------
 
-    def ask(self, num: int, text: str, options=None, actor: str = "worker") -> dict:
+    def normalize_artifacts(self, artifacts):
+        """What a DECISION REQUEST hands over alongside its question.
+
+        User's rule, verbatim: *"needs you is where we talk through things.
+        review means the session genuinely thinks the card is 100% complete.
+        needs you is that the card is waiting for my input before it can keep
+        moving forward"*. An agent that has built three mockups and wants one
+        picked is not finished -- it is waiting. So the question mechanism
+        carries the things you need in order to answer: a live URL, pictures,
+        and a short note, ingested exactly the way an evidence packet's
+        screenshots are (absolute paths in, stored refs with a `url` out).
+
+        `{url?, attachments?: [ref], notes?}` -- every field optional, but an
+        artifacts payload with nothing in it is a mistake worth naming.
+        """
+        if artifacts is None:
+            return None
+        if not isinstance(artifacts, dict):
+            raise ApiError(400, "bad_artifacts",
+                           "artifacts must be an object with url/attachments/notes",
+                           field="artifacts")
+        out = {}
+        url = artifacts.get("url")
+        if url is not None:
+            if not isinstance(url, str) or not url.strip():
+                raise ApiError(400, "bad_artifacts", "artifacts.url must be a non-empty string",
+                               field="artifacts.url")
+            if not re.match(r"^https?://", url.strip()):
+                raise ApiError(400, "bad_artifacts",
+                               "artifacts.url must be an http(s) URL the user can open",
+                               field="artifacts.url")
+            out["url"] = url.strip()
+        notes = artifacts.get("notes")
+        if notes is not None:
+            if not isinstance(notes, str):
+                raise ApiError(400, "bad_artifacts", "artifacts.notes must be a string",
+                               field="artifacts.notes")
+            if notes.strip():
+                out["notes"] = notes.strip()
+        atts = artifacts.get("attachments")
+        if atts is not None:
+            if not isinstance(atts, list):
+                raise ApiError(400, "bad_artifacts",
+                               "artifacts.attachments must be a list of paths or refs",
+                               field="artifacts.attachments")
+            if atts:
+                out["attachments"] = self.ingest_refs(atts)
+        if not out:
+            raise ApiError(400, "bad_artifacts",
+                           "artifacts carries nothing -- give it a url, attachments or notes, "
+                           "or omit it and ask a plain question",
+                           field="artifacts")
+        return out
+
+    def ask(self, num: int, text: str, options=None, actor: str = "worker",
+            artifacts=None) -> dict:
         text = (text or "").strip()
         if not text:
             raise ApiError(400, "missing_field", "question text is required", field="text")
+        artifacts = self.normalize_artifacts(artifacts)
         row = self.card_row(num)
         if row["state"] in TERMINAL_STATES:
             raise ApiError(409, "terminal_card",
@@ -3357,12 +3440,18 @@ class App:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self.conn.execute(
-                    "INSERT INTO questions(card_num, text, options, answered_at, created_at) "
-                    "VALUES(?,?,?,NULL,?)",
-                    (num, text, jdump(options) if options else None, now()))
+                    "INSERT INTO questions"
+                    "(card_num, text, options, artifacts, answered_at, created_at) "
+                    "VALUES(?,?,?,?,NULL,?)",
+                    (num, text, jdump(options) if options else None,
+                     jdump(artifacts) if artifacts else None, now()))
                 qid = int(cur.lastrowid)
-                self._append_event(num, actor, "question",
-                                   {"question_id": qid, "text": text, "options": options})
+                payload = {"question_id": qid, "text": text, "options": options}
+                # The artifacts ride on the event too, so the thread can still
+                # show what you were asked to look at after you have answered.
+                if artifacts:
+                    payload["artifacts"] = artifacts
+                self._append_event(num, actor, "question", payload)
                 self.conn.execute("COMMIT")
             except Exception:
                 self.conn.execute("ROLLBACK")
@@ -4662,7 +4751,8 @@ def make_handler(app: App):
                                            long_running=body.get("long_running"))
             if verb == "question":
                 return 201, app.ask(num, body.get("text"), body.get("options"),
-                                    actor=self.actor_or(body, "worker"))
+                                    actor=self.actor_or(body, "worker"),
+                                    artifacts=body.get("artifacts"))
             if verb == "ready":
                 packet = body.get("packet", body)
                 return 200, app.card_ready(num, packet,

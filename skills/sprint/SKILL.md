@@ -280,7 +280,7 @@ and the table is prose.
 | session | `integrated` (ok: true) | Your own echo from step 6 — card is now `completed`. No further action beyond the cleanup you already did as part of calling it (kill preview server, prune worktree). |
 | session | `integrated` (ok: false) | Your own echo from step 6 — card is back in `in_progress` with an `error` note. You already told the agent what failed when you posted it; nothing further here. |
 | worker | `progress`/`note`/`error` | Telemetry. No action required (the board shows it); read it if you're specifically checking on a card (step 5) or if `error` looks fatal, in which case flip it to `failed` yourself: `POST /api/cards/:num/state {"state":"failed","actor":"session","reason":"<machine-named>"}`. **`failed` and `stale` are session-only states** — a worker's own state route can only reach `triaging`/`in_progress`/`blocked`, so a dead agent can only be declared dead by you. |
-| worker | `question` | Server already flipped to `needs_you`. Nothing to do — the card face shows the question; you'll see the `answer` event when the user responds. |
+| worker | `question` | Server already flipped to `needs_you`. Nothing to do — the card face shows the question; you'll see the `answer` event when the user responds. A question with `payload.artifacts` is a **decision request** (mockups, a live URL, notes for a choice the agent cannot make itself); the rail renders them above the answer box, so still nothing to relay — but if you re-surface it after 30 minutes, say what is attached ("#42 wants you to pick one of three headers — screenshots and a preview are on the card"). |
 | worker | `evidence` (ready) | Card (or whole batch) just entered `ready`. Nothing required from you — it's now waiting on the user's verdict. Optional: a short sidebar note if the user seems to be waiting on it. |
 | server | `note` with `payload.settings` | The user changed the board's dispatch policy in the Settings panel (model, executors, concurrency). Nothing is owed in reply — but your next dispatch reads the new values, including a concurrency cap that may have just gone up (dispatch now) or down (don't start another until you are back under it). |
 | server | `agent_silent` | See step 5 — go investigate. |
@@ -579,6 +579,29 @@ you don't block on a worker, you find out what happened through the
 board and through `SendMessage` replies. Don't pass `isolation:
 "worktree"` — you already built the exact worktree it needs; the
 brief's job is to tell it where.
+
+Brief contents, every time:
+- The card's full text (all member cards' text, for a batch).
+- Absolute paths to any attachments (workers `Read` images directly —
+  never re-upload or re-describe them).
+- `SPRINT_SERVER`, `SPRINT_TOKEN`, and its card number(s).
+- Its assigned worktree path and branch.
+- A pointer to the worker contract (`agents/sprint-worker.md` — the
+  agent definition already carries this, but restate the non-negotiables
+  inline: no `rm`, no prompting commands, one branch, never push main,
+  report via the three helpers, screenshot light+dark from its own
+  worktree preview on any UI change).
+- **Which handoff it owes, if the card could go either way.** User
+  ruling, verbatim: *"needs you is where we talk through things. review
+  means the session genuinely thinks the card is 100% complete. needs
+  you is that the card is waiting for my input before it can keep moving
+  forward."* A card that asks for a design call, a pick between options,
+  or "is this what you meant" is a **decision request** — `sprint-ask
+  <num> "…" --options … --url … --attach … --notes …`, which lands it in
+  `needs_you` with the mockups/preview rendered above the answer box. It
+  is NOT a `sprint-ready` packet, and a packet is not a way to ask a
+  question. Say so in the brief when the card is that shape, so the
+  agent doesn't build one arbitrary answer and submit it as finished.
 
 A subagent gets `agents/sprint-worker.md` for free (it IS its agent
 definition), so the inline restatement of the contract is belt-and-

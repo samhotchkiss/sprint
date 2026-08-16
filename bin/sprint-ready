@@ -35,6 +35,21 @@ the human to easily validate the fix without having to read the code.
 so, either before/after screenshots or a link to a staging url for the
 branch." Every ready card must be validatable with zero code reading.
 
+A packet is ONE of the two things an agent can hand over, and the other
+one is not this command. User's rule, verbatim: "needs you is where we
+talk through things. review means the session genuinely thinks the card
+is 100% complete. needs you is that the card is waiting for my input
+before it can keep moving forward."
+
+  evidence packet   sprint-ready   "I believe this is done."       → ready
+  decision request  sprint-ask     "I need you to choose/answer
+                                    before I continue."            → needs_you
+
+So mockups to pick between, a design call, a "which of these three":
+those go through `sprint-ask` with `--options/--url/--attach/--notes`,
+never through the gate. This command prints an advisory notice on stderr
+(never a refusal) when a packet looks like a question in disguise.
+
 - test_result must report BOTH a pass count and a fail count (e.g.
   "12 pass, 0 fail" — "passed"/"passing"/"ok" and "failed"/"failing"/
   "error" also count as the respective word), never prose like "tests
@@ -78,6 +93,16 @@ import urllib.error
 import urllib.request
 
 REQUIRED_STR_FIELDS = ("claim", "diffstat", "branch", "test_cmd", "test_result")
+# Fields that belong to a DECISION REQUEST (sprint-ask), never to a packet. A
+# packet that carries one is a question wearing a packet's clothes.
+DECISION_FIELDS = ("options", "question", "artifacts", "choices")
+# A `validate` step (or a claim) that reads as a question rather than as a check
+# the user performs. "Confirm the header does not overlap?" never happens by
+# accident; "Which of these three do you want?" does.
+ASK_OPENERS = re.compile(
+    r"^\s*(which|should|would|could|do you|did you|are you|is this|is that|what|"
+    r"who|pick|choose|prefer|shall|can you|let me know|tell me|thoughts)\b",
+    re.IGNORECASE)
 # Mirrors bin/sprintd's WORK_KINDS.
 WORK_KINDS = ("code", "ops")
 # Mirrors bin/sprintd's PASS_RE / FAIL_RE exactly — both must match.
@@ -220,6 +245,56 @@ def validate_packet(packet):
                 fail(f"per_card[{i}].screenshots", "must be a JSON array of attachment path/ref strings")
 
 
+def warn(message):
+    print("sprint-ready: " + message, file=sys.stderr)
+
+
+def decision_smells(packet):
+    """Does this packet actually want to be a DECISION REQUEST?
+
+    User's rule, verbatim: "needs you is where we talk through things. review
+    means the session genuinely thinks the card is 100% complete. needs you is
+    that the card is waiting for my input before it can keep moving forward."
+
+    A packet says "I believe this is done". A question says "I need you to
+    choose before I continue". They land in different columns and they mean
+    different things to the person reading them, so a packet that is really a
+    question is a wrong answer to a question the user asks every time he opens
+    the board. Advisory ONLY — printed on stderr, never a gate: the packet has
+    passed the real rules, and this is judgment, not validation.
+    """
+    out = []
+    present = [f for f in DECISION_FIELDS if packet.get(f)]
+    if present:
+        out.append(
+            "this packet carries %s, which a packet has no field for. Options and "
+            "artifacts belong on a DECISION REQUEST: `sprint-ask <num> \"...\" "
+            "--options '[...]' --url ... --attach ...` lands the card in needs_you, "
+            "where the user answers it. Sending it through the gate instead asks "
+            "him to sign off on work you have said is unfinished."
+            % ", ".join(present))
+
+    steps = packet.get("validate")
+    if isinstance(steps, str):
+        steps = [steps]
+    asks = [s for s in (steps or [])
+            if isinstance(s, str) and (s.strip().endswith("?") or ASK_OPENERS.match(s))]
+    if asks:
+        out.append(
+            "a `validate` step reads like a question, not a check: %r. `validate` "
+            "is what the USER does to confirm the work ('open X, the header does "
+            "not overlap'). If you are actually asking him to decide something, "
+            "that is `sprint-ask` (add --url/--attach so he can see what he is "
+            "choosing between) and the card waits in needs_you." % asks[0].strip())
+
+    claim = packet.get("claim")
+    if isinstance(claim, str) and claim.strip().endswith("?"):
+        out.append(
+            "`claim` is a question. A claim is one sentence saying what SHIPPED; "
+            "if you cannot write one yet, the card is not ready — ask instead.")
+    return out
+
+
 def main(argv):
     args = parse_args(argv)
 
@@ -242,6 +317,8 @@ def main(argv):
         fail("packet", f"not valid JSON: {e}")
 
     validate_packet(packet)
+    for line in decision_smells(packet):
+        warn(line)
 
     if not args.server:
         fail("server", "pass --server or set SPRINT_SERVER")
