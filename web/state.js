@@ -97,6 +97,7 @@ export const STATE_LABEL = {
 export const store = {
   sprint: null,           // {title, hold_mode, opened_at, closed_at}
   columnOf: null,         // server-advised state -> column map (board.column_of)
+  settings: null,         // dispatch policy: model, executors, concurrency
   // `cursor` is the session's real drain cursor: every event with seq <= cursor
   // has been read by the session. Never guessed — the server is the only writer.
   session: { status: 'online', online: true, since: null, cursor: null, waiterSeconds: null },
@@ -120,6 +121,14 @@ export const store = {
   // only when this is > 0 — user, verbatim: "link should only appear once
   // there's a report within the sprint".
   reports: 0,
+  // Provider limit windows that are open ("fable until 11:50pm"). One quiet
+  // board-level line each, and nothing else — the cards that got moved are
+  // already wearing their model tag.
+  limits: [],
+  // The account window, if the whole Claude account is out: the big banner
+  // every board on the machine shows, and the Resume button in it. Null means
+  // the server said there is none.
+  accountLimit: null,
 
   // ---- rail + layout (client only) ----------------------------------------
   // Only one thing owns the rail at a time: a card, or the session chat.
@@ -211,6 +220,9 @@ export function normCard(c) {
     // normalizer builds an explicit shape — a field it doesn't name does not
     // exist in the tab, which is exactly how the tag silently didn't render.
     model: c.model || null,
+    // Why it is on that model ("fable limited until 23:50"). The board-level
+    // limit line reads this to say what the work moved TO.
+    model_reason: c.model_reason || null,
     default_model: c.default_model || null,
     created_at: c.created_at || null,
     updated_at: c.updated_at || null,
@@ -234,6 +246,12 @@ export function normCard(c) {
     phase: c.phase || null,
     phase_since: c.phase_since || null,
     phase_expected_seconds: c.phase_expected_seconds != null ? num(c.phase_expected_seconds) : null,
+    // Who ran this card and with what. Null on both means "the board's
+    // defaults", and `dispatch` is the server's resolution of that — including
+    // `is_default`, which is the only thing the face's tag asks about.
+    executor: c.executor || null,
+    model: c.model || null,
+    dispatch: c.dispatch || null,
   };
 }
 
@@ -251,8 +269,30 @@ function normQuestion(q) {
     id: q.id != null ? q.id : (q.question_id != null ? q.question_id : null),
     text: q.text || q.question || '',
     options,
+    // A DECISION REQUEST hands over the thing you need in order to answer —
+    // a live URL, screenshots, a note. Null on a plain question, and null on
+    // a board whose server is too old to have the field at all.
+    artifacts: normArtifacts(q.artifacts),
     answered_at: q.answered_at || null,
   };
+}
+
+/**
+ * What the agent attached to its question. Card #50, user verbatim: "needs you
+ * is where we talk through things. review means the session genuinely thinks
+ * the card is 100% complete. needs you is that the card is waiting for my input
+ * before it can keep moving forward." Tolerant like every normalizer here: a
+ * shape we do not recognise degrades to nothing rather than throwing.
+ */
+export function normArtifacts(a) {
+  let raw = a;
+  if (typeof raw === 'string') { try { raw = JSON.parse(raw); } catch { raw = null; } }
+  if (!raw || typeof raw !== 'object') return null;
+  const url = typeof raw.url === 'string' && /^https?:\/\//.test(raw.url.trim()) ? raw.url.trim() : null;
+  const notes = typeof raw.notes === 'string' && raw.notes.trim() ? raw.notes.trim() : null;
+  const attachments = Array.isArray(raw.attachments) ? raw.attachments.filter(Boolean) : [];
+  if (!url && !notes && !attachments.length) return null;
+  return { url, notes, attachments };
 }
 
 // online | busy | offline. `busy` means the session is attached and polling but
@@ -322,6 +362,9 @@ export function applyBoard(board) {
   if (known != null && (sess.cursor == null || sess.cursor < known)) sess.cursor = known;
   store.session = sess;
   if (board.column_of && typeof board.column_of === 'object') store.columnOf = board.column_of;
+  // The board's dispatch policy rides along so the Settings panel and the card
+  // faces are never a second fetch behind what the board just said.
+  if (board.settings && typeof board.settings === 'object') store.settings = board.settings;
 
   const list = Array.isArray(board.cards) ? board.cards : [];
   const next = new Map();
@@ -355,6 +398,19 @@ export function applyBoard(board) {
   // the header link is a statement about THIS sprint.
   const reports = num(board.reports);
   store.reports = reports != null && reports > 0 ? reports : 0;
+
+  // An older server sends no `limits` at all; that is not the same as "the
+  // limits ended", so an absent field leaves what we have alone and only an
+  // actual list replaces it.
+  if (Array.isArray(board.limits)) {
+    store.limits = board.limits.map(normLimit).filter(Boolean);
+  }
+  // The account window, hoisted by the server with its words and the id the
+  // Resume button posts to. `undefined` means an older server (leave what we
+  // have); `null` means the server looked and there is none.
+  if (board.account_limit !== undefined) {
+    store.accountLimit = board.account_limit ? normLimit(board.account_limit) : null;
+  }
 
   const seq = num(board.seq != null ? board.seq : board.last_seq);
   if (seq != null) store.seq = Math.max(store.seq, seq);
@@ -889,6 +945,100 @@ export function modelTag(card) {
 }
 
 export const MODEL_HINT = 'not the sprint default — this card was dispatched on a fallback model';
+
+// ---- provider limit windows ----------------------------------------------
+//
+// A limit window is one fact — "fable is unavailable until 11:50pm" — and it
+// gets one quiet line, in the same register as the session-offline banner. Not
+// a modal, not a toast, no per-card chrome: the cards that moved are already
+// wearing their model tag.
+
+/** `11:50pm` — a reset time in this browser's own clock. */
+export function clockLabel(ts) {
+  const t = ms(ts);
+  if (t == null) return '';
+  const d = new Date(t);
+  const h12 = d.getHours() % 12 || 12;
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${h12}:${mm}${d.getHours() < 12 ? 'am' : 'pm'}`;
+}
+
+export function normLimit(l) {
+  if (!l || typeof l !== 'object') return null;
+  const resets = ms(l.resets_at);
+  if (resets == null) return null;
+  return {
+    id: l.id != null ? l.id : null,
+    // "model" (one model went away, quiet line) or "account" (the whole Claude
+    // account is out and NOTHING runs — the big banner). An older server sends
+    // neither, and the thing it could only have meant is the quiet one.
+    kind: l.kind === 'account' ? 'account' : 'model',
+    model: l.model || '',
+    resetsAt: resets,
+    // Copy composed by the server, so the banner, the event log and the CLI
+    // cannot tell the user three different stories. Absent on a model window.
+    headline: l.headline || null,
+    action: l.action || null,
+    resumeLabel: l.resume_label || 'Resume',
+    detail: l.detail || null,
+    // The server's own rendering of the reset time, kept as the fallback for
+    // the browser's — they agree unless the two are in different timezones,
+    // and in that case the one in front of the user is the honest one.
+    label: l.resets_at_label || null,
+    source: l.source || null,
+    note: l.note || null,
+  };
+}
+
+/**
+ * Windows that are open RIGHT NOW. The server sends only these, but the tab
+ * checks the clock again anyway: the page repaints on a 30s timer and a line
+ * saying a model is limited until a time that has already passed is worse
+ * than no line at all.
+ */
+export function activeLimits(now = Date.now()) {
+  return store.limits.filter((l) => l.resetsAt > now && l.kind !== 'account');
+}
+
+/**
+ * The account window, or null. Same clock re-check as the quiet lines: a
+ * banner saying everything is stopped until a time that has already passed
+ * would be the worst one on the page to leave up.
+ *
+ * `account_limit` is the server's hoisted copy; the array is the fallback, so
+ * a board answering an older payload shape still raises the banner.
+ */
+export function accountLimit(now = Date.now()) {
+  const live = (l) => l && l.kind === 'account' && l.resetsAt > now;
+  if (live(store.accountLimit)) return store.accountLimit;
+  return store.limits.find(live) || null;
+}
+
+/**
+ * The sentence. "fable is rate-limited until 11:50pm — work is running on opus"
+ *
+ * The second half is only said when it is TRUE, and it is read off the board's
+ * own cards: the models carrying work that was explicitly downgraded for a
+ * limit (`model_reason` set by the session at dispatch). Nothing here guesses —
+ * with no downgraded cards on the board the line is just the first half, which
+ * is still the thing the user needed to know.
+ */
+export function limitLine(limit, cards = store.cards) {
+  const until = clockLabel(limit.resetsAt) || limit.label || '';
+  const head = `${limit.model} is rate-limited until ${until}`;
+  const on = new Set();
+  for (const card of cards.values()) {
+    if (!card.model_reason || !card.model) continue;
+    if (card.model === limit.model) continue;
+    if (columnOf(card.state) === 'done') continue;
+    on.add(card.model);
+  }
+  const fallbacks = Array.from(on).sort();
+  if (!fallbacks.length) return head;
+  const list = fallbacks.length === 1 ? fallbacks[0]
+    : `${fallbacks.slice(0, -1).join(', ')} and ${fallbacks[fallbacks.length - 1]}`;
+  return `${head} — work is running on ${list}`;
+}
 
 // ---- what happened to the message I just sent ---------------------------
 //

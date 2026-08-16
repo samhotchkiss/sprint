@@ -38,9 +38,15 @@ port).
 All of your own (session-level) API calls use `curl` with
 `-H "Authorization: Bearer $SPRINT_TOKEN"`. The three worker helpers
 (`sprint-post`, `sprint-ask`, `sprint-ready`) are for workers, not you —
-you have the full API, they get the narrow card-scoped slice. There is
-one helper that is yours and not theirs: `bin/sprint-recover <num…>`,
-which prints the recovery brief for a card whose agent died (step 5b).
+you have the full API, they get the narrow card-scoped slice. Two
+helpers are yours and not theirs, and both belong to step 5b:
+
+- `bin/sprint-recover <num…>` — the recovery brief for a card whose
+  agent died: state, last 10 timeline lines, worktree, branch, what is
+  dirty.
+- `bin/sprint-limit declare --model fable --resets "11:50pm"` — record
+  the reset time a provider's kill message gave you, so the board can
+  show it and tell you when it is over. `list` and `clear <id>` too.
 
 ## Card state machine (reference)
 
@@ -280,9 +286,12 @@ and the table is prose.
 | session | `integrated` (ok: true) | Your own echo from step 6 — card is now `completed`. No further action beyond the cleanup you already did as part of calling it (kill preview server, prune worktree). |
 | session | `integrated` (ok: false) | Your own echo from step 6 — card is back in `in_progress` with an `error` note. You already told the agent what failed when you posted it; nothing further here. |
 | worker | `progress`/`note`/`error` | Telemetry. No action required (the board shows it); read it if you're specifically checking on a card (step 5) or if `error` looks fatal, in which case flip it to `failed` yourself: `POST /api/cards/:num/state {"state":"failed","actor":"session","reason":"<machine-named>"}`. **`failed` and `stale` are session-only states** — a worker's own state route can only reach `triaging`/`in_progress`/`blocked`, so a dead agent can only be declared dead by you. |
-| worker | `question` | Server already flipped to `needs_you`. Nothing to do — the card face shows the question; you'll see the `answer` event when the user responds. |
+| worker | `question` | Server already flipped to `needs_you`. Nothing to do — the card face shows the question; you'll see the `answer` event when the user responds. A question with `payload.artifacts` is a **decision request** (mockups, a live URL, notes for a choice the agent cannot make itself); the rail renders them above the answer box, so still nothing to relay — but if you re-surface it after 30 minutes, say what is attached ("#42 wants you to pick one of three headers — screenshots and a preview are on the card"). |
 | worker | `evidence` (ready) | Card (or whole batch) just entered `ready`. Nothing required from you — it's now waiting on the user's verdict. Optional: a short sidebar note if the user seems to be waiting on it. |
+| server | `note` with `payload.settings` | The user changed the board's dispatch policy in the Settings panel (model, executors, concurrency). Nothing is owed in reply — but your next dispatch reads the new values, including a concurrency cap that may have just gone up (dispatch now) or down (don't start another until you are back under it). |
 | server | `agent_silent` | See step 5 — go investigate. |
+| server | `limit_cleared` | A provider limit window just ended. **This is a work signal, not a notification.** `payload.kind` says which procedure: `"model"` — re-dispatch what you downgraded, back on the model named in `payload.model`; `"account"` — the whole Claude account came back (the user pressed Resume after signing in with another session), so **re-dispatch every card parked or killed during the window, briefing each with its own timeline**. `payload.reason` says whether the clock got there or somebody cleared it early. See step 5b. |
+| server | `limit_declared` | A limit declaration — yours, or (for `kind: "account"`) one another board on this machine made. Nothing to do; the board is now showing the line or the banner. |
 | server | `stuck` | The board's staleness sweep: a card parked in a state somebody owes an action on. `payload.state` names which, and that is what you act on — see the row below. Nothing is broken; something is owed, and it's usually owed by you. |
 | server | `state` (blocked) | Note the reason; you'll re-check blocked cards periodically (not driven by an event — see "Blocked sweep" below). |
 
@@ -331,14 +340,16 @@ Clear ones that aren't blocked anymore by moving them back to
 ## 3. Dispatch
 
 Whenever you have queued/held-and-released work AND spare capacity,
-dispatch. Capacity = **concurrency cap 3** (default; the spec defines no
-server-side field for this, so treat it as a session-held policy you can
-raise/lower if the user says so in the sidebar) **active agents,
-counting a batch as ONE slot no matter how many member cards it
-carries.** Count distinct non-null `agent_name` values across cards
-currently in `triaging`/`in_progress`/`needs_you`/`blocked` — those
-worktrees are still live even if the card is temporarily stalled on a
-question or an external wall.
+dispatch. Capacity = **`worker.concurrency` from the board's settings**
+(`GET /api/settings`, default 3 — the user changes it in the Settings
+panel, and it is also on every `/api/board` payload as
+`settings.worker.concurrency`) **active agents, counting a batch as ONE
+slot no matter how many member cards it carries.** Count distinct
+non-null `agent_name` values across cards currently in
+`triaging`/`in_progress`/`needs_you`/`blocked` — those worktrees are
+still live even if the card is temporarily stalled on a question or an
+external wall. A tmux worker occupies a slot exactly like a subagent
+does.
 
 Dispatch order: pinned cards first, then oldest-queued-first. Don't
 dispatch `held` cards — those wait for hold mode to release or an
@@ -502,7 +513,70 @@ are still non-terminal per `GET /api/board`; anything left over —
 directly — always go through `git worktree remove` so git's own
 bookkeeping stays correct.
 
+### Settings: the board's dispatch policy
+
+`.sprint/config.json`, read over `GET /api/settings` (and mirrored on
+every `/api/board` payload as `settings`). **Read it at dispatch time,
+every time** — the user edits it from the Settings panel in the header
+and the change is meant to bite on the NEXT dispatch, not on a restart.
+A change also appends a `note` event with `actor: "server"` carrying the
+whole new settings object, so your normal tail wakes you when it happens;
+nothing is owed in response beyond noticing.
+
+```json
+{"worker": {
+  "model_policy": "lowest_feasible",
+  "default_executor": "subagent",
+  "executors": {"claude": {"kind": "subagent"},
+                "grok": {"kind": "tmux", "command": "grok", "session": "sprint-workers"}},
+  "concurrency": 3}}
+```
+
+**Model policy — lowest feasible, and say which one you picked.** User
+verbatim: *"our standing instructions should be to use the lowest
+feasible model (sonnet by default, opus if the orchestrator deems that
+necessary)"*. So:
+
+- `lowest_feasible` (the default) means **sonnet unless this specific
+  card needs more**. Reach for opus only for something you can name —
+  a design/architecture judgment call, a subtle concurrency or
+  correctness bug, a card two agents have already bounced. "It looks
+  hard" is not a reason; "sonnet bounced twice on exactly this" is.
+- `always_sonnet` / `always_opus` take the choice away from you. Honour
+  them literally; do not "upgrade" a card under `always_sonnet`.
+- **Stamp the model on the card at dispatch**, in the same `assign` call:
+  `{"model": "opus"}`. That is what makes the choice auditable after the
+  fact — an unstamped card is one nobody can tell you the cost of. Pass
+  it to the Agent tool's `model` parameter too, so the stamp and the
+  reality agree.
+- A card with no stamp inherits the policy, and the board resolves that
+  for you: every card payload carries
+  `dispatch: {executor, kind, command, session, model, is_default}`.
+
+**Executors.** `worker.executors` names the ways a worker can be run.
+`{"kind": "subagent"}` is the Agent tool, exactly as it always was.
+`{"kind": "tmux", "command": "grok", "session": "sprint-workers"}` is a
+CLI agent you drive in its own tmux window. The user's scope ruling,
+verbatim: **"Peer per card — mix grok-via-tmux and claude subagents"** —
+so this is a per-card choice, not a board mode. Pass it in `assign`
+(`{"executor": "grok"}`); the server refuses a name that is not in
+`worker.executors`, and the card face then shows a small `grok · tmux`
+tag because it differs from the default.
+
 ### The brief
+
+The brief is the SAME contract for both kinds of executor. A tmux worker
+gets it typed into its pane instead of passed to the Agent tool, and
+that is the only difference:
+
+- The card's full text (all member cards' text, for a batch).
+- Absolute paths to any attachments (workers `Read` images directly).
+- `SPRINT_SERVER`, `SPRINT_TOKEN`, and its card number(s).
+- Its assigned worktree path and branch.
+- The worker contract — no `rm`, no prompting commands, one branch,
+  never push main, report via the three helpers, phase + progress per
+  stretch, evidence packet rules, screenshots light+dark from its own
+  worktree preview on any UI change.
 
 Dispatch via the Agent tool, `subagent_type: sprint-worker`, with
 `description` set to the deterministic `<agent-name>` — that name is
@@ -525,15 +599,192 @@ Brief contents, every time:
   inline: no `rm`, no prompting commands, one branch, never push main,
   report via the three helpers, screenshot light+dark from its own
   worktree preview on any UI change).
+- **Which handoff it owes, if the card could go either way.** User
+  ruling, verbatim: *"needs you is where we talk through things. review
+  means the session genuinely thinks the card is 100% complete. needs
+  you is that the card is waiting for my input before it can keep moving
+  forward."* A card that asks for a design call, a pick between options,
+  or "is this what you meant" is a **decision request** — `sprint-ask
+  <num> "…" --options … --url … --attach … --notes …`, which lands it in
+  `needs_you` with the mockups/preview rendered above the answer box. It
+  is NOT a `sprint-ready` packet, and a packet is not a way to ask a
+  question. Say so in the brief when the card is that shape, so the
+  agent doesn't build one arbitrary answer and submit it as finished.
+
+A subagent gets `agents/sprint-worker.md` for free (it IS its agent
+definition), so the inline restatement of the contract is belt-and-
+braces there. For a tmux worker it is the only copy that exists.
+
+### Dispatching a tmux worker
+
+Everything up to the brief is identical — same fetch-first
+`git worktree add`, same deterministic `<agent-name>`, same `assign`.
+What changes is that YOU start the process and YOU type the brief in.
+The server does none of this; a tmux worker is a thing this session
+drives, exactly like a subagent is.
+
+```bash
+EX=grok                                  # the card's executor
+SESSION=sprint-workers                   # executors.<name>.session
+CMD=grok                                 # executors.<name>.command
+WIN=sprint-card-42                       # == the agent name
+WT="$PROJECT_ROOT/.sprint/worktrees/$WIN"
+
+# 1. the session exists (idempotent — never kill an existing one)
+tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION"
+
+# 2. a window per card, named after the card, starting IN the worktree
+#    with the board's credentials already exported
+tmux new-window -t "$SESSION" -n "$WIN" -c "$WT" \
+  -e SPRINT_SERVER="$SPRINT_SERVER" -e SPRINT_TOKEN="$SPRINT_TOKEN"
+tmux send-keys -t "$SESSION:$WIN" "$CMD" Enter    # starting a SHELL command is fine
+```
+
+Then record it and deliver the brief:
+
+1. `POST /api/cards/<num>/assign {"agent_name": "sprint-card-42",
+   "worktree": "...", "branch": "...", "executor": "grok",
+   "model": "grok-4"}` — the same call as always, with the executor and
+   model on it. Do this BEFORE the brief lands, so a worker that starts
+   posting immediately posts onto a card that already knows who it is.
+2. Write the brief to a file and deliver it with the **tmux-send skill's
+   verified send** — never raw `send-keys` for the brief itself
+   (send-keys types the text and the Enter gets swallowed by the TUI's
+   paste handling; the brief then sits unsent in the input box and the
+   card looks silently dead):
+
+   ```bash
+   tmux-send "$SESSION:$WIN" --file /tmp/brief-42.md
+   ```
+
+   Exit 0 means "submitted and verified" — **do not re-send**. Exit 3 =
+   wrong target (check `tmux-send --list`). Exit 4 = typed but not
+   verified → `tmux-send --nudge "$SESSION:$WIN"`, then look before
+   sending anything else. Exit 5 = the pane is showing a dialog (a trust
+   or permission prompt on first run) → `tmux-send --peek` and answer it
+   with `--keys`. Exit 6 = someone's draft is in the box → wait and
+   retry the same send.
+3. The brief must be self-contained, because a tmux worker is **not** a
+   Claude subagent: it has no `sprint-worker.md`, no pre-allowed tool
+   profile, and no idea what this board is. Spell out:
+   - the card text, attachment paths, worktree, branch, card number;
+   - `SPRINT_SERVER`/`SPRINT_TOKEN` (they are already exported in that
+     window, but say so — and give the **absolute paths** to
+     `sprint-post` / `sprint-ask` / `sprint-ready`, since the plugin's
+     `bin/` is almost certainly not on that agent's `PATH`);
+   - the full reporting protocol (phase + progress per stretch, ask and
+     stop, evidence packet, never let "committed" be the last word);
+   - the non-negotiables: no `rm`, no prompting commands, one branch,
+     never push to main, work only in that worktree.
+
+### Reaching a tmux worker afterwards
+
+`SendMessage` does not exist for these. Every follow-up — a user's
+answer, bounce notes, a nudge, "this card was canceled, stop" — is a
+`tmux-send` into that window, with the same words you would have sent a
+subagent and the same attachment paths on their own lines:
+
+```bash
+tmux-send sprint-workers:sprint-card-42 "User on #42: the header still overlaps — see this
+Attached (Read these): /Users/…/.sprint/attachments/<sha>.png"
+```
+
+Same rules as the brief: trust exit 0, nudge on 4, never re-send blind.
+
+### Liveness for a tmux worker
+
+The card's board events are the primary signal, exactly as for a
+subagent — `agent_silent` fires on the same five-minute rule and step 5
+still applies. What replaces "SendMessage it and see if it answers" is
+the window itself:
+
+```bash
+tmux has-session -t sprint-workers 2>/dev/null \
+  && tmux list-panes -t sprint-workers:sprint-card-42 \
+       -F '#{pane_pid} #{pane_current_command}'
+```
+
+- Window there, and `pane_current_command` is the agent (`grok`, `node`,
+  `python`…): it is alive. Ping it with `tmux-send` and ask for a phase.
+- Window there but the command is back to a bare shell (`zsh`/`bash`):
+  the agent **exited**. That is a dead worker wearing a live window.
+- No window at all: dead.
+- Either way, if the card is non-terminal, that is a `failed` card:
+  `POST /api/cards/<num>/state {"state":"failed","actor":"session",
+  "reason":"tmux worker exited"}` with a `note` saying what you found.
+  The board shows the user a Retry, and a retry is a **fresh** dispatch
+  (new window, new brief, honestly labelled as a new agent) — this is
+  the tmux analogue of killed-agent detection for subagents.
+
+Check panes on every `agent_silent`, and once per drain cycle for any
+card whose executor kind is `tmux` — a subagent that dies takes its task
+with it and you find out; a tmux agent that dies leaves a tidy prompt
+sitting there looking fine.
+
+### Cleaning up a tmux worker
+
+On any terminal state (`completed`, `rejected`, `failed`, `canceled`,
+`duplicate`) — the same moment you kill the preview server and prune the
+worktree:
+
+```bash
+tmux kill-window -t sprint-workers:sprint-card-42   # ignore "window not found"
+```
+
+Leave the *session* alone: it is shared by every tmux worker on this
+board. Never kill a window for a card that merely bounced or failed
+integration — that agent still has work to do, and its scrollback is the
+only transcript it has.
+
+### Checklist — driving a tmux worker by hand
+
+No test covers this path: it opens real windows and starts real agents,
+so it is verified by a human doing it once. Ten minutes, in order, with
+what you should see at each step.
+
+1. **Declare the executor.** Settings (header) → Executors:
+   `{"grok": {"kind": "tmux", "command": "grok", "session": "sprint-workers"}}`
+   → Save. Expect: the panel closes, "Settings saved — in effect for the
+   next dispatch", and `cat .sprint/config.json` shows it.
+2. **Assign a card to it.**
+   `curl -sS -X POST "$SPRINT_SERVER/api/cards/<num>/assign" -H "Authorization: Bearer $SPRINT_TOKEN" -H 'Content-Type: application/json' -d '{"agent_name":"sprint-card-<num>","worktree":"<wt>","branch":"sprint/card-<num>","executor":"grok","model":"grok-4"}'`
+   Expect: the card face carries a `grok · tmux` tag, and the timeline
+   note reads "assigned to sprint-card-N — grok · tmux · grok-4".
+3. **Open the window.** `tmux new-window -t sprint-workers -n
+   sprint-card-<num> -c <worktree>` then start the command.
+   Expect: `tmux-send --list` shows the pane.
+4. **Send the brief.** `tmux-send sprint-workers:sprint-card-<num>
+   --file <brief>`. Expect: `submitted and verified`, exit 0, and the
+   agent starts talking in the pane. If you get exit 4, the brief is
+   sitting unsent — `--nudge`, don't re-send.
+5. **Watch the board, not the pane.** Within a minute or two the card
+   should move to `triaging` with a restatement and a condensed title.
+   If the pane is busy and the board is silent, the brief's reporting
+   instructions did not land — that is a brief bug, not a worker bug.
+6. **Talk to it.** Type a chat message on the card in the UI, relay it
+   with `tmux-send`. Expect: the agent answers in the pane and posts on
+   the card.
+7. **Kill it deliberately.** Ctrl-C the agent in its pane, then run the
+   pane check from "Liveness" above. Expect: `pane_current_command` is
+   back to your shell, and the drill is to flip the card `failed` with a
+   reason. The card should show Retry.
+8. **Clean up.** `tmux kill-window -t sprint-workers:sprint-card-<num>`,
+   `git worktree remove`, and confirm the session itself is still there
+   with its other windows untouched.
 
 ---
 
 ## 4. Answers & chat — reaching a live agent
 
-`SendMessage` to the agent **by name** (`sprint-card-<num>` /
-`sprint-batch-<id>`). Mid-run messages land on the agent's next turn;
-if it already finished its turn (e.g. it's sitting at a `sprint-ask`
-pause), your message resumes it with its transcript intact.
+**Subagent:** `SendMessage` to the agent **by name**
+(`sprint-card-<num>` / `sprint-batch-<id>`). Mid-run messages land on the
+agent's next turn; if it already finished its turn (e.g. it's sitting at
+a `sprint-ask` pause), your message resumes it with its transcript
+intact.
+
+**tmux worker:** `tmux-send <session>:<window> "…"` instead — see
+"Reaching a tmux worker afterwards" in step 3. The card's `dispatch.kind`
+tells you which you are dealing with; never guess from the agent name.
 
 **Images relay as file paths.** A `chat`/`answer` event's
 `payload.attachments` is a list of `{sha256, url, mime, bytes, path}` —
@@ -565,7 +816,12 @@ The server already did the timing math (5 minutes, no worker event,
 claimed) — by the time you see this event, act:
 
 1. `SendMessage` the agent by name — a plain ping ("status?") lands on
-   its next turn if it's alive, or you'll notice it never responds.
+   its next turn if it's alive, or you'll notice it never responds. For a
+   **tmux** worker (`dispatch.kind == "tmux"`) the ping is a `tmux-send`
+   into its window, and the pane check comes first: a window whose
+   `pane_current_command` is back to a shell is a dead worker, and no
+   amount of pinging will tell you that (see "Liveness for a tmux
+   worker" in step 3).
 2. If you can inspect its transcript/task status directly, do that too
    — a wedged loop, a crashed process, and "still grinding on a slow
    step it forgot to flag" all look different once you look.
@@ -657,6 +913,38 @@ You find out one of three ways, and any one of them is enough:
 If you hit a provider limit dispatching one agent, assume it hit the
 others too. **Check every live card, not just the one you noticed.**
 
+### Read the reset time off the kill message FIRST
+
+The message that killed the agent usually says when it ends:
+
+```
+You've hit your session limit · resets 11:50pm (America/Denver)
+```
+
+**That sentence is the most valuable thing in the incident and it is
+gone the moment you scroll past it.** Record it before you do anything
+else — one command, and it can take the provider's wording verbatim:
+
+```
+bin/sprint-limit declare --model fable --resets "11:50pm" --source "kill message"
+```
+
+`--resets` also takes `"11:50pm (America/Denver)"`, an ISO 8601
+timestamp, or an epoch. A bare clock time means the **next** time it
+comes round, which at 11:52pm is tomorrow — the answer you meant. The
+command prints back the exact instant it landed on; read that line, it
+is how you catch a typo before the board acts on it.
+
+Declaring it does three things you would otherwise be doing by hand:
+the board shows a quiet line while the window is open ("fable is
+rate-limited until 11:50pm — work is running on opus"), `GET
+/api/limits` (and `/api/board`'s `limits`) can be asked what is
+limited, and when the window passes the board emits exactly one
+`limit_cleared` event — your cue to put the work back.
+
+If you cannot find a reset time, skip this and carry on; everything
+below still works. But look before you decide you cannot find it.
+
 ### The required response
 
 **Re-dispatch the same card(s) immediately, on the next model down.**
@@ -690,20 +978,141 @@ For each card:
      `git log origin/main..HEAD` and `git status` first, always. Redoing
      work on top of a half-finished commit is how a recoverable mess
      becomes a conflicted one.
-3. **Record the model** on the assign call so the user can see it:
-   `POST /api/cards/:num/assign {"agent_name":…, "worktree":…,
-   "branch":…, "model":"opus"}`. The card face shows the model **only
-   when it differs from the sprint default**, so an ordinary dispatch
-   stays quiet and a fallback is visible at a glance. The timeline note
-   reads "assigned to sprint-card-42 on opus".
+3. **Record the model AND why** on the assign call:
+
+   ```
+   POST /api/cards/:num/assign {"agent_name": …, "worktree": …, "branch": …,
+                                "model": "opus",
+                                "model_reason": "fable limited until 11:50pm"}
+   ```
+
+   The card face shows the model **only when it differs from the sprint
+   default**, so an ordinary dispatch stays quiet and a fallback is
+   visible at a glance. The timeline note reads "assigned to
+   sprint-card-42 on opus — fable limited until 11:50pm".
+
+   **`model_reason` is not decoration — it is how you find these cards
+   again.** When the window ends you will be re-reading `/api/board`,
+   possibly in a different session after a restart, and the cards that
+   were downgraded have to be knowable from the payload rather than
+   from your memory of what you did last night. Set it on every
+   limit-driven dispatch, and set it on anything you PARK for the limit
+   too (a card you left `queued` rather than dispatch): a queued card
+   with a `model_reason` is a card you owe a dispatch to.
 4. **Say it in the sidebar, once, for the batch**: which cards were
-   killed, what limit did it, and what they are now running on. One
-   line. The user should never be the one who notices that agents died.
+   killed, what limit did it, when it resets, and what they are now
+   running on. One line. The user should never be the one who notices
+   that agents died.
 
 If a card was already moved to `failed` by the board, the same procedure
 applies — the user's Retry and your re-dispatch are the same act; you do
 not need to wait for them to click it. `failed` preserves the timeline,
 the evidence, the branch and the worktree precisely so this works.
+
+### When the window ends — the `limit_cleared` reaction
+
+The board emits **one** `limit_cleared` event when a declared window
+passes (or when someone clears it early with `bin/sprint-limit clear
+<id>`). It is `card_num: null`, `actor: "server"`, and it names the
+model in `payload.model`. Your standing tail wakes on it like any other
+server event, and it is the second half of this procedure — without it,
+"downgrade now, restore later" is just "downgrade".
+
+On `limit_cleared`, in the same wakeup:
+
+1. **Find what was downgraded.** `GET /api/board` and take every
+   non-terminal card whose `model_reason` is set and whose `model` is
+   not the model that just came back. That is the list; there is no
+   filter endpoint and none is needed.
+2. **Put each one back on its original model.** For a card still in
+   flight, that means re-dispatching it on the model it should have had
+   — same worktree, same branch, and the same "inspect before you redo
+   anything" brief you used on the way down (`bin/sprint-recover <num>`
+   still prints it). For a card you parked in `queued`, dispatch it now.
+   Judgement applies to one case only: a downgraded agent that is nearly
+   done. Finishing beats switching horses — leave it, and clear the
+   reason when it lands.
+3. **Record the switch back**, the same way you recorded the switch
+   down: `assign` with the original `"model"` and `"model_reason": ""`.
+   The empty string is how you say "this is not a downgrade any more" —
+   omitting the field leaves the old reason on the card, which would
+   make it look downgraded forever. The timeline note is what tells the
+   user this card came home.
+4. **One sidebar line for the whole batch**: the window ended, and which
+   cards went back on which model.
+
+Then it is over: the board's limit line is already gone (it goes off the
+clock, not off your reaction), and no card is left wearing a reason that
+is no longer true.
+
+### The OTHER kind: the whole account is out
+
+Everything above is one model going away and the work moving down a
+tier. The account-level limit is a different animal: **the overall
+Claude weekly limit, where nothing can run at all and there is no next
+model down.** You will usually find out by dying yourself.
+
+Declare it the moment you see it — before re-dispatching anything,
+because there is nothing to re-dispatch onto:
+
+```
+bin/sprint-limit declare --account --resets "11:50pm" --source "kill message"
+```
+
+That does three things the model-kind declaration does not:
+
+- **Every board on this machine** grows a big banner at the top —
+  including boards in other projects, and boards started after the
+  declaration. It is machine-wide state (one file beside the registry),
+  not a message from you, so it survives your session dying, which it
+  is about to.
+- The banner says what happened, when it lifts, and what to do: **log
+  out of Claude, sign in with another Claude session, then press
+  Resume.** That is the user's move, not yours.
+- The **Resume button** in that banner clears the window and emits
+  `limit_cleared` with `payload.kind == "account"`. It works with no
+  session attached — which is the point, because while an account limit
+  is on there is no session.
+
+Before you go: park what is in flight. Any card you cannot dispatch
+gets `model_reason` set ("account limit until 11:50pm") exactly as in
+step 3 above — a parked card without one is a card nobody will find
+when the account comes back.
+
+### Reacting to an account-kind `limit_cleared`
+
+When the user presses Resume, a new session (his second Claude login)
+picks the board up. `payload.kind` tells you which procedure you are in:
+
+- `kind: "model"` — the procedure above: put downgraded cards back on
+  the original model.
+- `kind: "account"` — **re-dispatch every card that was parked or
+  killed while the window was on.** Not a tier change: these cards were
+  not running at all.
+
+For the account kind, in the same wakeup:
+
+1. **Build the list.** `GET /api/board`, and take every non-terminal
+   card whose `model_reason` mentions the account limit, plus every
+   card that went `failed` with a `worker gone:` reason during the
+   window (`GET /api/limits` gives you the window's `declared_at` and
+   `cleared_at` — anything that died between them belongs to it).
+2. **Brief each one with its OWN timeline.** `bin/sprint-recover <num>`
+   per card, pasted into that card's brief — never one shared summary
+   across the batch. A card's agent was killed mid-thought and the next
+   agent has to know what its predecessor had already committed; that
+   is per-card knowledge and it does not survive being averaged.
+   Include the two other lines from step 5b: a previous agent was
+   killed by a limit, and it must read `git log origin/main..HEAD` and
+   `git status` before redoing anything.
+3. **Dispatch on the normal model** — the account came back, not a
+   tier. Clear the parking reason with `"model_reason": ""` on the
+   assign.
+4. **One sidebar line for the batch**: the account limit is over and
+   which cards went back out.
+
+The banner is gone off the board already (it clears off the shared
+state, not off your reaction), on every board on the machine.
 
 ---
 
@@ -799,6 +1208,12 @@ prune. Don't kill it while the card is merely `bounced` back to
 `in_progress` or failed integration — the worker may still need it to
 re-verify the fix.
 
+A card whose `dispatch.kind` is `tmux` has one more thing to clean up at
+the same moment: `tmux kill-window -t <session>:<agent-name>`. Same
+condition (terminal states only), same exception (never on a bounce or a
+failed integration), and never the session itself — see "Cleaning up a
+tmux worker" in step 3.
+
 ---
 
 ## 7. Resume — after a crash or power loss
@@ -821,6 +1236,14 @@ re-verify the fix.
 5. Anything that doesn't successfully reattach (agent genuinely gone,
    no transcript to resume) → `failed`, with a note, retry available to
    the user.
+6. **tmux workers usually survive what killed you.** A card with
+   `dispatch.kind == "tmux"` lives in a tmux window that outlived this
+   session — do the pane check (step 3) rather than assuming it died: a
+   live pane means the agent kept working through your outage and the
+   reattach is just a `tmux-send` saying you are back and asking it to
+   re-verify its worktree before continuing. A window whose command is
+   back to a shell is `failed`, same as always. Do this before declaring
+   anything, or you will kill work that was fine.
 
 tmux note for the README, restated here since it's operationally
 relevant: the user always runs `claude` inside tmux. After a reboot the

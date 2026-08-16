@@ -2,9 +2,32 @@
 """sprint-ask — ask the user a question on a sprint card (flips it to needs_you).
 
 Usage:
-  sprint-ask <num> "question text" [--options '["yes","no"]'] [--server URL] [--token TOKEN]
+  sprint-ask <num> "question text" [--options '["yes","no"]']
+             [--url http://...] [--attach /abs/shot.png ...] [--notes "..."]
+             [--server URL] [--token TOKEN]
 
   --options takes a JSON array of strings rendered as quick-reply buttons.
+
+A DECISION REQUEST is this same command with something to look at attached.
+User's rule, verbatim: "needs you is where we talk through things. review
+means the session genuinely thinks the card is 100% complete. needs you is
+that the card is waiting for my input before it can keep moving forward."
+
+  evidence packet (sprint-ready)  "I believe this is done."     → ready
+  decision request (sprint-ask)   "I need you to choose/answer
+                                   before I continue."          → needs_you
+
+So a card that is waiting on a design call, a pick between mockups, or a
+"which of these three" NEVER goes through sprint-ready. It goes here, with
+the artifacts the user needs in order to decide:
+
+  --url URL       a live preview the user can open (http/https)
+  --attach PATH   a screenshot/mockup, absolute path, repeatable — the board
+                  reads it off disk and stores it exactly like a packet's
+  --notes TEXT    a short paragraph of context under the question
+
+The board renders those ABOVE the answer box in the rail, so the thing you
+are asking about is on screen while the answer is typed.
 
 Reads server URL and bearer token from --server/--token or the
 SPRINT_SERVER / SPRINT_TOKEN environment variables. Validates client-side
@@ -19,9 +42,13 @@ Stdlib only (urllib). No third-party deps.
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
+
+# Same ceiling the server puts on an attachment.
+MAX_ATTACH_BYTES = 25 * 1024 * 1024
 
 
 def fail(field, detail=""):
@@ -41,6 +68,12 @@ def parse_args(argv):
     p.add_argument("text", nargs="*", help="question text (quote it, or pass multiple words)")
     p.add_argument("--options", default=None,
                     help="JSON array of strings for quick-reply buttons, e.g. '[\"yes\",\"no\"]'")
+    p.add_argument("--url", default=None,
+                    help="a live preview the user can open while deciding (http/https)")
+    p.add_argument("--attach", action="append", default=[], metavar="PATH",
+                    help="absolute path to a screenshot/mockup to hand over (repeatable)")
+    p.add_argument("--notes", default=None,
+                    help="a short paragraph of context, rendered under the question")
     p.add_argument("--server", default=os.environ.get("SPRINT_SERVER"),
                     help="server base URL, e.g. http://100.x.x.x:8377 (or SPRINT_SERVER env)")
     p.add_argument("--token", default=os.environ.get("SPRINT_TOKEN"),
@@ -68,20 +101,60 @@ def validate(args):
             fail("options", "must be a JSON array of strings")
         if not options:
             fail("options", "array is empty — omit --options instead")
+    artifacts = validate_artifacts(args)
     if not args.server:
         fail("server", "pass --server or set SPRINT_SERVER")
     if not args.token:
         fail("token", "pass --token or set SPRINT_TOKEN")
-    return num, text, options
+    return num, text, options, artifacts
+
+
+def validate_artifacts(args):
+    """The decision-request half: everything checked before the network call.
+
+    Mirrors the server's `normalize_artifacts` so a typo names itself here
+    instead of coming back as a 400.
+    """
+    out = {}
+    if args.url is not None:
+        url = args.url.strip()
+        if not url:
+            fail("url", "is empty — omit --url instead")
+        if not re.match(r"^https?://", url):
+            fail("url", "must be an http(s) URL the user can open, got %r" % args.url)
+        out["url"] = url
+    if args.notes is not None:
+        if not args.notes.strip():
+            fail("notes", "is empty — omit --notes instead")
+        out["notes"] = args.notes.strip()
+    paths = []
+    for raw in args.attach or []:
+        path = (raw or "").strip()
+        if not path:
+            fail("attach", "an --attach entry is empty")
+        if not os.path.isabs(path):
+            fail("attach", "must be an absolute path, got %r" % raw)
+        if not os.path.isfile(path):
+            fail("attach", "no such file: %s" % path)
+        if os.path.getsize(path) > MAX_ATTACH_BYTES:
+            fail("attach", "%s is over the 25 MB ceiling" % os.path.basename(path))
+        if not path.lower().endswith((".png", ".jpg", ".jpeg")):
+            fail("attach", "must be a .png or .jpg — got %s" % os.path.basename(path))
+        paths.append(path)
+    if paths:
+        out["attachments"] = paths
+    return out or None
 
 
 def main(argv):
     args = parse_args(argv)
-    num, text, options = validate(args)
+    num, text, options, artifacts = validate(args)
 
     payload = {"text": text}
     if options is not None:
         payload["options"] = options
+    if artifacts is not None:
+        payload["artifacts"] = artifacts
 
     body = json.dumps(payload).encode("utf-8")
     server = args.server.rstrip("/")
@@ -98,7 +171,19 @@ def main(argv):
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
-            print(f"sprint-ask: question posted to #{num} — card is now needs_you.")
+            if artifacts:
+                bits = []
+                if artifacts.get("url"):
+                    bits.append("a live url")
+                if artifacts.get("attachments"):
+                    n = len(artifacts["attachments"])
+                    bits.append("%d attachment%s" % (n, "" if n == 1 else "s"))
+                if artifacts.get("notes"):
+                    bits.append("notes")
+                print(f"sprint-ask: decision request posted to #{num} with "
+                      f"{', '.join(bits)} — card is now needs_you (NOT ready).")
+            else:
+                print(f"sprint-ask: question posted to #{num} — card is now needs_you.")
             print("sprint-ask: end your turn now; you'll resume once the user answers.")
             return 0
     except urllib.error.HTTPError as e:

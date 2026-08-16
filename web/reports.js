@@ -243,7 +243,19 @@ export function renderReportPage(root, app, state) {
       h('span.report-dot', '·'),
       h('span', ageSuffix(d.ts)),
       h('span.report-dot', '·'),
-      h('a.report-raw', { href: d.url, target: '_blank', rel: 'noreferrer noopener' }, 'raw')) : null));
+      h('a.report-raw', { href: d.url, target: '_blank', rel: 'noopener noreferrer' }, 'raw')) : null));
+
+  // Card #52: which conversation is in the rail beside this, and why. When the
+  // report came off a card, that card IS the rail — you can read the document
+  // and talk to its agent without leaving the page. When it did not (a report
+  // posted into the sidebar), the session chat stays, and that is said out loud
+  // rather than left to be noticed.
+  if (d) {
+    page.appendChild(h('p.report-rail-note', d.card_num != null
+      ? `#${d.card_num} is open in the sidebar — reply to it there while you read.`
+      : 'This report was posted into the session chat, not onto a card, '
+        + 'so the sidebar stays on the session.'));
+  }
 
   if (state.error) page.appendChild(h('p.page-empty', 'Could not open this report — it may not exist on this board.'));
   else if (!d) page.appendChild(h('p.page-empty', 'loading…'));

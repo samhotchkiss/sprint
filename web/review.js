@@ -439,6 +439,7 @@ export function reviewBar(card, app) {
   const composing = bounceComposing(card.num) || !!draft(key);
 
   const notes = h('textarea.bounce-notes', {
+    id: 'bounce-' + card.num,
     rows: '2',
     placeholder: 'What has to change? (goes straight to the agent)',
     oninput: (e) => draft(key, e.target.value),
@@ -482,7 +483,8 @@ export function reviewBar(card, app) {
       h('button.btn.bounce', { type: 'button', onclick: () => send() },
         many ? `Submit bounce for #${card.num}` : 'Submit bounce'),
       h('button.btn.ghost', { type: 'button', onclick: () => cancel() }, 'Cancel')));
-    setTimeout(() => notes.focus(), 0);
+    // Focus is asked for once, by app.composeBounce, and restored by id after
+    // that (card #46) — never re-grabbed on every rebuild of this bar.
     if (prog && prog.error) {
       bar.appendChild(h('p.review-unit-error',
         `Stopped at #${prog.error} — ${prog.done} of ${prog.total} approved, nothing after it was sent.`));
@@ -500,13 +502,160 @@ export function reviewBar(card, app) {
     approve,
     h('button.btn.bounce', {
       type: 'button',
-      onclick: () => { bounceComposing(card.num, true); app.render(); },
+      onclick: () => app.composeBounce(card.num),
     }, many ? `Bounce #${card.num}` : 'Bounce'),
     h('button.btn.ghost.skip', {
       type: 'button',
       title: 'leave it in Awaiting review and come back to it',
       onclick: () => { if (flow) flow.skipped += 1; advance(app); },
     }, 'Skip')));
+  if (prog && prog.error) {
+    bar.appendChild(h('p.review-unit-error',
+      `Stopped at #${prog.error} — ${prog.done} of ${prog.total} approved, nothing after it was sent.`));
+  }
+  return bar;
+}
+
+// ---- the verdict, in the rail -------------------------------------------
+//
+// Card #53, user verbatim: "get the actions out of cards. I click the card, it
+// loads in the sidebar, and that's where I review and act."
+//
+// So this is where a verdict is given when you are NOT walking the queue: a bar
+// pinned at the bottom of the rail, above the composer, in exactly the place the
+// walkthrough's bar sits. Two consequences that matter:
+//
+//   * it cannot be scrolled off. A packet with six screenshots used to push
+//     Approve below the fold; the bar is outside the scrolling thread.
+//   * there is one of it. The packet no longer carries its own buttons, the
+//     review row no longer carries any, and the walkthrough swaps its bar in
+//     for this one — never two Approves on screen.
+
+/** The ready cards on the board right now, oldest number first. */
+function readyCards() {
+  return Array.from(store.cards.values())
+    .filter((c) => cardState(c) === 'ready')
+    .sort((a, b) => (a.num || 0) - (b.num || 0));
+}
+
+/**
+ * The work unit this card belongs to, but only when the unit shipped as ONE
+ * thing — one branch, one packet covering every member. That is card #26's whole
+ * licence for a single Approve, and it has to survive the actions leaving the
+ * rows: the unit Approve now lives in the rail, on any member of the unit.
+ */
+export function unitOf(card) {
+  if (!card) return null;
+  const key = unitKey(card);
+  const members = readyCards().filter((c) => unitKey(c) === key);
+  if (members.length < 2) return null;
+  const g = {
+    key, kind: 'group', cards: members, card: members[0],
+    title: unitTitle(members), branch: sharedBranch(members),
+    agent: members[0].agent_name || null,
+  };
+  return shipsAsOne(g) ? g : null;
+}
+
+/** The signature the rail memoises this bar on. Null = no bar for this card. */
+export function verdictBarSig(card) {
+  if (!card || cardState(card) !== 'ready') return null;
+  if (flowActive(card.num)) return null;          // the walkthrough's bar owns it
+  const unit = unitOf(card);
+  const p = unit ? unitProgress(unit.key) : null;
+  return [card.num, card.bounce_count,
+    bounceComposing(card.num) || draft(`bounce:${card.num}`) ? 'b' : '',
+    unit ? unit.cards.length : 0,
+    p ? `${p.done}/${p.total}${p.error ? 'e' + p.error : ''}` : ''].join('|');
+}
+
+export function packetVerdictBar(card, app) {
+  const key = `bounce:${card.num}`;
+  const bar = h('div.review-bar.is-verdict');
+  const unit = unitOf(card);
+  const members = unit ? unit.cards : [];
+  const many = members.length > 1;
+  const prog = unit ? unitProgress(unit.key) : null;
+
+  // Two bounces and the server tags `escalate`: stop offering a blind third try.
+  if (card.bounce_count >= 2) {
+    bar.appendChild(h('p.escalate',
+      'Bounced twice. The session stops retrying blind here and brings it to you to co-design.'));
+  }
+  if (many) {
+    bar.appendChild(h('p.review-bar-unit',
+      `One branch, one packet — ${members.map((c) => '#' + c.num).join(', ')}. `
+      + 'Approve takes the whole branch; Bounce sends back only this card.'));
+  }
+
+  // Card #44. Hitting Bounce is already the decision; from that moment the bar
+  // offers exactly two things — send it, or back out. Approve and Reject are not
+  // dimmed, they are GONE, because the failure being prevented is hitting
+  // Approve with a half-written bounce in the box under it.
+  const composing = bounceComposing(card.num) || !!draft(key);
+
+  const notes = h('textarea.bounce-notes', {
+    id: 'bounce-' + card.num,
+    rows: '2',
+    placeholder: 'What has to change? (goes straight to the agent)',
+    oninput: (e) => draft(key, e.target.value),
+    onkeydown: (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+      if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+    },
+  });
+  notes.value = draft(key);
+
+  function send() {
+    const text = notes.value.trim();
+    if (!text) { notes.focus(); return; }
+    draft(key, null);
+    bounceComposing(card.num, false);
+    app.verdict(card, 'bounce', text);
+  }
+
+  function cancel() {
+    // Cancel puts the buttons back. It drops only what you typed HERE — every
+    // other composer on the page keeps its draft.
+    draft(key, null);
+    bounceComposing(card.num, false);
+    app.render();
+  }
+
+  if (composing) {
+    bar.appendChild(h('div.review-notes', notes));
+    bar.appendChild(h('div.verdicts.is-bouncing',
+      h('button.btn.bounce', { type: 'button', onclick: () => send() }, 'Submit bounce'),
+      h('button.btn.ghost', { type: 'button', onclick: () => cancel() }, 'Cancel')));
+    // No focus grab here. Card #46: focus is asked for ONCE, when you press
+    // Bounce (app.composeBounce), and restored by id on every re-render after.
+    return bar;
+  }
+
+  const approve = h('button.btn.approve', {
+    type: 'button',
+    disabled: !!(prog && !prog.error),
+    title: many
+      ? `one branch, one packet — approves each of the ${members.length} cards on it`
+      : `approve #${card.num} — the session rebases, gates and merges the branch`,
+    onclick: () => (many ? approveUnit(unit.key, members.map((c) => c.num), app)
+      : app.verdict(card, 'approve')),
+  }, prog && !prog.error
+    ? `approving ${Math.min(prog.done + 1, prog.total)} of ${prog.total}…`
+    : (many ? `Approve all ${members.length}` : 'Approve'));
+
+  bar.appendChild(h('div.verdicts',
+    approve,
+    h('button.btn.bounce', {
+      type: 'button',
+      title: 'send it back with notes',
+      onclick: () => app.composeBounce(card.num),
+    }, many ? `Bounce #${card.num}` : 'Bounce'),
+    h('button.btn.reject', {
+      type: 'button',
+      title: 'this should not have been built — the branch is dropped',
+      onclick: () => app.verdict(card, 'reject', draft(key) || undefined),
+    }, 'Reject')));
   if (prog && prog.error) {
     bar.appendChild(h('p.review-unit-error',
       `Stopped at #${prog.error} — ${prog.done} of ${prog.total} approved, nothing after it was sent.`));
@@ -619,49 +768,33 @@ function groupRow(g, app, { compact }) {
         h('p', firstLine(shared.steps[0], compact ? 150 : 260)),
         shared.steps.length > 1 ? h('span.review-more', `+${shared.steps.length - 1} more`) : null));
     }
-    const thumb = thumbFor(shared, app);
+    const thumb = thumbFor(shared);
     const holder = h('div.review-unit-lead', lead);
     if (thumb) holder.appendChild(thumb);
     body.appendChild(holder);
   }
 
-  // One branch, one packet, one Approve (card #26) — issued as the same
-  // per-card POST for every member, in order, so the records underneath are
-  // unchanged. Units that did NOT ship as one thing keep their per-card
-  // verdicts and only offer the walkthrough.
+  // Card #53: a unit's controls are NAVIGATION only — open the work, or fold the
+  // pile out. The one Approve per work unit that card #26 asked for did not go
+  // away; it moved into the rail, where it stands on any member of the unit and
+  // says "Approve all N" over the packet you are actually reading. One click to
+  // open, one click to approve, and you cannot approve six cards you never saw.
   const acts = h('div.review-acts');
   const one = shipsAsOne(g);
   const waiting = one ? g.cards.filter((c) => cardState(c) === 'ready') : [];
   const prog = unitProgress(g.key);
-  if (one && waiting.length) {
-    const label = prog && !prog.error
-      ? `approving ${Math.min(prog.done + 1, prog.total)} of ${prog.total}…`
-      : (waiting.length > 1 ? `Approve all ${waiting.length}` : `Approve #${waiting[0].num}`);
-    acts.appendChild(h('button.btn.tiny.approve.review-approve-unit', {
-      type: 'button',
-      disabled: !!(prog && !prog.error),
-      title: waiting.length > 1
-        ? `one branch, one packet — approves each of the ${waiting.length} cards underneath`
-        : `approve #${waiting[0].num}`,
-      onclick: (e) => { e.stopPropagation(); approveUnit(g.key, g.cards.map((c) => c.num), app); },
-    }, label));
-  }
   acts.appendChild(h('button.btn.tiny.review-walk', {
     type: 'button',
-    title: one
-      ? 'read them one at a time before you decide'
+    title: one && waiting.length > 1
+      ? `read the branch, then approve all ${waiting.length} in the rail`
       : 'step through these one at a time, oldest first',
     onclick: () => startFlow(app, reviewSteps(g.cards)),
-  }, one ? 'Read them first' : `Review these ${g.cards.length}`));
+  }, one && waiting.length > 1 ? `Review the branch — ${waiting.length} cards`
+    : `Review these ${g.cards.length}`));
   acts.appendChild(h('button.btn.tiny.ghost.review-toggle-cards', {
     type: 'button',
     onclick: () => { groupOpen(g.key, !isOpen); app.render(); },
   }, isOpen ? 'Hide the cards' : 'Show the cards'));
-  if (shared && shared.live_url) {
-    acts.appendChild(h('a.btn.tiny.ghost.review-live', {
-      href: shared.live_url, target: '_blank', rel: 'noreferrer noopener', title: shared.live_url,
-    }, 'See it live ↗'));
-  }
   acts.appendChild(h('span.grow'));
   if (shared) acts.appendChild(h('span.review-meta', unitMeta(shared)));
   body.appendChild(acts);
@@ -709,15 +842,18 @@ export function reviewRow(card, app, { compact = false, inGroup = false, shared 
   const p = packetFor(card);
   const state = cardState(card);
   const merging = state === 'integrating';
-  const item = h('div.review-item', {
-    class: `review-item${inGroup ? ' in-group' : ''}${merging ? ' is-merging' : ''}`,
-    'data-num': card.num,
-  });
+  // Card #53, user verbatim: "get the actions out of cards. I click the card, it
+  // loads in the sidebar, and that's where I review and act." The whole row is
+  // one click target and nothing inside it takes a click of its own — no
+  // Approve, no Bounce, no thumbnail lightbox, no live link. Everything you can
+  // do to this card is in the rail, on the card, with the thread under it.
+  const item = openable(
+    `review-item${inGroup ? ' in-group' : ''}${merging ? ' is-merging' : ''}`, card, app);
 
   // Card #28: the row leads with the card's OWN title — what you asked for —
   // and the claim is the second line under it. A review row never leads with a
   // control's label or an agent's name.
-  const lead = openable('review-lead', card, app);
+  const lead = h('div.review-lead');
   lead.appendChild(h('span.row-num', '#' + card.num));
   const body = h('span.review-body',
     h('span.review-title', ownTitle(card) || firstLine(card.body || '', 70) || `Card #${card.num}`),
@@ -733,15 +869,20 @@ export function reviewRow(card, app, { compact = false, inGroup = false, shared 
         : null));
   }
   lead.appendChild(body);
-  const thumb = shared ? null : thumbFor(p, app);
+  const thumb = shared ? null : thumbFor(p);
   if (thumb) lead.appendChild(thumb);
   item.appendChild(lead);
 
-  item.appendChild(actionsRow(card, p, app, merging, shared));
+  item.appendChild(statusRow(card, p, merging, shared));
   return item;
 }
 
-function thumbFor(p, app) {
+/**
+ * The packet's first screenshot, as a picture and nothing else. It used to open
+ * a lightbox; card #53 took every click off the row except the one that opens
+ * the card, and the lightbox is one click further in, on the packet itself.
+ */
+function thumbFor(p) {
   if (!p.shots.length) return null;
   const urls = p.shots.map(attachmentUrl).filter(Boolean);
   if (!urls.length) return null;
@@ -751,15 +892,17 @@ function thumbFor(p, app) {
       src: urls[0], alt: caps[0] || 'screenshot', loading: 'lazy',
       onerror: (e) => { e.target.remove(); },
     }));
-  return h('button.review-thumb', {
-    type: 'button',
+  return h('span.review-thumb', {
     title: p.shots.length > 1 ? `${p.shots.length} screenshots` : (caps[0] || 'screenshot'),
-    onclick: (e) => { e.stopPropagation(); app.lightbox(urls, 0, caps); },
   }, frame, p.shots.length > 1 ? h('span.review-thumb-n', String(p.shots.length)) : null);
 }
 
-function actionsRow(card, p, app, merging, shared) {
-  const key = `bounce:${card.num}`;
+/**
+ * The line under a review row. Card #53: it says what this card is and where it
+ * is up to, and it does not DO anything — the verdict is in the rail, one click
+ * away, on the row you are already about to click.
+ */
+function statusRow(card, p, merging, shared) {
   const row = h('div.review-acts');
 
   if (merging) {
@@ -770,80 +913,18 @@ function actionsRow(card, p, app, merging, shared) {
     return row;
   }
 
-  // Card #44, on the row as in the rail: Bounce swaps the row's verdicts for
-  // Submit bounce + Cancel. Approve does not sit next to a notes box you are
-  // typing into.
-  const composing = bounceComposing(card.num) || !!draft(key);
-
-  const notes = h('textarea.bounce-notes', {
-    rows: '2',
-    placeholder: 'What has to change? (goes straight to the agent)',
-    oninput: (e) => draft(key, e.target.value),
-    onkeydown: (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-      if (e.key === 'Escape') { e.preventDefault(); cancel(); }
-    },
-  });
-  notes.value = draft(key);
-  const pop = h('div.bounce-pop', { hidden: !composing }, notes);
-
-  function send() {
-    const text = notes.value.trim();
-    if (!text) { notes.focus(); return; }
-    draft(key, null);
-    bounceComposing(card.num, false);
-    pop.hidden = true;
-    app.verdict(card, 'bounce', text);
-  }
-
-  function cancel() {
-    draft(key, null);
-    bounceComposing(card.num, false);
-    app.render();
-  }
-
-  if (composing) {
-    row.appendChild(h('button.btn.bounce.tiny', {
-      type: 'button',
-      onclick: (e) => { e.stopPropagation(); send(); },
-    }, 'Submit bounce'));
-    row.appendChild(h('button.btn.tiny.ghost', {
-      type: 'button',
-      onclick: (e) => { e.stopPropagation(); cancel(); },
-    }, 'Cancel'));
-    row.appendChild(h('span.grow'));
-    row.appendChild(h('span.review-meta', metaLine(card, p, shared), ' · ',
-      timeEl(card.last_activity_at, { suffix: false })));
-    setTimeout(() => notes.focus(), 0);
-    return h('div.review-actwrap', row, pop);
-  }
-
-  row.appendChild(h('button.btn.approve.tiny', {
-    type: 'button',
-    title: `approve #${card.num} — the session rebases, gates and merges the branch`,
-    onclick: (e) => { e.stopPropagation(); app.verdict(card, 'approve'); },
-  }, 'Approve'));
-  row.appendChild(h('button.btn.bounce.tiny', {
-    type: 'button',
-    title: 'send it back with notes',
-    onclick: (e) => {
-      e.stopPropagation();
-      bounceComposing(card.num, true);
-      app.render();
-    },
-  }, 'Bounce'));
-  if (p.live_url && !shared) {
-    row.appendChild(h('a.btn.tiny.ghost.review-live', {
-      href: p.live_url, target: '_blank', rel: 'noreferrer noopener', title: p.live_url,
-      onclick: (e) => e.stopPropagation(),
-    }, 'See it live ↗'));
-  }
+  // Card #44's composing state survives, as a STATE rather than as a control:
+  // the words are typed in the rail (#46), and the row only says that is where
+  // you left them.
+  const composing = bounceComposing(card.num) || !!draft(`bounce:${card.num}`);
+  row.appendChild(composing
+    ? h('span.review-composing', 'Bounce half-written — open it to finish')
+    : h('span.review-open-hint', 'Open it to approve, bounce or reject'));
   row.appendChild(h('span.grow'));
   row.appendChild(h('span.review-meta', metaLine(card, p, shared), ' · ',
     timeEl(card.last_activity_at, { suffix: false })));
 
-  const wrap = h('div.review-actwrap', row, pop);
-  return wrap;
+  return h('div.review-actwrap', row);
 }
 
 function metaLine(card, p, shared) {

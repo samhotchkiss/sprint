@@ -156,20 +156,72 @@ export function tickTimes(root = document) {
 
 // ---- text ----------------------------------------------------------------
 
-/** Split text into nodes, turning #123 into clickable card links. */
+/**
+ * Split text into nodes, turning #123 into a card link and a bare http(s) URL
+ * into a real link that opens in a new tab.
+ *
+ * Card #54, user verbatim: "make links clickable and should auto open in a new
+ * tab". The two link kinds are deliberately different animals: a `#N` is a move
+ * INSIDE this board (it opens the card in the rail, same tab, no navigation),
+ * and a URL is somewhere else entirely (new tab, `rel="noopener noreferrer"`,
+ * so a preview server can never reach back into the board's window).
+ *
+ * Nothing here builds markup out of the text: every piece is a text node or an
+ * element created by `h`, so an agent that posts `<script>` posts the
+ * characters `<script>` exactly as it always did.
+ */
+const LINK_RE = /(https?:\/\/[^\s<>"'`\]]+)|#(\d{1,7})\b/g;
+
+/** Trailing punctuation is almost always the sentence's, not the URL's. */
+function trimUrl(url) {
+  let end = url.length;
+  const closers = { ')': '(', ']': '[', '}': '{' };
+  while (end > 0) {
+    const ch = url[end - 1];
+    if ('.,;:!?'.includes(ch)) { end -= 1; continue; }
+    if (closers[ch]) {
+      const body = url.slice(0, end);
+      const opens = (body.match(new RegExp('\\' + closers[ch], 'g')) || []).length;
+      const shuts = (body.match(new RegExp('\\' + ch, 'g')) || []).length;
+      if (shuts > opens) { end -= 1; continue; }
+    }
+    break;
+  }
+  return url.slice(0, end);
+}
+
+/** One outbound link: new tab, no window handle back to the board. */
+export function extLink(url, label) {
+  return h('a.extlink', {
+    href: url,
+    target: '_blank',
+    rel: 'noopener noreferrer',
+    title: url,
+    // A link inside a row that opens the card must not do both things at once.
+    onclick: (e) => e.stopPropagation(),
+  }, label || url);
+}
+
 export function autolink(text, onCard) {
   const frag = document.createDocumentFragment();
   const s = String(text == null ? '' : text);
-  const re = /#(\d{1,7})\b/g;
+  const re = new RegExp(LINK_RE.source, 'g');
   let last = 0, m;
   while ((m = re.exec(s))) {
     if (m.index > last) frag.appendChild(document.createTextNode(s.slice(last, m.index)));
-    const num = Number(m[1]);
-    frag.appendChild(h('button.cardlink', {
-      type: 'button',
-      onclick: (e) => { e.preventDefault(); e.stopPropagation(); onCard && onCard(num); },
-    }, '#' + num));
-    last = m.index + m[0].length;
+    if (m[1]) {
+      const url = trimUrl(m[1]);
+      frag.appendChild(extLink(url));
+      last = m.index + url.length;
+      re.lastIndex = last;
+    } else {
+      const num = Number(m[2]);
+      frag.appendChild(h('button.cardlink', {
+        type: 'button',
+        onclick: (e) => { e.preventDefault(); e.stopPropagation(); onCard && onCard(num); },
+      }, '#' + num));
+      last = m.index + m[0].length;
+    }
   }
   if (last < s.length) frag.appendChild(document.createTextNode(s.slice(last)));
   return frag;

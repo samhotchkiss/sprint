@@ -115,7 +115,7 @@ function noteGeneration(payload) {
 //
 // Bump BOTH numbers in the same commit whenever web/ starts requiring an
 // endpoint or field a running server might not have.
-export const UI_API_VERSION = 4;
+export const UI_API_VERSION = 5;
 
 let serverApi = null;                // null = nothing has answered yet
 const staleListeners = new Set();
@@ -230,6 +230,16 @@ export const api = {
   // that fact, so the board does.
   sidebarSeen: (seq) => req('POST', '/api/sidebar/seen', { seq }),
   holdMode: (on) => req('POST', '/api/sprint', { action: 'set_hold_mode', hold_mode: !!on }),
+  // The Resume button in the account-limit banner. Server-side this is the
+  // same single-writer clear the clock uses, so pressing it twice (or pressing
+  // it on two boards) still emits exactly one `limit_cleared` per board.
+  clearLimit: (id, key) => req('POST', `/api/limits/${id}/clear`, {},
+    { idempotencyKey: key }),
+
+  // Dispatch policy: model policy, executors, concurrency. A document you
+  // replace, not an event you append — hence PUT.
+  settings: () => req('GET', '/api/settings'),
+  saveSettings: (patch) => req('PUT', '/api/settings', patch),
 
   // The report library. `scope` defaults to the OPEN sprint server-side — the
   // header link exists only when THIS sprint has a report, so the default is
