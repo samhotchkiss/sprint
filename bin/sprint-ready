@@ -19,7 +19,15 @@ The packet file must be a JSON object:
   }
 
 claim, diffstat, branch, test_cmd, test_result, validate, and ui_change
-are always required.
+are always required for ordinary (code) work.
+
+Non-code work sets "work_kind": "ops" and proves itself differently: a
+mailbox reprocess has no diff, no branch and no preview, so the required
+set becomes claim, validate and readback -- the log excerpt or command
+output you actually observed. test_cmd/test_result stay optional (and
+still need real counts if you give them), and diffstat/branch/ui_change/
+screenshots are not required at all. Pass readback as a string or an
+array of strings; the board renders it preformatted, verbatim.
 
 Prime rule (user, verbatim): "we need to make sure there's a way for
 the human to easily validate the fix without having to read the code.
@@ -61,6 +69,8 @@ import urllib.error
 import urllib.request
 
 REQUIRED_STR_FIELDS = ("claim", "diffstat", "branch", "test_cmd", "test_result")
+# Mirrors bin/sprintd's WORK_KINDS.
+WORK_KINDS = ("code", "ops")
 # Mirrors bin/sprintd's PASS_RE / FAIL_RE exactly — both must match.
 PASS_RE = re.compile(r"(\d+)\s*(?:pass|passed|passing|ok)\b", re.IGNORECASE)
 FAIL_RE = re.compile(r"(\d+)\s*(?:fail|failed|failing|error)", re.IGNORECASE)
@@ -88,25 +98,59 @@ def parse_args(argv):
     return p.parse_args(argv)
 
 
+def readback_text(packet):
+    """The observed evidence as one blob. Mirrors sprintd's App.readback_text."""
+    val = packet.get("readback")
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, list):
+        lines = [s for s in val if isinstance(s, str)]
+        if len(lines) != len(val):
+            return ""
+        return "\n".join(lines).strip()
+    return ""
+
+
 def validate_packet(packet):
     if not isinstance(packet, dict):
         fail("packet", "top-level JSON must be an object")
 
-    for field in REQUIRED_STR_FIELDS:
-        value = packet.get(field)
-        if not isinstance(value, str) or not value.strip():
-            fail(field, "must be a non-empty string")
+    work_kind = packet.get("work_kind") or "code"
+    if not isinstance(work_kind, str) or work_kind.strip().lower() not in WORK_KINDS:
+        fail("work_kind", 'must be "code" (the default) or "ops"')
+    work_kind = work_kind.strip().lower()
+    ops = work_kind == "ops"
 
-    test_result = packet["test_result"]
-    if not (PASS_RE.search(test_result) and FAIL_RE.search(test_result)):
-        fail("test_result", 'must report a pass count AND a fail count, e.g. "12 pass, 0 fail" — not prose like "tests pass"')
+    if ops:
+        # Ops work swaps the required set rather than relaxing it: what it can
+        # show is what actually came back, so that is what it owes.
+        claim = packet.get("claim")
+        if not isinstance(claim, str) or not claim.strip():
+            fail("claim", "must be a non-empty string")
+        if not readback_text(packet):
+            fail("readback", "required for ops work — the log excerpt or command "
+                             "output you observed, as a string or array of strings")
+    else:
+        for field in REQUIRED_STR_FIELDS:
+            value = packet.get(field)
+            if not isinstance(value, str) or not value.strip():
+                fail(field, "must be a non-empty string")
 
-    if " " in packet["branch"] or "\n" in packet["branch"]:
-        fail("branch", "not a valid git branch name (contains whitespace)")
+        if " " in packet["branch"] or "\n" in packet["branch"]:
+            fail("branch", "not a valid git branch name (contains whitespace)")
 
-    if "ui_change" not in packet or not isinstance(packet.get("ui_change"), bool):
+    test_result = packet.get("test_result")
+    if isinstance(test_result, str) and test_result.strip():
+        if not (PASS_RE.search(test_result) and FAIL_RE.search(test_result)):
+            fail("test_result", 'must report a pass count AND a fail count, e.g. "12 pass, 0 fail" — not prose like "tests pass"')
+    elif not ops:
+        fail("test_result", "must be a non-empty string")
+
+    if "ui_change" in packet and not isinstance(packet.get("ui_change"), bool):
+        fail("ui_change", "must be true or false")
+    if not ops and not isinstance(packet.get("ui_change"), bool):
         fail("ui_change", "required — must be true or false")
-    ui_change = packet["ui_change"]
+    ui_change = bool(packet.get("ui_change"))
 
     if "validate" not in packet:
         fail("validate", "required — 1-3 plain-English steps a human follows to confirm the fix without reading code")
