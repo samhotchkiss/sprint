@@ -354,6 +354,12 @@ def first_line_title(text: str, limit: int = 90) -> str:
     return line
 
 
+def image_line(n: int) -> str:
+    """The skim line for a message that is only pictures. Every event needs
+    words -- the card face and the timeline show `text` and nothing else."""
+    return "sent a screenshot" if n == 1 else "sent %d screenshots" % n
+
+
 class ApiError(Exception):
     def __init__(self, status: int, code: str, message: str = "", **extra):
         super().__init__(message or code)
@@ -731,8 +737,9 @@ class App:
                     (sprint["id"] if sprint else None, state, title, text, ts, ts))
                 num = int(cur.lastrowid)
                 self._append_event(num, actor, "submitted", {
-                    "text": text or ("%d image(s)" % len(attachments)),
+                    "text": text or image_line(len(attachments)),
                     "attachments": attachments,
+                    "images_only": not text,
                     "hold": bool(hold or hold_mode)})
                 self._append_event(num, "server", "state", {
                     "from": None, "to": state,
@@ -940,20 +947,42 @@ class App:
 
     # -- liveness ---------------------------------------------------------
 
-    def card_baseline(self, num: int):
-        """(ts, seq) of the last thing that counts as agent activity."""
-        row = self.q1(
-            "SELECT seq, ts FROM events WHERE card_num=? AND actor='worker' "
-            "ORDER BY seq DESC LIMIT 1", (num,))
-        if row is not None:
-            return row["ts"], row["seq"]
-        row = self.q1(
+    def card_baseline(self, num: int, row=None):
+        """(ts, seq) of the last thing that counts as activity for this card.
+
+        The clock keys on the AGENT, not the card. One agent can hold several
+        cards — a batch, or a handful assigned to the same worker — and it is
+        one process with one attention: while it is posting progress on card A
+        it is demonstrably not dead on card B. Ambering B every five minutes
+        for that was noise the user had to dismiss over and over.
+
+        So: any worker event on ANY card belonging to this card's agent resets
+        the baseline for all of them. `agent_silent` still fires per card (it
+        carries a card_num and the user reads it on the card), but only once the
+        agent itself has actually gone quiet. A card with no agent keeps the
+        plain per-card clock.
+        """
+        row = row if row is not None else self.q1("SELECT * FROM cards WHERE num=?", (num,))
+        agent = row["agent_name"] if row is not None else None
+        if agent:
+            hit = self.q1(
+                "SELECT e.seq AS seq, e.ts AS ts FROM events e "
+                "JOIN cards c ON c.num = e.card_num "
+                "WHERE c.agent_name=? AND e.actor='worker' "
+                "ORDER BY e.seq DESC LIMIT 1", (agent,))
+        else:
+            hit = self.q1(
+                "SELECT seq, ts FROM events WHERE card_num=? AND actor='worker' "
+                "ORDER BY seq DESC LIMIT 1", (num,))
+        if hit is not None:
+            return hit["ts"], hit["seq"]
+        # Nothing from the agent yet: the clock starts when this card last moved.
+        hit = self.q1(
             "SELECT seq, ts FROM events WHERE card_num=? AND kind='state' "
             "ORDER BY seq DESC LIMIT 1", (num,))
-        if row is not None:
-            return row["ts"], row["seq"]
-        crow = self.q1("SELECT updated_at FROM cards WHERE num=?", (num,))
-        return (crow["updated_at"] if crow else now()), 0
+        if hit is not None:
+            return hit["ts"], hit["seq"]
+        return (row["updated_at"] if row is not None else now()), 0
 
     def silence_notified(self, num: int, baseline_seq: int) -> bool:
         row = self.q1(
@@ -1514,9 +1543,13 @@ class App:
         if not text and not attachments:
             raise ApiError(400, "empty_submission",
                            "at least one of text or images is required")
-        payload = {"text": text or ("%d image(s)" % len(attachments))}
+        payload = {"text": text or image_line(len(attachments))}
         if attachments:
             payload["attachments"] = attachments
+        if not text:
+            # The line still needs words to be skimmable on the card face, but
+            # the thread should show the picture, not a caption of the picture.
+            payload["images_only"] = True
         if detail is not None:
             payload["detail"] = detail
         return self.card_event(num, "chat", payload, actor=actor)
@@ -1530,9 +1563,11 @@ class App:
             raise ApiError(400, "missing_field", "text is required", field="text")
         # Same two-part shape as a card event: a line to skim, an optional
         # expanded version the session can park its working in.
-        payload = {"text": text or ("%d image(s)" % len(attachments))}
+        payload = {"text": text or image_line(len(attachments))}
         if attachments:
             payload["attachments"] = attachments
+        if not text:
+            payload["images_only"] = True
         if detail is not None:
             payload["detail"] = detail
         with self.lock:

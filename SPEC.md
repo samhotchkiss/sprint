@@ -310,10 +310,21 @@ your assigned worktree; one branch; never push to main; never touch other cards'
   question panels of ≥46px option rows, and centred status changes (events, not speech). The
   evidence packet renders **as a message in the stream** — claim, "Check it yourself" numbered
   steps, screenshots, mono metadata (branch, diffstat, test counts), live URL, then Approve /
-  Bounce-with-notes / Reject. Composer pinned at the bottom: Return sends, Shift+Return newlines.
+  Bounce-with-notes / Reject. Composer pinned at the bottom: Return sends, Shift+Return newlines —
+  and it takes images exactly like the Drop-work sheet does (paste, drop, or the file picker →
+  removable thumbnails above the line → sent with the text as one message → screenshot tiles in the
+  thread → lightbox). Card threads and the session chat share one implementation (`compose.js`).
+  A half-written message survives a re-render, words and thumbnails both.
+- **The rail repaints without blinking.** Thread items are keyed and versioned: a frame that changed
+  nothing changes no DOM, a new line is appended, and the delivery pill under your own messages is
+  patched in place. Cursor frames (the most frequent thing on the wire — an active session moves its
+  drain cursor about once a second) paint the rail alone, because nothing else on the page reads the
+  cursor. Rebuilding the rail per frame threw away every `<img>` in the thread, which is exactly what
+  a blink is.
 - **Submit**: a "+ Drop work" modal sheet — textarea + paste-to-attach multiple images (thumbnails,
   removable) + `<input type=file multiple accept="image/*">` fallback + Hold toggle. Return submits,
-  Shift+Return makes a new line (Cmd/Ctrl+Enter still submits). Pasting an image anywhere opens it.
+  Shift+Return makes a new line (Cmd/Ctrl+Enter still submits). Pasting an image anywhere opens it,
+  and so does pressing `/` — unless the caret is already in a text field, where a slash is a slash.
 - **Chat button**: the product's single notification surface, with four states — closed, open
   (sage dot), **gold when a session line arrived while you were not looking** (Chaos pulses it with
   `goldFlash`; Calm holds the gold steady), and dimmed because a card has taken the rail. No

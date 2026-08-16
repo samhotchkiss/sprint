@@ -988,6 +988,14 @@ class TestSilenceTimer(Base):
         _, detail = self.get("/api/cards/%d" % num)
         return [e for e in detail["timeline"] if e["kind"] == "agent_silent"]
 
+    def _wait_for_silent_count(self, num, want, timeout=12.0):
+        deadline = time.time() + timeout
+        events = self._silent_events(num)
+        while time.time() < deadline and len(events) < want:
+            time.sleep(0.1)
+            events = self._silent_events(num)
+        return events
+
     def test_agent_silent_fires_once_and_rearms(self):
         quiet = self.new_card("quiet card")["num"]
         longjob = self.new_card("long job")["num"]
@@ -1033,6 +1041,87 @@ class TestSilenceTimer(Base):
         num = self.new_card("just queued")["num"]
         time.sleep(self.SILENCE_SECONDS + 0.8)
         self.assertEqual(self._silent_events(num), [])
+
+    # -- one agent, several cards --------------------------------------------
+    #
+    # The clock is the AGENT's, not the card's: an agent posting progress on
+    # one of its cards is not silent on the others.
+
+    def assign(self, num, agent):
+        status, body = self.post("/api/cards/%d/assign" % num,
+                                 {"agent_name": agent, "worktree": "/tmp/wt",
+                                  "branch": "sprint/" + agent})
+        self.assertEqual(status, 200, body)
+
+    def test_activity_on_one_card_keeps_the_agents_other_cards_quiet(self):
+        a = self.new_card("card A")["num"]
+        b = self.new_card("card B")["num"]
+        for num in (a, b):
+            self.assign(num, "sprint-batch-1")
+            self.to_in_progress(num)
+
+        # keep posting on A only, well past the threshold
+        deadline = time.time() + self.SILENCE_SECONDS * 2.5
+        while time.time() < deadline:
+            status, _ = self.post("/api/cards/%d/events" % a,
+                                  {"kind": "progress", "payload": {"text": "still on it"}})
+            self.assertEqual(status, 201)
+            time.sleep(0.3)
+
+        self.assertEqual(self._silent_events(b), [],
+                         "B must not amber while its own agent is visibly working on A")
+        self.assertEqual(self._silent_events(a), [])
+        _, board = self.get("/api/board")
+        by_num = {c["num"]: c for c in board["cards"]}
+        self.assertFalse(by_num[b]["silent"])
+        self.assertFalse(by_num[a]["silent"])
+
+    def test_both_cards_amber_once_the_agent_itself_goes_quiet(self):
+        a = self.new_card("card A")["num"]
+        b = self.new_card("card B")["num"]
+        for num in (a, b):
+            self.assign(num, "sprint-batch-2")
+            self.to_in_progress(num)
+        self.post("/api/cards/%d/events" % a, {"kind": "progress", "payload": {"text": "one line"}})
+
+        self.assertEqual(len(self._wait_for_silent(a)), 1)
+        self.assertEqual(len(self._wait_for_silent(b)), 1,
+                         "a truly quiet agent still ambers every card it holds")
+
+        # and one event per episode, per card — re-arm semantics unchanged
+        time.sleep(self.SILENCE_SECONDS + 0.6)
+        self.assertEqual(len(self._silent_events(a)), 1)
+        self.assertEqual(len(self._silent_events(b)), 1)
+
+        # a line on A re-arms BOTH cards, and both fire again
+        self.post("/api/cards/%d/events" % a, {"kind": "progress", "payload": {"text": "back"}})
+        _, board = self.get("/api/board")
+        by_num = {c["num"]: c for c in board["cards"]}
+        self.assertFalse(by_num[a]["silent"])
+        self.assertFalse(by_num[b]["silent"], "the agent spoke — B is not silent either")
+        self.assertEqual(len(self._wait_for_silent_count(a, 2)), 2)
+        self.assertEqual(len(self._wait_for_silent_count(b, 2)), 2)
+
+    def test_a_single_card_agent_is_unchanged(self):
+        num = self.new_card("solo")["num"]
+        self.assign(num, "sprint-card-solo")
+        self.to_in_progress(num)
+        self.assertEqual(len(self._wait_for_silent(num)), 1)
+
+    def test_another_agents_activity_does_not_cover_for_you(self):
+        mine = self.new_card("mine")["num"]
+        theirs = self.new_card("theirs")["num"]
+        self.assign(mine, "sprint-card-a")
+        self.assign(theirs, "sprint-card-b")
+        for num in (mine, theirs):
+            self.to_in_progress(num)
+        deadline = time.time() + self.SILENCE_SECONDS * 2.0
+        while time.time() < deadline:
+            self.post("/api/cards/%d/events" % theirs,
+                      {"kind": "progress", "payload": {"text": "busy over here"}})
+            time.sleep(0.3)
+        self.assertEqual(len(self._wait_for_silent(mine)), 1,
+                         "a different agent's chatter must not cover for a quiet one")
 
 
 class TestHoldMode(Base):

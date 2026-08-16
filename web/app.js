@@ -287,7 +287,7 @@ async function chat(card, text, images) {
     // The thumbnails you pasted are in the thread before the POST returns — the
     // data: URLs render as tiles directly, and the stored refs replace them the
     // moment the card refreshes.
-    payload: { text: text || (imgs.length ? `${imgs.length} image(s)` : ''), attachments: localRefs(imgs) },
+    payload: localPayload(text, imgs),
   });
   render();
   try {
@@ -305,16 +305,26 @@ async function chat(card, text, images) {
   }
 }
 
-/** Local, immediately-renderable refs for images we have not uploaded yet. */
-function localRefs(images) {
-  return (images || []).map((i) => ({ url: i.dataUrl, name: i.name || 'pasted image' }));
+/**
+ * The optimistic copy of a message we are still sending — word for word what
+ * the server will write, so the echo it sends back replaces ours cleanly. The
+ * thumbnails render straight from their data: URLs until the stored refs land.
+ */
+function localPayload(text, images) {
+  const imgs = images || [];
+  const payload = {
+    text: text || (imgs.length === 1 ? 'sent a screenshot' : `sent ${imgs.length} screenshots`),
+    attachments: imgs.map((i) => ({ url: i.dataUrl, name: i.name || 'pasted image' })),
+  };
+  if (!text && imgs.length) payload.images_only = true;
+  return payload;
 }
 
 /** A line to the session itself, in the sprint-level chat. */
 async function sessionChat(text, images) {
   const imgs = images || [];
-  const payload = { text: text || (imgs.length ? `${imgs.length} image(s)` : ''), attachments: localRefs(imgs) };
-  const line = normEvent({ actor: 'user', kind: 'chat', ts: new Date().toISOString(), payload });
+  const line = normEvent({ actor: 'user', kind: 'chat', ts: new Date().toISOString(),
+    payload: localPayload(text, imgs) });
   line.local = true;         // "sending…" — no seq yet, so nothing is claimed
   line.localEcho = true;     // replaced when the server's own copy arrives
   line.sortSeq = store.seq + 0.5;   // ordering only, never a delivery claim

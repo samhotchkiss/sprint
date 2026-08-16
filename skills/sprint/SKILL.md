@@ -137,9 +137,9 @@ re-dispatch a card that already has a live `agent_name`).
 | actor | kind | your reaction |
 |---|---|---|
 | user | `submitted` (card_num set) | New card landed. If hold mode is off it's already `queued`; consider it for dispatch (step 3) once you've drained the page. If hold mode is on it's `held` — do nothing until the user says go. |
-| user | `chat` (card_num set) | User talked to a specific card. If it has a live (non-terminal) agent, `SendMessage` the agent by name with the user's text as context. If terminal, post a `note` explaining you can't reach that agent anymore and, if the message calls for it, dispatch fresh work referencing the old timeline. |
-| user | `chat` (card_num NULL) | Sidebar message. This is the same conversation as your terminal — answer it, and if it asks you to act (unblock, re-batch, approve, "why has #123 been blocked so long") actually do that, don't just answer in prose. Reply via `POST /api/sidebar {"text":..., "actor":"session"}`. |
-| user | `answer` | An answer to a worker's question. Server already flipped `needs_you`→`in_progress`; your job is to relay the answer to the agent: `SendMessage` it by name with the answer text. |
+| user | `chat` (card_num set) | User talked to a specific card. If it has a live (non-terminal) agent, `SendMessage` the agent by name with the user's text as context — **and, if `payload.attachments` is non-empty, the absolute `path` of every attachment on its own line, so the agent can `Read` the images.** A pasted screenshot is usually the whole message ("this is what I mean"); a relay that drops it hands the agent a sentence about a picture it cannot see. If terminal, post a `note` explaining you can't reach that agent anymore and, if the message calls for it, dispatch fresh work referencing the old timeline. |
+| user | `chat` (card_num NULL) | Sidebar message. This is the same conversation as your terminal — answer it, and if it asks you to act (unblock, re-batch, approve, "why has #123 been blocked so long") actually do that, don't just answer in prose. Sidebar lines carry `payload.attachments` too — `Read` those paths before you answer. Reply via `POST /api/sidebar {"text":..., "actor":"session"}`. |
+| user | `answer` | An answer to a worker's question. Server already flipped `needs_you`→`in_progress`; your job is to relay the answer to the agent: `SendMessage` it by name with the answer text (plus any attachment paths from the `chat` line that came with it). |
 | user | `note` with `retry: true` (then `state`→`queued`) | The user hit **Retry** on a failed/stale card. The server already cleared the dead `agent_name`/`worktree` and re-queued it. Dispatch a **fresh** agent (step 3) with the card's full timeline as its brief, and have it say plainly that it is a new agent picking up where the last one died — never `SendMessage` the old name. |
 | user | `action` results (pin/cancel/hold/release/duplicate_of) | Mostly informational — no action needed beyond noticing state changed, unless `release` just moved held cards to queued (then consider dispatch) or `cancel` hit a card with a live agent (then tell that agent to stop: `SendMessage` "this card was canceled, wrap up and stop"). |
 | user | `verdict` (approve) | See step 6 — the card already flipped `ready`→`integrating` on the board (UI shows "merging…", no spinner). Do the actual git integration now, then call `POST /api/cards/:num/integrated` yourself to land it in `completed` or bounce it back with a real failure. |
@@ -311,6 +311,19 @@ Brief contents, every time:
 `sprint-batch-<id>`). Mid-run messages land on the agent's next turn;
 if it already finished its turn (e.g. it's sitting at a `sprint-ask`
 pause), your message resumes it with its transcript intact.
+
+**Images relay as file paths.** A `chat`/`answer` event's
+`payload.attachments` is a list of `{sha256, url, mime, bytes, path}` —
+`path` is absolute and on this machine. Put those paths in the
+`SendMessage` body, one per line, under the user's words:
+
+```
+User on #42: "the header still overlaps — see this"
+Attached (Read these): /Users/…/.sprint/attachments/<sha256>.png
+```
+
+The agent reads the image itself; never describe it for them, and never
+paste base64 into a message.
 
 **Never `SendMessage` a terminal card's agent** — once a card is
 `completed`/`rejected`/`failed`/`canceled`/`duplicate`, its worktree may
