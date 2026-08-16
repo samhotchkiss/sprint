@@ -6,6 +6,7 @@ temp data dir. Port 8377 (the real default) is never touched.
 """
 
 import base64
+import datetime
 import http.client
 import importlib.util
 import json
@@ -6575,6 +6576,481 @@ class TestPortSurvivesStopAndStart(unittest.TestCase):
         self.assertIn("is held by", r.stderr.decode())
         self.assertEqual(sprintd.http_get("127.0.0.1", landed, "/healthz")[0], 200)
         self.assertEqual(self._run("stop").returncode, 0)
+
+
+# --------------------------------------------------------------------------
+# Provider limit windows (card #47)
+#
+# The incident: three workers killed at once by a usage limit whose message
+# said when it would end, nothing captured that sentence, and the cards sat
+# open for hours. These tests are about the three things that failure needed —
+# record the window, show it, and fire exactly ONE resume signal when it ends.
+# --------------------------------------------------------------------------
+
+
+class TestResetTimeParsing(unittest.TestCase):
+    """`parse_reset_time` — the one parser the board and `sprint-limit` share.
+
+    Everything is pinned to a fixed reference instant, because "the next
+    occurrence of 11:50pm" is a different answer at 11:49 and at 11:51 and a
+    test that reads the wall clock would be right twice a day.
+    """
+
+    # 2026-08-16 23:52:00 local — two minutes PAST 11:50pm, which is the exact
+    # moment the real kill message arrives and the exact moment naive parsing
+    # gets it wrong.
+    REF = datetime.datetime(2026, 8, 16, 23, 52, 0).timestamp()
+
+    def at(self, value, ref=None):
+        return datetime.datetime.fromtimestamp(
+            sprintd.parse_reset_time(value, ref=self.REF if ref is None else ref))
+
+    def test_a_clock_time_means_the_next_time_it_comes_round(self):
+        # 11:50pm, read at 11:52pm, is TOMORROW. Reading it as today would put
+        # the reset two minutes in the past and clear the window instantly.
+        self.assertEqual(self.at("11:50pm"),
+                         datetime.datetime(2026, 8, 17, 23, 50))
+        # ...and the same time read BEFORE it happens is today.
+        ref = datetime.datetime(2026, 8, 16, 20, 0, 0).timestamp()
+        self.assertEqual(self.at("11:50pm", ref=ref),
+                         datetime.datetime(2026, 8, 16, 23, 50))
+
+    def test_the_shapes_a_human_actually_types(self):
+        self.assertEqual(self.at("11:50 PM"), datetime.datetime(2026, 8, 17, 23, 50))
+        self.assertEqual(self.at("11:50p.m."), datetime.datetime(2026, 8, 17, 23, 50))
+        self.assertEqual(self.at("9pm"), datetime.datetime(2026, 8, 17, 21, 0))
+        self.assertEqual(self.at("23:50"), datetime.datetime(2026, 8, 17, 23, 50))
+        # midnight and noon are the two that off-by-twelve bugs live in
+        self.assertEqual(self.at("12am"), datetime.datetime(2026, 8, 17, 0, 0))
+        self.assertEqual(self.at("12pm"), datetime.datetime(2026, 8, 17, 12, 0))
+
+    def test_iso_and_epoch(self):
+        self.assertEqual(self.at("2026-08-17T06:30:00"),
+                         datetime.datetime(2026, 8, 17, 6, 30))
+        # an offset is honoured rather than ignored
+        self.assertEqual(sprintd.parse_reset_time("2026-08-17T06:30:00+00:00"),
+                         datetime.datetime(2026, 8, 17, 6, 30,
+                                           tzinfo=datetime.timezone.utc).timestamp())
+        self.assertEqual(sprintd.parse_reset_time("2026-08-17T06:30:00Z"),
+                         datetime.datetime(2026, 8, 17, 6, 30,
+                                           tzinfo=datetime.timezone.utc).timestamp())
+        self.assertEqual(sprintd.parse_reset_time(1786945800), 1786945800.0)
+        self.assertEqual(sprintd.parse_reset_time("1786945800"), 1786945800.0)
+        # milliseconds, because something will eventually send them
+        self.assertEqual(sprintd.parse_reset_time(1786945800000), 1786945800.0)
+
+    def test_the_providers_own_parenthetical_zone(self):
+        """The kill message can be pasted verbatim, zone and all."""
+        utc = sprintd.parse_reset_time("11:50pm (UTC)", ref=self.REF)
+        self.assertEqual(
+            datetime.datetime.fromtimestamp(utc, datetime.timezone.utc),
+            datetime.datetime(2026, 8, 17, 23, 50, tzinfo=datetime.timezone.utc))
+        # a zone nobody has heard of is a 400, never a silent local reading
+        with self.assertRaises(sprintd.ApiError) as ctx:
+            sprintd.parse_reset_time("11:50pm (Bogus/Zone)", ref=self.REF)
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_nonsense_is_a_named_400_not_a_guess(self):
+        for bad in ("gibberish", "", "  ", "25:00", "13:70", "13pm", None, True, []):
+            with self.assertRaises(sprintd.ApiError) as ctx:
+                sprintd.parse_reset_time(bad, ref=self.REF)
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertEqual(ctx.exception.extra.get("field"), "resets_at")
+
+    def test_clock_label_is_the_words_the_board_uses(self):
+        ts = datetime.datetime(2026, 8, 17, 23, 50).timestamp()
+        self.assertEqual(sprintd.clock_label(ts), "11:50pm")
+        self.assertEqual(
+            sprintd.clock_label(datetime.datetime(2026, 8, 17, 0, 5).timestamp()),
+            "12:05am")
+        self.assertEqual(
+            sprintd.clock_label(datetime.datetime(2026, 8, 17, 12, 0).timestamp()),
+            "12:00pm")
+
+
+class LimitBase(Base):
+    def declare(self, model="fable", resets="11:50pm", **kw):
+        body = {"model": model, "resets_at": resets}
+        body.update(kw)
+        status, out = self.post("/api/limits", body)
+        self.assertIn(status, (200, 201), out)
+        return status, out
+
+    def limit_events(self, kind=None):
+        status, body = self.get("/api/events?after=0&limit=2000")
+        self.assertEqual(status, 200, body)
+        return [e for e in body["events"]
+                if e["kind"] in ("limit_declared", "limit_cleared")
+                and (kind is None or e["kind"] == kind)]
+
+
+class TestLimitWindows(LimitBase):
+    def test_declare_read_and_clear(self):
+        status, out = self.declare(source="kill message", note="three agents died")
+        self.assertEqual(status, 201)
+        self.assertTrue(out["created"])
+        lim = out["limit"]
+        self.assertEqual(lim["model"], "fable")
+        self.assertTrue(lim["active"])
+        self.assertGreater(lim["resets_at"], sprintd.now())
+        self.assertEqual(lim["source"], "kill message")
+
+        status, body = self.get("/api/limits")
+        self.assertEqual(status, 200, body)
+        self.assertEqual([l["id"] for l in body["active"]], [lim["id"]])
+        self.assertEqual(body["recent"], [])
+
+        # declaring it is a fact on the log, in words
+        declared = self.limit_events("limit_declared")
+        self.assertEqual(len(declared), 1)
+        self.assertIsNone(declared[0]["card_num"])
+        self.assertEqual(declared[0]["actor"], "server")
+        self.assertIn("rate-limited until", declared[0]["payload"]["text"])
+
+        status, out = self.post("/api/limits/%d/clear" % lim["id"])
+        self.assertEqual(status, 200, out)
+        self.assertTrue(out["cleared"])
+        self.assertFalse(out["limit"]["active"])
+        cleared = self.limit_events("limit_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0]["payload"]["reason"], "cleared_early")
+        self.assertEqual(cleared[0]["payload"]["model"], "fable")
+
+        status, body = self.get("/api/limits")
+        self.assertEqual(body["active"], [])
+        self.assertEqual([l["id"] for l in body["recent"]], [lim["id"]])
+
+    def test_redeclaring_the_same_window_updates_it(self):
+        """The session sees the same kill message on the second and third dead
+        agent. That must not become three lines on the board."""
+        _, first = self.declare()
+        _, second = self.declare(note="and a third agent")
+        self.assertFalse(second["created"])
+        self.assertEqual(second["limit"]["id"], first["limit"]["id"])
+        self.assertEqual(second["limit"]["note"], "and a third agent")
+        status, body = self.get("/api/limits")
+        self.assertEqual(len(body["active"]), 1)
+        # ...and the unchanged re-declaration says nothing new on the log
+        self.assertEqual(len(self.limit_events("limit_declared")), 1)
+
+    def test_a_corrected_reset_time_moves_the_window_it_corrects(self):
+        _, first = self.declare(resets="11:50pm")
+        _, second = self.declare(resets=sprintd.now() + 3600)
+        self.assertEqual(second["limit"]["id"], first["limit"]["id"])
+        self.assertNotEqual(second["limit"]["resets_at"], first["limit"]["resets_at"])
+        status, body = self.get("/api/limits")
+        self.assertEqual(len(body["active"]), 1)
+        # a real change IS worth saying out loud
+        self.assertEqual(len(self.limit_events("limit_declared")), 2)
+
+    def test_two_models_are_two_windows(self):
+        self.declare(model="fable")
+        self.declare(model="opus")
+        status, body = self.get("/api/limits")
+        self.assertEqual(sorted(l["model"] for l in body["active"]), ["fable", "opus"])
+
+    def test_a_passed_window_is_inactive_with_no_job_having_run(self):
+        """Activeness is COMPUTED. Nothing here runs the sweep — the background
+        threads are off in this fixture — and the window is still over, because
+        a board that was asleep across 11:50pm has to come back up knowing."""
+        self.assertIsNone(self.app._sweep_thread)
+        _, out = self.declare(resets=sprintd.now() - 10)
+        lim = out["limit"]
+        self.assertFalse(lim["active"])
+        self.assertIsNone(lim["cleared_at"])      # nothing wrote anything down
+
+        status, body = self.get("/api/limits")
+        self.assertEqual(body["active"], [])
+        self.assertEqual([l["id"] for l in body["recent"]], [lim["id"]])
+        status, board = self.get("/api/board")
+        self.assertEqual(board["limits"], [])
+        # and the resume signal has NOT been faked by the read path
+        self.assertEqual(self.limit_events("limit_cleared"), [])
+
+    def test_the_board_payload_carries_the_open_windows(self):
+        status, board = self.get("/api/board")
+        self.assertEqual(board["limits"], [])
+        _, out = self.declare()
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200)
+        self.assertEqual([l["id"] for l in board["limits"]], [out["limit"]["id"]])
+        self.assertEqual(board["limits"][0]["model"], "fable")
+        # the line the UI writes needs both halves of the sentence
+        self.assertTrue(board["limits"][0]["resets_at_label"])
+        self.assertEqual(board["default_model"], "fable")
+
+    def test_bad_declarations_are_named_400s(self):
+        status, body = self.post("/api/limits", {"resets_at": "11:50pm"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "model")
+        status, body = self.post("/api/limits", {"model": "fable"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "resets_at")
+        status, body = self.post("/api/limits", {"model": "fable",
+                                                 "resets_at": "half past nine-ish"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "resets_at")
+
+    def test_clearing_an_unknown_window_is_a_404(self):
+        status, body = self.post("/api/limits/999/clear")
+        self.assertEqual(status, 404, body)
+
+
+class TestLimitClearedFiresExactlyOnce(LimitBase):
+    """The one property that actually matters.
+
+    `limit_cleared` is not a log line the user reads — it is the signal the
+    session re-dispatches on. Two of them is two agents on the same card, so
+    "exactly once" is tested from every direction that could produce a storm:
+    a sweep that runs on a tick, a manual clear racing that tick, and threads.
+    """
+
+    def passed_window(self):
+        _, out = self.declare(resets=sprintd.now() - 1)
+        return out["limit"]["id"]
+
+    def test_a_sweep_on_a_tick_fires_once_no_matter_how_often_it_ticks(self):
+        self.passed_window()
+        fired = [self.app.sweep_limits() for _ in range(25)]
+        self.assertEqual(sum(fired), 1)
+        self.assertEqual(fired[0], 1)             # the FIRST tick is the one
+        self.assertEqual(len(self.limit_events("limit_cleared")), 1)
+
+    def test_concurrent_sweeps_and_clears_still_fire_once(self):
+        limit_id = self.passed_window()
+        errors = []
+
+        def hammer(fn):
+            def run():
+                try:
+                    for _ in range(10):
+                        fn()
+                except Exception as exc:       # a race must not throw either
+                    errors.append(exc)
+            return run
+
+        threads = [threading.Thread(target=hammer(self.app.sweep_limits))
+                   for _ in range(4)]
+        threads += [threading.Thread(
+            target=hammer(lambda: self.app.clear_limit(limit_id)))
+            for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.limit_events("limit_cleared")), 1)
+
+    def test_an_early_clear_and_the_clock_do_not_both_fire(self):
+        """Cleared early at 11:30, reset time arrives at 11:50: one event."""
+        _, out = self.declare(resets=sprintd.now() + 0.4)
+        status, _ = self.post("/api/limits/%d/clear" % out["limit"]["id"])
+        self.assertEqual(status, 200)
+        time.sleep(0.6)                            # the window's time arrives
+        self.assertEqual(self.app.sweep_limits(), 0)
+        events = self.limit_events("limit_cleared")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["payload"]["reason"], "cleared_early")
+
+    def test_the_clock_path_says_the_window_passed(self):
+        self.passed_window()
+        self.app.sweep_limits()
+        events = self.limit_events("limit_cleared")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["payload"]["reason"], "window_passed")
+        self.assertIn("can go back on", events[0]["payload"]["text"])
+
+    def test_the_guard_is_what_prevents_the_storm(self):
+        """Falsification. The test above would pass just as happily against an
+        implementation that never fires at all, or one the sweep only ever
+        reaches once by luck — so here the conditional UPDATE is REMOVED and
+        the storm is observed. If this test stops seeing duplicates, the one
+        above has stopped proving anything.
+        """
+        limit_id = self.passed_window()
+        real = sprintd.App.end_limit
+
+        def naive(app, lid, at=None):
+            """What this looked like before the guard: write, then announce."""
+            at = sprintd.now() if at is None else at
+            with app.lock:
+                row = app.conn.execute("SELECT * FROM limits WHERE id=?",
+                                       (lid,)).fetchone()
+                app.conn.execute("UPDATE limits SET cleared_at=? WHERE id=?",
+                                 (at, lid))
+                app._append_event(None, "server", "limit_cleared", {
+                    "limit_id": lid, "model": row["model"],
+                    "resets_at": row["resets_at"], "reason": "window_passed",
+                    "text": "naive"})
+            return True
+
+        # The sweep only selects windows that are still open, so a naive writer
+        # needs the window reopened between ticks to storm — which is exactly
+        # what a crash between the UPDATE and the COMMIT would leave behind.
+        sprintd.App.end_limit = naive
+        try:
+            for _ in range(3):
+                self.app.conn.execute(
+                    "UPDATE limits SET cleared_at=NULL WHERE id=?", (limit_id,))
+                self.app.sweep_limits()
+        finally:
+            sprintd.App.end_limit = real
+        self.assertGreater(len(self.limit_events("limit_cleared")), 1,
+                           "the naive writer did not storm — this falsification "
+                           "no longer proves the guard is load-bearing")
+
+        # ...and the real one, given the identical provocation, does not.
+        before = len(self.limit_events("limit_cleared"))
+        for _ in range(3):
+            self.app.conn.execute(
+                "UPDATE limits SET cleared_at=NULL WHERE id=?", (limit_id,))
+            self.app.sweep_limits()
+        self.assertEqual(len(self.limit_events("limit_cleared")) - before, 3,
+                         "each reopened window is its own episode")
+        # one per reopening, never several per reopening
+        self.assertEqual(self.app.sweep_limits(), 0)
+
+
+class TestModelReason(Base):
+    """WHY a card is not on the default model. Without it, "restore what was
+    downgraded" is a thing the session has to remember rather than read."""
+
+    def test_assign_records_it_and_every_payload_carries_it(self):
+        num = self.new_card("something to downgrade")["num"]
+        status, out = self.post("/api/cards/%d/assign" % num, {
+            "agent_name": "sprint-card-%d" % num, "worktree": "/tmp/wt",
+            "branch": "sprint/card-%d" % num, "model": "opus",
+            "model_reason": "fable limited until 23:50"})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["card"]["model_reason"], "fable limited until 23:50")
+
+        status, board = self.get("/api/board")
+        card = [c for c in board["cards"] if c["num"] == num][0]
+        self.assertEqual(card["model"], "opus")
+        self.assertEqual(card["model_reason"], "fable limited until 23:50")
+
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["model_reason"], "fable limited until 23:50")
+        note = [e for e in detail["timeline"]
+                if e["kind"] == "note" and e["payload"].get("model_reason")][0]
+        # the timeline reads as a sentence, not as a field dump
+        self.assertIn("on opus", note["payload"]["text"])
+        self.assertIn("fable limited until 23:50", note["payload"]["text"])
+
+    def test_an_empty_string_clears_it_and_omitting_it_does_not(self):
+        num = self.new_card("restore me")["num"]
+        self.post("/api/cards/%d/assign" % num,
+                  {"agent_name": "a", "model": "opus",
+                   "model_reason": "fable limited until 23:50"})
+        # a later assign that says nothing about the reason leaves it alone
+        self.post("/api/cards/%d/assign" % num, {"agent_name": "a"})
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["model_reason"], "fable limited until 23:50")
+        # ...and "" is how the session says "this is not a downgrade any more"
+        status, out = self.post("/api/cards/%d/assign" % num,
+                                {"agent_name": "a", "model": "fable",
+                                 "model_reason": ""})
+        self.assertEqual(status, 200, out)
+        self.assertIsNone(out["card"]["model_reason"])
+
+    def test_it_is_one_capped_line(self):
+        num = self.new_card("long reason")["num"]
+        status, out = self.post("/api/cards/%d/assign" % num, {
+            "agent_name": "a", "model_reason": "x" * 400 + "\nsecond line"})
+        self.assertEqual(status, 200, out)
+        self.assertLessEqual(len(out["card"]["model_reason"]), sprintd.MODEL_REASON_MAX)
+        self.assertNotIn("\n", out["card"]["model_reason"])
+        status, body = self.post("/api/cards/%d/assign" % num,
+                                 {"agent_name": "a", "model_reason": 17})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "model_reason")
+
+
+class TestLimitColumnsMigrate(unittest.TestCase):
+    """A board that has been up since before this landed must open, gain the
+    column and the table, and read a card written by the older server."""
+
+    def test_an_old_database_gains_model_reason_and_the_limits_table(self):
+        tmp = tempfile.mkdtemp(prefix="sprintd-limit-migrate-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        root = os.path.join(tmp, "project")
+        os.makedirs(root)
+        app = sprintd.App(root, token="t")
+        app.conn.execute("ALTER TABLE cards DROP COLUMN model_reason")
+        app.conn.execute("DROP TABLE limits")
+        app.conn.execute(
+            "INSERT INTO cards(sprint_id, state, title, body, created_at, updated_at) "
+            "VALUES(NULL,'in_progress','old','from before limits',1.0,1.0)")
+        app.close()
+
+        app2 = sprintd.App(root, token="t")
+        self.addCleanup(app2.close)
+        card = app2.card_json(app2.card_row(1))
+        self.assertIsNone(card["model_reason"])          # not a 500
+        out = app2.declare_limit("fable", "11:50pm")     # the table is back
+        self.assertTrue(out["limit"]["active"])
+        self.assertEqual([l["model"] for l in app2.active_limits()], ["fable"])
+        # and the migrated column takes a write
+        app2.assign(1, "sprint-card-1", None, None, model="opus",
+                    model_reason="fable limited until 23:50")
+        self.assertEqual(app2.card_json(app2.card_row(1))["model_reason"],
+                         "fable limited until 23:50")
+
+
+class TestSprintLimitCli(Base):
+    """`bin/sprint-limit` — what the session actually types when it reads a
+    kill message. Thin by design: the server owns the parsing."""
+
+    SPRINT_LIMIT = os.path.join(os.path.dirname(HERE), "bin", "sprint-limit")
+
+    def run_limit(self, *argv, token="test-token"):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN=token)
+        return subprocess.run([sys.executable, self.SPRINT_LIMIT]
+                              + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=90)
+
+    def test_declare_list_clear(self):
+        r = self.run_limit("declare", "--model", "fable", "--resets", "11:50pm",
+                           "--source", "kill message")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        out = r.stdout.decode()
+        self.assertIn("fable is limited until", out)
+        # it prints the exact assign call the session owes next
+        self.assertIn("model_reason", out)
+        status, body = self.get("/api/limits")
+        self.assertEqual(len(body["active"]), 1)
+        limit_id = body["active"][0]["id"]
+
+        r = self.run_limit("list")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("fable", r.stdout.decode())
+
+        r = self.run_limit("clear", str(limit_id))
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("available again", r.stdout.decode())
+        status, body = self.get("/api/limits")
+        self.assertEqual(body["active"], [])
+
+    def test_a_bad_time_fails_loudly_and_records_nothing(self):
+        r = self.run_limit("declare", "--model", "fable", "--resets", "soonish")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("11:50pm", r.stderr.decode())     # it says what IS accepted
+        status, body = self.get("/api/limits")
+        self.assertEqual(body["active"], [])
+
+    def test_it_refuses_to_run_without_a_server(self):
+        import subprocess
+        r = subprocess.run([sys.executable, self.SPRINT_LIMIT, "list"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           env={k: v for k, v in os.environ.items()
+                                if k not in ("SPRINT_SERVER", "SPRINT_TOKEN")},
+                           timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("SPRINT_SERVER", r.stderr.decode())
 
 
 if __name__ == "__main__":

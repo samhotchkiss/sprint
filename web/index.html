@@ -51,6 +51,10 @@ try {
 
   <div class="banner-slot" id="banner-slot" hidden>
     <div class="banner" id="banner"></div>
+    <!-- one quiet line per open provider limit window ("fable is rate-limited
+         until 11:50pm — work is running on opus"). Same slot, same register as
+         the offline banner; app.js fills it from the board's `limits`. -->
+    <div class="limit-banners" id="limit-banners" hidden></div>
   </div>
 
   <main class="main" id="main" aria-label="board"></main>

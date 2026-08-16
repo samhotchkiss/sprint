@@ -2635,3 +2635,37 @@ html.skin-chaos .packet-readback {
   border-radius: 0;
   line-height: 1.7;
 }
+
+/* ==========================================================================
+   APPENDED — provider limit line (card #47)
+   "fable is rate-limited until 11:50pm — work is running on opus", in the same
+   slot and the same restrained register as the session-offline banner. It is
+   deliberately the QUIETEST thing that can be said out loud: nothing is broken
+   and nothing is waiting on the user, so it borrows `.banner`'s shape and then
+   steps further back than `.banner.dim` does. Not a modal, not a toast, and
+   there is no per-card chrome to go with it — a card that was moved onto a
+   fallback model already wears its model tag.
+   ========================================================================== */
+
+.limit-banners { display: flex; flex-direction: column; }
+
+.banner.limit {
+  color: var(--dim);
+  border-color: var(--border);
+  /* A dashed edge reads as "a temporary condition" without spending any colour
+     on it — the accent belongs to things that need you. */
+  border-style: dashed;
+}
+
+/* The model and the time are the two words anyone actually reads off this
+   line, but underlining or colouring them would make a status line look like a
+   control. It stays one sentence. */
+.banner.limit span { overflow-wrap: anywhere; }
+
+/* Chaos: hard ink outline, no radius, like every other plate in the skin.
+   Dashed survives — it is what makes this one quieter than the warn banner
+   sitting directly above it. */
+html.skin-chaos .banner.limit {
+  border: 2px dashed var(--border);
+  border-radius: 0;
+}

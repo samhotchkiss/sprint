@@ -1,12 +1,12 @@
 // Wiring: boot, live transport, optimistic actions, render loop.
-import { h, clear, $, debounce, tickTimes, uid, firstLine } from './util.js';
+import { h, clear, $, debounce, tickTimes, uid, firstLine, reconcile } from './util.js';
 import {
   api, ApiError, NetworkError, initAuth, onServerGeneration, onServerStale, serverIsStale,
 } from './api.js';
 import { Live } from './live.js';
 import {
   store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
-  sections, headline, loadView, setView, setChatOpen,
+  sections, headline, loadView, setView, setChatOpen, activeLimits, limitLine,
 } from './state.js';
 import { renderList } from './list.js';
 import { renderBoard, renderFold } from './board.js';
@@ -141,8 +141,10 @@ function renderSessionBanner() {
   // was that it was not. Lowest priority of the three: a board nobody is home
   // at is more urgent news than a board that is merely behind.
   const stale = serverIsStale();
-  if (!offline && !transportDown && !stale) { el.bannerSlot.hidden = true; return; }
-  el.bannerSlot.hidden = false;
+  const limits = renderLimitBanners();
+  el.banner.hidden = !(offline || transportDown || stale);
+  el.bannerSlot.hidden = el.banner.hidden && !limits;
+  if (el.banner.hidden) return;
   const cls = offline ? 'banner warn' : 'banner dim';
   const text = offline ? 'session offline — items will queue'
     : transportDown ? 'lost the board connection — retrying'
@@ -155,6 +157,35 @@ function renderSessionBanner() {
     clear(el.banner);
     el.banner.appendChild(h('span', text));
   }
+}
+
+/**
+ * One quiet line per open provider limit window, in the same slot and the same
+ * register as the session-offline banner. The user asked for exactly this and
+ * ruled out the alternatives by shape: not a modal, not a toast, and no new
+ * per-card chrome (a downgraded card already wears its model tag).
+ *
+ * It disappears on its own. `activeLimits` re-checks the clock on every paint
+ * and the page repaints every 30s, so a window that ends while nobody is
+ * looking takes its line with it whether or not an event arrived.
+ *
+ * Returns how many lines are showing, so the slot knows whether to exist.
+ */
+function renderLimitBanners() {
+  const live = store.loaded ? activeLimits() : [];
+  // Keyed, so a repaint that changes nothing changes no DOM — the banner slot
+  // sits above the whole board and a flicker there is a flicker everywhere.
+  reconcile(el.limitBanners, live.map((lim) => {
+    const text = limitLine(lim);
+    return {
+      key: 'limit:' + (lim.id == null ? lim.model : lim.id),
+      ver: text,
+      make: () => h('div.banner.limit', { title: lim.note || lim.source || '' },
+        h('span', text)),
+    };
+  }));
+  el.limitBanners.hidden = !live.length;
+  return live.length;
 }
 
 /** Is the caret in something that takes text? Then a keystroke is not a shortcut. */
@@ -821,6 +852,7 @@ async function boot() {
   el.chatBtn = $('#chat-btn');
   el.bannerSlot = $('#banner-slot');
   el.banner = $('#banner');
+  el.limitBanners = $('#limit-banners');
   el.composeWrap = $('#compose-wrap');
   el.reportsLink = $('#reports-link');
   // scoped to the layout control — the skin control is a second .seg beside it

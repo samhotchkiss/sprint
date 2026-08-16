@@ -116,6 +116,10 @@ export const store = {
   // only when this is > 0 — user, verbatim: "link should only appear once
   // there's a report within the sprint".
   reports: 0,
+  // Provider limit windows that are open ("fable until 11:50pm"). One quiet
+  // board-level line each, and nothing else — the cards that got moved are
+  // already wearing their model tag.
+  limits: [],
 
   // ---- rail + layout (client only) ----------------------------------------
   // Only one thing owns the rail at a time: a card, or the session chat.
@@ -198,6 +202,9 @@ export function normCard(c) {
     // normalizer builds an explicit shape — a field it doesn't name does not
     // exist in the tab, which is exactly how the tag silently didn't render.
     model: c.model || null,
+    // Why it is on that model ("fable limited until 23:50"). The board-level
+    // limit line reads this to say what the work moved TO.
+    model_reason: c.model_reason || null,
     default_model: c.default_model || null,
     created_at: c.created_at || null,
     updated_at: c.updated_at || null,
@@ -342,6 +349,13 @@ export function applyBoard(board) {
   // the header link is a statement about THIS sprint.
   const reports = num(board.reports);
   store.reports = reports != null && reports > 0 ? reports : 0;
+
+  // An older server sends no `limits` at all; that is not the same as "the
+  // limits ended", so an absent field leaves what we have alone and only an
+  // actual list replaces it.
+  if (Array.isArray(board.limits)) {
+    store.limits = board.limits.map(normLimit).filter(Boolean);
+  }
 
   const seq = num(board.seq != null ? board.seq : board.last_seq);
   if (seq != null) store.seq = Math.max(store.seq, seq);
@@ -816,6 +830,76 @@ export function modelTag(card) {
 }
 
 export const MODEL_HINT = 'not the sprint default — this card was dispatched on a fallback model';
+
+// ---- provider limit windows ----------------------------------------------
+//
+// A limit window is one fact — "fable is unavailable until 11:50pm" — and it
+// gets one quiet line, in the same register as the session-offline banner. Not
+// a modal, not a toast, no per-card chrome: the cards that moved are already
+// wearing their model tag.
+
+/** `11:50pm` — a reset time in this browser's own clock. */
+export function clockLabel(ts) {
+  const t = ms(ts);
+  if (t == null) return '';
+  const d = new Date(t);
+  const h12 = d.getHours() % 12 || 12;
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${h12}:${mm}${d.getHours() < 12 ? 'am' : 'pm'}`;
+}
+
+export function normLimit(l) {
+  if (!l || typeof l !== 'object') return null;
+  const resets = ms(l.resets_at);
+  if (resets == null) return null;
+  return {
+    id: l.id != null ? l.id : null,
+    model: l.model || '',
+    resetsAt: resets,
+    // The server's own rendering of the reset time, kept as the fallback for
+    // the browser's — they agree unless the two are in different timezones,
+    // and in that case the one in front of the user is the honest one.
+    label: l.resets_at_label || null,
+    source: l.source || null,
+    note: l.note || null,
+  };
+}
+
+/**
+ * Windows that are open RIGHT NOW. The server sends only these, but the tab
+ * checks the clock again anyway: the page repaints on a 30s timer and a line
+ * saying a model is limited until a time that has already passed is worse
+ * than no line at all.
+ */
+export function activeLimits(now = Date.now()) {
+  return store.limits.filter((l) => l.resetsAt > now);
+}
+
+/**
+ * The sentence. "fable is rate-limited until 11:50pm — work is running on opus"
+ *
+ * The second half is only said when it is TRUE, and it is read off the board's
+ * own cards: the models carrying work that was explicitly downgraded for a
+ * limit (`model_reason` set by the session at dispatch). Nothing here guesses —
+ * with no downgraded cards on the board the line is just the first half, which
+ * is still the thing the user needed to know.
+ */
+export function limitLine(limit, cards = store.cards) {
+  const until = clockLabel(limit.resetsAt) || limit.label || '';
+  const head = `${limit.model} is rate-limited until ${until}`;
+  const on = new Set();
+  for (const card of cards.values()) {
+    if (!card.model_reason || !card.model) continue;
+    if (card.model === limit.model) continue;
+    if (columnOf(card.state) === 'done') continue;
+    on.add(card.model);
+  }
+  const fallbacks = Array.from(on).sort();
+  if (!fallbacks.length) return head;
+  const list = fallbacks.length === 1 ? fallbacks[0]
+    : `${fallbacks.slice(0, -1).join(', ')} and ${fallbacks[fallbacks.length - 1]}`;
+  return `${head} — work is running on ${list}`;
+}
 
 // ---- what happened to the message I just sent ---------------------------
 //
