@@ -7,47 +7,88 @@
 //
 // The composer is pinned to the bottom with the line that explains what this
 // place is: everything here appends, nothing is rewritten.
-import { h, clear } from './util.js';
-import { store, cardState, isSilent, draft } from './state.js';
+//
+// The rail is repainted a lot — every board event, every cursor move, every
+// 30-second tick — so it is built to be repainted cheaply. Head, thread and
+// composer each carry a signature; a paint that changes nothing replaces
+// nothing, the thread reconciles item by item, and the composer (where you may
+// be mid-sentence with a screenshot attached) is never thrown away unless what
+// it is for actually changed.
+import { h, clear, reconcile } from './util.js';
+import { store, cardState, isSilent, draft, attachedImages } from './state.js';
 import { renderThread, renderChat } from './thread.js';
+import { initCompose } from './compose.js';
 
 export function renderRail(root, app) {
-  const keep = root.querySelector('.thread');
+  const owner = railOwner();
+  if (!owner) {
+    if (root.firstChild) clear(root);
+    root.dataset.owner = '';
+    return;
+  }
+  const same = root.dataset.owner === owner;
+  if (!same) clear(root);            // a different card owns the rail: start clean
+  root.dataset.owner = owner;
+
+  const keep = same ? root.querySelector('.thread') : null;
   const prevTop = keep ? keep.scrollTop : null;
   const atBottom = keep ? (keep.scrollHeight - keep.scrollTop - keep.clientHeight < 80) : true;
-  const sameCard = root.dataset.owner === railOwner();
+  const thread = keep || h('div.thread');
 
-  clear(root);
-  root.dataset.owner = railOwner();
-  if (!railOwner()) return;
-
-  const thread = h('div.thread');
   if (store.detail) {
     const detail = store.detail;
     const card = detail.card;
-    root.appendChild(cardHead(detail, card, app));
+    syncPart(root, 'rail-head', headSig(detail, card), () => cardHead(detail, card, app));
+    if (!thread.parentNode) root.appendChild(thread);
     if (!card) {
-      thread.appendChild(h('p.thread-empty', detail.error || 'Loading card…'));
+      reconcile(thread, [{ key: 'loading', ver: detail.error || 1,
+        make: () => h('p.thread-empty', detail.error || 'Loading card…') }]);
     } else {
       renderThread(thread, { ...detail, state: cardState(card) }, app);
     }
-    root.appendChild(thread);
-    root.appendChild(composer(card, app));
+    syncPart(root, 'composer', composerSig(card), () => composer(card, app));
   } else {
-    root.appendChild(chatHead());
-    const lines = store.sidebar.slice().sort(byOrder);
-    renderChat(thread, lines, app);
-    root.appendChild(thread);
-    root.appendChild(chatComposer(app));
+    syncPart(root, 'rail-head', store.session.online ? 'on' : 'off', () => chatHead());
+    if (!thread.parentNode) root.appendChild(thread);
+    renderChat(thread, store.sidebar.slice().sort(byOrder), app);
+    syncPart(root, 'composer', store.session.online ? 'on' : 'off', () => chatComposer(app));
   }
 
   // Open at the newest word; a re-render while you are reading history stays put.
   requestAnimationFrame(() => {
     const t = root.querySelector('.thread');
     if (!t) return;
-    if (!sameCard || prevTop == null || atBottom) t.scrollTop = t.scrollHeight;
-    else t.scrollTop = prevTop;
+    if (!same || prevTop == null) t.scrollTop = t.scrollHeight;
+    else if (atBottom && t.scrollTop !== t.scrollHeight) t.scrollTop = t.scrollHeight;
   });
+}
+
+/**
+ * Replace one fixed part of the rail only when its signature changed. The parts
+ * are ordered head → thread → composer and each is built once, so replacing one
+ * never disturbs the others (and never disturbs the thread's scroll position).
+ */
+function syncPart(root, cls, sig, build) {
+  const found = root.querySelector('.' + cls);
+  const want = String(sig);
+  if (found && found.dataset.sig === want) return found;
+  const node = build();
+  node.dataset.sig = want;
+  if (found) root.replaceChild(node, found);
+  else root.appendChild(node);
+  return node;
+}
+
+function headSig(detail, card) {
+  if (!card) return 'loading:' + detail.num;
+  return [detail.num, card.title, cardState(card), card.pinned ? 'p' : ''].join('|');
+}
+
+function composerSig(card) {
+  if (!card) return 'none';
+  const state = cardState(card);
+  const q = state === 'needs_you' && card.question ? (card.question.id || 'q') : '';
+  return [card.num, state, q, isSilent(card) ? 'quiet' : ''].join('|');
 }
 
 function railOwner() {
@@ -127,82 +168,81 @@ function cardMenu(card, state, app) {
  * a message to the agent. The placeholder says which, so nothing is a surprise.
  */
 function composer(card, app) {
-  const foot = h('footer.composer');
-  if (!card) return foot;
+  if (!card) return h('form.composer');
 
   const state = cardState(card);
   const answering = state === 'needs_you' && !!card.question;
   const key = (answering ? 'answer:' : 'chat:') + card.num;
 
-  const ta = h('textarea', {
+  return composerBox({
     id: `composer-${card.num}`,
-    rows: '1',
-    placeholder: answering ? 'Answer in your own words…'
-      : (state === 'ready' ? 'Reply, or bounce with notes…' : 'Reply to this card…'),
-    oninput: (e) => { draft(key, e.target.value); grow(e.target); },
-    onkeydown: (e) => {
-      // Return sends, Shift+Return makes a new line.
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    key,
+    placeholder: answering ? 'Answer in your own words… (paste a screenshot too)'
+      : (state === 'ready' ? 'Reply, or bounce with notes…' : 'Reply to this card — paste a screenshot if it is easier'),
+    hint: isSilent(card)
+      ? 'Quiet for five minutes — the session is already checking on the agent.'
+      : 'Everything here appends — nothing is rewritten.',
+    send: (text, images) => {
+      // An answer is a question's answer, not an attachment carrier — so a
+      // screenshot pasted while answering goes to the agent as its own line
+      // first, and the answer follows and unblocks the card.
+      if (answering) app.answer(card, card.question, text, images);
+      else app.chat(card, text, images);
     },
   });
-  ta.value = draft(key);
-
-  function send() {
-    const text = ta.value.trim();
-    if (!text) return;
-    draft(key, null);
-    ta.value = '';
-    grow(ta);
-    if (answering) app.answer(card, card.question, text);
-    else app.chat(card, text);
-  }
-
-  foot.appendChild(h('form.composer-row', { onsubmit: (e) => { e.preventDefault(); send(); } },
-    ta,
-    h('button.btn.send', { type: 'submit' }, 'Send')));
-  foot.appendChild(h('span.composer-hint',
-    isSilent(card)
-      ? 'Quiet for five minutes — the session is already checking on the agent.'
-      : 'Everything here appends — nothing is rewritten.'));
-  return foot;
 }
 
 function chatComposer(app) {
-  const key = 'sidebar';
-  const ta = h('textarea', {
+  return composerBox({
     id: 'sidebar-text',
-    rows: '1',
-    placeholder: 'Ask the session anything…',
-    oninput: (e) => { draft(key, e.target.value); grow(e.target); },
-    onkeydown: (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-    },
-  });
-  ta.value = draft(key);
-
-  function send() {
-    const text = ta.value.trim();
-    if (!text) return;
-    draft(key, null);
-    ta.value = '';
-    grow(ta);
-    app.sessionChat(text);
-  }
-
-  const foot = h('footer.composer');
-  foot.appendChild(h('form.composer-row', { onsubmit: (e) => { e.preventDefault(); send(); } },
-    ta,
-    h('button.btn.send', { type: 'submit' }, 'Send')));
-  foot.appendChild(h('span.composer-hint',
-    store.session.online
+    key: 'sidebar',
+    placeholder: 'Ask the session anything… (paste a screenshot too)',
+    hint: store.session.online
       ? 'Everything here appends — nothing is rewritten.'
-      : 'The session is not reading right now — what you send waits in the queue.'));
-  return foot;
+      : 'The session is not reading right now — what you send waits in the queue.',
+    send: (text, images) => app.sessionChat(text, images),
+  });
 }
 
-function grow(ta, max = 160) {
-  ta.style.height = 'auto';
-  ta.style.height = Math.min(max, Math.max(ta.scrollHeight, 44)) + 'px';
+/**
+ * The rail's composer: the Drop-work sheet's box, minus the hold toggle. Paste
+ * or drop a screenshot and it becomes a removable thumbnail above the line you
+ * are typing; Return sends both together.
+ */
+function composerBox({ id, key, placeholder, hint, send }) {
+  const foot = h('form.composer', { autocomplete: 'off' });
+  const ta = h('textarea', { id, rows: '1', placeholder });
+  ta.value = draft(key);
+
+  const thumbs = h('div.thumbs.composer-thumbs', { hidden: true });
+  const err = h('span.composer-err', { hidden: true });
+  const fileId = `${id}-file`;
+  const file = h('input', { type: 'file', id: fileId, multiple: true, accept: 'image/*', hidden: true });
+
+  foot.appendChild(thumbs);
+  foot.appendChild(h('div.composer-row',
+    ta,
+    h('label.icon-btn.attach', { for: fileId, title: 'attach an image' }, '🖇'),
+    file,
+    h('button.btn.send', { type: 'submit' }, 'Send')));
+  foot.appendChild(err);
+  foot.appendChild(h('span.composer-hint', hint));
+
+  initCompose({
+    form: foot,
+    textarea: ta,
+    thumbsEl: thumbs,
+    fileInput: file,
+    errEl: err,
+    minHeight: 44,
+    maxHeight: 160,
+    // Both halves of a half-written message survive a re-render: the words in
+    // `drafts`, the screenshots in `attached`.
+    images: { get: () => attachedImages(key), set: (v) => attachedImages(key, v) },
+    onInput: (e) => draft(key, e.target.value),
+    onSubmit: ({ text, images }) => { draft(key, null); send(text || '', images); },
+  });
+  return foot;
 }
 
 // ---- lightbox ------------------------------------------------------------

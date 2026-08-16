@@ -37,6 +37,58 @@ export const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel
 
 export function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); return el; }
 
+/**
+ * Keyed reconcile: bring `root`'s children in line with `items` while touching
+ * as little DOM as possible.
+ *
+ * This exists because the rail used to be rebuilt from scratch on every frame,
+ * and frames arrive constantly — a live session moves its drain cursor every
+ * second or so. Rebuilding threw away every <img> in the thread and the browser
+ * visibly re-painted it: the rail blinked. Now an item is rebuilt only when its
+ * own content changed (`ver`), everything else is left exactly where it is, and
+ * a node that just needs a small update (a message's delivery pill) gets it via
+ * the `_sync` hook it hung on itself.
+ *
+ *   items: [{key, ver, make() -> Node}]
+ */
+export function reconcile(root, items) {
+  const existing = new Map();
+  for (const node of Array.from(root.children)) {
+    const k = node.dataset ? node.dataset.k : null;
+    if (k && !existing.has(k)) existing.set(k, node);
+    else root.removeChild(node);
+  }
+  const wanted = new Set();
+  items.forEach((item, i) => {
+    const ver = String(item.ver == null ? '1' : item.ver);
+    wanted.add(item.key);
+    let node = existing.get(item.key);
+    if (node && node.dataset.v !== ver) {
+      const fresh = item.make();
+      stamp(fresh, item.key, ver);
+      root.replaceChild(fresh, node);
+      existing.set(item.key, fresh);
+      node = fresh;
+    } else if (!node) {
+      node = item.make();
+      stamp(node, item.key, ver);
+      existing.set(item.key, node);
+    } else if (typeof node._sync === 'function') {
+      node._sync();                    // in place: no replacement, no repaint
+    }
+    const at = root.children[i];
+    if (at !== node) root.insertBefore(node, at || null);
+  });
+  for (const [k, node] of existing) {
+    if (!wanted.has(k) && node.parentNode === root) root.removeChild(node);
+  }
+}
+
+function stamp(node, key, ver) {
+  node.dataset.k = key;
+  node.dataset.v = ver;
+}
+
 export function debounce(fn, ms) {
   let t = null;
   const wrapped = (...a) => { clearTimeout(t); t = setTimeout(() => { t = null; fn(...a); }, ms); };

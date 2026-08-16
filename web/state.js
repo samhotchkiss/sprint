@@ -91,6 +91,7 @@ export const store = {
   seq: 0,
   detail: null,           // {num, card, timeline, evidence, attachments, pendingLines}
   drafts: new Map(),      // freeform text kept across re-renders
+  attached: new Map(),    // composer key -> images pasted but not sent yet
   expanded: new Set(),    // event keys whose long version you opened (see detail.js)
   doneOpen: false,
   loaded: false,
@@ -536,6 +537,19 @@ export function draft(key, value) {
   if (value === undefined) return store.drafts.get(key) || '';
   if (value === null || value === '') store.drafts.delete(key);
   else store.drafts.set(key, value);
+  return value;
+}
+
+/**
+ * Images pasted into a composer but not sent yet. Same reasoning as `draft`:
+ * the rail is rebuilt whenever the card it is showing moves, and a screenshot
+ * you just pasted must survive that — it is part of the message you are still
+ * writing.
+ */
+export function attachedImages(key, value) {
+  if (value === undefined) return store.attached.get(key) || [];
+  if (!value || !value.length) store.attached.delete(key);
+  else store.attached.set(key, value);
   return value;
 }
 

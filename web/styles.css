@@ -1003,6 +1003,24 @@ body.rail-open .rail { display: flex; }
 .composer textarea:focus { border-color: var(--accent); }
 .composer .btn.send { min-height: 44px; padding: 0 18px; }
 .composer-hint { font-family: var(--font-mono); font-size: 11px; color: var(--faint); }
+.composer-err { font-size: 12.5px; color: var(--bad); }
+/* paste/drop an image into the conversation: thumbnails sit above the line */
+.composer-thumbs { margin-bottom: 2px; }
+.composer .icon-btn.attach {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  min-width: 44px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  background: var(--input);
+  font-size: 16px;
+  line-height: 1;
+}
+.composer .icon-btn.attach:hover { border-color: var(--accent); color: var(--ink); }
+.composer.dropping { background: var(--chip); }
+.composer.dropping textarea { border-color: var(--accent); }
 
 /* card actions menu */
 .menu-wrap { position: relative; }
@@ -1537,6 +1555,7 @@ html.skin-chaos .sheet { border: 2px solid var(--border); box-shadow: var(--pane
 html.skin-chaos .menu { border: 2px solid var(--border); box-shadow: var(--panel-shadow); }
 html.skin-chaos .menu-item { border-radius: 0; }
 html.skin-chaos .thumb { border-radius: 0; border: 2px solid var(--border); }
+html.skin-chaos .composer .icon-btn.attach { border: 2px solid var(--border); border-radius: 0; }
 html.skin-chaos .toast { border: 2px solid var(--border); box-shadow: var(--panel-shadow); }
 html.skin-chaos .switch-track { border: 2px solid var(--border); }
 html.skin-chaos .switch-knob { border-radius: 0; }
