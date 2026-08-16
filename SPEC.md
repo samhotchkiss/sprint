@@ -37,6 +37,21 @@ recovery must be easy. The user always runs claude inside tmux.
 - Bind: `tailscale ip -4` result + `127.0.0.1`, both. If no tailnet IP: bind loopback only and say so
   loudly. **Never 0.0.0.0, never a LAN interface.** Fixed default port **8377** (`--port` overridable);
   same port reused on restart so the URL survives reboots.
+- `.sprint/last-restart.json` — the self-restart stamp (when, which sha, how many lately). The board
+  hashes the source file it is running (`bin/sprintd`) every few seconds and, when that file becomes
+  DIFFERENT code, re-execs itself in place with the same argv (`os.execv`, so the pid, port, token,
+  log fds and launchd job all survive; the browser re-syncs off `generation` exactly as it does after
+  a manual restart). Gates, all of them load-bearing: content not mtime; the same new sha seen twice
+  and not written in the last couple of seconds; it must `compile()`; no in-flight non-streaming
+  request (SSE is excluded by design — it is held open for hours); and the DB write lock is held
+  across the exec. Crash-loop guard: never twice inside 60s, never more than 3 in 10 minutes, stamp
+  written BEFORE the exec so a build that never comes back still counts. When a guard blocks it, the
+  board appends a `note` (`actor: "server"`, `payload.restart_pending: true`) for the SESSION —
+  never a banner telling the user to run `sprintd stop`. That banner is gone from `web/` for good
+  (user, verbatim: "don't show me this notice"). Every threshold is env-tunable
+  (`SPRINT_CODE_WATCH_TICK`, `SPRINT_CODE_SETTLE_SECONDS`, `SPRINT_SELFRESTART_MIN_INTERVAL`,
+  `SPRINT_SELFRESTART_MAX_BURST`, `SPRINT_SELFRESTART_BURST_WINDOW`,
+  `SPRINT_RESTART_DRAIN_SECONDS`).
 - Auth: random bearer token generated at first start, stored in `.sprint/token` (and mirrored into
   `server.json` while running). `start` reuses it across stop/start; `--token` forces a value,
   `--new-token` rotates. Browser: `/?t=TOKEN` sets a cookie. API: `Authorization: Bearer` or cookie.
@@ -529,33 +544,58 @@ retries and brings it to the user for co-design.
 
 ### Awaiting review — the signoff surface (SHIPPED)
 
-Ready cards are reviewed **by work unit**, not one identical row at a time. A unit is a batch, or
-failing that an agent, and it renders as one expandable row; a card on its own is a unit of one and
-renders as it always did. Every row leads with the packet's claim and its first "Check it yourself"
-step and carries the first screenshot as a thumbnail. **The row itself does nothing but open the
-card** (card #53 — see "Every action lives in the rail"): the verdict, the live link and the
-lightbox are all on the open card in the rail, one click away and pinned where they cannot be
-scrolled off. **Review next** is a filled button in its own bar above the stack (never another row)
-and walks the queue oldest-first in the rail, one STEP at a time with a running "3 of 13".
+**One card per work unit.** User ruling, verbatim (card #55): *"I just want the single card that
+lives in review, then when I open it up, it outlines everything that changed, and I can approve them
+together."* Work that shipped together — one batch, else one branch, else one agent — is ONE
+reviewable object, so Awaiting review holds **one entry per work unit**: a six-card branch is one
+card in the list, not six and not one that unfolds into six. A card on its own is a unit of one and
+looks exactly as it always did. The entry leads with the packet's claim and its first "Check it
+yourself" step and carries the first screenshot as a thumbnail; like every other face on the board
+(card #53) **it does nothing but open the rail**.
 
-- **Naming.** A unit row is named after the WORK in it: the member cards' own condensed titles
-  joined ("Restart-proof tabs + reply routing · 2 cards"), falling back to the branch's claim, then
-  to a descriptive branch name. **Never the agent** — "Agent card-23 · 2 cards" names a process, not
-  the thing you are being asked about, and the agent belongs in the row's metadata beside the
-  timestamp. A singleton row leads with the card's own title, never with a control's label.
-- **See-and-ack is per WORK UNIT for shared-packet groups, per card otherwise.** User verbatim:
-  *"i feel like i just hit approve way too many time"*, and his GO on the fix: *"ONE Approve per
-  work unit when the unit shipped as one branch with one packet (the six design cards = one click);
-  per-card records still written underneath, and you can still expand a group to bounce a single
-  member."* So a unit with ONE branch and ONE packet covering every member gets a single **Approve
-  all N** button; anything looser keeps per-card verdicts. The single button is not a bulk approve
-  and not a new endpoint: it issues the same per-card `POST /api/cards/:num/verdict` for every
-  member in order, so every card keeps its own verdict event and its own record. It reports
-  "approving 3 of 6…" in words (no spinner) and **stops on the first failure**, saying which card it
-  stopped at and that nothing after it was sent. Since card #53 that button lives in the RAIL, on
-  any member of the unit, over the packet you are actually reading — the unit ROW only expands and
-  opens. The walkthrough treats a shared-packet unit as one step: approve the unit, bounce the
-  member you are reading, or skip.
+Everything that used to arrange a long review list is GONE, deliberately and not as a follow-up: the
+grouped expand-to-see-the-members row, the per-member review rows, and the Review-next walkthrough
+with its next/skip/stop. All three answered "how do we arrange many review rows", which was the wrong
+question.
+
+- **The counts are DECISIONS, not cards.** The meter, the headline, the Needs-you section head and
+  the Board's Awaiting-review count all ask how many things are waiting on you: an open question is
+  one, a work unit is one whatever its size. "6 need you" over a list showing one card is the old
+  list talking.
+- **Naming.** A unit is named after the WORK in it: the member cards' own condensed titles joined
+  ("Restart-proof tabs + reply routing"), falling back to the branch's claim, then to a descriptive
+  branch name. **Never the agent** — "Agent card-23 · 2 cards" names a process, not the thing you
+  are being asked about, and the agent belongs in the metadata beside the timestamp. A singleton
+  leads with the card's own title, never with a control's label.
+- **The outline.** Opening a unit fills the rail with everything that changed, in one page read top
+  to bottom: what the branch says it did and how to check it once at the top, then **one numbered
+  section per member card** with its own claim, its own checks and its own screenshots, then the
+  branch's pictures, reports and diffstat as supporting evidence underneath. Nothing is behind an
+  expander — an outline you have to unfold is the deleted list wearing a different hat. Each section
+  carries the member's `#N`, which opens that card's own timeline in the rail with a way back.
+- **One Approve, per work unit.** User verbatim: *"i feel like i just hit approve way too many
+  time"*. The unit's verdict bar is pinned at the bottom of the rail under the outline — the same
+  place a single card's bar sits (card #53), outside the scrolling thread so six sections can never
+  push it off. **Approve all N** covers the unit; it is not a bulk endpoint and not a new one: it
+  issues the same per-card `POST /api/cards/:num/verdict` for every member in order, so every card
+  keeps its own verdict event and its own completion. It reports "approving 3 of 6…" in words (no
+  spinner) and **stops on the first failure**, saying which card it stopped at and that nothing
+  after it was sent.
+- **Bounce works at both grains.** Each section in the outline can send back just that member with
+  its own notes — the rest of the unit stays yours to approve, and the bounced member falls out of
+  the unit on the next frame. The bar's "Send it all back" sends every waiting member back with the
+  same notes.
+- **A unit is a PROJECTION, never a row in the database.** It is recomputed from the cards under
+  review every paint, so a bounced member leaves it by itself and a unit whose members have all
+  landed simply stops existing. Nothing is stored: `batch_id`, `branch`, `agent_name` and the shared
+  packet are already on the board payload. A synthetic card would be a second card identity that
+  every keyed thing on this board — events, evidence, verdicts, the rail, the hash route, the meter,
+  the sweep — would need an exception for, and it would need a state machine for "half approved,
+  half bounced" that the projection answers for free.
+- **Member cards keep existing** for tracking, chat and history. They just do not each demand a
+  verdict and do not each appear in the review list. Opening one on its own gets the ordinary
+  per-card bar (Approve / Bounce / Reject), which decides that card alone — the branch is approved
+  from its outline, never from under one card's thread.
 
 ## Batching & hold mode
 
@@ -680,16 +720,13 @@ your assigned worktree; one branch; never push to main; never touch other cards'
   expander. Clicking anywhere on it opens the card in the rail; Enter/Space does the same from the
   keyboard. Approve / Bounce / Reject, the quick-reply options, pin/hold/cancel/retry/duplicate
   (the ⋯ menu) and the bounce notes are all in the rail, on the open card.
-  **The verdict is a bar pinned at the bottom of the rail**, above the composer, in the same place
-  the Review-next walkthrough's bar sits — exactly one of the two is ever up, and neither can be
-  scrolled off by a packet with six screenshots in it. Card #26's *one Approve per work unit* moved
-  with it: on any member of a unit that shipped as one branch with one packet, the rail's bar reads
-  **"Approve all N"** and issues the same per-card POSTs in order. The one exception is a card that
-  does not exist yet — an un-submitted card's "not sent — retry" stays on its pill, because there is
-  no card to open.
-  The Review-next walkthrough keeps its own **navigation** controls (next / skip / stop) and the
-  Awaiting-review unit rows keep their expander and "Review these N": those move you around, they
-  do not act on a card.
+  **The verdict is a bar pinned at the bottom of the rail**, above the composer, where it cannot be
+  scrolled off by a packet with six screenshots in it. There is one of it and it is always in the
+  same spot: a single card's bar sits under its thread, and a work unit's **"Approve all N"** sits
+  under its outline (card #55) — never both at once, because the rail shows one thing at a time.
+  Card #26's *one Approve per work unit* is that unit bar, and it still issues the same per-card
+  POSTs in order. The one exception to the whole rule is a card that does not exist yet — an
+  un-submitted card's "not sent — retry" stays on its pill, because there is no card to open.
 - **Answering**: every question answers in the rail, on the card — options as ≥46px rows under the
   question, free text in the composer under them. The List row says *"3 options — open it to
   choose"* rather than carrying the chips itself (see above): a decision is never half on a row and
@@ -827,6 +864,12 @@ example."* Scope ruling: *"Peer per card — mix grok-via-tmux and claude subage
   the board down, and a change appends a `note` event (`actor: "server"`, carrying the new settings)
   so the session's own tail sees it. Read on demand, cached on mtime: `$EDITOR .sprint/config.json`
   needs no restart.
+- **The sprint's name** rides on the same endpoint (`PUT /api/settings {"name": "..."}`) but is NOT
+  in that file: it is the open sprint's title in the database, one source of truth, echoed back as
+  `name` on `/api/settings`, `/api/board` and `/healthz`. `sprintd start --name "..."` is the launch
+  path (and renames a board that is already up); the registry row follows it, so the title switcher
+  and the hub label a board by what it is about rather than by its directory. One line, ≤60 chars;
+  default is the project directory's name. A rename appends one `note` (`actor: "server"`).
 - **Per card**: `cards.executor`/`cards.model` (both nullable; NULL = the board's defaults), set via
   `POST /api/cards/:num/assign {executor?, model?}`, which refuses an executor that is not declared.
   Every card payload carries `dispatch: {executor, kind, command, session, model, source,

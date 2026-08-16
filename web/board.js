@@ -68,13 +68,14 @@ function boardGrid(app, { fold }) {
         body.appendChild(h('div.col-sec',
           h('span.col-sec-name', sec.label),
           h('span.grow'),
-          h('span.col-sec-count', String(sec.cards.length))));
+          h('span.col-sec-count', String(sec.count != null ? sec.count : sec.cards.length))));
       }
       if (sec.note) body.appendChild(h('p.col-note', sec.note));
       // Awaiting review is the one section whose tiles ARE interactive, on the
-      // user's ruling that an easy yes should not cost a drawer. It groups by
-      // work unit and carries the verdict on the row; everything else on the
-      // Board stays a face that only opens the rail.
+      // user's ruling that an easy yes should not cost a drawer. It is ONE card
+      // per work unit (card #55) — opening one fills the rail with an outline of
+      // everything that changed; everything else on the Board stays a face that
+      // only opens the rail.
       if (col.key === 'review' && sec.key === 'awaiting') {
         body.appendChild(reviewBlock(sec.cards, app, { compact: true }));
         continue;

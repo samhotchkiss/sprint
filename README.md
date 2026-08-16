@@ -49,13 +49,15 @@ running inside the project you want a board for.
    you, and everything under it — In motion, Blocked, Queued & held —
    gets quieter on purpose. **LIST/BOARD** in the header swaps the
    reading order for the kanban columns; it remembers which you picked.
-5. Answer a multiple-choice question straight from its row in the list.
-   Everything else happens in the right rail: click a card and its whole
-   thread opens there, with the evidence packet — claim, "check it
-   yourself" steps, screenshots, Approve / Bounce / Reject — in the
-   stream where it arrived. Click **Chat** for the session itself; it's
-   the same brain as the terminal, so it can act on what you say there,
-   not just answer. The rail holds one or the other, never both.
+5. Everything you do happens in the right rail: click a card and its
+   whole thread opens there, with the evidence packet — claim, "check it
+   yourself" steps, screenshots — and Approve / Bounce / Reject pinned
+   at the bottom where they can't be scrolled off. Work that shipped
+   together is **one card** in Awaiting review: open it and you get an
+   outline of everything that changed, one section per change, with a
+   single Approve under the lot. Click **Chat** for the session itself;
+   it's the same brain as the terminal, so it can act on what you say
+   there, not just answer. The rail holds one thing at a time.
 6. When an agent's output is a **document** rather than a line — an audit, a
    findings write-up, a comparison — it attaches it as a report. It reads in
    the thread as a title you can skim and expand, and a quiet **Reports** link
@@ -234,6 +236,17 @@ off. There's no separate "resume mode" to remember the syntax for — the
 same "start a sprint" trigger works too; the skill figures out on its
 own whether this is a fresh boot or a resume.
 
+**The board restarts itself when its code changes.** Nobody has to notice
+that `bin/sprintd` was edited and go bounce the server: the board watches
+the file it is running, and when that file becomes different code it
+re-execs itself in place — same process id, same port, same token, same
+open browser tab. It waits for the file to settle, refuses to exec into
+anything that will not even compile, waits for in-flight requests to
+finish, and will not restart twice inside a minute (or more than three
+times in ten). When a guard stops it, that goes in the event log for the
+session to pick up; it is never a notice telling you to run anything. The
+board's log line for it is `restarted to pick up new code`.
+
 **Your board URL survives a restart.** `sprintd stop` followed by
 `sprintd start` reuses the same port *and the same token*, so the URL you
 bookmarked keeps working and any browser already logged in stays logged
@@ -288,11 +301,38 @@ a live Claude Code conversation, not a daemon.
                     primary checkout or a serving dev worktree
 ```
 
+## Naming a sprint
+
+A board is called after its directory unless you say otherwise, which is
+fine for one board and useless for four ("russ", "sprint", "project"...).
+Name it after the work instead — at launch:
+
+```
+bin/sprintd start --name "Board self-restart and naming"
+```
+
+That name is what the header, the title switcher and the hub all show,
+and it goes into `~/.sprint/registry.json` so other boards' switchers see
+it too. `sprintd start --name` on a board that is already running is a
+rename, so a session that re-boots its board every morning can keep the
+name current. You can also rename it from the board's **Settings**
+sheet (first field), or over the API:
+
+```
+curl -X PUT $SPRINT_SERVER/api/settings -H "Authorization: Bearer $SPRINT_TOKEN" \
+     -H 'Content-Type: application/json' -d '{"name":"Billing week"}'
+```
+
+Names are one line, 60 characters or fewer. Leave it alone and it stays
+the directory name.
+
 ## Settings — model policy and executors
 
 The header's quiet **Settings** link edits `.sprint/config.json`, which is
 this board's dispatch policy (and is a plain file you can also edit by
-hand — the server re-reads it on change, no restart):
+hand — the server re-reads it on change, no restart). The sheet's first
+field is the sprint's **name**, which is not part of that file — it is
+the sprint itself, stored in the board's database:
 
 ```json
 {"worker": {

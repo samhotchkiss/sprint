@@ -2,6 +2,7 @@
 // truth, we only ever *display* it, so unknown/missing fields degrade instead of throwing.
 import { age, firstLine, ms, h } from './util.js';
 import { phaseOf } from './phase.js';
+import { reviewUnits } from './units.js';
 
 export const SILENT_MS = 5 * 60 * 1000;   // spec: 5 minutes with no worker event
 
@@ -107,6 +108,11 @@ export const store = {
   sidebar: [],            // sprint-level chat events
   seq: 0,
   detail: null,           // {num, card, timeline, evidence, attachments, pendingLines}
+  // Which work unit's outline the rail is showing, as {lead: <card num>} — the
+  // unit itself is never stored, only the card you opened it from (card #55).
+  // A unit is a projection over the cards under review, so it is recomputed
+  // every paint and dissolves by itself when its members stop needing you.
+  unit: null,
   drafts: new Map(),      // freeform text kept across re-renders
   bouncing: new Set(),    // card nums whose verdict row is mid-BOUNCE (see below)
   attached: new Map(),    // composer key -> images pasted but not sent yet
@@ -636,9 +642,13 @@ export function boardColumns() {
     const secs = c.sections.map((s) => {
       const cards = buckets.get(c.key + '/' + s.key);
       cards.sort(sorterFor(SORT_AS[s.key] || s.key, now));
-      return { ...s, cards };
+      // Awaiting review counts WORK UNITS, because that is what it shows: one
+      // card per unit (card #55). Every other section counts cards.
+      const count = (c.key === 'review' && s.key === 'awaiting')
+        ? reviewUnits(cards).length : cards.length;
+      return { ...s, cards, count };
     });
-    return { ...c, sections: secs, count: secs.reduce((n, s) => n + s.cards.length, 0) };
+    return { ...c, sections: secs, count: secs.reduce((n, s) => n + s.count, 0) };
   });
 }
 
@@ -657,15 +667,34 @@ export function sections() {
 export function meterSegments(secs = sections()) {
   return METER
     .map((m) => {
-      const n = (secs[m.key] && secs[m.key].cards.length) || 0;
+      const n = countFor(m.key, secs);
       return { ...m, count: n, label: `${n} ${m.word}` };
     })
     .filter((m) => m.count > 0);
 }
 
+/**
+ * How many things a section is asking of you. Everywhere but Needs you that is
+ * simply how many cards are in it — but a review is ONE decision per work unit
+ * (card #55), so six cards that shipped on one branch are one thing waiting on
+ * you, and saying "6 need you" over a list showing one card is the old list
+ * talking. The meter, the headline and the section head all count the same way.
+ */
+export function countFor(key, secs = sections()) {
+  const cards = (secs[key] && secs[key].cards) || [];
+  if (key !== 'needs_you') return cards.length;
+  return needsYouCount(cards);
+}
+
+/** Open questions are one each; finished work is one per work unit. */
+export function needsYouCount(cards) {
+  const asks = cards.filter((c) => needsKind(c) === 'question');
+  return asks.length + reviewUnits(cards.filter((c) => needsKind(c) !== 'question')).length;
+}
+
 /** The one-line headline beside the sprint title. Zero-count parts are dropped. */
 export function headline(secs = sections()) {
-  const n = (k) => (secs[k] && secs[k].cards.length) || 0;
+  const n = (k) => countFor(k, secs);
   const parts = [];
   if (n('needs_you')) parts.push(`${n('needs_you')} need you`);
   if (n('in_motion')) parts.push(`${n('in_motion')} running`);

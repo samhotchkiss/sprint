@@ -93,17 +93,28 @@ toggle in the sidebar thread, so the session can answer in a line and park its w
 4. **See it live ↗** — button to the branch's staging preview when available.
 5. Diffstat + branch; exact test command with counts ("42 pass, 0 fail" — never "tests pass").
 
-Actions on ready: **Approve** · **Bounce with notes** · **Reject**. Approve flips the card to a
-calm "merging…" badge (still in Ready; buttons hide) until the branch actually lands → Done. A
-merge failure returns it to In progress with an explanation line — visibly NOT the user's fault
-and NOT counted as a bounce. Bounce requires notes (they go straight to the agent); the card shows
-its bounce count; after two bounces the board shows an escalation line ("brought to you for
-co-design — no third blind retry").
+Actions on ready: **Approve** · **Bounce with notes** · **Reject**, in a bar pinned at the bottom
+of the rail so a packet with six screenshots in it can never push them off the screen. Approve
+flips the card to a calm "merging…" badge (still in Ready; the bar goes quiet) until the branch
+actually lands → Done. A merge failure returns it to In progress with an explanation line —
+visibly NOT the user's fault and NOT counted as a bounce. Bounce requires notes (they go straight
+to the agent); the card shows its bounce count; after two bounces the board shows an escalation
+line ("brought to you for co-design — no third blind retry").
 
-**Batch cards:** several cards share one agent/branch (e.g. 12 minor CSS fixes). Members stay
-individual cards; the drawer's evidence packet shows a per-card entry (own claim + screenshots).
-Verdicts are per-card; approving all members is one motion only because each item's evidence is
-individually visible.
+**Work that shipped together is ONE card in review.** Several cards on one branch (a batch of 12
+minor CSS fixes, six design cards from one agent) show up as a single entry in Awaiting review,
+named after the work in it. Opening it fills the rail with an **outline**: the branch's claim and
+its check steps once at the top, then one numbered section per member card with that card's own
+claim, checks and screenshots. **One Approve at the bottom covers the whole unit** — you can say
+yes to six changes in one click only because the outline above it just showed you all six.
+
+Underneath, nothing changed: the single Approve issues the ordinary per-card verdict for every
+member in order, so each card keeps its own verdict event, its own record and its own completion.
+It says "approving 3 of 6…" in words and stops at the first failure, naming the card it stopped
+at. A bounce works at either grain — send back one section with its own notes and the rest of the
+unit stays yours to approve, or send the whole branch back at once. Member cards still exist for
+tracking, chat and history; they just do not each demand a verdict, and they do not each appear in
+the review list. A card on its own is a unit of one and behaves exactly as it always did.
 
 ## 6. Submission behaviors
 

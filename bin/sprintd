@@ -46,16 +46,23 @@ DEFAULT_PORT = 8377
 PORT_SCAN_LIMIT = 40            # how far past a taken port to look for a free one
 DEFAULT_HUB_PORT = 8300         # one hub per machine, fixed so the URL is memorable
 
-# What this server can DO, as one number the page can compare itself against.
+# What this server can DO, as one number a client can compare itself against.
 # The generation says WHICH process answered; this says what that process knows
 # how to serve. Bump it whenever web/ starts depending on an endpoint or a field
 # a running server might not have, and bump UI_API_VERSION in web/api.js in the
-# same commit: an old server + a new page is exactly the silent degrade this
-# number exists to turn into a sentence ("this board needs a restart").
+# same commit.
+#
+# It used to be the trigger for a banner telling the HUMAN to run `sprintd stop`
+# then `sprintd start`. It no longer is, and never will be again: a board that
+# notices its own code changed restarts itself (see `check_code_update`), so the
+# gap this number measures closes on its own within seconds. What is left is a
+# diagnostic — the log, the hub and `/healthz` can still say which build
+# answered — and never a chore handed to the user.
 #   1 — the board through the hub/siblings work
 #   2 — phases (/api/board carries phase, phase_since, phase_expected_seconds)
 #   3 — decision requests (a question carries `artifacts`: url, attachments, notes)
-API_VERSION = 3
+#   4 — sprints carry a name (`/api/settings` name, registry rows follow it)
+API_VERSION = 4
 DATA_DIRNAME = ".sprint"
 HUB_DIRNAME = ".sprint"         # under $HOME: the machine-wide (cross-project) state
 REGISTRY_FILENAME = "registry.json"
@@ -90,6 +97,21 @@ DEFAULT_WAITER_ONLINE_SECONDS = 10.0            # waiter seen this recently == a
 DEFAULT_WAITER_GONE_SECONDS = 30.0             # waiter unseen this long == really gone
 DEFAULT_WAITER_PERSIST_SECONDS = 5.0           # how often the waiter mark hits disk
 DEFAULT_SSE_HEARTBEAT = 15.0                    # per spec
+
+# -- self-restart -----------------------------------------------------------
+#
+# A board is a long-running process serving code that gets edited under it. The
+# old answer was a banner asking the human to run `sprintd stop` then
+# `sprintd start`; the user's answer to that banner was "don't show me this
+# notice". Picking up new code is the server's own job, so the server watches
+# its own source file and re-execs itself in place when it changes.
+SELFRESTART_FILENAME = "last-restart.json"      # the crash-loop stamp, beside the DB
+DEFAULT_CODE_WATCH_TICK = 5.0                   # how often to look at our own source
+DEFAULT_CODE_SETTLE_SECONDS = 2.0               # a file written this recently is still moving
+DEFAULT_SELFRESTART_MIN_INTERVAL = 60.0         # never two self-restarts closer than this
+DEFAULT_SELFRESTART_MAX_BURST = 3               # ...and never more than this many
+DEFAULT_SELFRESTART_BURST_WINDOW = 600.0        # ...inside this window
+DEFAULT_RESTART_DRAIN_SECONDS = 10.0            # how long to wait for in-flight requests
 
 # `sprintd tail` -- the quiet ingress. It never exits on its own, so every
 # knob here is about how loudly it fails, not whether it gives up.
@@ -763,6 +785,60 @@ def pid_is_sprintd(pid: int) -> bool:
     return "sprintd" in cmd
 
 
+# The file this process is running. `__file__` is resolved at import, before
+# anything can chdir, so it stays right for the whole life of the process --
+# including across a re-exec, which is the one place it has to be.
+SPRINTD_PATH = os.path.realpath(os.path.abspath(__file__))
+
+
+def code_digest(path: str):
+    """(sha256, size, mtime) of a source file, or None if it cannot be read.
+
+    Content, not mtime, is what decides "this is different code": `git checkout`
+    of the same bytes, a touch, a rebase that lands where it started -- all move
+    the mtime and none of them are a reason to restart anything.
+    """
+    try:
+        st = os.stat(path)
+        with open(path, "rb") as fh:
+            blob = fh.read()
+    except OSError:
+        return None
+    return {"sha": hashlib.sha256(blob).hexdigest(), "size": st.st_size,
+            "mtime": st.st_mtime, "source": blob}
+
+
+def strip_flag(argv, flag: str) -> list:
+    """argv without `--flag value` / `--flag=value`."""
+    out, skip = [], False
+    for arg in argv:
+        if skip:
+            skip = False
+            continue
+        if arg == flag:
+            skip = True
+            continue
+        if arg.startswith(flag + "="):
+            continue
+        out.append(arg)
+    return out
+
+
+def code_compiles(blob: bytes, path: str) -> bool:
+    """Would python even load this file? Cheap, and it runs NOTHING.
+
+    The half-written file is the whole risk in watching your own source: an
+    editor's save, a `git checkout` mid-write, an scp in flight. Refusing to
+    exec into something that will not compile turns the ugliest failure mode
+    (a board that exits on startup and takes the sprint with it) into a wait.
+    """
+    try:
+        compile(blob, path, "exec")
+    except (SyntaxError, ValueError):
+        return False
+    return True
+
+
 def first_line_title(text: str, limit: int = 90) -> str:
     text = (text or "").strip()
     if not text:
@@ -1121,6 +1197,28 @@ def clean_title(value, limit: int = 90) -> str:
         raise ApiError(400, "bad_title", "title cannot be empty", field="title")
     if len(text) > limit:
         text = text[: limit - 1].rstrip() + "…"
+    return text
+
+
+SPRINT_NAME_MAX = 60            # it is a header, a menu row and a hub row
+
+
+def clean_sprint_name(value, limit: int = SPRINT_NAME_MAX) -> str:
+    """Normalize a sprint's name: one line, collapsed whitespace, capped.
+
+    This is the thing the user reads at the top of the board, in the switcher
+    and on the hub, so it is short by construction -- a name that has to be
+    truncated in three places is a sentence somebody put in the wrong field.
+    """
+    if not isinstance(value, str):
+        raise ApiError(400, "bad_name", "name must be a string", field="name")
+    text = " ".join(value.split())
+    if not text:
+        raise ApiError(400, "bad_name", "name cannot be empty", field="name")
+    if len(text) > limit:
+        raise ApiError(400, "bad_name",
+                       "name must be %d characters or fewer (this one is %d)"
+                       % (limit, len(text)), field="name")
     return text
 
 
@@ -1529,6 +1627,7 @@ class App:
                  worker_dead_seconds: float = None,
                  worker_longrun_factor: float = None,
                  default_model: str = None,
+                 code_path: str = None,
                  log=None):
         self.project_root = os.path.realpath(project_root)
         self.data_dir = os.path.realpath(data_dir or os.path.join(self.project_root, DATA_DIRNAME))
@@ -1638,6 +1737,44 @@ class App:
         self.siblings_ttl = env_float("SPRINT_SIBLINGS_TTL", DEFAULT_SIBLINGS_TTL)
         self._siblings_lock = threading.Lock()
         self._siblings_snap = None
+
+        # -- self-restart --------------------------------------------------
+        #
+        # Which file this process is running, and what it looked like when we
+        # loaded it. Everything downstream compares against this snapshot, so a
+        # board only ever restarts for code that is genuinely different from the
+        # code it is executing -- not for a touch, and not for its own restart.
+        self.code_path = os.path.realpath(code_path or SPRINTD_PATH)
+        snap = code_digest(self.code_path)
+        self.code_sha = snap["sha"] if snap else None
+        self.selfrestart_path = os.path.join(self.data_dir, SELFRESTART_FILENAME)
+        self.code_watch_tick = env_float("SPRINT_CODE_WATCH_TICK",
+                                         DEFAULT_CODE_WATCH_TICK)
+        self.code_settle_seconds = env_float("SPRINT_CODE_SETTLE_SECONDS",
+                                             DEFAULT_CODE_SETTLE_SECONDS)
+        self.selfrestart_min_interval = env_float(
+            "SPRINT_SELFRESTART_MIN_INTERVAL", DEFAULT_SELFRESTART_MIN_INTERVAL)
+        self.selfrestart_max_burst = env_int("SPRINT_SELFRESTART_MAX_BURST",
+                                             DEFAULT_SELFRESTART_MAX_BURST)
+        self.selfrestart_burst_window = env_float(
+            "SPRINT_SELFRESTART_BURST_WINDOW", DEFAULT_SELFRESTART_BURST_WINDOW)
+        self.restart_drain_seconds = env_float("SPRINT_RESTART_DRAIN_SECONDS",
+                                               DEFAULT_RESTART_DRAIN_SECONDS)
+        # Only a real `sprintd start` may re-exec itself: an App built by a test
+        # or imported by a helper has no argv worth exec'ing and no servers to
+        # drain. `cmd_start` turns both of these on once it is really serving.
+        self.watch_code = False
+        self.restart_argv = None
+        self.servers = []
+        self.resume_serving = None
+        self._execv = os.execv                  # seam: tests swap it, nothing else
+        self._code_thread = None
+        self._code_seen = None                  # a changed sha waiting to settle
+        self._code_told = set()                 # shas we have already spoken about
+        # In-flight, non-streaming requests. A restart waits for this to reach
+        # zero so nobody's POST dies in the middle of a write.
+        self._inflight = 0
+        self._inflight_cond = threading.Condition()
 
     # -- infra ------------------------------------------------------------
 
@@ -1814,6 +1951,248 @@ class App:
                                  daemon=True)
             self._sweep_thread = t
             t.start()
+        if self.watch_code and self._code_thread is None:
+            t = threading.Thread(target=self._code_loop, name="code", daemon=True)
+            self._code_thread = t
+            t.start()
+
+    # -- picking up new code ----------------------------------------------
+    #
+    # User ruling, verbatim: "don't show me this notice" -- about a banner that
+    # read "this board needs a restart to pick up new features — run `sprintd
+    # stop` then `sprintd start` in its project". Restarting a server is not
+    # work for a human. So the board watches the file it is running and, when
+    # that file becomes different code, re-execs ITSELF.
+    #
+    # `os.execv` and not a fork: exec replaces this process image in place, so
+    # the pid in server.json, the launchd job, the log fd and the terminal that
+    # started it all survive. Everything that makes the board what it is --
+    # port, token, data dir, registry row -- is already on disk and is re-read
+    # by the new image, so the URL in the user's browser keeps working and the
+    # tab re-syncs off `generation` exactly as it does after a manual restart.
+    #
+    # Four gates stand between "the file changed" and "exec", and each one
+    # exists because of a way this could take a sprint down:
+    #   1. CONTENT, not mtime -- a checkout that rewrites the same bytes is not
+    #      new code (`code_digest`).
+    #   2. SETTLED -- a file written in the last couple of seconds is probably
+    #      still being written; and the same sha has to be seen twice.
+    #   3. COMPILES -- we never exec into something python cannot even parse
+    #      (`code_compiles`). This is the difference between "wait a beat" and
+    #      "the board is gone".
+    #   4. IDLE -- no in-flight request, and the DB write lock in hand, so
+    #      nothing is half-written when the image is replaced.
+    # Plus the crash-loop guard: a stamp on disk with a minimum interval and a
+    # burst ceiling, so a file that keeps changing can never turn into a board
+    # that keeps restarting. When the guard says no, the news goes to the event
+    # log for the SESSION to read -- never to the user as a chore.
+
+    def enter_request(self):
+        with self._inflight_cond:
+            self._inflight += 1
+
+    def exit_request(self):
+        with self._inflight_cond:
+            self._inflight -= 1
+            if self._inflight <= 0:
+                self._inflight_cond.notify_all()
+
+    def inflight(self) -> int:
+        with self._inflight_cond:
+            return self._inflight
+
+    def wait_until_idle(self, timeout: float = None) -> bool:
+        """Block until no ordinary request is being served. False on timeout.
+
+        Streaming requests (SSE) deliberately do not count: they are held open
+        for hours by design, and waiting for one to end would mean never
+        restarting. A stream dies with the old image and the browser's
+        EventSource reconnects to the new one on its own -- the same thing it
+        already does across a manual restart.
+        """
+        deadline = now() + (self.restart_drain_seconds if timeout is None else timeout)
+        with self._inflight_cond:
+            while self._inflight > 0:
+                left = deadline - now()
+                if left <= 0:
+                    return False
+                self._inflight_cond.wait(left)
+            return True
+
+    def read_restart_stamp(self) -> dict:
+        """The crash-loop stamp: when we last re-exec'd, and how often lately."""
+        try:
+            with open(self.selfrestart_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def write_restart_stamp(self, sha: str, at: float = None) -> dict:
+        """Record the restart BEFORE doing it.
+
+        Before, because the whole point is to survive the case where the new
+        image never comes back: a stamp written after the exec would never be
+        written at all.
+        """
+        at = now() if at is None else at
+        prev = self.read_restart_stamp()
+        first = float(prev.get("burst_started_at") or 0)
+        count = int(prev.get("burst_count") or 0)
+        if not first or (at - first) > self.selfrestart_burst_window:
+            first, count = at, 0
+        stamp = {"at": at, "sha": sha, "pid": os.getpid(),
+                 "burst_started_at": first, "burst_count": count + 1}
+        tmp = self.selfrestart_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(jdump(stamp) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.selfrestart_path)
+        except OSError as exc:
+            # No stamp means no crash-loop guard, and no guard means we must not
+            # restart at all: an unwritable stamp is a reason to stay put.
+            self.log("could not write the self-restart stamp %s (%s)"
+                     % (self.selfrestart_path, exc))
+            return {}
+        return stamp
+
+    def restart_hold_reason(self, at: float = None):
+        """Why a restart must NOT happen right now, in the user's words, or None."""
+        at = now() if at is None else at
+        stamp = self.read_restart_stamp()
+        last = float(stamp.get("at") or 0)
+        if last and (at - last) < self.selfrestart_min_interval:
+            return ("held off — this board restarted itself %s ago"
+                    % human_span(at - last))
+        first = float(stamp.get("burst_started_at") or 0)
+        count = int(stamp.get("burst_count") or 0)
+        if first and count >= self.selfrestart_max_burst and \
+                (at - first) <= self.selfrestart_burst_window:
+            return ("paused — %d self-restarts inside %s, so this one is not "
+                    "automatic" % (count, human_span(self.selfrestart_burst_window)))
+        return None
+
+    def code_note(self, text: str, sha: str, kind: str, detail: str = None,
+                  once: bool = True):
+        """One quiet line in the event log, addressed to the session.
+
+        `actor: "server"` keeps it out of the sidebar thread (which is user and
+        session lines only), so this is a log entry and never a message telling
+        the person at the keyboard to go do ops.
+        """
+        key = (kind, sha)
+        if once:
+            if key in self._code_told:
+                return None
+            self._code_told.add(key)
+        payload = {"text": text, "code_update": True, "restart_kind": kind,
+                   "code_sha": (sha or "")[:12]}
+        if kind != "restarted":
+            # What the session ACTS on: new code is on disk and the board could
+            # not take it by itself.
+            payload["restart_pending"] = True
+        if detail:
+            payload["detail"] = detail
+        with self.lock:
+            seq = self._append_event(None, "server", "note", payload)
+        self.notify()
+        return seq
+
+    def check_code_update(self, at: float = None) -> str:
+        """Look at our own source once. Returns what happened, for the tests.
+
+        One of: "off", "unreadable", "unchanged", "settling", "broken",
+        "held", "busy", "restarting", "failed".
+        """
+        at = now() if at is None else at
+        if not self.code_sha:
+            return "off"
+        snap = code_digest(self.code_path)
+        if snap is None:
+            # A source file that vanished is not a reason to do anything: a
+            # `git checkout` between two commits does this for a moment.
+            return "unreadable"
+        if snap["sha"] == self.code_sha:
+            self._code_seen = None
+            return "unchanged"
+        if (at - snap["mtime"]) < self.code_settle_seconds:
+            return "settling"
+        if self._code_seen != snap["sha"]:
+            # Seen once is not seen: two identical looks, a tick apart, is what
+            # tells a finished write from a write in progress.
+            self._code_seen = snap["sha"]
+            return "settling"
+        if not code_compiles(snap["source"], self.code_path):
+            self.code_note(
+                "new code on disk does not compile — still serving the old build",
+                snap["sha"], "broken",
+                detail="%s changed but python cannot parse it; the board will "
+                       "pick it up as soon as it parses." % self.code_path)
+            return "broken"
+        hold = self.restart_hold_reason(at)
+        if hold:
+            self.code_note("new code on disk — self-restart %s" % hold,
+                           snap["sha"], "held",
+                           detail="%s changed. The board is still serving the "
+                                  "build it started with." % self.code_path)
+            return "held"
+        if not self.wait_until_idle():
+            # Somebody is mid-request. Nothing is wrong; look again next tick.
+            return "busy"
+        return "restarting" if self.self_restart(snap["sha"]) else "failed"
+
+    def self_restart(self, sha: str) -> bool:
+        """Re-exec this process with the new code. Returns False if it could not.
+
+        Ordering is the safety design. The note and the stamp are written while
+        the board is still whole; the listening sockets stop accepting but are
+        NOT closed, so a failed exec can go straight back to serving; the DB
+        write lock is held across the exec so no transaction can be open when
+        the image is replaced. SQLite is in WAL mode, so even the ugliest
+        version of this (a kill between the two) recovers on the next open.
+        """
+        argv = list(self.restart_argv or [])
+        if not argv:
+            self.log("self-restart wanted but no argv was recorded")
+            return False
+        self.code_note("restarted to pick up new code", sha, "restarted",
+                       once=False)
+        if not self.write_restart_stamp(sha):
+            return False
+        self.log("self-restart: exec %s" % " ".join(argv))
+        for s in self.servers:
+            try:
+                s.shutdown()            # stop accepting; do NOT close the socket
+            except Exception:
+                pass
+        self.wait_until_idle()
+        try:
+            with self.lock:             # no write may be open across the exec
+                self._execv(argv[0], argv)
+        except OSError as exc:
+            # We are still whole: the sockets were never closed and the DB is
+            # untouched. Go back to serving and tell the session why.
+            self.log("self-restart failed to exec (%s) -- resuming" % exc)
+            if self.resume_serving:
+                try:
+                    self.resume_serving()
+                except Exception:
+                    self.log("could not resume serving after a failed exec: %s"
+                             % traceback.format_exc())
+            self.code_note("could not restart into the new code (%s)" % exc,
+                           sha, "failed",
+                           detail="argv: %s" % " ".join(argv))
+            return False
+        return True                     # unreachable on a successful exec
+
+    def _code_loop(self):
+        while not self.stopping.wait(self.code_watch_tick):
+            try:
+                self.check_code_update()
+            except Exception:           # never let the watcher kill the board
+                self.log("code watch failed: %s" % traceback.format_exc())
 
     def q(self, sql, params=()):
         with self.lock:
@@ -2001,6 +2380,54 @@ class App:
                 raise
         self.notify()
         return self.q1("SELECT * FROM sprints WHERE id=?", (sid,))
+
+    def sprint_name(self) -> str:
+        """What this sprint is CALLED -- the one string the header, the switcher
+        and the hub all show. The open sprint's title, or the project's
+        directory name if nobody has named it."""
+        row = self.q1("SELECT * FROM sprints WHERE closed_at IS NULL "
+                      "ORDER BY id DESC LIMIT 1")
+        name = (row["title"] or "").strip() if row is not None else ""
+        return name or self.default_sprint_title()
+
+    def rename_sprint(self, name, actor: str = "user") -> dict:
+        """Name (or rename) the open sprint.
+
+        User ruling, verbatim: "every session should name itself on launch". A
+        board called after its directory tells you where it is, not what it is
+        about, and three of those in a switcher are three rows that all read the
+        same. So the session names it at launch (`sprintd start --name`), and
+        anybody can change it later from settings; both land here.
+
+        The name is the sprint's title in the database -- one source of truth --
+        and it is pushed into the machine-wide registry so the switcher and the
+        hub show it even when this board is the row somebody else is reading.
+        """
+        clean = clean_sprint_name(name)
+        row = self.open_sprint(create=True)
+        was = (row["title"] or "").strip()
+        if was != clean:
+            with self.lock:
+                self.conn.execute("UPDATE sprints SET title=? WHERE id=?",
+                                  (clean, row["id"]))
+                self._append_event(None, "server", "note", {
+                    "text": ("sprint named “%s”" % clean if not was
+                             else "sprint renamed “%s” → “%s”" % (was, clean)),
+                    "sprint_name": clean, "was": was or None,
+                    "by": actor if actor in ACTORS else "user",
+                })
+            self.notify()
+            # The snapshot the switcher polls carries the name too, and it is
+            # cached for ten seconds -- long enough for a rename to look broken.
+            with self._siblings_lock:
+                self._siblings_snap = None
+        try:
+            registry_touch(self.project_root, {"name": clean}, self.registry)
+        except OSError as exc:
+            self.log("could not update the registry name (%s) -- the switcher "
+                     "on other boards may lag" % exc)
+        return self.sprint_json(self.q1("SELECT * FROM sprints WHERE id=?",
+                                        (row["id"],)))
 
     @staticmethod
     def sprint_json(row) -> dict:
@@ -4864,6 +5291,10 @@ class App:
             counts[c["state"]] = counts.get(c["state"], 0) + 1
         return {
             "sprint": self.sprint_json(sprint),
+            # The sprint's name, hoisted: the header, the switcher's own row and
+            # the hub all render this one string, and none of them should have
+            # to know it is stored as the open sprint's title.
+            "name": self.sprint_name(),
             "hold_mode": bool(sprint["hold_mode"]) if sprint else False,
             "cards": cards,
             "counts": counts,
@@ -5196,7 +5627,28 @@ def make_handler(app: App):
             # replace, not an event you append.
             self._route("PUT")
 
+        def release_inflight(self):
+            """Stop counting as in-flight. Idempotent.
+
+            A long-held stream calls this the moment its headers are out: it is
+            "in flight" for hours by definition, and a self-restart that waited
+            for it would wait forever.
+            """
+            if getattr(self, "_inflight_counted", False):
+                self._inflight_counted = False
+                app.exit_request()
+
         def _route(self, method: str):
+            # A self-restart waits for this to hit zero, so every ordinary
+            # request is counted for exactly as long as it is being served.
+            self._inflight_counted = True
+            app.enter_request()
+            try:
+                return self._route_inner(method)
+            finally:
+                self.release_inflight()
+
+        def _route_inner(self, method: str):
             try:
                 parsed = urllib.parse.urlsplit(self.path)
                 path = urllib.parse.unquote(parsed.path)
@@ -5211,10 +5663,15 @@ def make_handler(app: App):
                         # The one field an open tab polls to tell "the server is
                         # slow" apart from "the server I knew is gone".
                         "generation": app.generation,
-                        # ...and the one that tells a NEW page it is talking to
-                        # an OLD server, so it can say "restart me" instead of
-                        # quietly losing the features that server never had.
+                        # Which build answered. Nothing asks a human to act on
+                        # it -- a board that is behind its own code restarts
+                        # itself -- but the log, the hub and `sprintd status`
+                        # can still say which build this is.
                         "api_version": API_VERSION,
+                        # What this sprint calls itself, so `sprintd start` can
+                        # re-assert the registry row without flattening a name
+                        # somebody set (and without holding a token).
+                        "sprint_name": app.sprint_name(),
                         "seq": app.max_seq()})
 
                 if not self.authed(query):
@@ -5297,6 +5754,13 @@ def make_handler(app: App):
                 # list in JS that drifts.
                 return self.json_out(200, {
                     "settings": app.settings(),
+                    # The sprint's NAME rides with settings because that is
+                    # where a rename belongs: it is the user's call, it is not
+                    # dispatch policy, and it is the one field here that is not
+                    # in config.json (the open sprint's title is the truth).
+                    "name": app.sprint_name(),
+                    "name_max": SPRINT_NAME_MAX,
+                    "name_default": app.default_sprint_title(),
                     "defaults": DEFAULT_SETTINGS,
                     "choices": {
                         "model_policy": list(MODEL_POLICIES),
@@ -5414,6 +5878,9 @@ def make_handler(app: App):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             self.close_connection = True
+            # Held open on purpose from here on, so it stops counting as an
+            # in-flight request (see `release_inflight`).
+            self.release_inflight()
 
             def cursor_frame(cur):
                 # A named `cursor` frame, deliberately WITHOUT an `id:` line:
@@ -5506,17 +5973,33 @@ def make_handler(app: App):
 
         # -- PUT --------------------------------------------------------
 
+        def settings_write(self, body):
+            """PUT and POST /api/settings are the same write. One place."""
+            actor = self.actor_or(body, "user")
+            patch = body.get("settings", body)
+            name = body.get("name")
+            if isinstance(patch, dict):
+                if name is None:
+                    name = patch.get("name")
+                patch = {k: v for k, v in patch.items()
+                         if k not in ("actor", "name")}
+            if name is not None:
+                # Renaming is the whole request when it is the only field, and
+                # a `{}` patch is a no-op write, so both shapes work.
+                app.rename_sprint(name, actor=actor)
+            settings = app.save_settings(patch, actor=actor)
+            return 200, {"ok": True, "settings": settings,
+                         "name": app.sprint_name(),
+                         "name_max": SPRINT_NAME_MAX,
+                         "sprint": app.sprint_json(app.open_sprint(create=True)),
+                         "defaults": DEFAULT_SETTINGS}
+
         def _put(self, path, query):
             if path != "/api/settings":
                 self.drain_body()
                 raise ApiError(404, "no_such_route", "no route for PUT %s" % path)
-            body = self.json_body()
-            patch = body.get("settings", body)
-            if isinstance(patch, dict):
-                patch = {k: v for k, v in patch.items() if k != "actor"}
-            settings = app.save_settings(patch, actor=self.actor_or(body, "user"))
-            return self.json_out(200, {"ok": True, "settings": settings,
-                                       "defaults": DEFAULT_SETTINGS})
+            status, obj = self.settings_write(self.json_body())
+            return self.json_out(status, obj)
 
         def _dispatch_post(self, path, query):
             body = self.json_body()
@@ -5525,12 +6008,7 @@ def make_handler(app: App):
                 # POST is the same write as PUT. curl-from-a-worker and the
                 # browser's own retry path both reach for POST; refusing it
                 # buys nothing but a confused 404 at 2am.
-                patch = body.get("settings", body)
-                if isinstance(patch, dict):
-                    patch = {k: v for k, v in patch.items() if k != "actor"}
-                settings = app.save_settings(patch, actor=self.actor_or(body, "user"))
-                return 200, {"ok": True, "settings": settings,
-                             "defaults": DEFAULT_SETTINGS}
+                return self.settings_write(body)
 
             if path == "/api/cards":
                 card = app.create_card(body.get("text"), body.get("images") or [],
@@ -6050,11 +6528,14 @@ def write_registry(entries: dict, registry: str = None):
 
 def registry_entry(project_root: str, port: int, host: str, hosts=None,
                    data_dir: str = None, pid: int = None,
-                   started_at: float = None) -> dict:
+                   started_at: float = None, name: str = None) -> dict:
     root = os.path.realpath(project_root)
     return {
         "project_root": root,
-        "name": os.path.basename(root.rstrip("/")) or root,
+        # What this sprint calls itself, if it has been named; the directory
+        # name is only the fallback. This is the label the switcher and the hub
+        # render, so it follows a rename (see `App.rename_sprint`).
+        "name": (name or "").strip() or os.path.basename(root.rstrip("/")) or root,
         "host": host,
         "hosts": list(hosts or [host]),
         "port": int(port),
@@ -6124,6 +6605,28 @@ def http_get(host: str, port: int, path: str, token: str = None, timeout: float 
         resp = conn.getresponse()
         raw = resp.read()
         return resp.status, raw
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def http_put_json(host: str, port: int, path: str, token: str, obj,
+                  timeout: float = 5.0):
+    """PUT one small JSON document. Used by `sprintd start --name` to name a
+    board that is ALREADY running: the live process owns the database, so the
+    name has to go through it and not around it."""
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        headers = {"Accept": "application/json",
+                   "Content-Type": "application/json",
+                   "Idempotency-Key": secrets.token_hex(8)}
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        conn.request("PUT", path, body=jdump(obj).encode("utf-8"), headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read()
     finally:
         try:
             conn.close()
@@ -6220,15 +6723,36 @@ def cmd_start(args) -> int:
     info = read_server_json(p["server_json"])
 
     if info:
-        state, _health = probe_server(info)
+        state, health = probe_server(info)
         if state == "healthy":
+            # `sprintd start --name "..."` on a board that is already up is a
+            # RENAME, not a no-op: the session says what this sprint is about
+            # on every boot, and a resumed board must end up wearing the same
+            # name a fresh one would.
+            live_name = (health or {}).get("sprint_name")
+            if getattr(args, "name", None):
+                try:
+                    st, raw = http_put_json(
+                        "127.0.0.1", info.get("port"), "/api/settings",
+                        info.get("token"), {"name": args.name})
+                    body = jload(raw.decode("utf-8", "replace"), {}) or {}
+                    if st == 200:
+                        live_name = body.get("name") or args.name
+                    else:
+                        print("notice: could not name this sprint (%s)"
+                              % (body.get("message") or "HTTP %s" % st),
+                              file=sys.stderr)
+                except (OSError, http.client.HTTPException) as exc:
+                    print("notice: could not name this sprint (%s)" % exc,
+                          file=sys.stderr)
             # Idempotent reuse -- and re-assert the registry row, so a board
             # that was already up before the hub existed still shows up on it.
             try:
                 registry_register(registry_entry(
                     project_root, info.get("port"), info.get("host") or "127.0.0.1",
                     hosts=info.get("hosts"), data_dir=info.get("data_dir") or p["data_dir"],
-                    pid=info.get("pid"), started_at=info.get("started_at")),
+                    pid=info.get("pid"), started_at=info.get("started_at"),
+                    name=live_name),
                     getattr(args, "registry", None))
             except OSError:
                 pass
@@ -6338,6 +6862,39 @@ def cmd_start(args) -> int:
     # Boards opened before sprints were named after their project are all
     # sitting under the literal "sprint"; give them the project's name once.
     app.name_untitled_sprint()
+    # `--name` is how a session names its sprint at launch (card #63). It wins
+    # over both the stored title and the directory-name default.
+    if getattr(args, "name", None):
+        try:
+            app.rename_sprint(args.name, actor="session")
+        except ApiError as exc:
+            print("error: %s" % exc.message, file=sys.stderr)
+            report(False, error=exc.message)
+            app.close()
+            return 1
+    # Everything the board needs to replace itself when its code changes
+    # (card #62). `--foreground` is added because this process is ALREADY the
+    # daemon: exec keeps the pid, the log fds and the launchd job, and
+    # daemonizing a second time would throw all three away. `--name` is dropped
+    # because it is a LAUNCH act: the name is in the database by now, and
+    # replaying the flag would undo a rename the user made since.
+    exec_argv = [sys.executable, app.code_path] + strip_flag(sys.argv[1:], "--name")
+    if "--foreground" not in exec_argv:
+        exec_argv.append("--foreground")
+    app.restart_argv = exec_argv
+
+    def start_serving():
+        spawned = []
+        for srv in servers:
+            t = threading.Thread(target=srv.serve_forever,
+                                 kwargs={"poll_interval": 0.2}, daemon=True)
+            t.start()
+            spawned.append(t)
+        return spawned
+
+    app.servers = servers
+    app.resume_serving = start_serving
+    app.watch_code = True
     app.start_background()
     write_server_json(p["server_json"], {
         "pid": os.getpid(), "port": actual_port, "host": hosts[0],
@@ -6362,7 +6919,8 @@ def cmd_start(args) -> int:
     try:
         registry_register(registry_entry(
             project_root, actual_port, hosts[0], hosts=hosts,
-            data_dir=p["data_dir"], started_at=app.started_at),
+            data_dir=p["data_dir"], started_at=app.started_at,
+            name=app.sprint_name()),
             getattr(args, "registry", None))
     except OSError as exc:
         app.log("could not write the sprint registry (%s) -- this board will "
@@ -6388,12 +6946,7 @@ def cmd_start(args) -> int:
         except (ValueError, OSError):
             pass
 
-    threads = []
-    for s in servers:
-        t = threading.Thread(target=s.serve_forever, kwargs={"poll_interval": 0.2},
-                             daemon=True)
-        t.start()
-        threads.append(t)
+    threads = start_serving()
     try:
         while not stop.is_set():
             stop.wait(0.5)
@@ -7006,6 +7559,12 @@ def hub_summarize(entry: dict, timeout: float = 2.5) -> dict:
         return row
     board = jload(raw.decode("utf-8", "replace"), {}) or {}
     row.update(board_rollup(board))
+    # A live board is the authority on its own name; the registry row is what we
+    # fall back to when it is not answering. Without this, a sprint renamed on
+    # one board would keep its old label on the hub until the registry caught up.
+    live_name = (board.get("name") or (board.get("sprint") or {}).get("title") or "").strip()
+    if live_name:
+        row["name"] = live_name
     row.update({
         "reachable": True,
         "status": "live",
@@ -7126,7 +7685,11 @@ def self_sibling_row(app, entry: dict = None) -> dict:
     root = os.path.realpath(app.project_root)
     row = dict(board_rollup(app.board()))
     row.update({
-        "name": entry.get("name") or os.path.basename(root.rstrip("/")) or root,
+        # Our own name comes from our own database, never from the registry
+        # row: a rename must show up in this board's switcher immediately,
+        # whether or not the registry write landed.
+        "name": app.sprint_name() or entry.get("name")
+                or os.path.basename(root.rstrip("/")) or root,
         "project_root": root,
         "port": port,
         "reachable": True,
@@ -7733,6 +8296,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("start", help="start the board server (idempotent)")
     s.add_argument("--port", type=int, default=None,
                    help="port (default %d, reused across restarts)" % DEFAULT_PORT)
+    s.add_argument("--name", default=None,
+                   help="what this sprint is CALLED, in the header, the switcher "
+                        "and the hub (e.g. \"Board self-restart\"). Name it after "
+                        "the work, not the directory; %d characters or fewer. "
+                        "Default: the project directory's name. Changing it later "
+                        "is a rename, in the board's settings panel."
+                        % SPRINT_NAME_MAX)
     s.add_argument("--token", default=None, help="force a bearer token")
     s.add_argument("--new-token", action="store_true",
                    help="mint a fresh token (default: reuse the existing one so "

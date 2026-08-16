@@ -11,6 +11,7 @@ import http.client
 import importlib.util
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -1375,6 +1376,142 @@ class TestBatches(Base):
         self.assertEqual(c["agent_name"], "sprint-card-%d" % solo)
         self.assertEqual(c["branch"], "sprint/card-%d" % solo)
         self.assertNotIn("per_card", c["evidence"]["packet"])
+
+
+class TestUnitVerdicts(Base):
+    """One Approve on a work unit, per-card records underneath it (card #55).
+
+    User ruling, verbatim: "I just want the single card that lives in review,
+    then when I open it up, it outlines everything that changed, and I can
+    approve them together."
+
+    The board shows ONE card for six, and the single Approve fans out into the
+    same per-card POST it always was. Nothing about that is a new endpoint or a
+    bulk write: every member card must still end up with its own verdict event,
+    its own state transition and its own completion, because that is the audit
+    trail and the per-card timeline the user reads afterwards.
+    """
+
+    def _unit_of_six(self, ready=True):
+        nums = [self.new_card("design nit %d" % i)["num"] for i in range(6)]
+        status, body = self.post("/api/batches",
+                                 {"card_nums": nums, "agent_name": "sprint-batch-1",
+                                  "branch": "sprint/batch-1",
+                                  "worktree": "/tmp/wt-batch-1"})
+        self.assertEqual(status, 201, body)
+        for num in nums:
+            self.to_in_progress(num)
+        if ready:
+            packet = dict(GOOD_PACKET,
+                          per_card=[{"card_num": n, "claim": "fixed #%d" % n} for n in nums])
+            status, body = self.post("/api/cards/%d/ready" % nums[0], {"packet": packet})
+            self.assertEqual(status, 200, body)
+        return nums
+
+    def verdicts_on(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return [e["payload"] for e in detail["timeline"] if e["kind"] == "verdict"]
+
+    def test_one_unit_approve_writes_a_verdict_and_a_completion_per_member(self):
+        nums = self._unit_of_six()
+        # This is exactly what the one Approve button does: the same per-card
+        # POST for every member, in order.
+        for num in nums:
+            status, body = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+            self.assertEqual(status, 200, body)
+
+        for num in nums:
+            self.assertEqual(self.state_of(num), "integrating")
+            got = self.verdicts_on(num)
+            self.assertEqual(len(got), 1, "#%d owes exactly one verdict event" % num)
+            self.assertEqual(got[0]["verdict"], "approve")
+            self.assertEqual(got[0]["scope"], "card",
+                             "a unit approve is six card verdicts, never one batch write")
+
+        # ...and the completion is per card too, one member at a time.
+        for num in nums:
+            status, body = self.post("/api/cards/%d/integrated" % num, {"ok": True})
+            self.assertEqual(status, 200, body)
+        for num in nums:
+            self.assertEqual(self.state_of(num), "completed")
+            self.assertIn("verdict", self.kinds_for(num))
+
+    def test_bouncing_one_section_leaves_its_siblings_ready(self):
+        nums = self._unit_of_six()
+        odd = nums[2]
+        status, body = self.post("/api/cards/%d/verdict" % odd,
+                                 {"verdict": "bounce", "notes": "the third one is still 2px off"})
+        self.assertEqual(status, 200, body)
+
+        self.assertEqual(self.state_of(odd), "in_progress")
+        _, detail = self.get("/api/cards/%d" % odd)
+        self.assertEqual(detail["card"]["bounce_count"], 1)
+        for num in nums:
+            if num == odd:
+                continue
+            self.assertEqual(self.state_of(num), "ready",
+                             "#%d was not the part you sent back" % num)
+            _, sib = self.get("/api/cards/%d" % num)
+            self.assertEqual(sib["card"]["bounce_count"], 0)
+            self.assertEqual(self.verdicts_on(num), [])
+
+        # the five that are left still approve as one unit
+        for num in [n for n in nums if n != odd]:
+            status, body = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(self.state_of(num), "integrating")
+        self.assertEqual(self.state_of(odd), "in_progress",
+                         "the bounced part stays with the agent while the rest merges")
+
+    def test_a_singleton_is_a_unit_of_one_and_behaves_exactly_as_before(self):
+        num = self.new_card("the scrim is too dark")["num"]
+        status, _ = self.post("/api/cards/%d/assign" % num,
+                              {"agent_name": "sprint-card-%d" % num,
+                               "worktree": "/tmp/wt-solo",
+                               "branch": "sprint/card-%d" % num})
+        self.assertEqual(status, 200)
+        self.post("/api/cards/%d/state" % num, {"state": "in_progress"})
+        # no per_card: a unit of one owes nothing a single card did not owe
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "ready")
+
+        status, body = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "integrating")
+        self.assertEqual(len(self.verdicts_on(num)), 1)
+        status, _ = self.post("/api/cards/%d/integrated" % num, {"ok": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "completed")
+
+    def test_a_whole_unit_bounce_sends_every_member_back(self):
+        nums = self._unit_of_six()
+        for num in nums:
+            status, body = self.post("/api/cards/%d/verdict" % num,
+                                     {"verdict": "bounce", "notes": "the whole branch is wrong"})
+            self.assertEqual(status, 200, body)
+        for num in nums:
+            self.assertEqual(self.state_of(num), "in_progress")
+            _, detail = self.get("/api/cards/%d" % num)
+            self.assertEqual(detail["card"]["bounce_count"], 1)
+            self.assertEqual(self.verdicts_on(num)[0]["notes"], "the whole branch is wrong")
+
+    def test_the_board_carries_one_packet_and_every_members_own_claim(self):
+        """What the outline is built from, in one fetch: the branch's packet on
+        every member, and each member's own claim inside its `per_card` entry."""
+        nums = self._unit_of_six()
+        _, board = self.get("/api/board")
+        cards = {c["num"]: c for c in board["cards"] if c["num"] in nums}
+        self.assertEqual(len(cards), 6)
+        claims = set()
+        for num in nums:
+            packet = cards[num]["evidence"]["packet"]
+            self.assertEqual(packet["claim"], GOOD_PACKET["claim"], "one packet for the unit")
+            self.assertEqual(cards[num]["branch"], "sprint/batch-1")
+            mine = [e for e in packet["per_card"] if e["card_num"] == num]
+            self.assertEqual(len(mine), 1)
+            claims.add(mine[0]["claim"])
+        self.assertEqual(len(claims), 6, "every section of the outline says its own thing")
 
 
 class StreamReader:
@@ -6757,14 +6894,17 @@ class TestSprintIsNamedAfterTheProject(Base):
         self.app.name_untitled_sprint()
         self.assertEqual(self.get("/api/board")[1]["sprint"]["title"], "Billing week")
 
-    def test_the_registry_name_is_unchanged_by_any_of_this(self):
-        """The switcher labels boards from the registry; this only names sprints."""
+    def test_an_unnamed_registry_row_still_falls_back_to_the_directory(self):
+        """The switcher labels boards from the registry. A sprint that named
+        itself puts that name in the row (see TestSprintNames); one that did
+        not still reads as its directory."""
         entry = sprintd.registry_entry(self.project_root, 8399, "127.0.0.1")
         self.assertEqual(entry["name"], "project")
 
 
 class TestApiVersionIsPublished(Base):
-    """A page can tell it is talking to a server older than itself."""
+    """Which build answered, as one number. It is a diagnostic now, not a
+    banner: a board behind its own code restarts itself (TestSelfRestart)."""
 
     def test_healthz_and_board_both_carry_the_api_version(self):
         status, health = self.get("/healthz", token=None)
@@ -8527,6 +8667,637 @@ class TestBlockedByDocs(Base):
         spec = self.read_repo_file("SPEC.md")
         self.assertIn("blocked_by", spec)
 
+
+# --------------------------------------------------------------------------
+# #62 -- the board picks up new code by itself
+# --------------------------------------------------------------------------
+
+WEB_DIR = os.path.join(os.path.dirname(HERE), "web")
+
+FAKE_SOURCE = "# a stand-in for bin/sprintd\nVALUE = 1\n"
+
+
+class SelfRestartBase(Base):
+    """An App pointed at a throwaway 'source file' it is pretending to run.
+
+    Nothing here execs anything: `_execv` is the one seam, and every test
+    swaps it for a recorder. The real exec is proven end to end further down,
+    against a real daemonized server (TestSelfRestartEndToEnd).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.code = os.path.join(self.tmp, "fake-sprintd")
+        self.write_code(FAKE_SOURCE)
+        self.app.code_path = self.code
+        self.app.code_sha = sprintd.code_digest(self.code)["sha"]
+        self.app.selfrestart_path = os.path.join(self.tmp, "last-restart.json")
+        self.app.restart_argv = [sys.executable, self.code, "start", "--foreground"]
+        self.app.code_settle_seconds = 0.0
+        self.app.restart_drain_seconds = 0.5
+        self.execs = []
+        self.app._execv = lambda path, argv: self.execs.append((path, list(argv)))
+
+    def write_code(self, text):
+        with open(self.code, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def look(self, times=2):
+        """The watcher looks every few seconds; a change needs two looks."""
+        out = []
+        for _ in range(times):
+            out.append(self.app.check_code_update())
+        return out
+
+    def server_notes(self):
+        rows = self.app.q("SELECT * FROM events WHERE card_num IS NULL "
+                          "AND actor='server' AND kind='note' ORDER BY seq")
+        return [sprintd.App.event_json(r) for r in rows]
+
+    def code_notes(self):
+        return [e for e in self.server_notes() if e["payload"].get("code_update")]
+
+
+class TestSelfRestart(SelfRestartBase):
+    def test_new_code_re_execs_this_process(self):
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "restarting"])
+        self.assertEqual(len(self.execs), 1, "exactly one exec")
+        path, argv = self.execs[0]
+        self.assertEqual(path, sys.executable)
+        self.assertEqual(argv, [sys.executable, self.code, "start", "--foreground"])
+
+    def test_the_same_bytes_are_never_new_code(self):
+        """A touch, a checkout that lands where it started: not a restart."""
+        os.utime(self.code, (time.time() - 1000, time.time() - 1000))
+        self.assertEqual(self.app.check_code_update(), "unchanged")
+        os.utime(self.code, None)
+        self.assertEqual(self.app.check_code_update(), "unchanged")
+        self.assertEqual(self.execs, [])
+
+    def test_a_file_written_a_moment_ago_is_left_alone(self):
+        self.app.code_settle_seconds = 30.0
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "settling"])
+        self.assertEqual(self.execs, [])
+
+    def test_a_source_file_that_cannot_be_parsed_is_never_exec_ed(self):
+        """The half-written file is the whole risk. It must cost a wait, not the board."""
+        self.write_code("def broken(:\n")
+        self.assertEqual(self.look(), ["settling", "broken"])
+        self.assertEqual(self.execs, [])
+        notes = self.code_notes()
+        self.assertTrue(notes)
+        self.assertIn("does not compile", notes[-1]["payload"]["text"])
+        # ...and once it parses, the restart happens on its own
+        self.write_code(FAKE_SOURCE + "VALUE = 3\n")
+        self.assertEqual(self.look(), ["settling", "restarting"])
+        self.assertEqual(len(self.execs), 1)
+
+    def test_a_missing_source_file_is_not_an_event(self):
+        os.rename(self.code, self.code + ".gone")
+        self.assertEqual(self.app.check_code_update(), "unreadable")
+        self.assertEqual(self.execs, [])
+        os.rename(self.code + ".gone", self.code)
+
+    def test_the_stamp_is_written_before_the_exec(self):
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.look()
+        stamp = self.app.read_restart_stamp()
+        self.assertTrue(os.path.exists(self.app.selfrestart_path))
+        self.assertEqual(stamp["pid"], os.getpid())
+        self.assertEqual(stamp["burst_count"], 1)
+        self.assertAlmostEqual(stamp["at"], time.time(), delta=30)
+        self.assertEqual(stamp["sha"], sprintd.code_digest(self.code)["sha"])
+
+    def test_one_quiet_line_in_the_log_says_it_restarted(self):
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.look()
+        notes = self.code_notes()
+        self.assertEqual([n["payload"]["text"] for n in notes],
+                         ["restarted to pick up new code"])
+        self.assertEqual(notes[0]["actor"], "server")
+        # information, not a task: nothing pending for anyone to do
+        self.assertNotIn("restart_pending", notes[0]["payload"])
+
+
+class TestSelfRestartCrashLoopGuard(SelfRestartBase):
+    """New code that keeps arriving must never become a board that keeps dying."""
+
+    def test_a_second_restart_inside_the_minimum_interval_is_held(self):
+        self.app.write_restart_stamp("deadbeef")          # we just restarted
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "held"])
+        self.assertEqual(self.execs, [])
+
+    def test_the_interval_passing_lets_the_restart_through(self):
+        self.app.write_restart_stamp(
+            "deadbeef", at=time.time() - sprintd.DEFAULT_SELFRESTART_MIN_INTERVAL - 5)
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "restarting"])
+        self.assertEqual(len(self.execs), 1)
+
+    def test_a_burst_of_restarts_stops_being_automatic(self):
+        """Three inside the window and the board stays put, interval or no interval."""
+        old = time.time() - sprintd.DEFAULT_SELFRESTART_MIN_INTERVAL - 5
+        with open(self.app.selfrestart_path, "w", encoding="utf-8") as fh:
+            json.dump({"at": old, "sha": "x", "pid": os.getpid(),
+                       "burst_started_at": time.time() - 60,
+                       "burst_count": sprintd.DEFAULT_SELFRESTART_MAX_BURST}, fh)
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "held"])
+        self.assertEqual(self.execs, [])
+        self.assertIn("paused", self.code_notes()[-1]["payload"]["text"])
+
+    def test_the_burst_window_expires(self):
+        old = time.time() - sprintd.DEFAULT_SELFRESTART_BURST_WINDOW - 60
+        with open(self.app.selfrestart_path, "w", encoding="utf-8") as fh:
+            json.dump({"at": old, "sha": "x", "pid": os.getpid(),
+                       "burst_started_at": old,
+                       "burst_count": 99}, fh)
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "restarting"])
+        self.assertEqual(len(self.execs), 1)
+        self.assertEqual(self.app.read_restart_stamp()["burst_count"], 1)
+
+    def test_the_held_notice_goes_to_the_SESSION_and_never_to_the_user(self):
+        """The fallback is an event the orchestrator handles, not a chore on screen."""
+        self.app.write_restart_stamp("deadbeef")
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.look()
+        note = self.code_notes()[-1]
+        self.assertTrue(note["payload"]["restart_pending"])
+        self.assertEqual(note["actor"], "server")
+        self.assertNotIn("sprintd stop", note["payload"]["text"])
+        self.assertNotIn("sprintd start", note["payload"]["text"])
+        # the sidebar is user+session lines only, so this is log, not chrome
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        for line in board["sidebar"]:
+            self.assertNotIn("restart", (line["payload"].get("text") or ""))
+
+    def test_the_same_held_news_is_said_once_not_every_tick(self):
+        self.app.write_restart_stamp("deadbeef")
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        for _ in range(6):
+            self.app.check_code_update()
+        self.assertEqual(len(self.code_notes()), 1)
+
+
+class TestSelfRestartWaitsForIdle(SelfRestartBase):
+    def test_a_request_in_flight_defers_the_restart(self):
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.app.enter_request()
+        try:
+            self.assertEqual(self.look(), ["settling", "busy"])
+            self.assertEqual(self.execs, [])
+        finally:
+            self.app.exit_request()
+        # nothing in flight now: the very next look restarts
+        self.assertEqual(self.app.check_code_update(), "restarting")
+        self.assertEqual(len(self.execs), 1)
+
+    def test_ordinary_requests_are_counted_while_they_are_served(self):
+        seen = []
+        original = self.app.board
+
+        def slow_board():
+            seen.append(self.app.inflight())
+            return original()
+
+        self.app.board = slow_board
+        try:
+            status, _ = self.get("/api/board")
+        finally:
+            self.app.board = original
+        self.assertEqual(status, 200)
+        self.assertEqual(seen, [1])
+        self.assertEqual(self.app.inflight(), 0, "the counter comes back down")
+
+    def test_a_held_open_stream_does_not_count_as_in_flight(self):
+        """SSE is held for hours by design; waiting for it would mean never."""
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        try:
+            conn.request("GET", "/api/stream", headers={
+                "Authorization": "Bearer test-token", "Accept": "text/event-stream"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)   # headers out: the stream is open
+            deadline = time.time() + 5
+            while self.app.inflight() > 0 and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(self.app.inflight(), 0)
+            self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+            self.assertEqual(self.look(), ["settling", "restarting"])
+        finally:
+            conn.close()
+
+
+class TestSelfRestartFailureIsRecoverable(SelfRestartBase):
+    def test_a_failed_exec_goes_back_to_serving_and_says_so(self):
+        resumed = []
+        self.app.resume_serving = lambda: resumed.append(True)
+
+        def boom(_path, _argv):
+            raise OSError(8, "Exec format error")
+
+        self.app._execv = boom
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "failed"])
+        self.assertEqual(resumed, [True])
+        note = self.code_notes()[-1]
+        self.assertIn("could not restart", note["payload"]["text"])
+        self.assertTrue(note["payload"]["restart_pending"])
+        # the board is still answering
+        self.assertEqual(self.get("/api/board")[0], 200)
+
+    def test_no_argv_means_no_restart(self):
+        self.app.restart_argv = None
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "failed"])
+        self.assertEqual(self.execs, [])
+
+
+class TestRestartArgv(unittest.TestCase):
+    """What the re-exec replays: the same launch, minus what must not repeat."""
+
+    def test_a_flag_and_its_value_come_out(self):
+        self.assertEqual(
+            sprintd.strip_flag(["start", "--name", "Billing", "--port", "9"], "--name"),
+            ["start", "--port", "9"])
+        self.assertEqual(
+            sprintd.strip_flag(["start", "--name=Billing", "--port", "9"], "--name"),
+            ["start", "--port", "9"])
+        self.assertEqual(sprintd.strip_flag(["start"], "--name"), ["start"])
+
+    def test_the_code_path_is_absolute_and_is_this_file(self):
+        self.assertTrue(os.path.isabs(sprintd.SPRINTD_PATH))
+        self.assertEqual(sprintd.SPRINTD_PATH, os.path.realpath(SPRINTD_PATH))
+
+
+class TestNoRestartBannerInTheWeb(unittest.TestCase):
+    """User, verbatim: "don't show me this notice"."""
+
+    def js_sources(self):
+        out = {}
+        for name in sorted(os.listdir(WEB_DIR)):
+            if not name.endswith(".js"):
+                continue
+            with open(os.path.join(WEB_DIR, name), "r", encoding="utf-8") as fh:
+                out[name] = fh.read()
+        return out
+
+    @staticmethod
+    def strip_comments(text):
+        """Drop // lines and /* */ blocks -- what is left is what SHIPS."""
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+        return "\n".join(re.sub(r"(^|\s)//.*$", "", line) for line in text.splitlines())
+
+    def test_no_page_tells_the_user_to_restart_a_board(self):
+        for name, src in self.js_sources().items():
+            code = self.strip_comments(src)
+            for banned in ("needs a restart", "sprintd stop", "sprintd start"):
+                self.assertNotIn(banned, code,
+                                 "%s still says %r to the user" % (name, banned))
+
+    def test_the_staleness_machinery_is_gone_entirely(self):
+        for name, src in self.js_sources().items():
+            code = self.strip_comments(src)
+            for banned in ("serverIsStale", "onServerStale", "noteMissingEndpoint"):
+                self.assertNotIn(banned, code, "%s still imports %r" % (name, banned))
+
+
+class TestSelfRestartEndToEnd(unittest.TestCase):
+    """The real thing: a daemonized board, a changed file, the SAME pid serving
+    the new code afterwards. `os.execv` replaces the image in place, so pid,
+    port and token all survive -- which is the whole reason nobody has to be
+    told to restart anything."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-exec-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "project")
+        os.makedirs(self.root)
+        # A COPY of the tree, so the test can edit the code it is running.
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        self.script = os.path.join(self.bin, "sprintd")
+        shutil.copy2(SPRINTD_PATH, self.script)
+        shutil.copytree(WEB_DIR, os.path.join(self.tmp, "web"))
+        self.registry = os.path.join(self.tmp, "hubstate", "registry.json")
+        self.port = self._free_port()
+        self.addCleanup(self._kill)
+
+    def _free_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def _kill(self):
+        info = sprintd.read_server_json(
+            os.path.join(self.root, ".sprint", sprintd.SERVER_JSON))
+        for pid in [(info or {}).get("pid"), getattr(self, "pid", None)]:
+            if isinstance(pid, int):
+                try:
+                    os.kill(pid, 15)
+                except OSError:
+                    pass
+
+    def _env(self):
+        env = dict(os.environ)
+        env.update({"SPRINT_REGISTRY": self.registry,
+                    "SPRINT_CODE_WATCH_TICK": "0.4",
+                    "SPRINT_CODE_SETTLE_SECONDS": "0",
+                    "SPRINT_RESTART_DRAIN_SECONDS": "5"})
+        return env
+
+    def _health(self):
+        try:
+            status, raw = sprintd.http_get("127.0.0.1", self.port, "/healthz", timeout=3)
+        except (OSError, http.client.HTTPException):
+            return None
+        return json.loads(raw.decode("utf-8")) if status == 200 else None
+
+    def test_touching_the_source_restarts_the_board_in_place(self):
+        import subprocess
+        r = subprocess.run([sys.executable, self.script, "--project-root", self.root,
+                            "start", "--port", str(self.port), "--token", "exec-token",
+                            "--no-tailscale"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           env=self._env(), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        before = self._health()
+        self.assertIsNotNone(before)
+        self.pid = before["pid"]
+        gen = before["generation"]
+
+        with open(self.script, "a", encoding="utf-8") as fh:
+            fh.write("\n# a change, landed while the board was running\n")
+
+        deadline = time.time() + 40
+        after = None
+        while time.time() < deadline:
+            h = self._health()
+            if h and h["generation"] != gen:
+                after = h
+                break
+            time.sleep(0.25)
+        self.assertIsNotNone(after, "the board never picked up the new code")
+        # Same process, new build: exec keeps the pid, the port and the token.
+        self.assertEqual(after["pid"], before["pid"])
+        self.assertGreater(after["started_at"], before["started_at"])
+        status, raw = sprintd.http_get("127.0.0.1", self.port, "/api/board",
+                                       "exec-token", timeout=5)
+        self.assertEqual(status, 200)          # same token, same port, still serving
+        # ...and it said so, in one line, in the log.
+        status, raw = sprintd.http_get("127.0.0.1", self.port,
+                                       "/api/events?after=0&limit=500",
+                                       "exec-token", timeout=5)
+        self.assertEqual(status, 200)
+        events = json.loads(raw.decode("utf-8"))["events"]
+        said = [e["payload"]["text"] for e in events
+                if e["payload"].get("restart_kind") == "restarted"]
+        self.assertEqual(said, ["restarted to pick up new code"])
+        # and nothing anywhere told a human to go restart anything
+        for e in events:
+            self.assertNotIn("sprintd stop", e["payload"].get("text") or "")
+
+
+# --------------------------------------------------------------------------
+# #63 -- a sprint names itself on launch
+# --------------------------------------------------------------------------
+
+
+class TestSprintNames(Base):
+    """User, verbatim: "every session should name itself on launch"."""
+
+    def name_now(self):
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        return board["name"]
+
+    def test_the_default_is_still_the_directory(self):
+        self.assertEqual(self.name_now(), "project")
+        self.assertEqual(self.get("/healthz", token=None)[1]["sprint_name"], "project")
+        self.assertEqual(self.get("/api/settings")[1]["name"], "project")
+
+    def test_a_name_shows_up_everywhere_a_board_is_labelled(self):
+        status, res = self.req("PUT", "/api/settings", {"name": "Board self-restart"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["name"], "Board self-restart")
+        # the header reads the sprint title; the switcher and the hub read `name`
+        status, board = self.get("/api/board")
+        self.assertEqual(board["name"], "Board self-restart")
+        self.assertEqual(board["sprint"]["title"], "Board self-restart")
+        self.assertEqual(self.get("/healthz", token=None)[1]["sprint_name"],
+                         "Board self-restart")
+        self.assertEqual(self.get("/api/settings")[1]["name"], "Board self-restart")
+        status, sibs = self.get("/api/siblings?fresh=1")
+        self.assertEqual(status, 200, sibs)
+        mine = [s for s in sibs["sprints"] if s["self"]]
+        self.assertEqual([s["name"] for s in mine], ["Board self-restart"])
+
+    def test_post_is_the_same_write_as_put(self):
+        status, res = self.post("/api/settings", {"name": "Renamed by POST"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.name_now(), "Renamed by POST")
+
+    def test_a_rename_reaches_the_registry_the_switcher_reads(self):
+        sprintd.registry_register(sprintd.registry_entry(
+            self.project_root, self.port, "127.0.0.1"))
+        key = os.path.realpath(self.project_root)
+        self.assertEqual(sprintd.read_registry()[key]["name"], "project")
+        status, _ = self.req("PUT", "/api/settings", {"name": "Named later"})
+        self.assertEqual(status, 200)
+        self.assertEqual(sprintd.read_registry()[key]["name"], "Named later")
+
+    def test_a_registry_row_carries_the_name_it_was_started_with(self):
+        entry = sprintd.registry_entry(self.project_root, 8399, "127.0.0.1",
+                                       name="Billing week")
+        self.assertEqual(entry["name"], "Billing week")
+        # ...and falls back to the directory when nobody named it
+        self.assertEqual(
+            sprintd.registry_entry(self.project_root, 8399, "127.0.0.1")["name"],
+            "project")
+
+    def test_renaming_twice_is_a_rename_not_a_second_sprint(self):
+        self.req("PUT", "/api/settings", {"name": "First"})
+        self.req("PUT", "/api/settings", {"name": "Second"})
+        status, sprints = self.get("/api/sprints")
+        self.assertEqual(status, 200, sprints)
+        self.assertEqual(len(sprints["sprints"]), 1)
+        self.assertEqual(self.name_now(), "Second")
+
+    def test_the_rename_is_one_quiet_line_in_the_log(self):
+        self.req("PUT", "/api/settings", {"name": "Named"})
+        self.req("PUT", "/api/settings", {"name": "Renamed"})
+        rows = self.app.q("SELECT * FROM events WHERE card_num IS NULL "
+                          "AND kind='note' ORDER BY seq")
+        texts = [sprintd.jload(r["payload"], {}).get("text") for r in rows]
+        named = [t for t in texts if t and "named" in t]
+        self.assertEqual(len(named), 2, texts)
+        self.assertIn("“Named”", named[0])
+        self.assertIn("“Named” → “Renamed”", named[1])
+
+    def test_saving_the_same_name_writes_nothing(self):
+        self.req("PUT", "/api/settings", {"name": "Steady"})
+        before = self.get("/api/board")[1]["seq"]
+        self.req("PUT", "/api/settings", {"name": "Steady"})
+        self.assertEqual(self.get("/api/board")[1]["seq"], before)
+
+    def test_a_name_only_write_leaves_dispatch_policy_alone(self):
+        status, res = self.req("PUT", "/api/settings",
+                               {"settings": {"worker": {"concurrency": 4}}})
+        self.assertEqual(status, 200, res)
+        status, res = self.req("PUT", "/api/settings", {"name": "Only the name"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["settings"]["worker"]["concurrency"], 4)
+        self.assertEqual(self.name_now(), "Only the name")
+
+    def test_a_name_and_a_settings_patch_in_one_request(self):
+        status, res = self.req("PUT", "/api/settings",
+                               {"name": "Both", "worker": {"concurrency": 3}})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["settings"]["worker"]["concurrency"], 3)
+        self.assertEqual(res["name"], "Both")
+
+    def test_a_name_that_is_not_a_name_is_refused_by_field(self):
+        for bad in ("", "   ", "x" * (sprintd.SPRINT_NAME_MAX + 1), 7, None, []):
+            status, res = self.req("PUT", "/api/settings", {"name": bad})
+            if bad is None:
+                # `null` means "no name in this request", not "clear the name"
+                self.assertEqual(status, 200, res)
+                continue
+            self.assertEqual(status, 400, (bad, res))
+            self.assertEqual(res["field"], "name")
+        self.assertEqual(self.name_now(), "project")
+
+    def test_whitespace_is_collapsed_not_preserved(self):
+        status, res = self.req("PUT", "/api/settings",
+                               {"name": "  Board   self  restart \n"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["name"], "Board self restart")
+
+    def test_the_settings_panel_is_told_the_limit_and_the_fallback(self):
+        status, res = self.get("/api/settings")
+        self.assertEqual(res["name_max"], sprintd.SPRINT_NAME_MAX)
+        self.assertEqual(res["name_default"], "project")
+
+
+class TestNamedBoardsOnTheHub(unittest.TestCase):
+    """A live board is the authority on its own name; the registry is the
+    fallback for one that is not answering."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-hubname-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.registry = os.path.join(self.tmp, "hubstate", "registry.json")
+        self._old = os.environ.get("SPRINT_REGISTRY")
+        os.environ["SPRINT_REGISTRY"] = self.registry
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        if self._old is None:
+            os.environ.pop("SPRINT_REGISTRY", None)
+        else:
+            os.environ["SPRINT_REGISTRY"] = self._old
+
+    def test_an_unreachable_board_keeps_the_registry_name(self):
+        entry = sprintd.registry_entry(os.path.join(self.tmp, "alpha"), 1, "127.0.0.1",
+                                       name="Alpha work")
+        row = sprintd.hub_summarize(entry, timeout=0.2)
+        self.assertEqual(row["name"], "Alpha work")
+        self.assertFalse(row["reachable"])
+
+
+class TestNameAtLaunch(unittest.TestCase):
+    """`sprintd start --name` is the boot path: the session names the sprint
+    after what it is about, not after the folder it happens to sit in."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-name-cli-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "project")
+        os.makedirs(self.root)
+        self.registry = os.path.join(self.tmp, "hubstate", "registry.json")
+        self.server_json = os.path.join(self.root, ".sprint", sprintd.SERVER_JSON)
+        self.port = self._free_port()
+        self.addCleanup(self._kill)
+
+    def _free_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def _kill(self):
+        info = sprintd.read_server_json(self.server_json)
+        if info and isinstance(info.get("pid"), int):
+            try:
+                os.kill(info["pid"], 15)
+            except OSError:
+                pass
+
+    def _run(self, *argv, timeout=60):
+        import subprocess
+        env = dict(os.environ)
+        env["SPRINT_REGISTRY"] = self.registry
+        return subprocess.run(
+            [sys.executable, SPRINTD_PATH, "--project-root", self.root] + list(argv),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=timeout)
+
+    def _name(self):
+        status, raw = sprintd.http_get("127.0.0.1", self.port, "/healthz", timeout=3)
+        self.assertEqual(status, 200)
+        return json.loads(raw.decode("utf-8"))["sprint_name"]
+
+    def test_a_session_names_its_sprint_on_launch(self):
+        r = self._run("start", "--port", str(self.port), "--token", "name-token",
+                      "--no-tailscale", "--name", "Board self-restart")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(self._name(), "Board self-restart")
+        key = os.path.realpath(self.root)
+        self.assertEqual(sprintd.read_registry(self.registry)[key]["name"],
+                         "Board self-restart")
+
+    def test_starting_again_with_a_new_name_renames_the_live_board(self):
+        r = self._run("start", "--port", str(self.port), "--no-tailscale",
+                      "--token", "name-token", "--name", "First idea")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        r2 = self._run("start", "--port", str(self.port), "--no-tailscale",
+                       "--name", "What it turned out to be")
+        self.assertEqual(r2.returncode, 0, r2.stderr.decode())
+        self.assertIn("already running", r2.stdout.decode())
+        self.assertEqual(self._name(), "What it turned out to be")
+        key = os.path.realpath(self.root)
+        self.assertEqual(sprintd.read_registry(self.registry)[key]["name"],
+                         "What it turned out to be")
+
+    def test_starting_again_with_no_name_keeps_the_one_it_has(self):
+        self._run("start", "--port", str(self.port), "--no-tailscale",
+                  "--token", "name-token", "--name", "Keeps its name")
+        r2 = self._run("start", "--port", str(self.port), "--no-tailscale")
+        self.assertEqual(r2.returncode, 0, r2.stderr.decode())
+        self.assertEqual(self._name(), "Keeps its name")
+        key = os.path.realpath(self.root)
+        self.assertEqual(sprintd.read_registry(self.registry)[key]["name"],
+                         "Keeps its name")
+
+    def test_no_name_means_the_directory_name(self):
+        r = self._run("start", "--port", str(self.port), "--no-tailscale",
+                      "--token", "name-token")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(self._name(), "project")
+
+    def test_a_name_nobody_could_read_is_refused_at_launch(self):
+        r = self._run("start", "--port", str(self.port), "--no-tailscale",
+                      "--name", "x" * 200)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("60 characters", r.stderr.decode())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

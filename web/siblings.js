@@ -13,7 +13,7 @@
 // the counting; this file only decides what to draw and where a click goes.
 
 import { h, clear } from './util.js';
-import { api, noteMissingEndpoint } from './api.js';
+import { api } from './api.js';
 
 const POLL_MS = 30000;      // no SSE: the other boards are not on our event log
 
@@ -35,12 +35,11 @@ export function startSiblings(onChange) {
     try {
       body = await api.siblings();
     } catch (err) {
-      // A 404 is not a failed poll: it is a server that has never heard of this
-      // endpoint, i.e. one older than the page asking. Say so once (the header
-      // renders "this board needs a restart") instead of silently rendering a
-      // board with no switcher and letting it read as a missing feature.
-      if (err && err.status === 404) noteMissingEndpoint('/api/siblings');
-      // Otherwise a failed poll leaves the last known list alone. Blanking the
+      // A 404 here means a server older than this page — one that never had
+      // /api/siblings. That used to raise a banner asking the user to restart
+      // the board; it no longer does, because the board notices its own code
+      // changed and restarts itself, and the next poll (30s) finds the
+      // endpoint. A failed poll leaves the last known list alone. Blanking the
       // title into plain text because one fetch timed out would be a worse lie
       // than a slightly stale menu, and this is never worth a toast.
       return;

@@ -35,6 +35,18 @@ write depends on them being current. Re-read `server.json` any time
 `sprintd start` reports a change (e.g. after a restart on a different
 port).
 
+**The board restarts itself when its code changes, and you never ask the
+user to do it.** If `bin/sprintd` is edited under a running board, the
+board re-execs itself in place — same pid, same port, same token — and
+writes one `note` saying `restarted to pick up new code`. Nothing is
+required of you. If a guard stopped it (two restarts inside a minute, a
+burst, a file that will not compile), you get a `note` carrying
+`payload.restart_pending: true` instead; that one is addressed to YOU.
+Read `payload.text`, and if the board really does need to come back on
+new code, do it yourself at a quiet moment. Never put "run `sprintd
+stop` then `sprintd start`" in front of the user — that instruction is
+what card #62 deleted.
+
 All of your own (session-level) API calls use `curl` with
 `-H "Authorization: Bearer $SPRINT_TOKEN"`. The three worker helpers
 (`sprint-post`, `sprint-ask`, `sprint-ready`) are for workers, not you —
@@ -82,10 +94,26 @@ went green, the overlapping card landed, the dependency shipped).
 1. `bin/sprintd doctor` — fix anything it flags before proceeding
    (python3 <3.9, no git, etc.; missing tailscale is fine, it just
    degrades to loopback-only).
-2. `bin/sprintd start` — idempotent. If a live server already owns the
-   port with a matching token, it exits 0 and tells you so; treat that
-   identically to a fresh start (still re-read `server.json`, still
-   proceed to drain — this IS the resume path, see step 7).
+2. **`bin/sprintd start --name "<what this sprint is about>"` — name it,
+   every single boot.** User ruling, verbatim: *"every session should
+   name itself on launch"*. The name is what the header, the title
+   switcher and the hub all show, and a machine running four boards
+   called "russ", "sprint", "project" and "project" tells the user
+   nothing. So derive a name from what you are actually here to do —
+   the user's opening ask, the theme of the queued cards, the thing you
+   were resumed for — and pass it. Rules: plain English, ≤8 words / 60
+   characters, sentence case, names the WORK not the folder ("Board
+   self-restart and naming", "Mail redesign — dark mode", not "sprint"
+   or "russ"). Do not ask the user what to call it; name it, and say
+   what you called it in your first sidebar line. If it turns out to be
+   about something else an hour later, rename it (same flag, or
+   `PUT /api/settings {"name": "..."}` — both work on a live board).
+   Everything else about `start` is unchanged: it is idempotent, and if
+   a live server already owns the port with a matching token it exits 0
+   and tells you so; treat that identically to a fresh start (still
+   re-read `server.json`, still proceed to drain — this IS the resume
+   path, see step 7), and `--name` renames that live board rather than
+   being ignored.
 3. Read `.sprint/server.json`, set `SPRINT_SERVER`/`SPRINT_TOKEN` per
    above. Print the URL for the user: `$SPRINT_SERVER/?t=$SPRINT_TOKEN`.
 4. `POST $SPRINT_SERVER/api/sprint {"action":"open"}` if there's no open
@@ -280,7 +308,7 @@ and the table is prose.
 | user | `answer` (`reply_to: "card:<num>"`) | An answer to a worker's question. Server already flipped `needs_you`→`in_progress`; your job is to relay the answer to the agent: `SendMessage` it by name with the answer text (plus any attachment paths from the `chat` line that came with it). |
 | user | `note` with `retry: true` (then `state`→`queued`) | The user hit **Retry** on a failed/stale card. The server already cleared the dead `agent_name`/`worktree` and re-queued it. Dispatch a **fresh** agent (step 3) with the card's full timeline as its brief, and have it say plainly that it is a new agent picking up where the last one died — never `SendMessage` the old name. |
 | user | `action` results (pin/cancel/hold/release/duplicate_of) | Mostly informational — no action needed beyond noticing state changed, unless `release` just moved held cards to queued (then consider dispatch) or `cancel` hit a card with a live agent (then tell that agent to stop: `SendMessage` "this card was canceled, wrap up and stop"). |
-| user | `verdict` (approve, `reply_to: "card:<num>"`) | See step 6 — the card already flipped `ready`→`integrating` on the board (UI shows "merging…", no spinner). Do the actual git integration now, then call `POST /api/cards/:num/integrated` yourself to land it in `completed` or bounce it back with a real failure. |
+| user | `verdict` (approve, `reply_to: "card:<num>"`) | See step 6 — the card already flipped `ready`→`integrating` on the board (UI shows "merging…", no spinner). Do the actual git integration now, then call `POST /api/cards/:num/integrated` yourself to land it in `completed` or bounce it back with a real failure. **Several of these landing at once on one branch is one Approve on a work unit — merge the branch once and `POST /integrated` per card (step 7).** |
 | user | `verdict` (bounce) | See step 6 — `SendMessage` notes to the agent. Card is already back in `in_progress` server-side. |
 | user | `verdict` (reject) | Card is terminal (`rejected`). Kill its preview server (step 6), prune its worktree, post a closing `note`, done — no git work. |
 | session | `integrated` (ok: true) | Your own echo from step 6 — card is now `completed`. No further action beyond the cleanup you already did as part of calling it (kill preview server, prune worktree). |
@@ -1224,6 +1252,19 @@ do the git work, then report the real outcome back through
    member cards while the rest of the batch still approves — integrate
    the approved subset, leave bounced members with the agent (same
    worktree, same branch, until they're re-readied).
+7. **One Approve on a work unit arrives as a BURST of verdicts, one per
+   member card.** The board reviews finished work by work unit — six
+   cards on one branch are one card in Awaiting review with one Approve
+   under them (card #55) — but that button is not a new endpoint: it
+   POSTs the ordinary per-card verdict for every member in order, so you
+   will drain six `verdict` (approve) events for six cards that all name
+   the same branch, seconds apart. **Integrate that branch ONCE.** Group
+   the drained verdicts by branch before you touch git; rebase, gate and
+   merge one time; then `POST /integrated` for every member card in the
+   group. Treating them as six independent approvals means six rebases
+   of the same branch, five of which are already merged and will look
+   like conflicts you did not cause. The same goes the other way: six
+   `integrated` echoes for one merge is correct and expected.
 
 There is now a real, documented failure path for a post-approval
 integration problem — it is never silent and never a retry loop on your
@@ -1268,8 +1309,11 @@ tmux worker" in step 3.
 
 `sprintd start` is idempotent by design for exactly this. On resume:
 
-1. `sprintd start` (idempotent — recovers a stale PID file itself; if
-   its process check fails it cleans up and starts fresh).
+1. `sprintd start --name "<what this sprint is about>"` (idempotent —
+   recovers a stale PID file itself; if its process check fails it
+   cleans up and starts fresh). Name it on resume too: a board that
+   comes back nameless is a board the user cannot find in the switcher.
+   Passing the same name it already has is a no-op.
 2. Read `server.json`, set `SPRINT_SERVER`/`SPRINT_TOKEN`.
 3. Read the persisted `orchestrator` cursor and go straight into the
    drain loop (step 2) from there — do not special-case "resume" beyond
@@ -1322,7 +1366,9 @@ badge. A chat message on any member card routes to the batch's agent
 with that member's context attached.
 
 Don't batch-approve blind — verdicts on a batch still go through
-`per_card` evidence per member (see step 6).
+`per_card` evidence per member (see step 6), and one Approve on the unit
+arrives as one verdict per member card that all integrate as a single
+branch merge (see step 7).
 
 ## Sidebar
 
