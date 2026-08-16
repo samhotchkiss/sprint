@@ -507,23 +507,22 @@ async function answer(card, question, text, images, key, reuse) {
   // server actually took (and failed to tell us about) replays instead of
   // landing twice.
   const idem = key || uid();
-  // A screenshot pasted while answering is its own line to the agent: the
-  // answer itself is the thing that unblocks the card, and it goes second so
-  // the image is already in the thread when the agent picks the answer up.
-  if (images && images.length) {
-    await chat(card, text, images);
-    if (!text) text = '(see the image above)';
-  }
+  // A screenshot pasted while answering rides the ANSWER (card #66), not a
+  // separate chat line before it: one event, so the agent reading the answer
+  // has the picture attached to the words it belongs to. An image with no words
+  // is still an answer — it says "this is what I meant".
+  const imgs = images || [];
+  if (!text && imgs.length) text = '(see the screenshot)';
   patch(card.num, 'in_progress');
   card.question = null;
   // "Delivered — the agent sees it next turn": the optimistic status line the
   // question panel is replaced by, in the thread, immediately.
   if (store.detail && store.detail.num === card.num) store.detail.justAnswered = true;
   const line = reuse
-    || pushPending(card.num, { actor: 'user', kind: 'answer', payload: { text } });
+    || pushPending(card.num, { actor: 'user', kind: 'answer', payload: localPayload(text, imgs) });
   render();
   try {
-    const res = await api.answer(card.num, q.id, text, idem);
+    const res = await api.answer(card.num, q.id, text, toBase64List(imgs), idem);
     settlePending(card.num, false, res && res.event, line);
     refreshBoard();
     if (store.detail && store.detail.num === card.num) refreshDetail();
@@ -549,9 +548,9 @@ async function answer(card, question, text, images, key, reuse) {
         // Open the card: a lost answer is worth a rail, and a toast that is
         // gone in four seconds is the silence this card is about.
         openCard(card.num);
-        target = pushPending(card.num, { actor: 'user', kind: 'answer', payload: { text } });
+        target = pushPending(card.num, { actor: 'user', kind: 'answer', payload: localPayload(text, imgs) });
       }
-      failPending(target, () => answer(card, q, text, null, idem, target));
+      failPending(target, () => answer(card, q, text, imgs, idem, target));
     }
     render();
   }
@@ -651,6 +650,10 @@ async function sessionChat(text, images, key, reuse) {
  */
 async function verdict(card, kind, notes, key, opts) {
   const quiet = !!(opts && opts.quiet);
+  // Card #66: a bounce can carry the screenshot that shows what is wrong. It
+  // rides the verdict event, so the agent picking the card back up reads the
+  // notes and sees the picture in the same place.
+  const imgs = (opts && opts.images) || [];
   const before = card.state;
   const idem = key || uid();
   const word = kind === 'approve' ? 'Approve' : kind === 'bounce' ? 'Bounce' : 'Reject';
@@ -660,7 +663,7 @@ async function verdict(card, kind, notes, key, opts) {
   clearVerdictError(card.num);
   render();
   try {
-    await api.verdict(card.num, kind, notes, idem);
+    await api.verdict(card.num, kind, notes, idem, toBase64List(imgs));
     if (!quiet) {
       toast(kind === 'approve' ? `#${card.num} approved — merging now; it moves to Done when the branch lands.`
         : kind === 'bounce' ? `#${card.num} bounced back with your notes.`

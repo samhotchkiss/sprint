@@ -15,11 +15,12 @@
 // be mid-sentence with a screenshot attached) is never thrown away unless what
 // it is for actually changed.
 import { h, clear, reconcile, autolink } from './util.js';
-import { store, cardState, isSilent, draft, attachedImages } from './state.js';
+import { store, cardState, isSilent, draft, attachedImages, cardComposerKey } from './state.js';
 import { phaseOf, phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
 import { renderThread, renderChat } from './thread.js';
 import { initCompose } from './compose.js';
+import { paperclip } from './attach.js';
 import { syncPart, syncOptional } from './slots.js';
 import {
   unitInReview, unitSig, unitHead, unitOutline, unitBar, verdictBarSig, packetVerdictBar,
@@ -166,7 +167,7 @@ function composerKey(card) {
  * the agent asked a question (or the answer landed) underneath you.
  */
 function draftKey(card) {
-  return 'card:' + card.num;
+  return cardComposerKey(card.num);
 }
 
 function railOwner(unit) {
@@ -364,25 +365,6 @@ function composerBox({ id, key, placeholder, hint, send }) {
     onSubmit: ({ text, images }) => { draft(key, null); send(text || '', images); },
   });
   return foot;
-}
-
-/** Drawn, not typed: an emoji paperclip renders differently on every machine. */
-function paperclip() {
-  const ns = 'http://www.w3.org/2000/svg';
-  const svg = document.createElementNS(ns, 'svg');
-  svg.setAttribute('viewBox', '0 0 24 24');
-  svg.setAttribute('width', '17');
-  svg.setAttribute('height', '17');
-  svg.setAttribute('aria-hidden', 'true');
-  const path = document.createElementNS(ns, 'path');
-  path.setAttribute('d', 'M20 11.5 12.2 19.3a5 5 0 0 1-7.1-7.1l8-8a3.4 3.4 0 1 1 4.8 4.8l-8 8a1.8 1.8 0 0 1-2.5-2.5l7.2-7.2');
-  path.setAttribute('fill', 'none');
-  path.setAttribute('stroke', 'currentColor');
-  path.setAttribute('stroke-width', '1.6');
-  path.setAttribute('stroke-linecap', 'round');
-  path.setAttribute('stroke-linejoin', 'round');
-  svg.appendChild(path);
-  return svg;
 }
 
 // ---- lightbox ------------------------------------------------------------

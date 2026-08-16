@@ -95,13 +95,37 @@ def one_line(text, limit=110):
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+def attachment_paths(payload):
+    """The pictures on one event, as absolute paths the new agent can Read.
+
+    Card #66: a bounce, an answer or a chat line can carry a screenshot, and the
+    screenshot is often the whole point of the message ("here is what is wrong").
+    The board stores every one of them content-addressed and hands the path back
+    on the event itself, so a recovery brief can name the file rather than
+    telling the next agent that a picture exists somewhere.
+    """
+    out = []
+    for att in (payload.get("attachments") or payload.get("images") or []):
+        if not isinstance(att, dict):
+            continue
+        path = att.get("path") or att.get("source_path")
+        if path and path not in out:
+            out.append(path)
+    return out
+
+
 def event_line(ev):
     payload = ev.get("payload") or {}
     text = payload.get("text") or ""
     if not text and payload.get("phase"):
         text = "phase: %s" % payload["phase"]
-    return "  %-6s %-9s %s" % (ev.get("actor", "?"), ev.get("kind", "?"),
-                               one_line(text))
+    lines = ["  %-6s %-9s %s" % (ev.get("actor", "?"), ev.get("kind", "?"),
+                                 one_line(text))]
+    # Indented to land under the text of the line it belongs to. card_report
+    # prefixes the FIRST line with two more spaces, so these carry their own.
+    for path in attachment_paths(payload):
+        lines.append(" " * 21 + "image: %s" % path)
+    return "\n".join(lines)
 
 
 def worktree_report(worktree, branch, out):
@@ -180,6 +204,20 @@ def card_report(detail, lines):
         out.append("    (nothing on the timeline at all)")
     for ev in timeline[-lines:]:
         out.append("  " + event_line(ev))
+
+    # Every picture anyone attached to this card, in one place, as paths a new
+    # agent can open with Read. A bounce that says "look at this" is useless to
+    # the agent that cannot find "this".
+    shots = []
+    for att in (detail.get("attachments") or []):
+        if isinstance(att, dict):
+            path = att.get("path") or att.get("source_path")
+            if path and path not in shots:
+                shots.append(path)
+    if shots:
+        out.append("  screenshots on this card (open them with Read):")
+        for path in shots:
+            out.append("    %s" % path)
     return "\n".join(out)
 
 

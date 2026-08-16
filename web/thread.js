@@ -21,6 +21,7 @@ import { h, ageSuffix, richText, firstLine, reconcile, timeEl, autolink } from '
 import { attachmentUrl, attachmentCaption } from './api.js';
 import {
   SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, normArtifacts,
+  attachedImages, cardComposerKey, draft,
 } from './state.js';
 import { detailBlock } from './detail.js';
 import { splitAttachments, docsVer, reportRow } from './reports.js';
@@ -80,8 +81,19 @@ export function threadItems(detail, app) {
   items.forEach((ev, i) => {
     if (i === liveQuestion) return;
     const key = ev.kind === 'submitted' ? 'submitted' : eventKey(ev);
+    // An event's pictures render under it whatever KIND it is. A bounce is a
+    // status line rather than a bubble, and card #66 is the reason that stopped
+    // being a reason to drop its screenshot: the agent picking the card back up
+    // has to see what you were pointing at, in the timeline, under the notes.
+    const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
+    const pushOwnAttachments = () => {
+      if (!Array.isArray(atts) || !atts.length) return;
+      for (const a of atts) shown.add(attachmentUrl(a));
+      pushAttachments(out, key, atts, app, ev.actor === 'user');
+    };
     if (SYSTEM_KINDS.has(ev.kind) && ev.kind !== 'submitted' && ev.kind !== 'evidence') {
       out.push({ key, ver: 1, data: ev, make: () => statusChange(ev, app) });
+      pushOwnAttachments();
       return;
     }
     if (ev.kind === 'evidence') return;        // the packet itself renders below
@@ -91,11 +103,7 @@ export function threadItems(detail, app) {
       data: ev,
       make: () => message(ev, app),
     });
-    const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
-    if (Array.isArray(atts) && atts.length) {
-      for (const a of atts) shown.add(attachmentUrl(a));
-      pushAttachments(out, key, atts, app, ev.actor === 'user');
-    }
+    pushOwnAttachments();
     // A decision request that has already been answered keeps what it handed
     // over: the mockups you chose between are part of the history of the choice.
     if (ev.kind === 'question') {
@@ -370,7 +378,16 @@ function questionPanel(card, q, app) {
     for (const opt of q.options) {
       opts.appendChild(h('button.ask-opt', {
         type: 'button',
-        onclick: () => app.answer(card, q, opt.value),
+        // Card #66: picking an option is still an answer, so it takes the
+        // screenshot you pasted into the box under it along with it — the
+        // picture was part of the reply you were composing, not a stray.
+        onclick: () => {
+          const key = cardComposerKey(card.num);
+          const imgs = attachedImages(key);
+          attachedImages(key, []);
+          draft(key, null);
+          app.answer(card, q, opt.value, imgs);
+        },
       },
         h('span.ask-opt-label', opt.label),
         h('span.grow'),

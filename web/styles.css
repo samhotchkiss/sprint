@@ -1104,6 +1104,31 @@ body.rail-open .rail { display: flex; }
 .bounce-notes:focus { border-color: var(--accent); }
 .escalate { font-family: var(--font-mono); font-size: 11px; color: var(--accent); }
 
+/* A bounce takes pictures too (card #66). The thumbnails sit above the words,
+   exactly where the composer puts them, so "what I pasted" reads the same way
+   in every box on the board. */
+.bounce-zone { display: flex; flex-direction: column; gap: 8px; }
+.bounce-thumbs { margin-bottom: 0; }
+.bounce-zone.dropping .bounce-notes { border-color: var(--accent); }
+.verdicts.is-bouncing .icon-btn.attach {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  min-width: 40px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  background: var(--input);
+  color: var(--faint);
+  cursor: pointer;
+  flex: none;
+}
+.verdicts.is-bouncing .icon-btn.attach:hover { border-color: var(--accent); color: var(--ink); }
+html.skin-chaos .verdicts.is-bouncing .icon-btn.attach {
+  border: 2px solid var(--border);
+  border-radius: 0;
+}
+
 /* composer, pinned */
 .composer {
   padding: 16px 18px;

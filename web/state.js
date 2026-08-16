@@ -838,6 +838,17 @@ export function bounceComposing(num, value) {
  * you just pasted must survive that — it is part of the message you are still
  * writing.
  */
+/**
+ * The one key a card's composer files its half-written message under — words in
+ * `drafts`, screenshots in `attached`.
+ *
+ * It lives here rather than in the rail because it is not only the rail's any
+ * more: answering a decision request by CLICKING one of its options (card #66)
+ * has to pick up the screenshot you pasted into the box under it, and the thread
+ * that draws those buttons must be able to name the same drawer.
+ */
+export function cardComposerKey(num) { return 'card:' + num; }
+
 export function attachedImages(key, value) {
   if (value === undefined) return store.attached.get(key) || [];
   if (!value || !value.length) store.attached.delete(key);

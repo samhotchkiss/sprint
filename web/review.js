@@ -39,7 +39,8 @@
 // be there.
 import { h, timeEl, firstLine, plural, richText } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
-import { store, cardState, draft, bounceComposing } from './state.js';
+import { store, cardState, draft, bounceComposing, attachedImages } from './state.js';
+import { initAttach, paperclip } from './attach.js';
 import { shortAgent, openable } from './list.js';
 import { reviewUnits, unitOf, packetFor, memberPart, ownTitle } from './units.js';
 import { splitAttachments, reportRow } from './reports.js';
@@ -90,7 +91,7 @@ function readyMembers(nums) {
  * and leaves the failure on screen: nothing after it was sent, and the button
  * offers to pick up where it stopped.
  */
-async function runUnit(unit, kind, notes, app) {
+async function runUnit(unit, kind, notes, app, images) {
   const key = unit.key;
   const prev = running.get(key);
   if (prev && !prev.error) return false;          // already in flight
@@ -103,7 +104,7 @@ async function runUnit(unit, kind, notes, app) {
     st.at = card.num;
     app.render();
     // eslint-disable-next-line no-await-in-loop
-    const ok = await app.verdict(card, kind, notes, null, { quiet: true });
+    const ok = await app.verdict(card, kind, notes, null, { quiet: true, images });
     if (!ok) { st.error = card.num; app.render(); return false; }
     st.done += 1;
     app.render();
@@ -117,7 +118,11 @@ async function runUnit(unit, kind, notes, app) {
 }
 
 export function approveUnit(unit, app) { return runUnit(unit, 'approve', null, app); }
-export function bounceUnit(unit, notes, app) { return runUnit(unit, 'bounce', notes, app); }
+export function bounceUnit(unit, notes, app, images) {
+  // One set of screenshots, sent with every card in the unit. They are
+  // content-addressed, so N cards referencing the same picture is one file.
+  return runUnit(unit, 'bounce', notes, app, images);
+}
 
 /** What the progress line says while a unit is being decided, or after it broke. */
 function progressLine(prog) {
@@ -222,7 +227,7 @@ function unitHint(unit, waiting, prog) {
       ? 'Approved — the session is merging this branch now.'
       : 'Nothing here is waiting on you any more.';
   }
-  if (unit.cards.some((c) => bounceComposing(c.num))) return 'Bounce half-written — open it to finish';
+  if (unit.cards.some((c) => bounceStarted(c.num))) return 'Bounce half-written — open it to finish';
   return waiting.length > 1
     ? `Open it to read all ${waiting.length} changes and approve them together`
     : 'Open it to read the changes and approve them';
@@ -284,7 +289,7 @@ function statusRow(card, p, merging) {
   // Card #44's composing state survives, as a STATE rather than as a control:
   // the words are typed in the rail (#46), and the line only says that is where
   // you left them.
-  const composing = bounceComposing(card.num) || !!draft(`bounce:${card.num}`);
+  const composing = bounceStarted(card.num);
   row.appendChild(composing
     ? h('span.review-composing', 'Bounce half-written — open it to finish')
     : h('span.review-open-hint', 'Open it to approve, bounce or reject'));
@@ -336,8 +341,8 @@ export function unitSig(unit) {
   const prog = unitProgress(unit.key);
   return [unit.key, unit.size,
     unit.cards.map((c) => `${c.num}:${cardState(c)}:${c.bounce_count || 0}`).join(','),
-    unit.cards.map((c) => (bounceComposing(c.num) ? 'b' + c.num : '')).join(''),
-    bounceComposing(unitBounceNum(unit)) ? 'ball' : '',
+    unit.cards.map((c) => (bounceStarted(c.num) ? 'b' + c.num + bounceSig(c.num) : '')).join(''),
+    bounceStarted(unitBounceNum(unit)) ? 'ball' + bounceSig(unitBounceNum(unit)) : '',
     prog ? `${prog.kind}${prog.done}/${prog.total}${prog.error ? 'e' + prog.error : ''}` : '',
   ].join('|');
 }
@@ -478,32 +483,49 @@ function changeSection(unit, card, n, app) {
     label: `Send #${card.num} back`,
     placeholder: 'What has to change about this one? (goes straight to the agent)',
     submit: `Send #${card.num} back`,
-    run: (text) => app.verdict(card, 'bounce', text),
+    run: (text, images) => app.verdict(card, 'bounce', text, null, { images }),
     hint: 'Only this part goes back — the rest of the unit stays yours to approve.',
   }));
   return sec;
 }
 
 /**
- * A bounce composer. Pressing the button is already the decision (card #44), so
- * from that moment there are exactly two things on offer: send it, or back out.
- * The words are typed HERE, in the rail (card #46) — never into a box in a list
- * that the next board frame rebuilds.
+ * The draft of a bounce: the words AND the screenshots, under one key.
+ *
+ * Card #66, user verbatim: "i need to be able to paste images into ANY text
+ * entry area-- I just tried to bounce a card with a screenshot showing the
+ * issue, it wouldn't let me paste an image in." A bounce with a picture in it
+ * is the ordinary case — the screenshot IS the note — so the picture is part of
+ * the half-written bounce exactly as the typing is, survives a repaint the same
+ * way, and is thrown away by Cancel the same way.
  */
-function bounceRow(card, app, { label, placeholder, submit, run, hint, num }) {
-  const n = num == null ? card.num : num;
-  const key = `bounce:${n}`;
-  const wrap = h('div.unit-bounce');
-  const composing = bounceComposing(n) || !!draft(key);
+function bounceKey(n) { return `bounce:${n}`; }
 
-  if (!composing) {
-    wrap.appendChild(h('button.btn.tiny.bounce', {
-      type: 'button',
-      onclick: () => app.composeBounce(n),
-    }, label));
-    return wrap;
-  }
+/** Is there a half-written bounce for this number — words, pictures or both? */
+export function bounceStarted(n) {
+  const key = bounceKey(n);
+  return bounceComposing(n) || !!draft(key) || attachedImages(key).length > 0;
+}
 
+/** Part of a signature: what a repaint has to notice about a pending bounce. */
+function bounceSig(n) {
+  return (bounceStarted(n) ? 'b' : '') + (attachedImages(bounceKey(n)).length || '');
+}
+
+/**
+ * The notes box itself: a textarea that takes pasted and dropped screenshots,
+ * with the thumbnails above it and the paperclip beside the buttons. It is the
+ * same `attach.js` mount the rail composer and the Drop-work sheet use — one
+ * handler, so a bounce behaves like every other box you can type in.
+ */
+function notesBox(n, { placeholder, send, cancel }) {
+  const key = bounceKey(n);
+  const thumbs = h('div.thumbs.bounce-thumbs', { hidden: true });
+  const err = h('span.composer-err', { hidden: true });
+  const fileId = `bounce-${n}-file`;
+  const file = h('input', {
+    type: 'file', id: fileId, multiple: true, accept: 'image/*', hidden: true,
+  });
   const notes = h('textarea.bounce-notes', {
     id: 'bounce-' + n,
     rows: '2',
@@ -516,24 +538,71 @@ function bounceRow(card, app, { label, placeholder, submit, run, hint, num }) {
   });
   notes.value = draft(key);
 
+  const zone = h('div.bounce-zone', thumbs, notes, file, err);
+  const att = initAttach({
+    zone,
+    textarea: notes,
+    thumbsEl: thumbs,
+    errEl: err,
+    fileInput: file,
+    images: { get: () => attachedImages(key), set: (v) => attachedImages(key, v) },
+  });
+  return { zone, notes, att, fileId };
+}
+
+/** The paperclip that opens the file picker for a bounce box. */
+function attachBtn(fileId) {
+  return h('label.icon-btn.attach', {
+    for: fileId, title: 'attach an image',
+  }, paperclip(15));
+}
+
+/**
+ * A bounce composer. Pressing the button is already the decision (card #44), so
+ * from that moment there are exactly two things on offer: send it, or back out.
+ * The words are typed HERE, in the rail (card #46) — never into a box in a list
+ * that the next board frame rebuilds.
+ */
+function bounceRow(card, app, { label, placeholder, submit, run, hint, num }) {
+  const n = num == null ? card.num : num;
+  const key = bounceKey(n);
+  const wrap = h('div.unit-bounce');
+  const composing = bounceStarted(n);
+
+  if (!composing) {
+    wrap.appendChild(h('button.btn.tiny.bounce', {
+      type: 'button',
+      onclick: () => app.composeBounce(n),
+    }, label));
+    return wrap;
+  }
+
+  const box = notesBox(n, { placeholder, send: () => send(), cancel: () => cancel() });
+
   function send() {
-    const text = notes.value.trim();
-    if (!text) { notes.focus(); return; }
+    const text = box.notes.value.trim();
+    const images = box.att.get().slice();
+    // A screenshot on its own says plenty — this is the exact case card #66 was
+    // filed for, so an image with no words is a complete bounce.
+    if (!text && !images.length) { box.notes.focus(); return; }
     draft(key, null);
+    attachedImages(key, []);
     bounceComposing(n, false);
-    run(text);
+    run(text, images);
   }
 
   function cancel() {
     draft(key, null);
+    attachedImages(key, []);
     bounceComposing(n, false);
     app.render();
   }
 
-  wrap.appendChild(notes);
+  wrap.appendChild(box.zone);
   wrap.appendChild(h('div.verdicts.is-bouncing',
     h('button.btn.bounce', { type: 'button', onclick: () => send() }, submit),
-    h('button.btn.ghost', { type: 'button', onclick: () => cancel() }, 'Cancel')));
+    h('button.btn.ghost', { type: 'button', onclick: () => cancel() }, 'Cancel'),
+    attachBtn(box.fileId)));
   if (hint) wrap.appendChild(h('p.unit-bounce-hint', hint));
   return wrap;
 }
@@ -568,14 +637,14 @@ export function unitBar(unit, app) {
   }
 
   const n = unitBounceNum(unit);
-  const composingAll = bounceComposing(n) || !!draft(`bounce:${n}`);
+  const composingAll = bounceStarted(n);
   if (composingAll) {
     bar.appendChild(bounceRow(unit.lead, app, {
       num: n,
       label: '',
       placeholder: `What has to change? (goes to the agent for all ${waiting.length})`,
       submit: `Send all ${waiting.length} back`,
-      run: (text) => bounceUnit(unit, text, app),
+      run: (text, images) => bounceUnit(unit, text, app, images),
       hint: `Every one of the ${waiting.length} cards goes back with the same notes.`,
     }));
     const err = progressLine(prog);
@@ -626,12 +695,12 @@ export function verdictBarSig(card) {
   if (!card || cardState(card) !== 'ready') return null;
   const unit = unitInReview(card.num);
   return [card.num, card.bounce_count,
-    bounceComposing(card.num) || draft(`bounce:${card.num}`) ? 'b' : '',
+    bounceSig(card.num),
     unit && unit.size > 1 ? unit.size : 0].join('|');
 }
 
 export function packetVerdictBar(card, app) {
-  const key = `bounce:${card.num}`;
+  const key = bounceKey(card.num);
   const bar = h('div.review-bar.is-verdict');
   const unit = unitInReview(card.num);
   const many = !!unit && unit.size > 1;
@@ -651,41 +720,44 @@ export function packetVerdictBar(card, app) {
   // offers exactly two things — send it, or back out. Approve and Reject are not
   // dimmed, they are GONE, because the failure being prevented is hitting
   // Approve with a half-written bounce in the box under it.
-  const composing = bounceComposing(card.num) || !!draft(key);
+  const composing = bounceStarted(card.num);
 
-  const notes = h('textarea.bounce-notes', {
-    id: 'bounce-' + card.num,
-    rows: '2',
-    placeholder: 'What has to change? (goes straight to the agent)',
-    oninput: (e) => draft(key, e.target.value),
-    onkeydown: (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-      if (e.key === 'Escape') { e.preventDefault(); cancel(); }
-    },
-  });
-  notes.value = draft(key);
+  // Built only when it is on screen — a box nobody can see should not be
+  // listening for pastes on behalf of a bar that is showing three buttons.
+  const box = composing
+    ? notesBox(card.num, {
+      placeholder: 'What has to change? (paste a screenshot if it is easier)',
+      send: () => send(),
+      cancel: () => cancel(),
+    })
+    : null;
 
   function send() {
-    const text = notes.value.trim();
-    if (!text) { notes.focus(); return; }
+    const text = box.notes.value.trim();
+    const images = box.att.get().slice();
+    // Card #66: a screenshot with no words is a complete bounce.
+    if (!text && !images.length) { box.notes.focus(); return; }
     draft(key, null);
+    attachedImages(key, []);
     bounceComposing(card.num, false);
-    app.verdict(card, 'bounce', text);
+    app.verdict(card, 'bounce', text, null, { images });
   }
 
   function cancel() {
     // Cancel puts the buttons back. It drops only what you typed HERE — every
-    // other composer on the page keeps its draft.
+    // other composer on the page keeps its draft, and its screenshots.
     draft(key, null);
+    attachedImages(key, []);
     bounceComposing(card.num, false);
     app.render();
   }
 
   if (composing) {
-    bar.appendChild(h('div.review-notes', notes));
+    bar.appendChild(h('div.review-notes', box.zone));
     bar.appendChild(h('div.verdicts.is-bouncing',
       h('button.btn.bounce', { type: 'button', onclick: () => send() }, 'Submit bounce'),
-      h('button.btn.ghost', { type: 'button', onclick: () => cancel() }, 'Cancel')));
+      h('button.btn.ghost', { type: 'button', onclick: () => cancel() }, 'Cancel'),
+      attachBtn(box.fileId)));
     // No focus grab here. Card #46: focus is asked for ONCE, when you press
     // Bounce (app.composeBounce), and restored by id on every re-render after.
     return bar;

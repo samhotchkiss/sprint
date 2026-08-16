@@ -156,15 +156,26 @@ export const api = {
   // text, images, or both — exactly like dropping work on the board
   chat: (num, text, images, key) => req('POST', `/api/cards/${num}/chat`,
     images && images.length ? { text, images } : { text }, { idempotencyKey: key }),
-  answer: (num, question_id, text, key) =>
-    req('POST', `/api/cards/${num}/answer`, { question_id, text }, { idempotencyKey: key }),
+  // An answer takes screenshots exactly like a chat line does (card #66): the
+  // picture rides the answer event itself, so the agent that reads the answer
+  // sees what you were pointing at without hunting the thread for it.
+  answer: (num, question_id, text, images, key) =>
+    req('POST', `/api/cards/${num}/answer`,
+      images && images.length ? { question_id, text, images } : { question_id, text },
+      { idempotencyKey: key }),
   action: (num, action, extra, key) =>
     req('POST', `/api/cards/${num}/action`, { action, ...(extra || {}) }, { idempotencyKey: key }),
   retry: (num, key) =>
     req('POST', `/api/cards/${num}/action`, { action: 'retry' }, { idempotencyKey: key }),
-  verdict: (num, verdict, notes, key) =>
-    req('POST', `/api/cards/${num}/verdict`, notes ? { verdict, notes } : { verdict },
-      { idempotencyKey: key }),
+  // A bounce carries the screenshot that shows what is wrong (card #66) — it
+  // lands on the verdict event, so the agent picking the card back up sees it
+  // in the timeline next to the notes.
+  verdict: (num, verdict, notes, key, images) =>
+    req('POST', `/api/cards/${num}/verdict`, {
+      verdict,
+      ...(notes ? { notes } : {}),
+      ...(images && images.length ? { images } : {}),
+    }, { idempotencyKey: key }),
 
   sidebar: (text, images, key) => req('POST', '/api/sidebar',
     images && images.length ? { text, images, actor: 'user' } : { text, actor: 'user' },

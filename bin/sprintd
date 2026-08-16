@@ -849,6 +849,23 @@ def first_line_title(text: str, limit: int = 90) -> str:
     return line
 
 
+def posted_images(body):
+    """The pictures on a POST, under either name.
+
+    `images` is what every surface has always sent and what SPEC.md documents.
+    `attachments` is accepted beside it because that is what the payload the
+    pictures END UP in is called, and a caller who reads a card back and posts
+    the same word should not get a silent drop. Same list, same validation, same
+    store either way.
+    """
+    if not isinstance(body, dict):
+        return None
+    imgs = body.get("images")
+    if imgs is None:
+        imgs = body.get("attachments")
+    return imgs
+
+
 def image_line(n: int) -> str:
     """The skim line for a message that is only pictures. Every event needs
     words -- the card face and the timeline show `text` and nothing else."""
@@ -4340,11 +4357,21 @@ class App:
     # -- verdicts ---------------------------------------------------------
 
     def verdict(self, num: int, verdict: str, notes: str = "", scope: str = "card",
-                actor: str = "user") -> dict:
+                actor: str = "user", images=None) -> dict:
+        """A decision on one card (or a batch), optionally with screenshots.
+
+        Card #66, user verbatim: "i need to be able to paste images into ANY
+        text entry area-- I just tried to bounce a card with a screenshot
+        showing the issue, it wouldn't let me paste an image in." The pictures
+        ride the verdict EVENT, through the same content-addressed store every
+        other surface uses, so the agent picking the card back up finds them on
+        its own timeline next to the notes -- with an absolute path, no second
+        fetch.
+        """
         if verdict not in ("approve", "bounce", "reject"):
             raise ApiError(400, "bad_verdict",
                            "verdict must be approve, bounce or reject")
-        row = self.card_row(num)
+        row = self.card_row(num)      # 404 before we write anything to disk
         targets = [num]
         if scope == "batch":
             members = self.batch_members(row["batch_id"])
@@ -4377,6 +4404,11 @@ class App:
                                from_state=crow["state"], to_state=to_state, card=cn)
             plan.append((cn, crow["state"], to_state, escalate, bounce))
 
+        # Stored once, after every target is known to be legal and before a
+        # single event is written: a verdict that 409s must not leave blobs
+        # behind, and a whole unit sent back with the same picture is one file.
+        attachments = self.store_images(images)
+
         results = []
         for cn, from_state, to_state, escalate, bounce in plan:
             with self.lock:
@@ -4387,6 +4419,15 @@ class App:
                     payload = {"verdict": verdict, "notes": notes or "",
                                "scope": scope, "bounce_count": bounce,
                                "text": ("%s — %s" % (label, notes)) if notes else label}
+                    if attachments:
+                        payload["attachments"] = attachments
+                        if not notes:
+                            # Every event needs words: a bounce whose whole
+                            # point is the picture still reads on the card face.
+                            payload["text"] = "%s — with %s" % (
+                                label,
+                                "a screenshot" if len(attachments) == 1
+                                else "%d screenshots" % len(attachments))
                     if escalate:
                         payload["escalate"] = True
                         payload["text"] = (
@@ -4573,11 +4614,22 @@ class App:
         return {"ok": True, "question": self.question_json(qrow),
                 "card": self.card_json(self.card_row(num), brief=True)}
 
-    def answer(self, num: int, question_id: int, text: str, actor: str = "user") -> dict:
+    def answer(self, num: int, question_id: int, text: str, actor: str = "user",
+               images=None) -> dict:
+        """Answer an open question -- in words, and optionally in pictures.
+
+        Card #66: the answer box is a text entry area like any other, so a
+        screenshot pasted into it rides the ANSWER event rather than a separate
+        chat line before it. One event, so the agent reading the answer has the
+        picture attached to the words it belongs to.
+        """
         text = (text or "").strip()
-        if not text:
+        self.card_row(num)              # 404 before we write anything to disk
+        attachments = self.store_images(images)
+        if not text and not attachments:
             raise ApiError(400, "missing_field", "answer text is required", field="text")
-        self.card_row(num)
+        if not text:
+            text = image_line(len(attachments))
         with self.lock:
             qrow = self.conn.execute(
                 "SELECT * FROM questions WHERE id=?", (question_id,)).fetchone()
@@ -4599,8 +4651,10 @@ class App:
                     raise ApiError(409, "already_answered",
                                    "question %s was already answered" % question_id,
                                    question_id=question_id)
-                self._append_event(num, actor, "answer",
-                                   {"question_id": question_id, "text": text})
+                apayload = {"question_id": question_id, "text": text}
+                if attachments:
+                    apayload["attachments"] = attachments
+                self._append_event(num, actor, "answer", apayload)
                 self.conn.execute("COMMIT")
             except ApiError:
                 raise
@@ -6032,7 +6086,7 @@ def make_handler(app: App):
                 return self.settings_write(body)
 
             if path == "/api/cards":
-                card = app.create_card(body.get("text"), body.get("images") or [],
+                card = app.create_card(body.get("text"), posted_images(body) or [],
                                        bool(body.get("hold")),
                                        actor=self.actor_or(body, "user"),
                                        reports=body.get("reports"))
@@ -6059,7 +6113,7 @@ def make_handler(app: App):
                 return 201, app.sidebar_post(body.get("text"),
                                              side if side == "session" else "user",
                                              detail=body.get("detail"),
-                                             images=body.get("images"),
+                                             images=posted_images(body),
                                              reports=body.get("reports"))
 
             if path == "/api/batches":
@@ -6102,7 +6156,7 @@ def make_handler(app: App):
 
             if verb == "chat":
                 return 201, app.card_chat(num, body.get("text"),
-                                          images=body.get("images"),
+                                          images=posted_images(body),
                                           detail=body.get("detail"),
                                           reports=body.get("reports"),
                                           actor=self.actor_or(body, "user"))
@@ -6121,7 +6175,8 @@ def make_handler(app: App):
                     raise ApiError(400, "missing_field",
                                    "question_id must be an integer", field="question_id")
                 return 200, app.answer(num, qid, body.get("text"),
-                                       actor=self.actor_or(body, "user"))
+                                       actor=self.actor_or(body, "user"),
+                                       images=posted_images(body))
             if verb == "action":
                 return 200, app.action(num, body.get("action"), body,
                                        actor=self.actor_or(body, "user"),
@@ -6129,7 +6184,8 @@ def make_handler(app: App):
             if verb == "verdict":
                 return 200, app.verdict(num, body.get("verdict"), body.get("notes") or "",
                                         body.get("scope") or "card",
-                                        actor=self.actor_or(body, "user"))
+                                        actor=self.actor_or(body, "user"),
+                                        images=posted_images(body))
             if verb == "events":
                 kind = body.get("kind")
                 payload = body.get("payload")
