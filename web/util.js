@@ -74,7 +74,10 @@ export function reconcile(root, items) {
       stamp(node, item.key, ver);
       existing.set(item.key, node);
     } else if (typeof node._sync === 'function') {
-      node._sync();                    // in place: no replacement, no repaint
+      // In place: no replacement, no repaint. `data` lets a reused node pick up
+      // a fresher version of the same thing — the optimistic copy of a message
+      // being replaced by the server's, say — without rebuilding anything.
+      node._sync(item.data);
     }
     const at = root.children[i];
     if (at !== node) root.insertBefore(node, at || null);
