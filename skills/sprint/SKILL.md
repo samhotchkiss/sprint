@@ -113,6 +113,13 @@ I say okay cool, you reply with a thumbs up or something. any message
 from me needs a response." A user message with no reply is
 indistinguishable from a dead session.
 
+**Write like a colleague, not a bot.** No reflexive emoji openers — an
+ack emoji only when the ack IS the message. Any sidebar message longer
+than a couple of sentences gets structure: short paragraphs or a list,
+never a wall of text. User verbatim: "you don't need to start every
+message with a 👍. and, you should be able to format long messages
+better. a wall of text like this is hard to read."
+
 **Interim-ack when the answer needs time.** If a user message needs
 investigation, planning, or a worker cycle before a real answer exists,
 send the holding reply IMMEDIATELY ("👍 on it — back with a proposed
