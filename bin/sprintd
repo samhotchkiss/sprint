@@ -67,6 +67,7 @@ WAITER_CURSOR = "waiter"       # row in `cursors` holding the last waiter sighti
 DEFAULT_MAX_UPLOAD = 25 * 1024 * 1024          # 25 MB, per spec
 DEFAULT_SILENCE_SECONDS = 300.0                 # 5 minutes, per spec
 DEFAULT_SILENCE_TICK = 5.0
+DEFAULT_SWEEP_TICK = 15.0                       # how often the staleness sweep looks
 DEFAULT_SESSION_OFFLINE_SECONDS = 90.0          # per spec: cursor lag that counts as "behind"
 DEFAULT_WAITER_ONLINE_SECONDS = 10.0            # waiter seen this recently == attached
 DEFAULT_WAITER_GONE_SECONDS = 30.0             # waiter unseen this long == really gone
@@ -84,8 +85,48 @@ TAIL_UNREACHABLE_SECONDS = 60.0  # down this long: say so ONCE, then keep trying
 ACTORS = ("user", "session", "worker", "server")
 EVENT_KINDS = (
     "submitted", "state", "chat", "question", "answer", "progress",
-    "evidence", "verdict", "agent_silent", "note", "error",
+    "evidence", "verdict", "agent_silent", "stuck", "note", "error",
 )
+
+# --------------------------------------------------------------------------
+# Staleness sweep
+#
+# `agent_silent` watches a working AGENT. This watches a PARKED CARD: a state
+# somebody owes an action on and nothing is going to move it until they do.
+# Three approved cards once sat at "merging" for two hours because the session
+# missed their approve events -- nothing was silent, nothing was broken, the
+# work was simply owed and forgotten. So the server keeps its own clock on the
+# five states with an owner, and says so out loud on the same stream everything
+# else rides.
+#
+# Each row: state, who owes it, the env var that tunes it, and the default.
+# `queued` only counts when nobody has been assigned -- a queued card with an
+# agent is mid-pickup, not abandoned.
+STUCK_RULES = (
+    ("integrating", "SPRINT_SWEEP_INTEGRATING_SECONDS", 600.0),      # 10 min
+    ("queued",      "SPRINT_SWEEP_QUEUED_SECONDS",      900.0),      # 15 min
+    ("blocked",     "SPRINT_SWEEP_BLOCKED_SECONDS",     1800.0),     # 30 min
+    ("needs_you",   "SPRINT_SWEEP_NEEDS_YOU_SECONDS",   1800.0),     # 30 min
+    ("ready",       "SPRINT_SWEEP_READY_SECONDS",       86400.0),    # 24 h
+)
+STUCK_STATES = tuple(r[0] for r in STUCK_RULES)
+
+# A reminder is not a klaxon. After the opening notice the sweep backs off hard
+# and then shuts up entirely: an episode is at most one notice plus these three
+# repeats. Re-arms only when the card actually changes state -- which is the
+# only thing that proves somebody dealt with it.
+DEFAULT_SWEEP_BACKOFF = (600.0, 1800.0, 5400.0)   # 10m -> 30m -> 90m -> silence
+DEFAULT_SWEEP_MAX_REMINDERS = 3
+
+# What each state's one-liner says. Plain English, no jargon, names the owed
+# action -- the session reads these straight off the tail.
+STUCK_TEXT = {
+    "integrating": "approved %s ago, still merging — the session owes it a /integrated",
+    "queued": "queued %s with nobody on it — dispatch it or say why not",
+    "blocked": "blocked %s with no word — worth re-checking the wall",
+    "needs_you": "waiting on you for %s — the question is still unanswered",
+    "ready": "ready for review %s — it is waiting on a verdict",
+}
 
 STATES = (
     "held", "queued", "triaging", "in_progress", "needs_you", "blocked",
@@ -324,6 +365,22 @@ def env_int(name: str, default: int) -> int:
     return int(env_float(name, float(default)))
 
 
+def human_span(seconds: float) -> str:
+    """"12m" / "1h 5m" / "2d". The same compact shape the board's card faces
+    use, so a sweep line reads exactly like the age text sitting next to it."""
+    s = max(0, int(round(float(seconds))))
+    if s < 60:
+        return "%ds" % s
+    m = s // 60
+    if m < 60:
+        return "%dm" % m
+    h, rem = m // 60, m % 60
+    if h < 24:
+        return ("%dh %dm" % (h, rem)) if rem else "%dh" % h
+    d, hrem = h // 24, h % 24
+    return ("%dd %dh" % (d, hrem)) if hrem else "%dd" % d
+
+
 def jdump(obj) -> str:
     return json.dumps(obj, separators=(",", ":"), sort_keys=False, default=str)
 
@@ -476,6 +533,8 @@ class App:
                  waiter_gone_seconds: float = None,
                  waiter_persist_seconds: float = None,
                  sse_heartbeat: float = None, max_upload: int = None,
+                 sweep_tick: float = None, sweep_thresholds: dict = None,
+                 sweep_backoff=None, sweep_max_reminders: int = None,
                  log=None):
         self.project_root = os.path.realpath(project_root)
         self.data_dir = os.path.realpath(data_dir or os.path.join(self.project_root, DATA_DIRNAME))
@@ -516,6 +575,24 @@ class App:
             max_upload if max_upload is not None
             else env_int("SPRINT_MAX_UPLOAD", DEFAULT_MAX_UPLOAD))
 
+        # Staleness sweep. Every threshold is env-tunable by design: the only
+        # honest way to test a ten-minute rule is to make it ten seconds.
+        self.sweep_tick = (
+            sweep_tick if sweep_tick is not None
+            else env_float("SPRINT_SWEEP_TICK", DEFAULT_SWEEP_TICK))
+        overrides = dict(sweep_thresholds or {})
+        self.sweep_thresholds = {}
+        for state, envname, default in STUCK_RULES:
+            self.sweep_thresholds[state] = (
+                float(overrides[state]) if state in overrides
+                else env_float(envname, default))
+        self.sweep_backoff = tuple(
+            float(x) for x in (sweep_backoff if sweep_backoff is not None
+                               else DEFAULT_SWEEP_BACKOFF))
+        self.sweep_max_reminders = (
+            int(sweep_max_reminders) if sweep_max_reminders is not None
+            else env_int("SPRINT_SWEEP_MAX_REMINDERS", DEFAULT_SWEEP_MAX_REMINDERS))
+
         self._log = log
         self.lock = threading.RLock()
         self.cond = threading.Condition()
@@ -526,6 +603,7 @@ class App:
         with self.lock:
             self.conn.executescript(SCHEMA)
         self._silence_thread = None
+        self._sweep_thread = None
         # Waiter proof-of-life. In memory for the hot path (every poll), flushed
         # to the `cursors` table at most every waiter_persist_seconds so a server
         # restart doesn't forget that the session was attached a moment ago.
@@ -552,6 +630,8 @@ class App:
             self.cond.notify_all()
         if self._silence_thread is not None:
             self._silence_thread.join(timeout=5)
+        if self._sweep_thread is not None:
+            self._sweep_thread.join(timeout=5)
         with self.lock:
             try:
                 self.conn.close()
@@ -563,6 +643,11 @@ class App:
             t = threading.Thread(target=self._silence_loop, name="silence",
                                  daemon=True)
             self._silence_thread = t
+            t.start()
+        if self._sweep_thread is None:
+            t = threading.Thread(target=self._sweep_loop, name="sweep",
+                                 daemon=True)
+            self._sweep_thread = t
             t.start()
 
     def q(self, sql, params=()):
@@ -756,6 +841,7 @@ class App:
         out["last_event"] = self.event_json(last) if last else None
         out["last_activity_at"] = last["ts"] if last else row["updated_at"]
         out["silent"] = self.card_is_silent(num, row)
+        out["stuck"] = self.card_is_stuck(num, row)
         oq = self.q1(
             "SELECT * FROM questions WHERE card_num=? AND answered_at IS NULL "
             "ORDER BY id DESC LIMIT 1", (num,))
@@ -1134,6 +1220,128 @@ class App:
                         "last_activity_at": ts2,
                         "text": "no worker activity on #%s for %.0fs" % (num, now() - ts2),
                     })
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+            fired += 1
+        if fired:
+            self.notify()
+        return fired
+
+    # -- staleness sweep --------------------------------------------------
+    #
+    # The silence timer above watches an agent that stopped talking. This
+    # watches a card that stopped MOVING while somebody owed it an action --
+    # a different failure with a different owner, so it gets its own clock,
+    # its own event kind, and its own thread.
+
+    def _last_state_seq(self, num: int) -> int:
+        """The seq of the card's last transition. An episode of stuckness runs
+        from there: moving the card is the one act that proves somebody dealt
+        with it, so it is also the one thing that re-arms the reminders."""
+        row = self.q1("SELECT seq FROM events WHERE card_num=? AND kind='state' "
+                      "ORDER BY seq DESC LIMIT 1", (num,))
+        return int(row["seq"]) if row is not None else 0
+
+    def _stuck_events_since(self, num: int, seq: int) -> list:
+        return self.q("SELECT seq, ts FROM events WHERE card_num=? AND kind='stuck' "
+                      "AND seq>? ORDER BY seq", (num, seq))
+
+    def stuck_baseline(self, num: int, row) -> float:
+        """When this card's current parking started ticking.
+
+        For four of the five states that is simply when it entered the state:
+        a `ready` card does not become less unreviewed because its agent chats
+        on it. `blocked` is the exception -- its threshold is a RE-CHECK
+        interval, and a note on a blocked card is somebody re-checking, so any
+        real activity restarts that clock. The sweep's own events never do:
+        a reminder that reset the timer it is reminding about would only ever
+        fire once.
+        """
+        st = self.q1("SELECT ts FROM events WHERE card_num=? AND kind='state' "
+                     "ORDER BY seq DESC LIMIT 1", (num,))
+        since = float(st["ts"]) if st is not None else float(row["updated_at"])
+        if row["state"] == "blocked":
+            hit = self.q1(
+                "SELECT ts FROM events WHERE card_num=? "
+                "AND kind NOT IN ('stuck','agent_silent') "
+                "ORDER BY seq DESC LIMIT 1", (num,))
+            if hit is not None and float(hit["ts"]) > since:
+                since = float(hit["ts"])
+        return since
+
+    def stuck_due(self, row):
+        """The payload this card owes a `stuck` event right now, or None.
+
+        Pure read: `sweep_stuck` calls it once loose and once again under the
+        lock, because a card can move between the two.
+        """
+        num, state = row["num"], row["state"]
+        threshold = self.sweep_thresholds.get(state)
+        if threshold is None:
+            return None
+        # A queued card with an agent on it is mid-pickup, not abandoned.
+        if state == "queued" and row["agent_name"]:
+            return None
+        since = self.stuck_baseline(num, row)
+        elapsed = now() - since
+        if elapsed < threshold:
+            return None
+        priors = self._stuck_events_since(num, self._last_state_seq(num))
+        # One opening notice plus at most `sweep_max_reminders` repeats, then
+        # this episode goes quiet for good. Nagging a card the user has decided
+        # to leave alone is how a signal turns back into noise.
+        if len(priors) > self.sweep_max_reminders:
+            return None
+        if priors:
+            gap = self.sweep_backoff[min(len(priors) - 1, len(self.sweep_backoff) - 1)]
+            if (now() - float(priors[-1]["ts"])) < gap:
+                return None
+        return {
+            "card_num": num,
+            "state": state,
+            "stuck_for_seconds": round(elapsed, 1),
+            "threshold_seconds": threshold,
+            "reminder": len(priors),      # 0 = the opening notice
+            "since": since,
+            "text": STUCK_TEXT[state] % human_span(elapsed),
+        }
+
+    def card_is_stuck(self, num: int, row=None) -> bool:
+        """Has the sweep flagged this card and it still hasn't moved? The board
+        reads this to amber the card's age text."""
+        row = row if row is not None else self.q1("SELECT * FROM cards WHERE num=?", (num,))
+        if row is None or row["state"] not in STUCK_STATES:
+            return False
+        return bool(self._stuck_events_since(num, self._last_state_seq(num)))
+
+    def _sweep_loop(self):
+        while not self.stopping.wait(self.sweep_tick):
+            try:
+                self.sweep_stuck()
+            except Exception:  # never let the timer thread die
+                self.log("staleness sweep failed: %s" % traceback.format_exc())
+
+    def sweep_stuck(self) -> int:
+        placeholders = ",".join("?" * len(STUCK_STATES))
+        rows = self.q("SELECT * FROM cards WHERE state IN (%s)" % placeholders,
+                      STUCK_STATES)
+        fired = 0
+        for row in rows:
+            num = row["num"]
+            if self.stuck_due(row) is None:
+                continue
+            with self.lock:
+                fresh = self.q1("SELECT * FROM cards WHERE num=?", (num,))
+                if fresh is None:
+                    continue
+                payload = self.stuck_due(fresh)   # re-check: it may have moved
+                if payload is None:
+                    continue
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._append_event(num, "server", "stuck", payload)
                     self.conn.execute("COMMIT")
                 except Exception:
                     self.conn.execute("ROLLBACK")
