@@ -197,7 +197,7 @@ Each line it prints is one event, pre-summarised:
   exactly as long as your tail is attached, the same way the waiter's
   polling used to.
 - `--user-only` narrows it to `actor: "user"` events. That is the subset
-  you must answer *promptly*, but it also means `agent_silent`,
+  you must answer *promptly*, but it also means `agent_silent`, `stuck`,
   `evidence` and worker `error` events stop waking you — so use it only
   while you are genuinely parked on a human (hold mode, or every card is
   in `ready` waiting on a verdict), and go back to the unfiltered tail
@@ -263,7 +263,32 @@ and the table is prose.
 | worker | `question` | Server already flipped to `needs_you`. Nothing to do — the card face shows the question; you'll see the `answer` event when the user responds. |
 | worker | `evidence` (ready) | Card (or whole batch) just entered `ready`. Nothing required from you — it's now waiting on the user's verdict. Optional: a short sidebar note if the user seems to be waiting on it. |
 | server | `agent_silent` | See step 5 — go investigate. |
+| server | `stuck` | The board's staleness sweep: a card parked in a state somebody owes an action on. `payload.state` names which, and that is what you act on — see the row below. Nothing is broken; something is owed, and it's usually owed by you. |
 | server | `state` (blocked) | Note the reason; you'll re-check blocked cards periodically (not driven by an event — see "Blocked sweep" below). |
+
+### `stuck` — what to do per state
+
+`payload` is `{state, stuck_for_seconds, threshold_seconds, text}`. Act
+on `state`, not on the wording:
+
+| `payload.state` | your reaction |
+|---|---|
+| `integrating` (>10 min) | **You owe this one a finish.** The user approved it and the git work either never started or never got reported. Rebase/gate/merge it now and `POST /api/cards/:num/integrated {"ok": true}` — or, if it failed, `{"ok": false, "reason": "<what broke>"}` so it goes back to the agent. Never leave it at "merging". |
+| `queued` (>15 min, no agent) | Dispatch it (step 3) if you have capacity. If you don't, say so where the user can see it: a sidebar line naming the card and what it's waiting behind. "Queued" with no explanation past a quarter hour is the same as lost. |
+| `blocked` (>30 min) | Re-check the wall (the Blocked sweep below, but now with a specific card named). Still blocked → post a `note` saying you re-checked and what's still true. Not blocked anymore → move it back to `queued`/`in_progress` and dispatch. |
+| `needs_you` (>30 min) | Re-surface the question to the user: a sidebar line with the card number and the question in one sentence. The UI chimed once when the card flipped; this is your cue to ask again in words. Do NOT answer it yourself. |
+| `ready` (>24 h) | A gentle reminder, at most **once a day**: mention it in the sidebar alongside anything else waiting on a verdict. One line, no repetition — the sweep's own backoff assumes you aren't adding noise of your own. |
+
+The sweep repeats on a backoff (10m → 30m → 90m) and then goes quiet
+after three reminders, re-arming only when the card actually changes
+state. So a second `stuck` on the same card means your first reaction
+didn't move it — do something different, or tell the user why not.
+
+`stuck` events are `actor: "server"`, which means **your default tail
+prints them and `--user-only` does not** (same as `agent_silent`). That
+is by design: `--user-only` is "a human is waiting", and the whole point
+of the sweep is that no human is. One more reason to run the unfiltered
+tail whenever anything is in motion.
 
 ### Blocked sweep
 

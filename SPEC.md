@@ -66,7 +66,7 @@ recovery must be easy. The user always runs claude inside tmux.
 - `events(seq INTEGER PRIMARY KEY AUTOINCREMENT, card_num NULL, ts, actor, kind, payload JSON)` —
   the single append-only truth. `card_num NULL` = sprint-level (sidebar chat, session status).
   `actor ∈ {user, session, worker, server}`. `kind ∈ {submitted, state, chat, question, answer,
-  progress, evidence, verdict, agent_silent, note, error}`. Card state and timelines are projections
+  progress, evidence, verdict, agent_silent, stuck, note, error}`. Card state and timelines are projections
   of this log. seq is the global cursor for ingress.
   **Every `actor: "user"` event carries `payload.reply_to`** — `"sidebar"` (sprint-level) or
   `"card:<num>"` — stamped by the server at write time, in the one place any event is written, so it
@@ -199,6 +199,35 @@ master session should get nudged and it should check on the subagent."
   found to the card as a `note`, and acts: annotate long-running work (set `long_running`), restart a
   wedged agent, or flip to needs_you/failed.
 - Cards show last activity + elapsed; UI ambers a silent card. No spinners anywhere.
+
+## Staleness sweep (auto — the board notices what nobody did)
+
+User verbatim: **"We need some sort of auto sweep on the board to keep these from going stale."**
+Three approved cards sat at "merging" for two hours because the session missed their approve
+events. Nothing was silent and nothing was broken — the work was simply *owed and forgotten*, which
+`agent_silent` (a clock on a working AGENT) cannot see.
+
+- Second server timer beside the silence one: any card parked in a state someone owes an action on
+  appends a `stuck` event (`card_num` set, `actor: "server"`) —
+  `integrating` >10 min (the session owes `/integrated` — today's failure), `queued` with no agent
+  >15 min, `blocked` >30 min since its last real activity (a re-check interval, so a note on a
+  blocked card restarts it), `needs_you` unanswered >30 min (the UI chimed once at the flip; this
+  lets the session re-notify in words), `ready` >24 h (gentle review reminder).
+- Payload: `{state, stuck_for_seconds, threshold_seconds, text}` — `text` is a plain-English
+  one-liner ("approved 12m ago, still merging — the session owes it a /integrated").
+- Repeats back off: one opening notice, then reminders at 10m → 30m → 90m, then silence. Three
+  reminders per episode, and an episode **re-arms only when the card changes state** — the one act
+  that proves somebody dealt with it. Thresholds, tick, backoff and cap are env-tunable
+  (`SPRINT_SWEEP_INTEGRATING_SECONDS`, `SPRINT_SWEEP_QUEUED_SECONDS`, `SPRINT_SWEEP_BLOCKED_SECONDS`,
+  `SPRINT_SWEEP_NEEDS_YOU_SECONDS`, `SPRINT_SWEEP_READY_SECONDS`, `SPRINT_SWEEP_TICK`,
+  `SPRINT_SWEEP_MAX_REMINDERS`), which is the only honest way to test a ten-minute rule.
+- `stuck` rides the normal stream, so the session's default `sprintd tail` wakes on it with no
+  special casing. `--user-only` does NOT show it — that filter means "a human is waiting", and the
+  point of the sweep is that no human is. SKILL.md's event-reaction table carries a per-state row.
+- UI: no new chrome. The event renders as a quiet amber system line in the card timeline
+  ("stuck: approved 12m ago, still merging") and the card's age text — the one thing on a face
+  already about time passing — goes amber (`/api/board` carries `stuck` per card, cleared the moment
+  the card moves).
 - Session liveness — three states, each grounded in something the session actually did:
   `online` (nothing pending, or the orchestrator cursor moved within 90s), `busy` (the cursor is
   behind pending events past 90s **but** the session's waiter has polled within 30s — "session is on
