@@ -391,8 +391,9 @@ the fix without having to read the code. so, either before/after screenshots or 
 url for the branch."** Every ready card must be validatable with zero code reading.
 
 Packet: `{claim (one sentence), diffstat, branch, test_cmd, test_result ("N pass, 0 fail" — counts,
-never "tests pass"), validate (REQUIRED: 1-3 plain-English steps a human follows to confirm the fix
-without reading code), ui_change (REQUIRED bool), screenshots?: [attachment refs], live_url?,
+never "tests pass"), validate (REQUIRED: 1-3 plain-English steps, ~8th-grade reading level — see
+"Voice & microcopy" in docs/board-functional-spec.md — a human follows to confirm the fix without
+reading code), ui_change (REQUIRED bool), screenshots?: [attachment refs], live_url?,
 work_kind?: code|ops, readback? (ops), per_card?: [{card_num, claim, screenshots?}] }`.
 
 **Ops cards — the same bar, a different shape of proof.** Non-code work (reprocess a mailbox, rotate

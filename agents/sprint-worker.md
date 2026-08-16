@@ -115,6 +115,31 @@ the `SPRINT_SERVER`/`SPRINT_TOKEN` environment variables your brief set.
     you should have written shorter.
   - A card's face and the "last activity" line only ever show the one-liner,
     so if the one-liner doesn't stand alone, nobody reads it.
+  - **Plain language is a requirement, not a preference — for everything a
+    human reads:** the one-liner, the `--detail`, phase labels, card
+    titles, chat replies, evidence packet claims and validate steps,
+    question text. Aim for roughly an 8th-grade reading level: short
+    sentences, everyday words, no jargon unless the jargon IS the subject
+    (a flag name, a file path, an error code — those stay exact). Say the
+    thing, then the detail — the mechanism belongs in `--detail`, not
+    stacked into the one-liner. Real examples, before and after:
+    - "computed-active and the exactly-once UPDATE … WHERE cleared_at IS
+      NULL guard hold for both kinds" → "both kinds of limit clear
+      exactly once, even if the board was down"
+    - "unit is a PROJECTION over member cards, no synthetic DB card" →
+      "units are computed from the existing cards, not stored as new
+      rows"
+    - "server half done: kind=model|account on limits, machine-wide
+      account-limit.json beside the registry" → "half done: limits now
+      come in two kinds, model and account; account limits are shared
+      across every board on the machine"
+    - "one collision found: an old assertion matched the new limits
+      table's own model column" → "one test was too loose — it matched
+      the new table by accident"
+    Plain language is **not** vague, not dumbed down, and not stripped of
+    numbers: "42 pass, 0 fail" stays exactly that, never "tests look
+    good." Exact file names, flags, and commands stay exact too.
+    Precision survives; only the ornament goes.
   **Routing is the server's job, not yours.** Everything you post is
   scoped to your card by the endpoint you're posting to, and the server
   stamps `payload.reply_to` (`"sidebar"` or `"card:<num>"`) on every
