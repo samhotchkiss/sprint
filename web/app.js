@@ -1,6 +1,6 @@
 // Wiring: boot, live transport, optimistic actions, render loop.
 import { h, clear, $, debounce, tickTimes, uid, firstLine } from './util.js';
-import { api, ApiError, initAuth } from './api.js';
+import { api, ApiError, NetworkError, initAuth, onServerGeneration } from './api.js';
 import { Live } from './live.js';
 import {
   store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
@@ -152,6 +152,10 @@ const refreshBoard = debounce(async () => {
     const board = await api.board();
     applyBoard(board);
     if (store.detail) syncDetailCard();
+    // A board we could actually fetch is proof our credentials are good — so a
+    // sign-in wall raised by an earlier 401 comes back down by itself once a
+    // restarted server accepts us again.
+    hideAuthWall();
     render();
   } catch (err) { handleError(err, null); }
 }, 200);
@@ -163,7 +167,14 @@ const refreshDetail = debounce(async () => {
     const res = await api.card(num);
     if (!store.detail || store.detail.num !== num) return;
     const d = normDetail(res, num);
-    store.detail = { ...store.detail, ...d, pendingLines: (store.detail.pendingLines || []).filter((p) => p.pending) };
+    // Lines still in flight stay, and so does anything that FAILED: a message
+    // the board never took has to survive every refresh until you retry it or
+    // give up on it. Dropping it here is how a send became silence.
+    store.detail = {
+      ...store.detail,
+      ...d,
+      pendingLines: (store.detail.pendingLines || []).filter((p) => p.pending || p.failed),
+    };
     // Only the rail changed. On a fresh load this fetch lands a beat after the
     // board does, and repainting the whole page for it is the "card comes in
     // and then blinks" the user saw: the board is redrawn by its own refresh,
@@ -248,9 +259,13 @@ async function sendSubmit(pending) {
 
 function retrySubmit(pending) { sendSubmit(pending); }
 
-async function answer(card, question, text, images) {
+async function answer(card, question, text, images, key, reuse) {
   const before = card.state;
   const q = question || card.question || {};
+  // One key per attempt-chain: a retry re-POSTs the SAME key, so an answer the
+  // server actually took (and failed to tell us about) replays instead of
+  // landing twice.
+  const idem = key || uid();
   // A screenshot pasted while answering is its own line to the agent: the
   // answer itself is the thing that unblocks the card, and it goes second so
   // the image is already in the thread when the agent picks the answer up.
@@ -263,11 +278,12 @@ async function answer(card, question, text, images) {
   // "Delivered — the agent sees it next turn": the optimistic status line the
   // question panel is replaced by, in the thread, immediately.
   if (store.detail && store.detail.num === card.num) store.detail.justAnswered = true;
-  pushPending(card.num, { actor: 'user', kind: 'answer', payload: { text } });
+  const line = reuse
+    || pushPending(card.num, { actor: 'user', kind: 'answer', payload: { text } });
   render();
   try {
-    await api.answer(card.num, q.id, text);
-    settlePending(card.num);
+    const res = await api.answer(card.num, q.id, text, idem);
+    settlePending(card.num, false, res && res.event, line);
     refreshBoard();
     if (store.detail && store.detail.num === card.num) refreshDetail();
   } catch (err) {
@@ -279,19 +295,33 @@ async function answer(card, question, text, images) {
       // Someone (or a second click) already answered this one. Say so gently
       // and catch up — never throw a 409 in the user's face.
       toast('That question was already answered — catching up.');
+      settlePending(card.num, false, null, line);
       refreshBoard();
     } else {
       toast(errText(err, 'answer did not send'));
       handleError(err, null);
+      // The answer is still on screen, marked failed, with the same key behind
+      // its retry — never a question that silently un-answered itself.
+      let target = line;
+      if (!target) {
+        // Answered inline from the List, so there is no thread to fail into.
+        // Open the card: a lost answer is worth a rail, and a toast that is
+        // gone in four seconds is the silence this card is about.
+        openCard(card.num);
+        target = pushPending(card.num, { actor: 'user', kind: 'answer', payload: { text } });
+      }
+      failPending(target, () => answer(card, q, text, null, idem, target));
     }
-    settlePending(card.num, true);
     render();
   }
 }
 
-async function chat(card, text, images) {
+async function chat(card, text, images, key, reuse) {
   const imgs = images || [];
-  const line = pushPending(card.num, {
+  const idem = key || uid();
+  // A retry re-sends the line already in the thread rather than adding a second
+  // copy of the same words.
+  const line = reuse || pushPending(card.num, {
     actor: 'user', kind: 'chat',
     // The thumbnails you pasted are in the thread before the POST returns — the
     // data: URLs render as tiles directly, and the stored refs replace them the
@@ -300,14 +330,18 @@ async function chat(card, text, images) {
   });
   render();
   try {
-    const res = await api.chat(card.num, text, toBase64List(imgs));
+    const res = await api.chat(card.num, text, toBase64List(imgs), idem);
     // Stamp the real seq on our own line so it reads "landed" the instant the
     // POST returns, and flips to "session is on it" when the cursor passes it.
     settlePending(card.num, false, res && res.event, line);
     render();
     refreshDetail();
   } catch (err) {
-    settlePending(card.num, true);
+    // The message stays in the thread, marked "failed to send — tap to retry",
+    // and the retry re-POSTs the same Idempotency-Key. Only THIS line fails:
+    // a message you sent a minute ago is not retroactively un-sent because a
+    // later one timed out.
+    failPending(line, () => chat(card, text, imgs, idem, line));
     toast(errText(err, 'message did not send'));
     handleError(err, null);
     render();
@@ -330,17 +364,20 @@ function localPayload(text, images) {
 }
 
 /** A line to the session itself, in the sprint-level chat. */
-async function sessionChat(text, images) {
+async function sessionChat(text, images, key, reuse) {
   const imgs = images || [];
-  const line = normEvent({ actor: 'user', kind: 'chat', ts: new Date().toISOString(),
+  const idem = key || uid();
+  const line = reuse || normEvent({ actor: 'user', kind: 'chat', ts: new Date().toISOString(),
     payload: localPayload(text, imgs) });
   line.local = true;         // "sending…" — no seq yet, so nothing is claimed
+  line.failed = false;
+  line.retry = null;
   line.localEcho = true;     // replaced when the server's own copy arrives
-  line.sortSeq = store.seq + 0.5;   // ordering only, never a delivery claim
-  store.sidebar.push(line);
+  if (line.sortSeq == null) line.sortSeq = store.seq + 0.5;   // ordering only, never a delivery claim
+  if (!reuse) store.sidebar.push(line);
   render();
   try {
-    const res = await api.sidebar(text, toBase64List(imgs));
+    const res = await api.sidebar(text, toBase64List(imgs), idem);
     line.local = false;
     if (res && res.event && res.event.payload && res.event.payload.attachments) {
       line.payload.attachments = res.event.payload.attachments;
@@ -353,21 +390,28 @@ async function sessionChat(text, images) {
     }
     render();
   } catch (err) {
+    // Exactly the bug this card was filed for: a sidebar line the backend never
+    // took used to sit there saying "sending…". It says "failed to send — tap
+    // to retry" now, and the retry reuses the same key and the same line.
     line.local = false;
     line.failed = true;
+    line.retry = () => sessionChat(text, imgs, idem, line);
     toast(errText(err, 'the session did not get that'));
     handleError(err, null);
     render();
   }
 }
 
-async function verdict(card, kind, notes) {
+async function verdict(card, kind, notes, key) {
   const before = card.state;
+  const idem = key || uid();
+  const word = kind === 'approve' ? 'Approve' : kind === 'bounce' ? 'Bounce' : 'Reject';
   // Approve does not mean Done: the card sits in Ready as "merging" until the branch lands.
   patch(card.num, kind === 'approve' ? 'integrating' : kind === 'bounce' ? 'in_progress' : 'rejected');
+  clearVerdictError(card.num);
   render();
   try {
-    await api.verdict(card.num, kind, notes);
+    await api.verdict(card.num, kind, notes, idem);
     toast(kind === 'approve' ? `#${card.num} approved — merging now; it moves to Done when the branch lands.`
       : kind === 'bounce' ? `#${card.num} bounced back with your notes.`
         : `#${card.num} rejected.`);
@@ -378,8 +422,31 @@ async function verdict(card, kind, notes) {
     card.state = before;
     toast(errText(err, 'verdict did not stick'));
     handleError(err, null);
+    // A toast is gone in four seconds and a verdict is not a small thing to
+    // lose. The failure goes IN the thread, above the verdict bar you are
+    // looking at, and stays there until the retry succeeds.
+    const line = pushPending(card.num, {
+      actor: 'server', kind: 'error',
+      payload: {
+        text: `${word} did not go through — ${errText(err, 'the board did not take it')}. `
+          + 'The card is still yours to sign off; try the button again.',
+      },
+    });
+    if (line) {
+      line.verdictError = true;
+      // `failed` is what keeps it through the next detail refresh — a lost
+      // verdict must not quietly disappear off the thread a second later.
+      line.pending = false;
+      line.failed = true;
+    }
     render();
   }
+}
+
+/** Drop the last failed-verdict line for a card — a fresh attempt supersedes it. */
+function clearVerdictError(num) {
+  if (!store.detail || store.detail.num !== num) return;
+  store.detail.pendingLines = (store.detail.pendingLines || []).filter((l) => !l.verdictError);
 }
 
 async function cardAction(card, action, extra) {
@@ -458,6 +525,27 @@ function settlePending(num, failed, event, entry) {
   if (!entry && !(seq && !Number.isNaN(seq))) store.detail.pendingLines = [];
 }
 
+/**
+ * One line failed to send. It stays exactly where it is, marked, with the way
+ * to try again hung on it — `retry` re-POSTs with the SAME Idempotency-Key, so
+ * a send that was slow but actually landed replays rather than duplicating.
+ *
+ * Only the line that failed is marked. Marking every pending line (which is
+ * what this used to do) told you a message had failed when it hadn't.
+ */
+function failPending(line, retry) {
+  if (!line) return;
+  line.pending = false;
+  line.failed = true;
+  line.retry = async () => {
+    line.failed = false;
+    line.retry = null;
+    line.pending = true;
+    render();
+    await retry();
+  };
+}
+
 // ---- the rail ------------------------------------------------------------
 
 function openCard(num) {
@@ -510,6 +598,10 @@ function toast(msg) {
 }
 
 function errText(err, fallback) {
+  if (err instanceof NetworkError) {
+    return err.timedOut ? `${fallback} — the board did not answer in time`
+      : `${fallback} — could not reach the board`;
+  }
   if (err instanceof ApiError) {
     if (err.fields) return `${fallback} — missing ${[].concat(err.fields).join(', ')}`;
     if (err.status === 409) return 'that already happened — catching up';
@@ -527,10 +619,46 @@ function showAuthWall() {
   if (!el.authwall.hidden) return;
   el.authwall.hidden = false;
   clear(el.authwall);
+  // After a restart this is the honest reason, and it is the one case where the
+  // board genuinely cannot fix itself: a rotated token means a new link.
+  const restarted = serverRestarted;
   el.authwall.appendChild(h('div.authwall-card',
-    h('h2', 'This board needs its link'),
-    h('p', 'The access token is missing or expired. Open the URL the session printed when it started the sprint — the one ending in ?t=… — and this page will work again.'),
+    h('h2', restarted ? 'The board restarted — it needs its link again' : 'This board needs its link'),
+    h('p', restarted
+      ? 'The server came back as a new process and no longer accepts this tab’s token. Open the URL the session printed when it restarted the sprint — the one ending in ?t=… — and everything picks up where it left off. Nothing you typed is lost.'
+      : 'The access token is missing or expired. Open the URL the session printed when it started the sprint — the one ending in ?t=… — and this page will work again.'),
     h('button.btn.send', { type: 'button', onclick: () => location.reload() }, 'Reload')));
+}
+
+/** Credentials work again (a board fetch came back) — take the wall down. */
+function hideAuthWall() {
+  if (el.authwall && !el.authwall.hidden) {
+    el.authwall.hidden = true;
+    clear(el.authwall);
+  }
+}
+
+// ---- the backend restarted ----------------------------------------------
+
+let serverRestarted = false;
+
+/**
+ * A different server process answered us. Everything the tab believed about
+ * its connection is void: the stream is dead, the cursor has to be re-driven,
+ * and the board has to be re-fetched. None of that touches what you were in
+ * the middle of writing — drafts and pasted screenshots live in the store, not
+ * in the DOM, and a half-written message survives this exactly like it
+ * survives any other re-render.
+ */
+function onServerRestart(live) {
+  serverRestarted = true;
+  toast('The board restarted — reconnecting and catching up.');
+  // Resume the stream from OUR cursor: the log is append-only and seq-stable
+  // across a restart, so we pick up precisely where we stopped hearing.
+  if (live) live.resync();
+  refreshBoard();
+  if (store.detail) refreshDetail();
+  render();
 }
 
 // ---- boot ----------------------------------------------------------------
@@ -703,6 +831,9 @@ async function firstLoad() {
     onCursor: (seq) => { if (applyCursor(seq)) paintRail(); },
     onAuthError: showAuthWall,
   });
+  // The first /api/board already recorded this server's generation, so it is
+  // the baseline: anything different from here on is a NEW backend.
+  onServerGeneration(() => onServerRestart(live));
   live.start(store.seq);
 
   setTimeout(armNotifications, 1500);

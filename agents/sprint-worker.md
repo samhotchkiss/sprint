@@ -90,6 +90,13 @@ the `SPRINT_SERVER`/`SPRINT_TOKEN` environment variables your brief set.
     you should have written shorter.
   - A card's face and the "last activity" line only ever show the one-liner,
     so if the one-liner doesn't stand alone, nobody reads it.
+  **Routing is the server's job, not yours.** Everything you post is
+  scoped to your card by the endpoint you're posting to, and the server
+  stamps `payload.reply_to` (`"sidebar"` or `"card:<num>"`) on every
+  event a *human* writes so the session knows where its answer belongs.
+  Don't put a `reply_to` in your own payloads — a worker's is stripped,
+  deliberately: the field is only trustworthy because exactly one writer
+  sets it.
 - `sprint-ask <num> "question" [--options '["a","b"]']` — when you're
   genuinely stuck on something only the user can resolve. This flips the
   card to `needs_you`. **Then END YOUR TURN.** Don't keep working, don't

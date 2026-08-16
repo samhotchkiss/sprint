@@ -844,10 +844,32 @@ body.rail-open .rail { display: flex; }
 .item.is-pending .bubble { opacity: .72; }
 .item.is-failed .bubble { border-color: #4a3236; }
 
-.msg-status { font-family: var(--font-mono); font-size: 10.5px; color: var(--faint); }
+/* The delivery pill. It is a <button> so that a failed send is one tap from
+   going again; while there is nothing to retry it is disabled and reads as the
+   plain label it always was. */
+.msg-status {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: inherit;
+}
+.msg-status[disabled] { cursor: default; opacity: 1; }
 .msg-status.is-seen { color: var(--good); }
 .msg-status.is-failed { color: var(--bad); }
 .msg-status.is-sending { color: var(--meta); }
+/* "failed to send — tap to retry": the one delivery state that is an action. */
+.msg-status.is-retry {
+  cursor: pointer;
+  border: 1px solid var(--bad);
+  border-radius: 999px;
+  padding: 2px 9px;
+  min-height: 22px;
+}
+.msg-status.is-retry:hover { background: rgba(214, 106, 106, .14); }
+.msg-status.is-retry:focus-visible { outline: 2px solid var(--bad); outline-offset: 2px; }
 
 /* the "more context" disclosure — only rows that really have more get one */
 .detail { margin-top: 9px; }
@@ -1572,6 +1594,9 @@ html.skin-chaos .composer { border-top: 2px solid var(--rule); }
 html.skin-chaos .bubble { border: 2px solid var(--agent-line); border-radius: 0; box-shadow: var(--row-shadow); }
 html.skin-chaos .item.from-you .bubble { border-radius: 0; border-color: var(--you-line); }
 html.skin-chaos .status-label { line-height: 1.7; }
+/* Chaos: radius 0 and an ink outline, same as every other hard-bevelled
+   control. Identical words, identical behaviour — only the surface changes. */
+html.skin-chaos .msg-status.is-retry { border: 2px solid var(--bad); border-radius: 0; }
 
 html.skin-chaos .ask { border: 2px solid var(--border); box-shadow: var(--row-shadow); }
 html.skin-chaos .ask-opt { border: 2px solid var(--border); box-shadow: var(--row-shadow); }
