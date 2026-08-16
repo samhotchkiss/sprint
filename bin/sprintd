@@ -49,8 +49,10 @@ DEFAULT_HUB_PORT = 8300         # one hub per machine, fixed so the URL is memor
 # What this server can DO, as one number a client can compare itself against.
 # The generation says WHICH process answered; this says what that process knows
 # how to serve. Bump it whenever web/ starts depending on an endpoint or a field
-# a running server might not have, and bump UI_API_VERSION in web/api.js in the
-# same commit.
+# a running server might not have. (It used to say "and bump UI_API_VERSION in
+# web/api.js in the same commit" -- there is no such constant any more; the page
+# stopped comparing itself against this the day the server started restarting
+# itself, and the line outlived the mechanism it described.)
 #
 # It used to be the trigger for a banner telling the HUMAN to run `sprintd stop`
 # then `sprintd start`. It no longer is, and never will be again: a board that
@@ -62,7 +64,11 @@ DEFAULT_HUB_PORT = 8300         # one hub per machine, fixed so the URL is memor
 #   2 — phases (/api/board carries phase, phase_since, phase_expected_seconds)
 #   3 — decision requests (a question carries `artifacts`: url, attachments, notes)
 #   4 — sprints carry a name (`/api/settings` name, registry rows follow it)
-API_VERSION = 4
+#   5 — conversation cards (cards carry `kind` + `conversation`; POST
+#       /api/cards/<n>/seen records the read receipt the highlight is derived from)
+#   6 — the switcher's square (`chat_unread` on /api/board and on every siblings
+#       row; POST /api/sidebar/seen records the manager channel's read receipt)
+API_VERSION = 6
 DATA_DIRNAME = ".sprint"
 HUB_DIRNAME = ".sprint"         # under $HOME: the machine-wide (cross-project) state
 REGISTRY_FILENAME = "registry.json"
@@ -156,6 +162,35 @@ BULK_MAX = 50
 WORK_KINDS = ("code", "ops")
 
 # --------------------------------------------------------------------------
+# Card kinds -- what SHAPE of thing a card is, which is a different question
+# from `work_kind` (how a finished card proves itself).
+#
+# User, verbatim: "we're discovering we need another card type for an ongoing
+# conversation thread. I think it's a lower section in the 'needs you' column
+# where the card gets highlighted if there's an unread and unseen message. once
+# I see the message, the highlighting dims, and once I respond the highlight
+# goes away completely. with russ, this lets me have distinct conversations on
+# specific needs"
+#
+# A conversation is NOT work: it has no queue, no agent lifecycle, no evidence
+# packet, no verdict and no merge. It sits in its own state -- `conversation` --
+# for exactly that reason: every timer, sweep and gate in this file is written
+# against the work states, so a state that is in none of them is excluded from
+# all of them by construction rather than by a list of exceptions somebody has
+# to remember to update.
+CARD_KINDS = ("work", "conversation")
+CONVERSATION_STATE = "conversation"
+
+# Which events are a MESSAGE in a conversation, as opposed to telemetry. A
+# progress line is an agent narrating itself; a chat/question/note/error is
+# somebody talking to you, and an answer is you talking back.
+CONV_MESSAGE_KINDS = ("chat", "question", "note", "error", "answer", "submitted")
+# Who counts as "them" and who counts as "you" in that thread. `server` is the
+# board's own voice and is neither.
+CONV_THEM = ("session", "worker")
+CONV_YOU = ("user",)
+
+# --------------------------------------------------------------------------
 # Settings -- .sprint/config.json
 #
 # Per-project policy the SESSION reads at dispatch time. The server stores and
@@ -195,6 +230,15 @@ DEFAULT_SETTINGS = {
         "executors": dict(DEFAULT_EXECUTORS),
         "concurrency": 3,
     },
+    # What the session running this board CALLS ITSELF -- a first name, chosen
+    # by the session at launch, so the sidebar reads "Chuck: I've picked up #12"
+    # instead of "Session: ...". Empty means nobody has introduced themselves
+    # and every label falls back to the generic one.
+    #
+    # This is NOT the sprint's name (that is the open sprint's title). Two
+    # different things: the board is called "Billing week", the colleague
+    # running it is called Chuck.
+    "agent_name": "",
 }
 # `default_executor` accepts either a named executor or the bare kind
 # "subagent" -- the out-of-the-box board has no named executors worth typing.
@@ -376,6 +420,10 @@ STATES = (
     "held", "queued", "triaging", "in_progress", "needs_you", "blocked",
     "ready", "integrating", "completed", "rejected", "failed", "stale",
     "duplicate", "canceled",
+    # A conversation card, for as long as the conversation is open. It is not a
+    # step in the work lifecycle and nothing moves it along -- only the user
+    # ends it, with `cancel`, meaning "this discussion is done".
+    "conversation",
 )
 
 # Legal transitions. `ready` is never reachable here from a plain state POST --
@@ -405,7 +453,14 @@ TRANSITIONS = {
     "stale": {"queued", "in_progress", "triaging", "canceled", "rejected",
               "duplicate", "failed"},
     "duplicate": {"queued"},
-    "canceled": {"queued"},
+    # A canceled card reopens into the queue -- unless it is a conversation,
+    # which reopens back into the conversation it always was. `transition`
+    # refuses the wrong one of these per card kind, so the pair here is not a
+    # hole: it is both halves of one door.
+    "canceled": {"queued", "conversation"},
+    # A conversation never becomes work and never merges. The ONLY way out is
+    # the user closing it.
+    "conversation": {"canceled"},
 }
 
 TERMINAL_STATES = {"completed", "rejected", "duplicate", "canceled"}
@@ -422,6 +477,9 @@ COLUMN_OF = {
     "ready": "ready", "integrating": "ready", "completed": "done",
     "rejected": "done", "failed": "in_progress", "stale": "queued",
     "duplicate": "done", "canceled": "done",
+    # Conversations live at the bottom of Needs you, in their own section --
+    # they are the other shape of "this one is on me".
+    "conversation": "needs_you",
 }
 
 SCHEMA = """
@@ -461,6 +519,7 @@ CREATE TABLE IF NOT EXISTS cards (
   long_running INTEGER NOT NULL DEFAULT 0,
   external_agent INTEGER NOT NULL DEFAULT 0,
   work_kind TEXT NOT NULL DEFAULT 'code',
+  kind TEXT NOT NULL DEFAULT 'work',
   -- Which executor ran this card (a name from settings' worker.executors) and
   -- which model it was dispatched with. NULL means "whatever the board's
   -- defaults were" -- the card face only tags a choice that differs.
@@ -1239,6 +1298,32 @@ def clean_sprint_name(value, limit: int = SPRINT_NAME_MAX) -> str:
     return text
 
 
+AGENT_NAME_MAX = 24             # a first name, not a job title
+
+
+def clean_agent_name(value, limit: int = AGENT_NAME_MAX) -> str:
+    """Normalize the session's own name, or "" for none.
+
+    The session picks this for itself at launch ("Chuck"), and it is rendered
+    wherever a session line is attributed -- the sidebar, a card thread, the
+    rail's header. So it is a NAME: one line, no newlines, short enough to sit
+    in front of a message without becoming the message. `null` and `""` both
+    mean "no name", which is how you take one back.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ApiError(400, "bad_agent_name", "agent_name must be a string",
+                       field="agent_name")
+    text = " ".join(value.split())
+    if len(text) > limit:
+        raise ApiError(400, "bad_agent_name",
+                       "agent_name must be %d characters or fewer (this one is "
+                       "%d) — it is a first name, not a description"
+                       % (limit, len(text)), field="agent_name")
+    return text
+
+
 def clean_model(value):
     """Normalize a model name, or None. Free-form on purpose: the board records
     what the session says it dispatched on and never adjudicates the list."""
@@ -1511,10 +1596,13 @@ def validate_settings(patch, base=None) -> dict:
         raise _bad("settings", "settings must be an object")
     current = normalize_settings(base)
     for key in patch:
-        if key != "worker":
+        if key not in ("worker", "agent_name"):
             raise ApiError(400, "unknown_key",
-                           "%s is not a settings section (only \"worker\" exists today)"
-                           % key, field=key)
+                           "%s is not a setting (\"worker\" and \"agent_name\" "
+                           "are the two that exist today)" % key, field=key)
+    agent_name = current["agent_name"]
+    if "agent_name" in patch:
+        agent_name = clean_agent_name(patch["agent_name"])
     worker_patch = patch.get("worker", {})
     if not isinstance(worker_patch, dict):
         raise _bad("worker", "worker must be an object")
@@ -1565,18 +1653,25 @@ def validate_settings(patch, base=None) -> dict:
                    "default_executor \"%s\" is not in worker.executors "
                    "(known: %s)" % (default, ", ".join(
                        sorted(list(worker["executors"].keys()) + [BUILTIN_EXECUTOR]))))
-    return {"worker": worker}
+    return {"worker": worker, "agent_name": agent_name}
 
 
 def normalize_settings(raw) -> dict:
     """Whatever is on disk, made whole. Unknown/broken content falls back to the
     default for that key rather than 500-ing the board -- a hand-edited file
     must never be able to take the sprint down."""
-    out = {"worker": dict(DEFAULT_SETTINGS["worker"])}
+    out = {"worker": dict(DEFAULT_SETTINGS["worker"]),
+           "agent_name": DEFAULT_SETTINGS["agent_name"]}
     out["worker"]["executors"] = {
         k: dict(v) for k, v in DEFAULT_SETTINGS["worker"]["executors"].items()}
     if not isinstance(raw, dict):
         return out
+    try:
+        out["agent_name"] = clean_agent_name(raw.get("agent_name"))
+    except ApiError:
+        # A hand-edited name that is too long or not a string is a nameless
+        # session, not a dead board.
+        out["agent_name"] = ""
     worker = raw.get("worker")
     if not isinstance(worker, dict):
         return out
@@ -1807,6 +1902,11 @@ class App:
         # Which model the agent on this card was dispatched on. NULL means
         # "the sprint default" -- the face only ever shows the exception.
         ("cards", "model", "TEXT"),
+        # What SHAPE of card this is: `work` (everything the board has ever
+        # had) or `conversation` (an ongoing thread that never becomes work).
+        # Defaulting to 'work' is what makes this migration free: every row
+        # that already exists is, by definition, the kind that already existed.
+        ("cards", "kind", "TEXT NOT NULL DEFAULT 'work'"),
         # What a DECISION REQUEST hands over with its question: a live URL,
         # screenshots, and a short note. NULL for a plain question, which is
         # every question a board created before this landed.
@@ -1863,6 +1963,24 @@ class App:
             return bool(row[name])
         except (IndexError, KeyError):
             return False
+
+    def card_kind(self, row) -> str:
+        """`work` or `conversation`, tolerant of a database from before kinds.
+
+        An old DB has no `kind` column at all, and every card in it predates
+        conversations -- so "I don't know" and "work" are the same answer, and
+        this degrades to it rather than raising.
+        """
+        if row is None or "kind" not in self.columns("cards"):
+            return "work"
+        try:
+            val = row["kind"]
+        except (IndexError, KeyError):
+            return "work"
+        return val if val in CARD_KINDS else "work"
+
+    def is_conversation(self, row) -> bool:
+        return self.card_kind(row) == "conversation"
 
     def log(self, msg: str):
         line = "%s sprintd %s" % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg)
@@ -1930,6 +2048,25 @@ class App:
             changed = [k for k in SETTINGS_KEYS
                        if merged["worker"].get(k) != current["worker"].get(k)]
             w = merged["worker"]
+            # Naming yourself is not a dispatch policy change, and saying so in
+            # the same sentence would be a lie. It gets its own line, in the
+            # session's own voice, because it is an introduction.
+            if merged["agent_name"] != current["agent_name"]:
+                was, now = current["agent_name"], merged["agent_name"]
+                if not now:
+                    text = "the session dropped the name “%s”" % was
+                elif not was:
+                    text = "the session is called “%s”" % now
+                else:
+                    text = "the session renamed itself “%s” → “%s”" % (was, now)
+                with self.lock:
+                    self._append_event(None, "server", "note", {
+                        "text": text, "agent_name": now, "was": was or None,
+                        "by": actor if actor in ACTORS else "user",
+                    })
+            if not changed:
+                self.notify()
+                return merged
             with self.lock:
                 self._append_event(None, "server", "note", {
                     "text": "settings changed: %s — in effect for the next dispatch"
@@ -2407,6 +2544,40 @@ class App:
         name = (row["title"] or "").strip() if row is not None else ""
         return name or self.default_sprint_title()
 
+    def agent_name(self) -> str:
+        """What the session running this board calls ITSELF, or "".
+
+        User ruling, verbatim: "I also meant that the session agent gave
+        themselves a name. Like "Chuck"". Different from `sprint_name`: the
+        board is named after the work, the session is named after nobody --
+        it picks a first name at launch so a line in the sidebar reads like a
+        colleague talking rather than like a system component.
+        """
+        return self.settings().get("agent_name") or ""
+
+    def claim_agent_name(self, name, actor: str = "session") -> dict:
+        """Take a name at launch -- but only if the session has not got one.
+
+        A name that changes every time the board restarts is not a name. The
+        rule ("keep it across restarts") is enforced HERE and not left to the
+        caller, because the caller is a fresh session that does not remember
+        the last one. So `sprintd start --agent-name` is first-write-wins: it
+        introduces a session that has never introduced itself, and it is a
+        no-op for one that has.
+
+        Renaming on purpose is a different act with a different door: PUT
+        /api/settings {"agent_name": ...}, which is what the settings panel
+        uses and always applies.
+        """
+        wanted = clean_agent_name(name)
+        current = self.agent_name()
+        if current and wanted and current != wanted:
+            return {"agent_name": current, "claimed": False, "wanted": wanted}
+        if current == wanted:
+            return {"agent_name": current, "claimed": False, "wanted": wanted}
+        self.save_settings({"agent_name": wanted}, actor=actor)
+        return {"agent_name": wanted, "claimed": True, "wanted": wanted}
+
     def rename_sprint(self, name, actor: str = "user") -> dict:
         """Name (or rename) the open sprint.
 
@@ -2506,12 +2677,18 @@ class App:
             # doesn't -- the session owns checking on it.
             "external_agent": bool(row["external_agent"]),
             "work_kind": row["work_kind"] or "code",
+            # What SHAPE of card this is. `work` on every card the board has
+            # ever had; `conversation` on an ongoing thread that never enters
+            # the work lifecycle.
+            "kind": self.card_kind(row),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             # Who ran this card and with what. NULL on both means "the board's
             # defaults" -- which is why the face only tags a card that differs.
             "executor": c_executor,
         }
+        if out["kind"] == "conversation":
+            out["conversation"] = self.conversation_json(num)
         # Resolved for the face: "grok · tmux" needs the executor's KIND, and
         # the card alone does not know it. `is_default` is the tag's whole
         # question -- a board where everything runs on the default should
@@ -2593,6 +2770,92 @@ class App:
                 "created_at": row["created_at"],
                 "shared": row["card_num"] != num}
 
+    # -- conversations ----------------------------------------------------
+    #
+    # Three highlight states, and every one of them is DERIVED at read time:
+    #
+    #   unseen  something arrived from the session or a worker AFTER the last
+    #           time you opened this card -> strong highlight
+    #   seen    you have opened it since that message but have not replied
+    #           -> dimmed highlight
+    #   clear   your own message is the latest thing in the thread -> nothing
+    #
+    # The only thing stored is a read receipt -- `last_seen_seq`, one cursor per
+    # conversation card, written when you open it. Everything else is read off
+    # the append-only log. Deriving beats storing a flag because it SELF-HEALS:
+    # an event that lands late, a receipt written twice, a reply sent from a
+    # second tab -- none of them can leave a stale boolean behind, because there
+    # is no boolean.
+
+    @staticmethod
+    def seen_cursor_name(num) -> str:
+        return "seen:card:%d" % int(num)
+
+    def last_seen_seq(self, num: int) -> int:
+        return self.cursor_seq(self.seen_cursor_name(num))
+
+    def mark_seen(self, num: int, seq=None) -> dict:
+        """Record that the user has looked at this conversation.
+
+        Monotonic on purpose: a receipt never walks backwards, so a stale tab
+        posting an old seq cannot un-read a message you have already seen.
+        """
+        row = self.card_row(num)
+        if not self.is_conversation(row):
+            raise ApiError(409, "not_a_conversation",
+                           "#%s is a work card -- read receipts are a "
+                           "conversation thing" % num,
+                           card_kind=self.card_kind(row))
+        if seq is None:
+            seq = self.max_seq()
+        try:
+            seq = int(seq)
+        except (TypeError, ValueError):
+            raise ApiError(400, "missing_field", "seq must be an integer",
+                           field="seq")
+        if seq < 0:
+            raise ApiError(400, "missing_field", "seq must be an integer",
+                           field="seq")
+        name = self.seen_cursor_name(num)
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO cursors(name, seq, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET seq=MAX(cursors.seq, excluded.seq), "
+                "updated_at=excluded.updated_at",
+                (name, seq, now()))
+        return {"ok": True, "num": num, "last_seen_seq": self.last_seen_seq(num),
+                "card": self.card_json(self.card_row(num), brief=True)}
+
+    def conversation_json(self, num: int) -> dict:
+        """The three-state highlight, derived from the log and one receipt."""
+        seen = self.last_seen_seq(num)
+        placeholders = ",".join("?" * len(CONV_MESSAGE_KINDS))
+
+        def newest(actors):
+            row = self.q1(
+                "SELECT seq FROM events WHERE card_num=? AND kind IN (%s) "
+                "AND actor IN (%s) ORDER BY seq DESC LIMIT 1"
+                % (placeholders, ",".join("?" * len(actors))),
+                (num,) + tuple(CONV_MESSAGE_KINDS) + tuple(actors))
+            return int(row["seq"]) if row is not None else 0
+
+        theirs = newest(CONV_THEM)
+        yours = newest(CONV_YOU)
+        if theirs > yours:
+            state = "unseen" if theirs > seen else "seen"
+        else:
+            # You spoke last (or nobody has spoken at all): nothing is owed.
+            state = "clear"
+        return {
+            "state": state,
+            "last_seen_seq": seen,
+            "latest_incoming_seq": theirs,
+            "latest_user_seq": yours,
+            # One word for "does this want your eyes", so a face never has to
+            # re-derive the rule from three numbers.
+            "unread": state != "clear",
+        }
+
     @staticmethod
     def question_json(row) -> dict:
         keys = row.keys()
@@ -2606,15 +2869,25 @@ class App:
         }
 
     def create_card(self, text: str, images: list, hold: bool, actor: str = "user",
-                    reports: list = None) -> dict:
+                    reports: list = None, kind: str = "work") -> dict:
         text = (text or "").strip()
         images = images or []
         if not text and not images and not (reports or []):
             raise ApiError(400, "empty_submission",
                            "at least one of text or images is required")
+        kind = (kind or "work").strip().lower()
+        if kind not in CARD_KINDS:
+            raise ApiError(400, "bad_kind",
+                           "kind must be one of %s" % ", ".join(CARD_KINDS),
+                           field="kind")
         sprint = self.open_sprint(create=True)
         hold_mode = bool(sprint["hold_mode"]) if sprint else False
         state = "held" if (hold or hold_mode) else "queued"
+        if kind == "conversation":
+            # Hold mode is a brake on DISPATCH, and a conversation is never
+            # dispatched. Holding one would park a thread nobody is going to
+            # release, so it opens as what it is.
+            state = CONVERSATION_STATE
 
         # Attachments are content-addressed and written to disk BEFORE the
         # event that references them.
@@ -2629,19 +2902,22 @@ class App:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self.conn.execute(
-                    "INSERT INTO cards(sprint_id, state, title, body, created_at, updated_at) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (sprint["id"] if sprint else None, state, title, text, ts, ts))
+                    "INSERT INTO cards(sprint_id, state, title, body, kind, "
+                    "created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (sprint["id"] if sprint else None, state, title, text, kind,
+                     ts, ts))
                 num = int(cur.lastrowid)
                 self._append_event(num, actor, "submitted", {
                     "text": text or (report_line(len(docs)) if docs
                                      else image_line(len(attachments))),
                     "attachments": attachments,
                     "images_only": not text and not docs,
-                    "hold": bool(hold or hold_mode)})
+                    "kind": kind,
+                    "hold": bool(hold or hold_mode) and kind == "work"})
                 self._append_event(num, "server", "state", {
                     "from": None, "to": state,
-                    "reason": "hold mode is on" if (hold or hold_mode) else None,
+                    "reason": ("a conversation, not a work item" if kind == "conversation"
+                               else ("hold mode is on" if (hold or hold_mode) else None)),
                     "text": "new → %s" % state})
                 self.conn.execute("COMMIT")
             except Exception:
@@ -3194,6 +3470,27 @@ class App:
             if frm == to_state:
                 # Idempotent no-op; still surfaces as success.
                 return self.card_json(row, brief=True)
+            # The kind gate, ahead of the state gate: a conversation has no
+            # work lifecycle to move through, and a work card cannot slip into
+            # the conversation state by asking nicely. `canceled` is shared
+            # ground -- both kinds close the same way -- so this is the one
+            # place that says which of the two doors out of `canceled` is
+            # yours.
+            kind = self.card_kind(row)
+            if kind == "conversation" and to_state not in (CONVERSATION_STATE, "canceled"):
+                raise ApiError(
+                    409, "not_a_work_card",
+                    "#%s is a conversation, not a work card -- it has no "
+                    "%s step. Cancel it when the discussion is done."
+                    % (num, to_state),
+                    from_state=frm, to_state=to_state, card_kind=kind,
+                    allowed=[CONVERSATION_STATE, "canceled"])
+            if kind != "conversation" and to_state == CONVERSATION_STATE:
+                raise ApiError(
+                    409, "not_a_conversation",
+                    "#%s is a work card; use the make_conversation action to "
+                    "turn it into one" % num,
+                    from_state=frm, to_state=to_state, card_kind=kind)
             if to_state not in TRANSITIONS.get(frm, set()):
                 raise ApiError(
                     409, "illegal_transition",
@@ -4281,6 +4578,16 @@ class App:
 
     def card_ready(self, num: int, packet, actor: str = "worker") -> dict:
         row = self.card_row(num)
+        # A conversation has nothing to prove and nobody to sign it off. This
+        # fires BEFORE the packet is even looked at, so the answer is about the
+        # card rather than about which field the packet forgot.
+        if self.is_conversation(row):
+            raise ApiError(409, "not_a_work_card",
+                           "#%s is a conversation, not a work card -- there is "
+                           "no evidence packet, no verdict and no merge on one"
+                           % num,
+                           card_kind="conversation", from_state=row["state"],
+                           to_state="ready")
         missing = self.validate_packet(row, packet)
         if missing:
             with self.lock:
@@ -4372,6 +4679,11 @@ class App:
             raise ApiError(400, "bad_verdict",
                            "verdict must be approve, bounce or reject")
         row = self.card_row(num)      # 404 before we write anything to disk
+        if self.is_conversation(row):
+            raise ApiError(409, "not_a_work_card",
+                           "#%s is a conversation -- there is nothing to "
+                           "approve, bounce or reject on one" % num,
+                           card_kind="conversation")
         targets = [num]
         if scope == "batch":
             members = self.batch_members(row["batch_id"])
@@ -4582,6 +4894,13 @@ class App:
         if row["state"] in TERMINAL_STATES:
             raise ApiError(409, "terminal_card",
                            "#%s is %s; cannot ask" % (num, row["state"]))
+        # On a conversation you just talk. A question panel exists to unblock a
+        # working agent, and there is no agent here to unblock.
+        if self.is_conversation(row):
+            raise ApiError(409, "not_a_work_card",
+                           "#%s is a conversation -- say it as a message, not "
+                           "as a question that blocks the card" % num,
+                           card_kind="conversation")
         if row["state"] != "needs_you" and \
                 "needs_you" not in TRANSITIONS.get(row["state"], set()):
             raise ApiError(409, "illegal_transition",
@@ -4769,6 +5088,43 @@ class App:
             "AND actor IN ('user','session') AND seq>? ORDER BY seq LIMIT ?",
             (after, limit))
         return [self.event_json(r) for r in rows]
+
+    # -- the session channel's own read receipt -----------------------------
+    #
+    # The title switcher has to answer "does that OTHER board want me", and one
+    # of the two things that means is "the session said something over there
+    # that nobody has read". That is not a client flag -- the tab that would
+    # hold it is not open -- so it is the same shape as a conversation's
+    # receipt: one cursor, and a count derived from the log against it.
+
+    SIDEBAR_SEEN_CURSOR = "seen:sidebar"
+
+    def mark_sidebar_seen(self, seq=None) -> dict:
+        if seq is None:
+            seq = self.max_seq()
+        try:
+            seq = int(seq)
+        except (TypeError, ValueError):
+            raise ApiError(400, "missing_field", "seq must be an integer", field="seq")
+        if seq < 0:
+            raise ApiError(400, "missing_field", "seq must be an integer", field="seq")
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO cursors(name, seq, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET seq=MAX(cursors.seq, excluded.seq), "
+                "updated_at=excluded.updated_at",
+                (self.SIDEBAR_SEEN_CURSOR, seq, now()))
+        return {"ok": True, "last_seen_seq": self.cursor_seq(self.SIDEBAR_SEEN_CURSOR),
+                "chat_unread": self.sidebar_unread()}
+
+    def sidebar_unread(self) -> int:
+        """Lines the SESSION has said in the manager channel that nobody has
+        opened. Your own messages are never unread to you."""
+        seen = self.cursor_seq(self.SIDEBAR_SEEN_CURSOR)
+        row = self.q1(
+            "SELECT COUNT(*) AS n FROM events WHERE card_num IS NULL "
+            "AND kind IN ('chat','note') AND actor='session' AND seq>?", (seen,))
+        return int(row["n"]) if row is not None else 0
 
     def make_batch(self, card_nums, agent_name, branch, worktree=None,
                    actor: str = "session") -> dict:
@@ -4960,6 +5316,10 @@ class App:
         self.notify()
         return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
 
+    # A conversation has no queue and no agent, so the verbs that push work
+    # around are meaningless on one. What is left is the two things you can
+    # honestly do to a thread: keep it at the top, and end it.
+    CONVERSATION_ACTIONS = ("pin", "unpin", "cancel", "reopen")
     # -- blocked by -------------------------------------------------------
     #
     # User, verbatim: "when one card is blocked by another, show that in the
@@ -5110,7 +5470,41 @@ class App:
     def action(self, num: int, action: str, body: dict, actor: str = "user",
                from_browser: bool = False) -> dict:
         row = self.card_row(num)
-        if action in ("long_running", "external_agent"):
+        if self.is_conversation(row) and action not in self.CONVERSATION_ACTIONS:
+            raise ApiError(409, "not_a_work_card",
+                           "#%s is a conversation -- %s is a work verb. You can "
+                           "%s one." % (num, action,
+                                        ", ".join(self.CONVERSATION_ACTIONS)),
+                           card_kind="conversation",
+                           allowed=list(self.CONVERSATION_ACTIONS))
+        if action == "make_conversation":
+            # Promote a work card into a thread. The card, its number, its body
+            # and its whole timeline stay exactly where they are -- the only
+            # thing that changes is what the board expects of it.
+            if row["state"] in TERMINAL_STATES:
+                raise ApiError(409, "illegal_transition",
+                               "#%s is %s; reopen it before making it a "
+                               "conversation" % (num, row["state"]),
+                               from_state=row["state"],
+                               to_state=CONVERSATION_STATE)
+            # Kind and state change together or not at all: a card that was one
+            # and not the other is a card no rule in this file describes.
+            with self.lock:
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._write_transition(
+                        num, row["state"], CONVERSATION_STATE, actor,
+                        "made a conversation -- a thread now, not a work item",
+                        extra={"card_kind": "conversation"})
+                    self.conn.execute(
+                        "UPDATE cards SET kind='conversation', updated_at=? "
+                        "WHERE num=?", (now(), num))
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+            self.notify()
+        elif action in ("long_running", "external_agent"):
             # Both of these turn the silence timer OFF for a card, so they are
             # the session's to set, not a click in a browser: the user has no
             # way to know whether an agent is legitimately quiet. `long_running`
@@ -5241,13 +5635,21 @@ class App:
                                "#%s is %s; only a closed card (%s) can be reopened"
                                % (num, row["state"], ", ".join(sorted(TERMINAL_STATES))),
                                from_state=row["state"], to_state="queued")
-            self.transition(num, "queued", actor,
-                            reason="reopened — back in the queue",
-                            extra={"reopened_from": row["state"]})
+            # A reopened conversation goes back to being the conversation it
+            # always was, never into the work queue.
+            if self.is_conversation(row):
+                self.transition(num, CONVERSATION_STATE, actor,
+                                reason="reopened — the discussion is back on",
+                                extra={"reopened_from": row["state"]})
+            else:
+                self.transition(num, "queued", actor,
+                                reason="reopened — back in the queue",
+                                extra={"reopened_from": row["state"]})
         else:
             raise ApiError(400, "bad_action",
                            "action must be pin, unpin, cancel, hold, release, "
                            "duplicate_of, blocked_by, retry, reopen, "
+                           "make_conversation, "
                            "long_running or external_agent")
         return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
 
@@ -5349,12 +5751,23 @@ class App:
             # the hub all render this one string, and none of them should have
             # to know it is stored as the open sprint's title.
             "name": self.sprint_name(),
+            # ...and who is running it. "" until the session introduces itself;
+            # every label that would say "Session" says this instead. Note the
+            # level: THIS is the session's own name ("Chuck"), while a card's
+            # `agent_name` is the worker subagent working that card
+            # ("sprint-card-118"). Different things, different objects.
+            "agent_name": self.agent_name(),
             "hold_mode": bool(sprint["hold_mode"]) if sprint else False,
             "cards": cards,
             "counts": counts,
             # The sidebar thread ships with the board so the UI never has to
             # reconstruct it by scanning the whole event log.
             "sidebar": self.sidebar_thread(limit=200),
+            # How many session lines in the manager channel nobody has opened.
+            # The switcher's gold reads this the same way it reads needs_you --
+            # a question you have not seen is a question either way.
+            "chat_unread": self.sidebar_unread(),
+            "chat_seen_seq": self.cursor_seq(self.SIDEBAR_SEEN_CURSOR),
             "batches": [self.batch_json(b) for b in batch_ids],
             # How many report documents THIS sprint has. The header's Reports
             # link exists only when this is > 0 -- user, verbatim: "link should
@@ -5368,6 +5781,10 @@ class App:
             # Flat mirror of session.cursor: how far the session has drained.
             "cursor": self.cursor_seq(),
             "states": list(STATES),
+            # What shapes of card this server knows about. `work` is everything
+            # the board has ever had; `conversation` is a thread that never
+            # enters the work lifecycle.
+            "card_kinds": list(CARD_KINDS),
             # What "no badge" means on a card face.
             "default_model": self.default_model,
             # Provider limit windows that are open RIGHT NOW (computed off the
@@ -5747,6 +6164,9 @@ def make_handler(app: App):
                         # re-assert the registry row without flattening a name
                         # somebody set (and without holding a token).
                         "sprint_name": app.sprint_name(),
+                        # ...and who is already running it, so a re-launch can
+                        # see it already has a name and keep it.
+                        "agent_name": app.agent_name(),
                         "seq": app.max_seq()})
 
                 if not self.authed(query):
@@ -5836,6 +6256,10 @@ def make_handler(app: App):
                     "name": app.sprint_name(),
                     "name_max": SPRINT_NAME_MAX,
                     "name_default": app.default_sprint_title(),
+                    # The session's own name is IN settings (config.json), but
+                    # it is hoisted here too so a panel never has to know that.
+                    "agent_name": app.agent_name(),
+                    "agent_name_max": AGENT_NAME_MAX,
                     "defaults": DEFAULT_SETTINGS,
                     "choices": {
                         "model_policy": list(MODEL_POLICIES),
@@ -6066,6 +6490,8 @@ def make_handler(app: App):
             return 200, {"ok": True, "settings": settings,
                          "name": app.sprint_name(),
                          "name_max": SPRINT_NAME_MAX,
+                         "agent_name": settings.get("agent_name") or "",
+                         "agent_name_max": AGENT_NAME_MAX,
                          "sprint": app.sprint_json(app.open_sprint(create=True)),
                          "defaults": DEFAULT_SETTINGS}
 
@@ -6089,7 +6515,8 @@ def make_handler(app: App):
                 card = app.create_card(body.get("text"), posted_images(body) or [],
                                        bool(body.get("hold")),
                                        actor=self.actor_or(body, "user"),
-                                       reports=body.get("reports"))
+                                       reports=body.get("reports"),
+                                       kind=body.get("kind") or "work")
                 return 201, card
 
             if path == "/api/cards/bulk":
@@ -6105,6 +6532,11 @@ def make_handler(app: App):
                 return 200, app.bulk_action(body.get("card_nums"),
                                             body.get("action"), body,
                                             actor=self.actor_or(body, "user"))
+
+            if path == "/api/sidebar/seen":
+                # "I have read the manager channel up to here." The switcher's
+                # gold on OTHER boards is derived against this.
+                return 200, app.mark_sidebar_seen(body.get("seq"))
 
             if path == "/api/sidebar":
                 # The sidebar is the user and the session talking; a worker has
@@ -6177,6 +6609,11 @@ def make_handler(app: App):
                 return 200, app.answer(num, qid, body.get("text"),
                                        actor=self.actor_or(body, "user"),
                                        images=posted_images(body))
+            if verb == "seen":
+                # The read receipt the conversation highlight is derived from.
+                # `seq` is what the tab had actually rendered when it looked;
+                # omitting it means "everything on the board right now".
+                return 200, app.mark_seen(num, body.get("seq"))
             if verb == "action":
                 return 200, app.action(num, body.get("action"), body,
                                        actor=self.actor_or(body, "user"),
@@ -6619,20 +7056,109 @@ def registry_entry(project_root: str, port: int, host: str, hosts=None,
         "pid": int(pid if pid is not None else os.getpid()),
         "data_dir": data_dir or os.path.join(root, DATA_DIRNAME),
         "started_at": float(started_at if started_at is not None else now()),
+        # Deliberately no "ordinal": that number belongs to the registry, which
+        # hands one out the first time it sees this project and never again.
+        # If a fresh entry carried one, every restart would overwrite the place
+        # the board already has (see `registry_register`).
     }
+
+
+# ---- where a board sits in a numbered list ---------------------------------
+#
+# Card #57, user verbatim: "the order of sprints should stay the same in the
+# list, so I can count on .1 always going to session a, .2 always going to
+# session b, etc, and not have to reassess the list each time."
+#
+# So position is a property of the BOARD, not of how much it currently wants
+# your attention. The registry stamps each project with an `ordinal` the first
+# time it registers; that number never changes again, restarts included, and a
+# board that appears later gets a bigger one. Every numbered listing sorts by
+# it, so all of them agree and none of them move under the user's fingers.
+# Attention is still shown -- the dot and the counts on each row -- it just
+# stopped being allowed to REORDER anything.
+
+
+def entry_ordinal(entry: dict):
+    """The row's place in line, or None for a row written before ordinals."""
+    try:
+        ordinal = int(entry.get("ordinal"))
+    except (TypeError, ValueError):
+        return None
+    return ordinal if ordinal >= 0 else None
+
+
+def entry_started_at(entry: dict) -> float:
+    """`started_at` as a number, and 0.0 for anything unreadable -- a garbled
+    field must never crash the read path that draws the switcher."""
+    try:
+        return float(entry.get("started_at"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def next_ordinal(entries: dict) -> int:
+    """One past the highest ordinal in the registry: the end of the line.
+
+    Never reuses the number of a board that unregistered. Reuse is how a new
+    sprint would silently inherit somebody else's muscle memory.
+    """
+    seen = [n for n in (entry_ordinal(e) for e in entries.values())
+            if n is not None]
+    return (max(seen) + 1) if seen else 0
+
+
+def registry_backfill_ordinals(entries: dict) -> dict:
+    """Number any rows that predate ordinals. Mutates and returns `entries`.
+
+    Runs once, inside the register lock. Oldest board first, ties broken on
+    project_root, so it is a pure function of the registry's contents: two
+    boards doing this one after the other reach the same answer, and the order
+    it produces is the same one `registry_order_key` was already reporting for
+    un-numbered rows -- nobody gets renumbered by the upgrade itself.
+    """
+    missing = [k for k, e in entries.items() if entry_ordinal(e) is None]
+    if not missing:
+        return entries
+    missing.sort(key=lambda k: (entry_started_at(entries[k]), k))
+    n = next_ordinal(entries)
+    for k in missing:
+        entries[k] = dict(entries[k], ordinal=n)
+        n += 1
+    return entries
+
+
+def registry_order_key(key: str, entry: dict):
+    """Sort key for every numbered listing of boards: first-seen order.
+
+    A row with no ordinal yet sorts by when it started, behind everything
+    numbered -- exactly where the backfill above is about to put it -- and
+    ties break on project_root so two readers can never disagree.
+    """
+    ordinal = entry_ordinal(entry)
+    if ordinal is None:
+        return (1, entry_started_at(entry), key)
+    return (0, ordinal, key)
 
 
 def registry_register(entry: dict, registry: str = None) -> dict:
     """Add/replace this project's row. Keyed by project_root, so restarting the
-    same board never produces a second row for it."""
+    same board never produces a second row for it.
+
+    The row also earns its `ordinal` here, the first time this project is ever
+    seen, and keeps it for good: a restart re-registers the same project_root,
+    finds the number already sitting there, and drops back into the same slot
+    in the switcher instead of jumping to the end of it.
+    """
     path = registry_path(registry)
     with _FileLock(path):
-        entries = read_registry(registry)
+        entries = registry_backfill_ordinals(read_registry(registry))
         key = os.path.realpath(entry["project_root"])
         prev = entries.get(key) or {}
         merged = dict(prev)
-        merged.update(entry)
+        merged.update(entry)               # `entry` carries no ordinal of its own
         merged.pop("last_seen", None)      # a fresh start re-earns its liveness
+        if entry_ordinal(merged) is None:
+            merged["ordinal"] = next_ordinal(entries)
         entries[key] = merged
         write_registry(entries, registry)
     return entries[key]
@@ -6822,6 +7348,33 @@ def cmd_start(args) -> int:
                 except (OSError, http.client.HTTPException) as exc:
                     print("notice: could not name this sprint (%s)" % exc,
                           file=sys.stderr)
+            # `--agent-name` on a board that is already up is the opposite of a
+            # rename: whoever is running this board already introduced
+            # themselves, and a session that comes back after a restart keeps
+            # the name it had. So it is only sent when nobody has one.
+            live_agent = (health or {}).get("agent_name") or ""
+            if getattr(args, "agent_name", None):
+                if live_agent:
+                    if live_agent != " ".join(args.agent_name.split()):
+                        print("notice: this session is already called “%s” — "
+                              "keeping it (a name does not change on restart)"
+                              % live_agent, file=sys.stderr)
+                else:
+                    try:
+                        st, raw = http_put_json(
+                            "127.0.0.1", info.get("port"), "/api/settings",
+                            info.get("token"), {"agent_name": args.agent_name,
+                                                "actor": "session"})
+                        body = jload(raw.decode("utf-8", "replace"), {}) or {}
+                        if st == 200:
+                            live_agent = body.get("agent_name") or args.agent_name
+                        else:
+                            print("notice: could not set the session's name (%s)"
+                                  % (body.get("message") or "HTTP %s" % st),
+                                  file=sys.stderr)
+                    except (OSError, http.client.HTTPException) as exc:
+                        print("notice: could not set the session's name (%s)" % exc,
+                              file=sys.stderr)
             # Idempotent reuse -- and re-assert the registry row, so a board
             # that was already up before the hub existed still shows up on it.
             try:
@@ -6949,13 +7502,32 @@ def cmd_start(args) -> int:
             report(False, error=exc.message)
             app.close()
             return 1
+    # `--agent-name` is how the session introduces ITSELF (card #63). First
+    # write wins: a board whose session already has a name keeps it, so a
+    # restart is the same colleague coming back rather than a new hire.
+    if getattr(args, "agent_name", None):
+        try:
+            claim = app.claim_agent_name(args.agent_name, actor="session")
+            if not claim["claimed"] and claim["agent_name"] != claim["wanted"]:
+                print("notice: this session is already called “%s” — keeping it "
+                      "(a name does not change on restart)" % claim["agent_name"],
+                      file=sys.stderr)
+        except ApiError as exc:
+            print("error: %s" % exc.message, file=sys.stderr)
+            report(False, error=exc.message)
+            app.close()
+            return 1
     # Everything the board needs to replace itself when its code changes
     # (card #62). `--foreground` is added because this process is ALREADY the
     # daemon: exec keeps the pid, the log fds and the launchd job, and
     # daemonizing a second time would throw all three away. `--name` is dropped
     # because it is a LAUNCH act: the name is in the database by now, and
     # replaying the flag would undo a rename the user made since.
-    exec_argv = [sys.executable, app.code_path] + strip_flag(sys.argv[1:], "--name")
+    # `--agent-name` goes with it, for the stronger version of the same reason:
+    # the session's name is in config.json by now, and it must survive a
+    # restart untouched.
+    exec_argv = [sys.executable, app.code_path] + strip_flag(
+        strip_flag(sys.argv[1:], "--name"), "--agent-name")
     if "--foreground" not in exec_argv:
         exec_argv.append("--foreground")
     app.restart_argv = exec_argv
@@ -7555,6 +8127,10 @@ def board_rollup(board: dict) -> dict:
     return {
         "needs_you": counts.get("needs_you", 0),
         "ready": counts.get("ready", 0),
+        # Session lines in that board's manager channel that nobody opened.
+        # A board older than this field simply reports none, which is the
+        # honest degrade: no claim rather than a wrong one.
+        "chat_unread": int(board.get("chat_unread") or 0),
         "in_motion": counts.get("in_progress", 0),
         "queued": counts.get("queued", 0) + counts.get("held", 0),
         "blocked": counts.get("blocked", 0),
@@ -7679,6 +8255,13 @@ def hub_sort_key(row: dict):
 # Self is always in the list (flagged `self: true`) so the menu renders the
 # full set with the current board marked, and rolled up straight from
 # `app.board()` rather than by asking ourselves over HTTP.
+#
+# The one place the two lists differ is ORDER. The hub sorts by what is waiting
+# on you (`hub_sort_key`): it is a landing page you arrive at cold, you read it
+# top to bottom, and nothing on it is keyed to a number. The switcher does not:
+# its rows are numbered, `.` then `2` is supposed to be a reflex, and a list
+# that re-sorts itself between two glances makes that reflex a coin flip. So it
+# renders in registry order and never moves (`registry_order_key`).
 
 DEFAULT_SIBLINGS_TTL = 10.0     # server-side cache; the browser polls every 30s
 
@@ -7694,6 +8277,10 @@ def sibling_row(row: dict, is_self: bool = False) -> dict:
         "alive": bool(row.get("reachable")),
         "needs_you": int(row.get("needs_you") or 0),
         "ready": int(row.get("ready") or 0),
+        # The switcher's square is gold for needs_you OR an unread session
+        # line, green for ready, and split when both -- so the row carries
+        # both halves and the tab decides how to draw them.
+        "chat_unread": int(row.get("chat_unread") or 0),
         "in_motion": int(row.get("in_motion") or 0),
         "blocked": int(row.get("blocked") or 0),
         "queued": int(row.get("queued") or 0),
@@ -7703,51 +8290,70 @@ def sibling_row(row: dict, is_self: bool = False) -> dict:
     }
 
 
-def sibling_sort_key(row: dict):
-    """Current board first (it is where you already are), then whatever is
-    waiting on you, longest wait first, then alphabetical."""
-    if row.get("self"):
-        return (0, 0, 0, "")
-    tier = 1 if row.get("needs_you") else 2
-    return (tier, -(row.get("stuck_seconds") or 0), -(row.get("needs_you") or 0),
-            (row.get("name") or "").lower())
-
-
 def siblings_snapshot(app, registry: str = None, timeout: float = 1.5) -> dict:
-    """Every LIVE board on this machine, including this one.
+    """Every LIVE board on this machine, including this one, in a STABLE order.
 
-    Dead/unreachable rows are dropped rather than greyed: unlike the hub, whose
-    job is to tell you a board died, this list exists to be clicked -- a row you
-    cannot navigate to is noise in a menu. The port-recycling guard is the hub's
-    (`/healthz` + `project_root` match), so a registry row whose port was taken
-    by some other project never shows up wearing that project's name.
+    Registry order -- when each board was first seen -- and nothing else. The
+    numbers beside these rows are meant to become muscle memory, so what "2"
+    points at has to be what it pointed at last time you looked. Nothing here
+    re-sorts by who is waiting on you: attention is still on every row, in the
+    dot and the counts beside it, it just no longer MOVES anybody.
+
+    That holds for this board's own row too, which sits in its registry place
+    rather than floating to the top. Otherwise "2" would mean a different
+    sprint depending on which board you happened to be looking at, and the
+    whole point is that it doesn't. The row is still marked `self`, and the
+    menu still says "here" next to it.
+
+    Dead/unreachable rows are dropped rather than greyed, and the survivors
+    close the gap. Unlike the hub, whose job is to tell you a board died, this
+    list exists to be clicked: a row you cannot navigate to is noise, and a
+    number that goes nowhere is worse than one that shifted. The survivors keep
+    their order among themselves, and a board that comes back gets its old
+    place back, because the ordinal is stamped on the project and not on the
+    run. The port-recycling guard is the hub's (`/healthz` + `project_root`
+    match), so a registry row whose port was taken by some other project never
+    shows up wearing that project's name.
     """
     self_root = os.path.realpath(app.project_root)
-    rows, saw_self = [], False
+    ranked, saw_self = [], False
     for key, entry in read_registry(registry).items():
         entry = dict(entry)
         entry.setdefault("project_root", key)
+        order = registry_order_key(key, entry)
         if os.path.realpath(entry.get("project_root") or key) == self_root:
-            rows.append(self_sibling_row(app, entry))
+            ranked.append((order, self_sibling_row(app, entry)))
             saw_self = True
             continue
         row = hub_summarize(entry, timeout=timeout)
         if not row.get("reachable"):
             continue
-        rows.append(sibling_row(row))
+        ranked.append((order, sibling_row(row)))
     if not saw_self:
-        # No registry row for us (registry write failed, or a board started
-        # before the registry existed). We are demonstrably alive -- we are
-        # answering this request -- so we list ourselves anyway.
-        rows.append(self_sibling_row(app, None))
-    rows.sort(key=sibling_sort_key)
+        # No registry row for us (the registry write failed, or this board
+        # started before the registry existed). We are demonstrably alive --
+        # we are answering this request -- so we list ourselves anyway, and at
+        # the very end: a board with no number of its own must never land in
+        # the middle and push everyone else's number along.
+        ranked.append(((2, 0.0, self_root), self_sibling_row(app, None)))
+    ranked.sort(key=lambda pair: pair[0])
+    rows = [row for _, row in ranked]
     others = [r for r in rows if not r["self"]]
     return {
         "sprints": rows,
         "count": len(rows),
-        # The one number the title dot reads: needs_you ANYWHERE BUT HERE.
-        # This board's own needs-you pile is already on the page behind it.
+        # What the title's square reads, and it is only ever about ELSEWHERE:
+        # this board's own piles are already on the page behind it. Two
+        # numbers, because the square has two halves -- gold for a board that
+        # wants an answer (a question, or a session line nobody opened), green
+        # for a board that wants a verdict.
+        #
+        # The bug this fixes, in the user's own board: needs_you 0, ready 8 --
+        # eight branches waiting on him and the switcher said nothing at all.
         "needs_you_elsewhere": sum(r["needs_you"] for r in others),
+        "asking_elsewhere": sum(r["needs_you"] + r.get("chat_unread", 0)
+                                for r in others),
+        "review_elsewhere": sum(r["ready"] for r in others),
         "server_time": now(),
     }
 
@@ -8380,6 +8986,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "Default: the project directory's name. Changing it later "
                         "is a rename, in the board's settings panel."
                         % SPRINT_NAME_MAX)
+    s.add_argument("--agent-name", default=None,
+                   help="what the SESSION running this board calls itself, as a "
+                        "short first name (e.g. \"Chuck\"); %d characters or "
+                        "fewer. Pick one, do not ask for one. First write wins: "
+                        "a board whose session already has a name keeps it, so "
+                        "a restart is the same colleague coming back. Rename on "
+                        "purpose from the board's settings panel."
+                        % AGENT_NAME_MAX)
     s.add_argument("--token", default=None, help="force a bearer token")
     s.add_argument("--new-token", action="store_true",
                    help="mint a fresh token (default: reuse the existing one so "

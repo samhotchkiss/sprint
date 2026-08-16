@@ -20,17 +20,20 @@
 import { h, ageSuffix, richText, firstLine, reconcile, timeEl, autolink } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
 import {
-  SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, normArtifacts,
-  attachedImages, cardComposerKey, draft,
+  SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, normArtifacts, actorLabel,
+  sessionLabel, store, attachedImages, cardComposerKey, draft,
 } from './state.js';
 import { detailBlock } from './detail.js';
 import { splitAttachments, docsVer, reportRow } from './reports.js';
 
+// Only the CSS class is fixed here. The name over a bubble comes from
+// `actorLabel`, because the session's is whatever the session called itself
+// ("Chuck") and that can change while the thread is on screen.
 const ACTOR = {
-  user: { label: 'You', cls: 'from-you' },
-  session: { label: 'Session', cls: 'from-session' },
-  worker: { label: 'Agent', cls: 'from-agent' },
-  server: { label: 'Board', cls: 'from-agent' },
+  user: { cls: 'from-you' },
+  session: { cls: 'from-session' },
+  worker: { cls: 'from-agent' },
+  server: { cls: 'from-agent' },
 };
 
 /**
@@ -179,8 +182,12 @@ export function renderChat(root, lines, app) {
 
 export function chatItems(lines, app) {
   if (!lines.length) {
-    return [{ key: 'empty', ver: 1, make: () => h('div.thread-empty',
-      h('p', 'This is the session itself — same brain as the terminal.'),
+    // `ver` carries the name so an introduction repaints this line instead of
+    // leaving a stale "the session itself" over a chat with Chuck in it.
+    return [{ key: 'empty', ver: sessionLabel(), make: () => h('div.thread-empty',
+      h('p', store.agentName
+        ? `This is ${store.agentName} — the session itself, same brain as the terminal.`
+        : 'This is the session itself — same brain as the terminal.'),
       h('p', 'Ask it anything: “why have #123, #127 and #128 been blocked for so long?”')) }];
   }
   const out = [];
@@ -232,7 +239,8 @@ function message(first, app) {
     onclick: () => { if (ev && typeof ev.retry === 'function') ev.retry(); },
   });
   const when = h('span.msg-when');
-  item.appendChild(h('div.msg-head', h('span.msg-who', who.label), status, when));
+  const whoEl = h('span.msg-who', actorLabel(ev.actor));
+  item.appendChild(h('div.msg-head', whoEl, status, when));
 
   // A message that is only pictures gets no bubble: the tiles underneath ARE
   // the message, and "sent a screenshot" over a screenshot is a caption nobody
@@ -256,6 +264,11 @@ function message(first, app) {
   // image in it, is never re-created for it.
   item._sync = (next) => {
     if (next && next !== ev) ev = next;
+    // The session naming itself mid-thread renames every line it ever wrote —
+    // it is the same person, and a history that says "Session" above older
+    // messages and "Chuck" above newer ones would read like two people.
+    const name = actorLabel(ev.actor);
+    if (whoEl.textContent !== name) whoEl.textContent = name;
     const st = mine ? messageStatus(ev) : null;
     item.className = `item ${who.cls}${mine ? ' mine' : ''}`
       + `${ev.pending || ev.local ? ' is-pending' : ''}${ev.failed ? ' is-failed' : ''}`;

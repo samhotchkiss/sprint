@@ -4322,6 +4322,219 @@ class TestHubDeadBoards(HubBase):
         return port
 
 
+class TestSwitcherOrderIsStable(HubBase):
+    """Card #57, the bounce, user verbatim: "the order of sprints should stay
+    the same in the list, so I can count on .1 always going to session a, .2
+    always going to session b, etc, and not have to reassess the list each
+    time."
+
+    So the ONE property every test here defends: two reads of `/api/siblings`
+    that differ only in who is waiting on you come back in the same order. The
+    boards are deliberately registered out of alphabetical order, so a list
+    that fell back to sorting by name would fail too.
+    """
+
+    def order(self, board):
+        snap = sprintd.siblings_snapshot(board["app"])
+        return [s["name"] for s in snap["sprints"]]
+
+    def three(self):
+        """zeta, then alpha, then mid -- first seen is neither alphabetical nor
+        reverse-alphabetical, so only registry order can produce it."""
+        return self.board("zeta"), self.board("alpha"), self.board("mid")
+
+    def closed_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def kill(self, board):
+        """Make a board unreachable the way a real one goes: its registry row
+        points at a port with nothing behind it."""
+        sprintd.registry_touch(board["root"], {"port": self.closed_port()})
+
+    def revive(self, board):
+        sprintd.registry_touch(board["root"], {"port": board["port"]})
+
+    # -- the order itself ---------------------------------------------------
+
+    def test_the_list_is_first_seen_order_not_alphabetical(self):
+        zeta, alpha, mid = self.three()
+        self.assertEqual(self.order(zeta), ["zeta", "alpha", "mid"])
+
+    def test_every_board_on_the_machine_reports_the_same_order(self):
+        """".2" has to mean one sprint, not "the second one from wherever you
+        happen to be standing"."""
+        zeta, alpha, mid = self.three()
+        self.assertEqual(self.order(zeta), self.order(alpha))
+        self.assertEqual(self.order(alpha), self.order(mid))
+
+    def test_the_board_you_are_on_keeps_its_place_instead_of_floating_first(self):
+        zeta, alpha, mid = self.three()
+        snap = sprintd.siblings_snapshot(mid["app"])
+        self.assertEqual([s["name"] for s in snap["sprints"]],
+                         ["zeta", "alpha", "mid"])
+        # it is still marked, so the menu can still say "here" beside it
+        self.assertEqual([s["name"] for s in snap["sprints"] if s["self"]], ["mid"])
+
+    # -- attention may be SHOWN, never SORTED BY -----------------------------
+
+    def test_two_reads_with_the_attention_moved_are_the_same_order(self):
+        """The falsification: the sprint that starts wanting you is the LAST
+        one in the list and has the oldest question on the machine, which is
+        exactly what the old sort floated to the top."""
+        zeta, alpha, mid = self.three()
+        before = self.order(zeta)
+        self.assertEqual(before, ["zeta", "alpha", "mid"])
+
+        num = self.card_needs_you(mid, "stuck one", "which colour?")
+        mid["app"].conn.execute(
+            "UPDATE questions SET created_at=created_at-3600 WHERE card_num=?", (num,))
+        mid["app"].conn.commit()
+        self.card_ready(alpha)
+
+        after = sprintd.siblings_snapshot(zeta["app"])["sprints"]
+        self.assertEqual([s["name"] for s in after], before,
+                         "attention moved a row -- that is the whole bug")
+        # ...and it is still SHOWN, which is why it never needed to be sorted:
+        # the row carries the dot's number and the wait it has been waiting.
+        loud = [s for s in after if s["name"] == "mid"][0]
+        self.assertEqual(loud["needs_you"], 1)
+        self.assertGreater(loud["stuck_seconds"], 3500)
+        self.assertEqual([s for s in after if s["name"] == "alpha"][0]["ready"], 1)
+
+    def test_answering_the_question_does_not_move_the_row_back(self):
+        """The reverse move, which is the one that would make the user reassess
+        the list twice: a sprint that STOPS needing him."""
+        zeta, alpha, mid = self.three()
+        num = self.card_needs_you(alpha, "ask", "well?")
+        loud = self.order(zeta)
+        status, body = self.bpost(alpha, "/api/cards/%d/answer" % num,
+                                  {"text": "the green one"})
+        self.assertIn(status, (200, 201), body)
+        self.assertEqual(
+            [s["needs_you"] for s in sprintd.siblings_snapshot(zeta["app"])["sprints"]],
+            [0, 0, 0], "the question really was answered")
+        self.assertEqual(self.order(zeta), loud)
+
+    # -- boards arriving and leaving ----------------------------------------
+
+    def test_a_new_board_appends_and_renumbers_nobody(self):
+        zeta, alpha, mid = self.three()
+        before = self.order(zeta)
+        # a fourth sprint, alphabetically first, and needing you on arrival
+        late = self.board("aaa-latecomer")
+        self.card_needs_you(late, "brand new", "look at me")
+        after = self.order(zeta)
+        self.assertEqual(after[:3], before,
+                         "an arrival must not shift anyone already numbered")
+        self.assertEqual(after[3], "aaa-latecomer")
+
+    def test_a_restart_puts_a_board_back_in_its_own_slot(self):
+        """A restart is the same board (same project root), so it keeps its
+        number rather than going to the back of the queue."""
+        zeta, alpha, mid = self.three()
+        before = self.order(zeta)
+        sprintd.registry_register(sprintd.registry_entry(
+            alpha["root"], alpha["port"], "127.0.0.1",
+            data_dir=alpha["data_dir"], pid=os.getpid()))
+        self.assertEqual(self.order(zeta), before)
+
+    def test_a_dead_board_closes_the_gap_and_comes_back_to_its_own_place(self):
+        """A dropped row compacts: this list exists to be clicked, and a number
+        that navigates nowhere is worse than a number that moved. What must NOT
+        happen is the survivors also shuffling."""
+        zeta, alpha, mid = self.three()
+        self.kill(alpha)
+        self.assertEqual(self.order(zeta), ["zeta", "mid"])
+        self.revive(alpha)
+        self.assertEqual(self.order(zeta), ["zeta", "alpha", "mid"])
+
+    def test_a_board_with_no_registry_row_lists_itself_last(self):
+        """Registry write failed, or the board predates the registry. It is
+        demonstrably alive -- it is answering -- so it is listed, but at the end
+        where it cannot push anybody else's number along."""
+        zeta, alpha, mid = self.three()
+        sprintd.registry_unregister(zeta["root"])
+        self.assertEqual(self.order(zeta), ["alpha", "mid", "zeta"])
+        self.assertEqual(self.order(alpha), ["alpha", "mid"],
+                         "the other boards simply cannot see it")
+
+
+class TestRegistryOrdinals(RegistryBase):
+    """The number itself: handed out once, on first sight, and never edited."""
+
+    def ordinals(self):
+        return {e["name"]: e.get("ordinal")
+                for e in sprintd.read_registry().values()}
+
+    def test_ordinals_are_handed_out_in_registration_order(self):
+        sprintd.registry_register(self.entry("zeta", 9101))
+        sprintd.registry_register(self.entry("alpha", 9102))
+        self.assertEqual(self.ordinals(), {"zeta": 0, "alpha": 1})
+
+    def test_re_registering_never_changes_the_number(self):
+        root = os.path.join(self.tmp, "alpha")
+        sprintd.registry_register(self.entry("zeta", 9101))
+        sprintd.registry_register(self.entry("alpha", 9102, root=root, pid=111))
+        sprintd.registry_register(self.entry("alpha", 9209, root=root, pid=222))
+        self.assertEqual(self.ordinals(), {"zeta": 0, "alpha": 1})
+        self.assertEqual(sprintd.read_registry()[os.path.realpath(root)]["port"], 9209)
+
+    def test_a_fresh_entry_carries_no_ordinal_of_its_own(self):
+        """If it did, every restart would overwrite the row's real place."""
+        self.assertNotIn("ordinal", self.entry("alpha", 9101))
+
+    def test_a_departed_board_s_number_is_not_reused(self):
+        """Reuse is how a brand-new sprint would inherit someone else's muscle
+        memory. The next board takes the next number, gaps and all."""
+        a = self.entry("alpha", 9101)
+        sprintd.registry_register(a)
+        sprintd.registry_register(self.entry("beta", 9102))
+        sprintd.registry_unregister(a["project_root"])
+        sprintd.registry_register(self.entry("gamma", 9103))
+        self.assertEqual(self.ordinals(), {"beta": 1, "gamma": 2})
+
+    def test_rows_from_an_older_sprintd_are_numbered_oldest_first(self):
+        """Upgrade path: the registry on disk has no ordinals at all. The
+        backfill has to land on the order those rows were ALREADY being read
+        in, so nobody is renumbered by the upgrade itself."""
+        now = sprintd.now()
+        legacy = {}
+        for name, age in (("newer", 100), ("oldest", 900), ("middle", 500)):
+            e = self.entry(name, 9100 + age, started_at=now - age)
+            e.pop("ordinal", None)
+            legacy[e["project_root"]] = e
+        sprintd.write_registry(legacy)
+        self.assertEqual(self.ordinals(),
+                         {"newer": None, "oldest": None, "middle": None})
+        by_age = sorted(legacy.items(),
+                        key=lambda kv: sprintd.registry_order_key(*kv))
+        self.assertEqual([kv[1]["name"] for kv in by_age],
+                         ["oldest", "middle", "newer"])
+        # the first board to register anything numbers them all, in that order
+        sprintd.registry_register(self.entry("brand-new", 9999))
+        self.assertEqual(self.ordinals(), {"oldest": 0, "middle": 1, "newer": 2,
+                                           "brand-new": 3})
+
+    def test_an_unnumbered_row_sorts_behind_every_numbered_one(self):
+        """Where the backfill is about to put it, so the two agree."""
+        numbered = {"ordinal": 7, "started_at": 1.0}
+        legacy = {"started_at": 0.0}
+        self.assertLess(sprintd.registry_order_key("/a", numbered),
+                        sprintd.registry_order_key("/b", legacy))
+
+    def test_a_garbled_ordinal_is_treated_as_absent_not_as_a_crash(self):
+        for bad in (None, "", "two", -1, {}, [3]):
+            self.assertIsNone(sprintd.entry_ordinal({"ordinal": bad}), bad)
+        self.assertEqual(sprintd.entry_started_at({"started_at": "soon"}), 0.0)
+        # ...and a registry full of junk still numbers cleanly
+        self.assertEqual(sprintd.next_ordinal({"a": {"ordinal": "x"}}), 0)
+
+
 class TestHubServer(HubBase):
     """The hub page and its API, over real HTTP."""
 
@@ -9484,6 +9697,197 @@ class TestSprintNames(Base):
         self.assertEqual(res["name_default"], "project")
 
 
+class TestAgentName(Base):
+    """The SESSION's own name.
+
+    User, verbatim: "This is good, but I also meant that the session agent gave
+    themselves a name. Like "Chuck"". Two different names live on one board --
+    the sprint is called after the work, and the session running it is called
+    after nobody in particular, because a colleague has a first name. This is
+    the second one.
+    """
+
+    def config_path(self):
+        return os.path.join(self.project_root, ".sprint", "config.json")
+
+    def put(self, patch, **kw):
+        return self.req("PUT", "/api/settings", patch, **kw)
+
+    def name_now(self):
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        return board["agent_name"]
+
+    # -- unset -----------------------------------------------------------
+
+    def test_nobody_has_a_name_until_somebody_takes_one(self):
+        self.assertEqual(self.name_now(), "")
+        self.assertEqual(self.get("/api/settings")[1]["agent_name"], "")
+        self.assertEqual(self.get("/api/settings")[1]["settings"]["agent_name"], "")
+        self.assertEqual(self.get("/healthz", token=None)[1]["agent_name"], "")
+        # and an unnamed session costs nothing on disk: no config, no write
+        self.assertFalse(os.path.exists(self.config_path()))
+
+    def test_the_sprint_name_is_a_different_field(self):
+        status, res = self.put({"name": "Billing week", "agent_name": "Chuck"})
+        self.assertEqual(status, 200, res)
+        status, board = self.get("/api/board")
+        self.assertEqual(board["name"], "Billing week")
+        self.assertEqual(board["agent_name"], "Chuck")
+        # naming the board does not name the session, or the other way round
+        self.put({"name": "Billing week two"})
+        self.assertEqual(self.name_now(), "Chuck")
+        self.put({"agent_name": "Dolores"})
+        self.assertEqual(self.get("/api/board")[1]["name"], "Billing week two")
+
+    # -- round trip ------------------------------------------------------
+
+    def test_a_name_round_trips_through_every_reader(self):
+        status, res = self.put({"agent_name": "Chuck", "actor": "session"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["agent_name"], "Chuck")
+        self.assertEqual(res["settings"]["agent_name"], "Chuck")
+        self.assertEqual(self.name_now(), "Chuck")
+        self.assertEqual(self.get("/api/settings")[1]["agent_name"], "Chuck")
+        self.assertEqual(self.get("/healthz", token=None)[1]["agent_name"], "Chuck")
+        with open(self.config_path(), "r", encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["agent_name"], "Chuck")
+
+    def test_post_is_the_same_write_as_put(self):
+        status, res = self.post("/api/settings", {"agent_name": "Chuck"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.name_now(), "Chuck")
+
+    def test_it_survives_a_restart_of_the_process(self):
+        self.put({"agent_name": "Chuck"})
+        app2 = sprintd.App(self.project_root, token="t")
+        self.addCleanup(app2.close)
+        self.assertEqual(app2.agent_name(), "Chuck")
+
+    def test_a_rename_propagates_to_everything_that_shows_it(self):
+        self.put({"agent_name": "Chuck"})
+        status, res = self.put({"agent_name": "Dolores"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["agent_name"], "Dolores")
+        self.assertEqual(self.name_now(), "Dolores")
+        self.assertEqual(self.get("/healthz", token=None)[1]["agent_name"], "Dolores")
+
+    def test_a_name_can_be_taken_back(self):
+        self.put({"agent_name": "Chuck"})
+        status, res = self.put({"agent_name": ""})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["agent_name"], "")
+        self.assertEqual(self.name_now(), "")
+
+    def test_null_means_no_name_in_this_request_not_clear_it(self):
+        self.put({"agent_name": "Chuck"})
+        status, res = self.put({"worker": {"concurrency": 4}})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.name_now(), "Chuck")
+
+    def test_a_name_only_write_leaves_dispatch_policy_alone(self):
+        self.put({"worker": {"concurrency": 4}})
+        status, res = self.put({"agent_name": "Chuck"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["settings"]["worker"]["concurrency"], 4)
+        self.assertEqual(res["agent_name"], "Chuck")
+
+    def test_a_name_and_a_policy_change_in_one_request(self):
+        status, res = self.put({"agent_name": "Chuck", "worker": {"concurrency": 5}})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["settings"]["worker"]["concurrency"], 5)
+        self.assertEqual(res["agent_name"], "Chuck")
+
+    # -- what a name is --------------------------------------------------
+
+    def test_whitespace_is_collapsed_not_preserved(self):
+        status, res = self.put({"agent_name": "  Chuck  the   Third \n"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["agent_name"], "Chuck the Third")
+
+    def test_a_name_that_is_not_a_name_is_refused_by_field(self):
+        for bad in ("x" * (sprintd.AGENT_NAME_MAX + 1), 7, [], {"a": 1}, True):
+            status, res = self.put({"agent_name": bad})
+            self.assertEqual(status, 400, (bad, res))
+            self.assertEqual(res["field"], "agent_name", (bad, res))
+        self.assertEqual(self.name_now(), "")
+
+    def test_a_junk_name_on_disk_is_a_nameless_session_not_a_dead_board(self):
+        os.makedirs(os.path.dirname(self.config_path()), exist_ok=True)
+        with open(self.config_path(), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"agent_name": ["not", "a", "name"],
+                                 "worker": {"concurrency": 4}}))
+        self.assertEqual(self.name_now(), "")
+        self.assertEqual(self.get("/api/board")[1]["settings"]["worker"]["concurrency"], 4)
+
+    def test_the_settings_panel_is_told_the_limit(self):
+        status, res = self.get("/api/settings")
+        self.assertEqual(res["agent_name_max"], sprintd.AGENT_NAME_MAX)
+        self.assertEqual(res["defaults"]["agent_name"], "")
+
+    # -- the log ---------------------------------------------------------
+
+    def notes(self):
+        rows = self.app.q("SELECT * FROM events WHERE card_num IS NULL "
+                          "AND kind='note' ORDER BY seq")
+        return [sprintd.jload(r["payload"], {}).get("text") for r in rows]
+
+    def test_an_introduction_is_one_quiet_line_of_its_own(self):
+        self.put({"agent_name": "Chuck", "actor": "session"})
+        self.put({"agent_name": "Dolores"})
+        self.put({"agent_name": ""})
+        said = [t for t in self.notes() if t and "session" in t]
+        self.assertEqual(said, [
+            "the session is called “Chuck”",
+            "the session renamed itself “Chuck” → “Dolores”",
+            "the session dropped the name “Dolores”",
+        ], self.notes())
+
+    def test_naming_yourself_is_not_a_settings_changed_line(self):
+        self.put({"agent_name": "Chuck"})
+        self.assertEqual([t for t in self.notes() if t and t.startswith("settings changed")],
+                         [])
+
+    def test_saving_the_same_name_writes_nothing(self):
+        self.put({"agent_name": "Chuck"})
+        before = self.get("/api/board")[1]["seq"]
+        self.put({"agent_name": "Chuck"})
+        self.assertEqual(self.get("/api/board")[1]["seq"], before)
+
+    # -- launch ----------------------------------------------------------
+
+    def test_the_first_launch_takes_the_name(self):
+        claim = self.app.claim_agent_name("Chuck")
+        self.assertEqual(claim, {"agent_name": "Chuck", "claimed": True,
+                                 "wanted": "Chuck"})
+        self.assertEqual(self.name_now(), "Chuck")
+
+    def test_a_restart_never_renames_the_session(self):
+        self.app.claim_agent_name("Chuck")
+        claim = self.app.claim_agent_name("Dolores")
+        self.assertEqual(claim, {"agent_name": "Chuck", "claimed": False,
+                                 "wanted": "Dolores"})
+        self.assertEqual(self.name_now(), "Chuck")
+        # ...and it is not a second line in the log either
+        self.assertEqual(len([t for t in self.notes() if t and "called" in t]), 1)
+
+    def test_a_deliberate_rename_still_works_after_a_claim(self):
+        self.app.claim_agent_name("Chuck")
+        status, res = self.put({"agent_name": "Dolores"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.name_now(), "Dolores")
+
+    def test_the_launch_flag_exists_and_says_what_it_is_for(self):
+        args = sprintd.build_parser().parse_args(["start", "--agent-name", "Chuck"])
+        self.assertEqual(args.agent_name, "Chuck")
+        self.assertIsNone(sprintd.build_parser().parse_args(["start"]).agent_name)
+
+    def test_a_self_restart_drops_the_launch_name(self):
+        argv = ["start", "--name", "Billing", "--agent-name", "Chuck", "--port", "8462"]
+        kept = sprintd.strip_flag(sprintd.strip_flag(argv, "--name"), "--agent-name")
+        self.assertEqual(kept, ["start", "--port", "8462"])
+
+
 class TestNamedBoardsOnTheHub(unittest.TestCase):
     """A live board is the authority on its own name; the registry is the
     fallback for one that is not answering."""
@@ -9596,6 +10000,608 @@ class TestNameAtLaunch(unittest.TestCase):
                       "--name", "x" * 200)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("60 characters", r.stderr.decode())
+
+
+
+class ConversationBase(Base):
+    def new_conversation(self, text="let's talk about the ingestion backlog",
+                         actor=None):
+        body = {"text": text, "kind": "conversation"}
+        if actor:
+            body["actor"] = actor
+        status, card = self.post("/api/cards", body)
+        self.assertEqual(status, 201, card)
+        return card
+
+    def convo(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return detail["card"]["conversation"]
+
+    def conv_state(self, num):
+        return self.convo(num)["state"]
+
+    def say(self, num, text, actor):
+        status, out = self.post("/api/cards/%d/chat" % num,
+                                {"text": text, "actor": actor})
+        self.assertEqual(status, 201, out)
+        return out
+
+    def head(self):
+        return self.get("/api/board")[1]["seq"]
+
+
+class TestConversationCards(ConversationBase):
+    """A conversation is a card that is NOT work.
+
+    User, verbatim: "we're discovering we need another card type for an ongoing
+    conversation thread ... with russ, this lets me have distinct conversations
+    on specific needs".
+    """
+
+    def test_a_conversation_opens_as_a_conversation_not_in_the_queue(self):
+        card = self.new_conversation()
+        self.assertEqual(card["kind"], "conversation")
+        self.assertEqual(card["state"], "conversation")
+        self.assertEqual(card["column"], "needs_you")
+
+    def test_an_ordinary_card_is_still_work_and_says_so(self):
+        card = self.new_card("fix the header")
+        self.assertEqual(card["kind"], "work")
+        self.assertEqual(card["state"], "queued")
+        self.assertNotIn("conversation", card,
+                         "a work card carries no conversation block at all")
+
+    def test_the_session_can_start_one(self):
+        card = self.new_conversation("a question that is not a work item",
+                                     actor="session")
+        self.assertEqual(card["kind"], "conversation")
+        _, detail = self.get("/api/cards/%d" % card["num"])
+        sub = [e for e in detail["timeline"] if e["kind"] == "submitted"][0]
+        self.assertEqual(sub["actor"], "session")
+
+    def test_hold_mode_does_not_park_a_conversation(self):
+        self.post("/api/sprint", {"action": "set_hold_mode", "hold_mode": True})
+        held = self.new_card("a work item during hold mode")
+        self.assertEqual(held["state"], "held")
+        # Hold is a brake on dispatch, and nothing dispatches a conversation --
+        # holding one would park a thread nobody is going to release.
+        card = self.new_conversation()
+        self.assertEqual(card["state"], "conversation")
+
+    def test_a_bad_kind_is_a_named_400(self):
+        status, body = self.post("/api/cards", {"text": "x", "kind": "sandwich"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get("field"), "kind")
+
+    def test_the_board_publishes_the_kinds_it_knows(self):
+        _, board = self.get("/api/board")
+        self.assertEqual(board["card_kinds"], ["work", "conversation"])
+
+
+class TestConversationIsNotWork(ConversationBase):
+    """Every work verb refuses a conversation, by name."""
+
+    def test_the_evidence_gate_refuses_a_packet_on_a_conversation(self):
+        num = self.new_conversation()["num"]
+        packet = dict(GOOD_PACKET)
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": packet})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body.get("error"), "not_a_work_card")
+        self.assertEqual(body.get("card_kind"), "conversation")
+        self.assertEqual(self.state_of(num), "conversation")
+        # …and nothing was recorded: a refused packet is not evidence.
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertIsNone(detail["evidence"])
+        self.assertEqual([e for e in detail["timeline"] if e["kind"] == "evidence"], [])
+
+    def test_a_conversation_cannot_be_moved_into_the_work_lifecycle(self):
+        num = self.new_conversation()["num"]
+        for state in ("triaging", "in_progress", "blocked"):
+            body = {"state": state}
+            if state == "blocked":
+                body["reason"] = "ci_red"
+            status, out = self.post("/api/cards/%d/state" % num, body)
+            self.assertEqual(status, 409, (state, out))
+            self.assertEqual(out.get("error"), "not_a_work_card", state)
+        self.assertEqual(self.state_of(num), "conversation")
+
+    def test_a_conversation_takes_no_verdict(self):
+        num = self.new_conversation()["num"]
+        status, body = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body.get("error"), "not_a_work_card")
+
+    def test_a_question_on_a_conversation_is_refused_before_it_is_written(self):
+        num = self.new_conversation()["num"]
+        status, body = self.post("/api/cards/%d/question" % num,
+                                 {"text": "which one?"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body.get("error"), "not_a_work_card")
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["questions"], [],
+                         "a refused question must not be half-written")
+        self.assertEqual(self.state_of(num), "conversation")
+
+    def test_work_verbs_are_refused_and_the_thread_verbs_are_not(self):
+        num = self.new_conversation()["num"]
+        for action in ("hold", "release", "retry", "duplicate_of"):
+            status, body = self.post("/api/cards/%d/action" % num,
+                                     {"action": action, "dup_of": 1})
+            self.assertEqual(status, 409, (action, body))
+            self.assertEqual(body.get("error"), "not_a_work_card", action)
+        status, body = self.post("/api/cards/%d/action" % num, {"action": "pin"})
+        self.assertEqual(status, 200, body)
+
+    def test_closing_one_is_cancel_and_reopening_puts_the_thread_back(self):
+        num = self.new_conversation()["num"]
+        status, _ = self.post("/api/cards/%d/action" % num, {"action": "cancel"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "canceled")
+        status, _ = self.post("/api/cards/%d/action" % num, {"action": "reopen"})
+        self.assertEqual(status, 200)
+        # NOT `queued`: a reopened conversation is the conversation it was.
+        self.assertEqual(self.state_of(num), "conversation")
+
+    def test_a_work_card_cannot_walk_into_the_conversation_state(self):
+        num = self.new_card("ordinary work")["num"]
+        status, body = self.post("/api/cards/%d/state" % num,
+                                 {"state": "conversation"})
+        self.assertEqual(status, 400, body)   # not even in the allowed list
+
+    def test_a_reopened_work_card_still_goes_to_the_queue(self):
+        num = self.new_card("closed too early")["num"]
+        self.post("/api/cards/%d/action" % num, {"action": "cancel"})
+        self.post("/api/cards/%d/action" % num, {"action": "reopen"})
+        self.assertEqual(self.state_of(num), "queued")
+
+    def test_conversations_are_outside_every_silence_and_staleness_clock(self):
+        num = self.new_conversation()["num"]
+        # Both sweeps run against the work states; a conversation is in none of
+        # them, which is the whole reason it has a state of its own.
+        self.assertEqual(self.app.sweep_silence(), 0)
+        self.assertEqual(self.app.sweep_stuck(), 0)
+        self.assertFalse(self.app.card_is_silent(num))
+        self.assertFalse(self.app.card_is_stuck(num))
+
+
+class TestMakeConversation(ConversationBase):
+    def test_a_work_card_can_be_promoted_and_keeps_everything(self):
+        num = self.new_card("this turned out not to be work")["num"]
+        self.to_in_progress(num)
+        self.post("/api/cards/%d/chat" % num, {"text": "some history"})
+        status, out = self.post("/api/cards/%d/action" % num,
+                                {"action": "make_conversation"})
+        self.assertEqual(status, 200, out)
+        _, detail = self.get("/api/cards/%d" % num)
+        card = detail["card"]
+        self.assertEqual(card["kind"], "conversation")
+        self.assertEqual(card["state"], "conversation")
+        self.assertEqual(card["body"], "this turned out not to be work")
+        self.assertIn("chat", [e["kind"] for e in detail["timeline"]],
+                      "the timeline it already had is untouched")
+        # …and it is now refused by the gate like any other conversation.
+        status, _ = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 409)
+
+    def test_kind_and_state_move_together_or_not_at_all(self):
+        num = self.new_card("closed already")["num"]
+        self.post("/api/cards/%d/action" % num, {"action": "cancel"})
+        status, body = self.post("/api/cards/%d/action" % num,
+                                 {"action": "make_conversation"})
+        self.assertEqual(status, 409, body)
+        card = self.get("/api/cards/%d" % num)[1]["card"]
+        self.assertEqual(card["kind"], "work")
+        self.assertEqual(card["state"], "canceled")
+
+
+class TestConversationHighlight(ConversationBase):
+    """The three states, and the derivation behind them.
+
+    unseen — they spoke after you last looked
+    seen   — you have looked since, but you have not replied
+    clear  — your own message is the latest
+    """
+
+    def test_a_conversation_you_started_asks_nothing_of_you(self):
+        num = self.new_conversation()["num"]
+        self.assertEqual(self.conv_state(num), "clear")
+
+    def test_a_conversation_the_SESSION_started_is_unseen_from_the_off(self):
+        """The point of the whole thing: "the session must be able to start one
+        -- that's how I'll ask you things that aren't a work item." A thread it
+        opened is a thing it said, so it wants your eyes immediately."""
+        num = self.new_conversation("a question that is not a work item",
+                                    actor="session")["num"]
+        self.assertEqual(self.conv_state(num), "unseen")
+
+    def test_a_message_from_the_session_makes_it_unseen(self):
+        num = self.new_conversation()["num"]
+        self.say(num, "here is what I found", "session")
+        self.assertEqual(self.conv_state(num), "unseen")
+        self.assertTrue(self.convo(num)["unread"])
+
+    def test_a_worker_counts_as_them_too(self):
+        num = self.new_conversation()["num"]
+        self.say(num, "an agent chiming in", "worker")
+        self.assertEqual(self.conv_state(num), "unseen")
+
+    def test_opening_it_dims_the_highlight_to_seen(self):
+        num = self.new_conversation()["num"]
+        self.say(num, "here is what I found", "session")
+        status, out = self.post("/api/cards/%d/seen" % num, {"seq": self.head()})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(self.conv_state(num), "seen")
+        self.assertTrue(self.convo(num)["unread"],
+                        "seen still wants your reply — it is dimmed, not gone")
+
+    def test_replying_clears_it_completely(self):
+        num = self.new_conversation()["num"]
+        self.say(num, "here is what I found", "session")
+        self.post("/api/cards/%d/seen" % num, {"seq": self.head()})
+        self.say(num, "ok, do that", "user")
+        self.assertEqual(self.conv_state(num), "clear")
+        self.assertFalse(self.convo(num)["unread"])
+
+    def test_replying_without_ever_opening_it_also_clears_it(self):
+        # No receipt at all. `clear` is about who spoke last, not about reading.
+        num = self.new_conversation()["num"]
+        self.say(num, "here is what I found", "session")
+        self.say(num, "ok, do that", "user")
+        self.assertEqual(self.conv_state(num), "clear")
+        self.assertEqual(self.convo(num)["last_seen_seq"], 0)
+
+    def test_a_new_message_after_you_replied_is_unseen_again(self):
+        num = self.new_conversation()["num"]
+        self.say(num, "first", "session")
+        self.post("/api/cards/%d/seen" % num, {"seq": self.head()})
+        self.say(num, "my answer", "user")
+        self.assertEqual(self.conv_state(num), "clear")
+        self.say(num, "one more thing", "session")
+        self.assertEqual(self.conv_state(num), "unseen")
+
+    def test_the_receipt_never_walks_backwards(self):
+        num = self.new_conversation()["num"]
+        self.say(num, "here is what I found", "session")
+        top = self.head()
+        self.post("/api/cards/%d/seen" % num, {"seq": top})
+        # A stale tab posting an old seq must not un-read what you have read.
+        self.post("/api/cards/%d/seen" % num, {"seq": 1})
+        self.assertEqual(self.convo(num)["last_seen_seq"], top)
+        self.assertEqual(self.conv_state(num), "seen")
+
+    def test_the_receipt_is_what_the_tab_rendered_not_what_arrived_after(self):
+        num = self.new_conversation()["num"]
+        self.say(num, "the line you read", "session")
+        rendered = self.head()
+        # …and one that landed while the POST was in flight.
+        self.say(num, "the line that landed a beat later", "session")
+        self.post("/api/cards/%d/seen" % num, {"seq": rendered})
+        self.assertEqual(self.conv_state(num), "unseen",
+                         "you have not seen the newer line, so it is still unseen")
+
+    def test_telemetry_is_not_a_message(self):
+        num = self.new_conversation()["num"]
+        # A progress line is an agent narrating itself, not somebody talking to
+        # you: it must not light a conversation up.
+        status, out = self.post("/api/cards/%d/events" % num,
+                                {"kind": "progress", "payload": {"text": "still reading"}})
+        self.assertEqual(status, 201, out)
+        self.assertEqual(self.conv_state(num), "clear")
+
+    def test_the_boards_number_is_the_same_number_the_card_gives(self):
+        num = self.new_conversation()["num"]
+        self.say(num, "here is what I found", "session")
+        _, board = self.get("/api/board")
+        row = {c["num"]: c for c in board["cards"]}[num]
+        self.assertEqual(row["kind"], "conversation")
+        self.assertEqual(row["conversation"], self.convo(num))
+
+    def test_a_receipt_on_a_work_card_is_a_named_409(self):
+        num = self.new_card("ordinary work")["num"]
+        status, body = self.post("/api/cards/%d/seen" % num, {"seq": 1})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body.get("error"), "not_a_conversation")
+
+    def test_a_junk_seq_is_a_named_400(self):
+        num = self.new_conversation()["num"]
+        for bad in ("banana", -1):
+            status, body = self.post("/api/cards/%d/seen" % num, {"seq": bad})
+            self.assertEqual(status, 400, (bad, body))
+            self.assertEqual(body.get("field"), "seq")
+
+
+class TestConversationDerivationIsFalsifiable(ConversationBase):
+    """The derivation, mutated, must break something named.
+
+    Nothing here is a second implementation of the rule -- these poke the ONE
+    implementation and assert the three states move the way the user described
+    them. If `conversation_json` is rewritten to return a constant, or to
+    compare the wrong pair of numbers, exactly these go red.
+    """
+
+    def test_all_three_states_are_reachable_on_one_card(self):
+        num = self.new_conversation()["num"]
+        seen_states = [self.conv_state(num)]
+        self.say(num, "they speak", "session")
+        seen_states.append(self.conv_state(num))
+        self.post("/api/cards/%d/seen" % num, {"seq": self.head()})
+        seen_states.append(self.conv_state(num))
+        self.say(num, "you reply", "user")
+        seen_states.append(self.conv_state(num))
+        # A derivation that returns a constant cannot produce this sequence.
+        self.assertEqual(seen_states, ["clear", "unseen", "seen", "clear"])
+
+    def test_unseen_needs_BOTH_a_newer_message_and_an_older_receipt(self):
+        num = self.new_conversation()["num"]
+        self.say(num, "they speak", "session")
+        theirs = self.convo(num)["latest_incoming_seq"]
+        # receipt exactly AT the message: seen, never unseen. A `>=` where the
+        # code says `>` (or the reverse) shows up right here.
+        self.post("/api/cards/%d/seen" % num, {"seq": theirs})
+        self.assertEqual(self.conv_state(num), "seen")
+        # one short of it: still unseen
+        num2 = self.new_conversation()["num"]
+        self.say(num2, "they speak", "session")
+        theirs2 = self.convo(num2)["latest_incoming_seq"]
+        self.post("/api/cards/%d/seen" % num2, {"seq": theirs2 - 1})
+        self.assertEqual(self.conv_state(num2), "unseen")
+
+    def test_clear_is_decided_by_who_spoke_last_not_by_the_receipt(self):
+        num = self.new_conversation()["num"]
+        self.say(num, "they speak", "session")
+        self.say(num, "you reply", "user")
+        c = self.convo(num)
+        self.assertGreater(c["latest_user_seq"], c["latest_incoming_seq"])
+        self.assertEqual(c["last_seen_seq"], 0)
+        self.assertEqual(c["state"], "clear",
+                         "your own message being last is what clears it")
+
+    def test_the_reported_numbers_are_the_ones_the_state_was_derived_from(self):
+        num = self.new_conversation()["num"]
+        theirs = self.say(num, "they speak", "session")["event"]["seq"]
+        yours = self.say(num, "you reply", "user")["event"]["seq"]
+        c = self.convo(num)
+        self.assertEqual(c["latest_incoming_seq"], theirs)
+        self.assertEqual(c["latest_user_seq"], yours)
+
+
+class TestConversationMigration(unittest.TestCase):
+    """An old database gets the column, and every row in it stays work.
+
+    The board is a long-running process on a machine that has been running it
+    for weeks; the DB on disk predates every column added since. `kind` lands
+    through ADDED_COLUMNS with DEFAULT 'work', which is the one default that
+    makes the migration free -- every card that already exists is, by
+    definition, the kind that already existed.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-migrate-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "project")
+        os.makedirs(self.root)
+
+    def _old_db(self):
+        """A database exactly as a server from before conversations left it."""
+        import sqlite3
+        data = os.path.join(self.root, ".sprint")
+        os.makedirs(data, exist_ok=True)
+        conn = sqlite3.connect(os.path.join(data, "sprint.db"))
+        schema = sprintd.SCHEMA.replace("  kind TEXT NOT NULL DEFAULT 'work',\n", "")
+        self.assertNotIn("DEFAULT 'work'", schema,
+                         "the old cards table must really lack the kind column")
+        conn.executescript(schema)
+        now = time.time()
+        conn.execute("INSERT INTO sprints(id, opened_at, title) VALUES(1, ?, 'old')",
+                     (now,))
+        conn.execute(
+            "INSERT INTO cards(num, sprint_id, state, title, body, created_at, updated_at) "
+            "VALUES(7, 1, 'in_progress', 'an old card', 'from before kinds', ?, ?)",
+            (now, now))
+        conn.execute(
+            "INSERT INTO events(card_num, ts, actor, kind, payload) VALUES(7,?,?,?,?)",
+            (now, "user", "submitted", json.dumps({"text": "from before kinds"})))
+        conn.commit()
+        conn.close()
+
+    def test_an_old_database_gains_the_column_and_keeps_its_cards(self):
+        self._old_db()
+        app = sprintd.App(self.root, token="t")
+        self.addCleanup(app.close)
+        self.assertIn("kind", app.columns("cards"))
+        card = app.card_json(app.card_row(7))
+        self.assertEqual(card["kind"], "work")
+        self.assertEqual(card["state"], "in_progress")
+        self.assertEqual(card["title"], "an old card")
+        self.assertNotIn("conversation", card)
+        # and it still behaves as work: the gate takes a packet on it
+        out = app.card_ready(7, dict(GOOD_PACKET))
+        self.assertTrue(out["ok"])
+        self.assertEqual(app.card_row(7)["state"], "ready")
+
+    def test_a_conversation_created_after_the_migration_works(self):
+        self._old_db()
+        app = sprintd.App(self.root, token="t")
+        self.addCleanup(app.close)
+        card = app.create_card("a thread on an upgraded board", [], False,
+                               kind="conversation")
+        self.assertEqual(card["state"], "conversation")
+        self.assertEqual(card["conversation"]["state"], "clear")
+        app.card_chat(card["num"], "something new", actor="session")
+        self.assertEqual(
+            app.card_json(app.card_row(card["num"]))["conversation"]["state"],
+            "unseen")
+
+    def test_the_migration_is_idempotent(self):
+        self._old_db()
+        app = sprintd.App(self.root, token="t")
+        app.close()
+        app2 = sprintd.App(self.root, token="t")
+        self.addCleanup(app2.close)
+        self.assertIn("kind", app2.columns("cards"))
+        self.assertEqual(app2.card_json(app2.card_row(7))["kind"], "work")
+
+    def test_card_kind_degrades_on_a_database_that_never_ran_the_migration(self):
+        """`card_kind` is asked about rows from a DB it did not create."""
+        self._old_db()
+        app = sprintd.App(self.root, token="t")
+        self.addCleanup(app.close)
+        row = app.card_row(7)
+        # Pretend the column is not there (an older sibling process, a replica)
+        app._columns = {"cards": {c for c in app.columns("cards") if c != "kind"}}
+        self.assertEqual(app.card_kind(row), "work")
+        self.assertFalse(app.is_conversation(row))
+
+
+class TestSidebarReadReceipt(Base):
+    """What the switcher's GOLD half is derived from on a board nobody has open.
+
+    User's ruling, verbatim: "gold for needs you or a new message from the
+    session chat, green for needs review". A tab that is not open cannot hold
+    "you have read the manager channel", so the board writes it down: one
+    cursor, and the count derived from the log against it.
+    """
+
+    def say(self, text, actor="session"):
+        status, out = self.post("/api/sidebar", {"text": text, "actor": actor})
+        self.assertEqual(status, 201, out)
+        return out
+
+    def unread(self):
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        return board["chat_unread"]
+
+    def test_a_fresh_board_has_nothing_unread(self):
+        self.assertEqual(self.unread(), 0)
+
+    def test_a_session_line_is_unread_until_it_is_seen(self):
+        self.say("three agents running, cap is 3")
+        self.assertEqual(self.unread(), 1)
+        self.say("and #12 just landed")
+        self.assertEqual(self.unread(), 2)
+        status, out = self.post("/api/sidebar/seen", {"seq": self.get("/api/board")[1]["seq"]})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["chat_unread"], 0)
+        self.assertEqual(self.unread(), 0)
+
+    def test_your_own_messages_are_never_unread_to_you(self):
+        self.say("keep the order. but batch the css ones.", actor="user")
+        self.assertEqual(self.unread(), 0)
+
+    def test_worker_telemetry_never_reaches_the_manager_channel(self):
+        num = self.new_card("some work")["num"]
+        self.to_in_progress(num)
+        self.post("/api/cards/%d/events" % num,
+                  {"kind": "progress", "payload": {"text": "reading"}})
+        self.assertEqual(self.unread(), 0)
+
+    def test_the_receipt_never_walks_backwards(self):
+        first = self.say("first")["event"]["seq"]
+        self.say("second")
+        top = self.get("/api/board")[1]["seq"]
+        self.assertGreater(top, first, "the two lines must have different seqs")
+        self.post("/api/sidebar/seen", {"seq": top})
+        self.assertEqual(self.unread(), 0)
+        # A stale tab posting an older seq must not un-read what you have read.
+        self.post("/api/sidebar/seen", {"seq": first})
+        self.assertEqual(self.unread(), 0)
+
+    def test_a_line_after_the_receipt_is_unread_again(self):
+        self.say("first")
+        self.post("/api/sidebar/seen", {"seq": self.get("/api/board")[1]["seq"]})
+        self.assertEqual(self.unread(), 0)
+        self.say("one more thing")
+        self.assertEqual(self.unread(), 1)
+
+    def test_a_junk_seq_is_a_named_400(self):
+        for bad in ("banana", -3):
+            status, body = self.post("/api/sidebar/seen", {"seq": bad})
+            self.assertEqual(status, 400, (bad, body))
+            self.assertEqual(body.get("field"), "seq")
+
+
+class TestSwitcherSquare(Base):
+    """The two halves of the square, as the board reports them.
+
+    The bug, from the user's own machine: a board sitting at needs_you 0 and
+    ready 8 -- eight finished branches waiting on his verdict -- and the
+    switcher showed nothing at all, because the indicator only ever read
+    needs_you.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # /api/siblings reads the machine-wide registry. Point it at an empty
+        # temp one: a test must never health-check the boards actually running
+        # on this machine, and its answers must not depend on them.
+        self.app.registry = os.path.join(self.tmp, "registry.json")
+        self.app._siblings_snap = None
+
+    def ready_card(self):
+        num = self.new_card("a finished branch")["num"]
+        self.to_in_progress(num)
+        packet = dict(GOOD_PACKET)
+        packet["branch"] = "sprint/card-%d" % num
+        status, out = self.post("/api/cards/%d/ready" % num, {"packet": packet})
+        self.assertEqual(status, 200, out)
+        return num
+
+    def rollup(self):
+        return sprintd.board_rollup(self.app.board())
+
+    def test_the_rollup_reports_both_halves(self):
+        r = self.rollup()
+        self.assertEqual(r["needs_you"], 0)
+        self.assertEqual(r["ready"], 0)
+        self.assertEqual(r["chat_unread"], 0)
+
+    def test_ready_alone_is_a_signal_the_rollup_carries(self):
+        for _ in range(8):
+            self.ready_card()
+        r = self.rollup()
+        # The exact shape of the reported bug.
+        self.assertEqual(r["needs_you"], 0)
+        self.assertEqual(r["ready"], 8)
+        self.assertEqual(r["chat_unread"], 0)
+
+    def test_an_unread_session_line_is_a_signal_too(self):
+        self.post("/api/sidebar", {"text": "want me to hold?", "actor": "session"})
+        r = self.rollup()
+        self.assertEqual(r["needs_you"], 0)
+        self.assertEqual(r["ready"], 0)
+        self.assertEqual(r["chat_unread"], 1)
+
+    def test_a_sibling_row_carries_chat_unread(self):
+        self.post("/api/sidebar", {"text": "want me to hold?", "actor": "session"})
+        self.ready_card()
+        row = sprintd.self_sibling_row(self.app)
+        self.assertEqual(row["chat_unread"], 1)
+        self.assertEqual(row["ready"], 1)
+        self.assertTrue(row["self"])
+
+    def test_the_siblings_payload_splits_asking_from_review(self):
+        status, body = self.get("/api/siblings")
+        self.assertEqual(status, 200, body)
+        # This board is always `self`, and the two "elsewhere" numbers are
+        # about everyone BUT this board -- so on a one-board machine they are
+        # zero no matter what is piled up here.
+        self.assertIn("asking_elsewhere", body)
+        self.assertIn("review_elsewhere", body)
+        self.assertEqual(body["asking_elsewhere"], 0)
+        self.assertEqual(body["review_elsewhere"], 0)
+        self.assertEqual([r["self"] for r in body["sprints"]], [True])
+
+    def test_a_board_payload_from_an_older_server_reports_no_unread(self):
+        """`board_rollup` is fed a payload fetched over HTTP from a sibling.
+
+        A board too old to publish `chat_unread` must produce a missing half,
+        never a wrong one -- the square loses its gold, it does not invent it.
+        """
+        board = self.app.board()
+        board.pop("chat_unread", None)
+        self.assertEqual(sprintd.board_rollup(board)["chat_unread"], 0)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

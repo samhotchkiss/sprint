@@ -335,6 +335,16 @@ root; several run at once in different tmux windows.
   board is always in the list flagged `self: true` and rolled up straight from its own DB, never over
   HTTP. Unreachable rows are **dropped**, not greyed: a hub row exists to tell you a board died, a
   menu row exists to be clicked. Cached 10s server-side (`SPRINT_SIBLINGS_TTL`).
+  **Order is stable and server-side**, user verbatim: "the order of sprints should stay the same in
+  the list, so I can count on .1 always going to session a, .2 always going to session b, etc, and not
+  have to reassess the list each time." The registry stamps every project an `ordinal` the first time
+  it registers and never edits it again, so a board keeps its place across restarts and a new one
+  appends. `/api/siblings` sorts by that and by nothing else — including the `self` row, which sits in
+  its own place rather than first, so all boards on the machine agree on what "2" means. Attention is
+  **shown** (the dot, the counts) and never sorted by. Dropping a dead row compacts the list: a number
+  that navigates nowhere is worse than one that shifted, and the board gets its place back when it
+  returns. The hub page keeps its attention sort — it is read cold, top to bottom, and nothing on it
+  is keyed to a number.
   UI: >1 live board and the header title becomes a dropdown — one ≥44px row per sprint (name, its
   counts, a dot when that sprint has `needs_you > 0`, "here" on the current one), clicking navigates
   to that board's signed URL in the same tab, on the host you are already using. The title carries a
@@ -853,7 +863,8 @@ additional tmux sessions and tmux-send — so I may want it to use grok subagent
 example."* Scope ruling: *"Peer per card — mix grok-via-tmux and claude subagents"*.
 
 - **Store**: `.sprint/config.json` (a file, not a table — hand-editable, survives `stop`, diffs in a
-  terminal). `{"worker": {"model_policy", "default_executor", "executors", "concurrency"}}`.
+  terminal). `{"worker": {"model_policy", "default_executor", "executors", "concurrency"},
+  "agent_name": ""}`.
   `model_policy ∈ {lowest_feasible (default), always_opus, always_sonnet}`; `executors` is
   name → `{kind: subagent|tmux, command?, session?, model?, note?}` (a `tmux` executor REQUIRES a
   command; `session` defaults to `sprint-workers`); `concurrency` is 1–20, default 3.
@@ -871,12 +882,26 @@ example."* Scope ruling: *"Peer per card — mix grok-via-tmux and claude subage
   path (and renames a board that is already up); the registry row follows it, so the title switcher
   and the hub label a board by what it is about rather than by its directory. One line, ≤60 chars;
   default is the project directory's name. A rename appends one `note` (`actor: "server"`).
+- **The session's own name** is the OTHER name, and the two are not the same thing: the sprint is
+  named after the work, the session running it is named like a colleague. User, verbatim: *"I also
+  meant that the session agent gave themselves a name. Like "Chuck""*. It IS in `config.json`
+  (top-level `agent_name`, default `""`), settable with `PUT /api/settings {"agent_name": "Chuck"}`
+  and echoed as `agent_name` on `/api/settings`, `/api/board` and `/healthz`. ≤24 chars, one line;
+  `""` takes it back. Every UI label that would read *Session* — a bubble in the sidebar, a bubble in
+  a card thread, the rail's chat header, a row in the report library — reads the name instead, and
+  falls straight back to *Session* when there isn't one. Note the level: this is the SESSION's name,
+  while a card's `agent_name` is the worker subagent on that card.
+  `sprintd start --agent-name "Chuck"` is the launch path and is **first-write-wins** — a board whose
+  session already has a name keeps it, so a restart is the same colleague coming back rather than a
+  new hire, and the self-restart exec drops the flag for the same reason. Renaming on purpose is the
+  `PUT` (or the settings panel's *Session name* field). Taking a name appends its own one-line `note`
+  ("the session is called “Chuck”"), never a `settings changed` line — it isn't dispatch policy.
 - **Per card**: `cards.executor`/`cards.model` (both nullable; NULL = the board's defaults), set via
   `POST /api/cards/:num/assign {executor?, model?}`, which refuses an executor that is not declared.
   Every card payload carries `dispatch: {executor, kind, command, session, model, source,
   is_default}` — the server's resolution of card-over-policy, so no surface has to redo it.
-- **UI**: a quiet `Settings` link in the header opens a sheet (model policy segmented control, default
-  executor select, concurrency, executors as JSON) whose standing sentence is *a change takes effect
+- **UI**: a quiet `Settings` link in the header opens a sheet (sprint name, session name, model policy
+  segmented control, default executor select, concurrency, executors as JSON) whose standing sentence is *a change takes effect
   for the NEXT dispatch — cards already running keep the executor and model they started with*. Card
   faces, List rows and the rail head carry a small `grok · tmux` tag **only when that card is not on
   the defaults**; the model is on the tooltip and the rail head, not on the crowded face.

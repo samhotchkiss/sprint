@@ -163,6 +163,12 @@ export const api = {
     req('POST', `/api/cards/${num}/answer`,
       images && images.length ? { question_id, text, images } : { question_id, text },
       { idempotencyKey: key }),
+  // The read receipt behind a conversation card's highlight. `seq` is what this
+  // tab had actually rendered when you looked at it; the server keeps the
+  // highest one it has been told about, so a stale tab can never un-read a
+  // message.
+  seen: (num, seq, key) =>
+    req('POST', `/api/cards/${num}/seen`, { seq }, { idempotencyKey: key }),
   action: (num, action, extra, key) =>
     req('POST', `/api/cards/${num}/action`, { action, ...(extra || {}) }, { idempotencyKey: key }),
   retry: (num, key) =>
@@ -180,6 +186,10 @@ export const api = {
   sidebar: (text, images, key) => req('POST', '/api/sidebar',
     images && images.length ? { text, images, actor: 'user' } : { text, actor: 'user' },
     { idempotencyKey: key }),
+  // "I have read the manager channel up to here." What the OTHER boards'
+  // switcher squares are derived against — a tab that is not open cannot hold
+  // that fact, so the board does.
+  sidebarSeen: (seq) => req('POST', '/api/sidebar/seen', { seq }),
   holdMode: (on) => req('POST', '/api/sprint', { action: 'set_hold_mode', hold_mode: !!on }),
   // The Resume button in the account-limit banner. Server-side this is the
   // same single-writer clear the clock uses, so pressing it twice (or pressing

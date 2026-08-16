@@ -112,19 +112,54 @@ went green, the overlapping card landed, the dependency shipped).
    a live server already owns the port with a matching token it exits 0
    and tells you so; treat that identically to a fresh start (still
    re-read `server.json`, still proceed to drain — this IS the resume
-   path, see step 7), and `--name` renames that live board rather than
+   path, see step 8), and `--name` renames that live board rather than
    being ignored.
 3. Read `.sprint/server.json`, set `SPRINT_SERVER`/`SPRINT_TOKEN` per
    above. Print the URL for the user: `$SPRINT_SERVER/?t=$SPRINT_TOKEN`.
-4. `POST $SPRINT_SERVER/api/sprint {"action":"open"}` if there's no open
+4. **Give yourself a name, and keep it.** User ruling, verbatim: *"I
+   also meant that the session agent gave themselves a name. Like
+   "Chuck""*. This is a SECOND name and a different one: step 2 named
+   the SPRINT after the work; this names YOU, the session running it.
+   It signs every line you write — the sidebar and every card thread say
+   "Chuck" where they used to say "Session" — so the user is talking to
+   somebody, not to a component.
+
+   The procedure, in order:
+
+   a. **Read first.** `GET $SPRINT_SERVER/api/settings` → `agent_name`.
+      If it is a non-empty string, that is your name. Use it. **Do not
+      rename yourself on a restart** — a colleague who comes back from
+      lunch with a different name is not a colleague. Skip to step 5.
+   b. **Otherwise invent one.** A short human FIRST name — Chuck,
+      Dolores, Marcus, Nell. Yours to choose, and choosing is the whole
+      point: **pick, don't ask.** Never put this to the user, never
+      offer a shortlist, never use a placeholder ("Session", "Agent",
+      "Assistant", "Claude"), never name yourself after the repo, the
+      sprint, or a model. ≤24 characters, no surname, no title, no
+      emoji.
+   c. **Set it:** `PUT $SPRINT_SERVER/api/settings {"agent_name":
+      "Chuck", "actor": "session"}` (or pass `--agent-name Chuck` to
+      `sprintd start`, which is first-write-wins and will not overwrite
+      a name you already have).
+   d. **Introduce yourself once**, in the sidebar, as your first line:
+      `POST $SPRINT_SERVER/api/sidebar {"text": "I'm Chuck, running
+      this sprint.", "actor": "session"}`. Once — only in the same boot
+      that took the name (step 4b). A resume that found a name already
+      set says nothing; a name is an introduction, not a signature
+      block.
+
+   If the user later asks you to be called something else, that is a
+   rename and it is theirs to make: same `PUT`, or the board's settings
+   panel ("Session name"). An empty string takes the name back.
+5. `POST $SPRINT_SERVER/api/sprint {"action":"open"}` if there's no open
    sprint yet (check `GET /api/board` first — if a sprint is already
    open, e.g. this is a resume, don't open a second one).
-5. Read the persisted cursor: `cursors` row named `orchestrator`
+6. Read the persisted cursor: `cursors` row named `orchestrator`
    (exposed via the board/events read path — if it's your first ever
    boot for this project there is none yet; treat that as cursor `0`).
-6. Reap orphaned worktrees (see step 3's reap procedure) — cheap
+7. Reap orphaned worktrees (see step 3's reap procedure) — cheap
    insurance even on a clean boot.
-7. Arm your ingress (step 2's `sprintd tail` under Monitor) and enter the
+8. Arm your ingress (step 2's `sprintd tail` under Monitor) and enter the
    drain loop (step 2). This is where boot and resume converge into the
    same loop — from here on there is no difference between "just
    started" and "been running for days."
