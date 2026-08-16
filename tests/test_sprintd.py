@@ -4913,6 +4913,24 @@ class TestExternalAgentsAndLongRunning(Base):
             time.sleep(0.1)
         self.assertGreater(len(self.silent_events(num)), before)
 
+    def test_a_session_note_counts_on_an_ASSIGNED_card_too(self):
+        """The clock keys on the AGENT, so the agent-wide branch of the
+        baseline has to agree with the per-card one."""
+        num = self.new_card("assigned to an outside seat")["num"]
+        self.assertEqual(self.post("/api/cards/%d/assign" % num,
+                                   {"agent_name": "russ-codex-4"})[0], 200)
+        self.assertEqual(self.post("/api/cards/%d/state" % num,
+                                   {"state": "in_progress"})[0], 200)
+        self.assertTrue(self.await_silence(num))
+        before = len(self.silent_events(num))
+        self.assertEqual(self.post("/api/cards/%d/events" % num,
+                                   {"kind": "note", "actor": "session",
+                                    "payload": {"text": "pinged the seat, "
+                                                        "it is alive"}})[0], 201)
+        time.sleep(0.5)
+        self.assertEqual(len(self.silent_events(num)), before,
+                         "a session note on an assigned card resets the clock")
+
     def test_a_server_reminder_never_counts_as_activity(self):
         """The sweep's own noise must not reset the clock it is complaining
         about -- that is how a nag becomes permanent silence."""
