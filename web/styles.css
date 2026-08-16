@@ -2290,3 +2290,161 @@ html.skin-chaos .packet-readback {
   border-radius: 0;
   line-height: 1.7;
 }
+
+/* --------------------------------------------------------------------------
+   card #43 — sprint settings + the per-card executor tag
+   (appended section: three agents are editing this file in parallel, so this
+   block is self-contained and touches nothing above it)
+
+   Two surfaces. The Settings panel is the board's dispatch policy — model,
+   executors, how many run at once — reached from a deliberately quiet header
+   link, because it is something you visit twice a month. The executor tag is
+   the other half: it appears on a card ONLY when that card was dispatched
+   differently from the board's default, so "grok · tmux" means "this one is
+   not like the others" rather than being chrome on every face.
+   -------------------------------------------------------------------------- */
+
+/* the header link — quieter than Drop work, same weight as Chat */
+.settings-btn { color: var(--faint); }
+.settings-btn:hover { color: var(--ink); border-color: var(--border-chip); }
+
+.settings-sheet { width: 620px; gap: 14px; }
+.settings-head h2 {
+  font-family: var(--font-display);
+  font-size: 19px;
+  font-weight: var(--display-weight);
+  color: var(--ink);
+  margin: 0 0 6px;
+  text-transform: var(--display-case);
+}
+/* the one sentence the panel exists to say out loud */
+.settings-when {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--dim);
+  max-width: 66ch;
+}
+.settings-when strong { color: var(--ink); font-weight: 600; }
+
+.settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-height: 56vh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.settings-field { display: flex; flex-direction: column; gap: 7px; }
+.settings-label {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.settings-hint {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--faint);
+  max-width: 68ch;
+}
+.settings-seg { align-self: flex-start; }
+
+.settings-select,
+.settings-num {
+  font-family: var(--font-body);
+  font-size: 14px;
+  color: var(--ink);
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  padding: 0 12px;
+  min-height: 44px;
+  outline: none;
+  align-self: flex-start;
+}
+.settings-select { min-width: 240px; }
+.settings-num { width: 110px; }
+.settings-select:focus, .settings-num:focus { border-color: var(--accent); }
+
+.settings-json {
+  width: 100%;
+  min-height: 132px;
+  max-height: 32vh;
+  resize: vertical;
+  background: var(--input);
+  color: var(--body-ink);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  padding: 11px 12px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  outline: none;
+}
+.settings-json:focus { border-color: var(--accent); }
+
+.settings-foot { display: flex; align-items: center; gap: 10px; }
+.settings-status { font-size: 12.5px; color: var(--faint); }
+.settings-err {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--bad);
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  padding: 9px 11px;
+}
+
+/* the tag — mono, quiet, and never on a card running the defaults */
+.exec-tag {
+  display: inline-flex;
+  align-items: baseline;
+  flex: none;
+  padding: 2px 7px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--exec-ink, #b6a6cd);
+  background: var(--exec-bg, #16131d);
+  border: 1px solid var(--exec-line, #2b2536);
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
+.row-agent .exec-tag { margin-left: 7px; }
+.rail-head .exec-tag { flex: none; }
+/* The card foot is one line: agent · tag · age. The agent name gives way
+   before the tag does, and neither is allowed to wrap the age onto its own
+   row (which is what an untamed tag did to a 300px column). */
+.card-foot { flex-wrap: nowrap; }
+.card-foot > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-foot .exec-tag { max-width: 62%; overflow: hidden; text-overflow: ellipsis; }
+
+@media (max-width: 1199px) {
+  /* Fold: 740px tall is the scarce dimension, so the sheet starts higher and
+     the fields scroll inside it rather than pushing Save off the screen. */
+  #settings-wrap { padding-top: 22px; }
+  .settings-sheet { width: 100%; }
+  .settings-body { max-height: 56vh; }
+  .settings-json { min-height: 96px; }
+  .settings-foot .btn { min-height: 44px; }
+  /* the header is 54px and already full — the link keeps its words, not an icon */
+  .settings-btn { padding: 0 10px; }
+}
+
+/* ---- Chaos: same words, hard edges --------------------------------------- */
+
+html.skin-chaos .settings-sheet { border: 2px solid var(--border); }
+html.skin-chaos .settings-select,
+html.skin-chaos .settings-num,
+html.skin-chaos .settings-json,
+html.skin-chaos .settings-err { border: 2px solid var(--border); border-radius: 0; }
+html.skin-chaos .settings-when,
+html.skin-chaos .settings-hint { line-height: 1.7; }
+html.skin-chaos .exec-tag {
+  border: 1px solid var(--border);
+  border-radius: 0;
+  color: #e7dcff;
+  background: #241a45;
+  box-shadow: inset 1px 1px 0 #4b3a86, inset -1px -1px 0 #0a0618;
+}

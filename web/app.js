@@ -14,6 +14,7 @@ import { initCompose, toBase64List, imageFiles } from './compose.js';
 import { installNotifications, attention, armNotifications, clearBadge } from './notify.js';
 import { loadSkin, installSkinToggle, installBlip } from './skin.js';
 import { startSiblings, renderTitle, closeSiblingMenu } from './siblings.js';
+import { installSettings, closeSettings, settingsOpen } from './settings.js';
 
 const el = {};
 let compose = null;
@@ -753,6 +754,13 @@ async function boot() {
   // The skin is pure CSS, but a re-paint costs nothing and keeps anything that
   // reads a computed colour honest.
   installSkinToggle($('#skin-seg'), render);
+  // Saved settings change what the NEXT dispatch does, and they change what a
+  // card face calls "the default" — so the board is refetched, not just
+  // repainted.
+  installSettings($('#settings-btn'), () => {
+    toast('Settings saved — in effect for the next dispatch.');
+    refreshBoard();
+  });
   el.chatBtn.addEventListener('click', () => toggleChat());
   $('#drop-btn').addEventListener('click', () => openCompose());
   $('#compose-cancel').addEventListener('click', () => closeCompose());
@@ -775,7 +783,8 @@ async function boot() {
     // "/" is the shortcut to drop work — from anywhere on the board, and from a
     // text box that is still empty. Once there are words in the box a slash is
     // just a slash, and inside the Drop-work sheet itself it always is.
-    if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey && el.composeWrap.hidden) {
+    if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey
+        && el.composeWrap.hidden && !settingsOpen()) {
       const a = document.activeElement;
       const inSheet = !!(a && el.composeWrap.contains(a));
       if (!inSheet && (!isTyping(a) || emptyTextTarget(a))) {
@@ -785,6 +794,7 @@ async function boot() {
       }
     }
     if (e.key === 'Escape') {
+      if (closeSettings()) return;
       if (closeSiblingMenu()) { render(); return; }
       if (!el.lightbox.hidden) { closeLightbox(el.lightbox); return; }
       if (!el.composeWrap.hidden) { closeCompose(); return; }

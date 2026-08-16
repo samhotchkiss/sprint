@@ -151,6 +151,11 @@ export const api = {
     images && images.length ? { text, images, actor: 'user' } : { text, actor: 'user' },
     { idempotencyKey: key }),
   holdMode: (on) => req('POST', '/api/sprint', { action: 'set_hold_mode', hold_mode: !!on }),
+
+  // Dispatch policy: model policy, executors, concurrency. A document you
+  // replace, not an event you append — hence PUT.
+  settings: () => req('GET', '/api/settings'),
+  saveSettings: (patch) => req('PUT', '/api/settings', patch),
 };
 
 /**

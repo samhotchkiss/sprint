@@ -19,6 +19,7 @@ import {
   meterSegments, sections, isSilent, isStuck, STUCK_HINT, STATE_LABEL,
 } from './state.js';
 import { phaseChip } from './phase.js';
+import { executorTag } from './settings.js';
 import { renderMeter } from './meter.js';
 import { shortAgent } from './list.js';
 import { reviewBlock } from './review.js';
@@ -130,8 +131,12 @@ export function renderCardFace(card, app) {
 
   // The age is the only thing on the face that can say "this has been sitting
   // here too long", so that is where the sweep's amber goes. No new chrome.
+  // "grok · tmux" sits with the agent name, and only when this card was
+  // dispatched differently from the board's default — a tag on every card
+  // would say nothing.
   face.appendChild(h('div.card-foot',
     h('span', shortAgent(card.agent_name)),
+    executorTag(card, { compact: true }),
     h('span.grow'),
     h('span', { class: isStuck(card) ? 'is-stuck-age' : null,
       title: isStuck(card) ? STUCK_HINT : null },

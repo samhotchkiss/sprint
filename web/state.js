@@ -97,6 +97,7 @@ export const STATE_LABEL = {
 export const store = {
   sprint: null,           // {title, hold_mode, opened_at, closed_at}
   columnOf: null,         // server-advised state -> column map (board.column_of)
+  settings: null,         // dispatch policy: model, executors, concurrency
   // `cursor` is the session's real drain cursor: every event with seq <= cursor
   // has been read by the session. Never guessed — the server is the only writer.
   session: { status: 'online', online: true, since: null, cursor: null, waiterSeconds: null },
@@ -210,6 +211,12 @@ export function normCard(c) {
     phase: c.phase || null,
     phase_since: c.phase_since || null,
     phase_expected_seconds: c.phase_expected_seconds != null ? num(c.phase_expected_seconds) : null,
+    // Who ran this card and with what. Null on both means "the board's
+    // defaults", and `dispatch` is the server's resolution of that — including
+    // `is_default`, which is the only thing the face's tag asks about.
+    executor: c.executor || null,
+    model: c.model || null,
+    dispatch: c.dispatch || null,
   };
 }
 
@@ -298,6 +305,9 @@ export function applyBoard(board) {
   if (known != null && (sess.cursor == null || sess.cursor < known)) sess.cursor = known;
   store.session = sess;
   if (board.column_of && typeof board.column_of === 'object') store.columnOf = board.column_of;
+  // The board's dispatch policy rides along so the Settings panel and the card
+  // faces are never a second fetch behind what the board just said.
+  if (board.settings && typeof board.settings === 'object') store.settings = board.settings;
 
   const list = Array.isArray(board.cards) ? board.cards : [];
   const next = new Map();

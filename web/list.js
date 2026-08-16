@@ -10,6 +10,7 @@ import {
   waitingMark, isStuck, BLOCKED_NOTE,
 } from './state.js';
 import { phaseChip } from './phase.js';
+import { executorTag } from './settings.js';
 import { renderMeter } from './meter.js';
 import { renderDone } from './done.js';
 import { reviewBlock } from './review.js';
@@ -156,7 +157,9 @@ export function motionRow(card, app) {
   row.appendChild(h('span.row-prog', { title: st.title },
     h('span.prog-track', h('span.prog-fill', { style: { width: st.pct + '%', background: st.color } })),
     chip || h('span.prog-label', { style: { color: st.color } }, st.label)));
-  row.appendChild(h('span.row-agent', shortAgent(card.agent_name)));
+  // The agent's name, and — only when this card is not on the board's default
+  // executor/model — how it was dispatched: "grok · tmux".
+  row.appendChild(h('span.row-agent', shortAgent(card.agent_name), executorTag(card, { compact: true })));
   return row;
 }
 

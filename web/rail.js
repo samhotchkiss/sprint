@@ -17,6 +17,7 @@
 import { h, clear, reconcile } from './util.js';
 import { store, cardState, isSilent, draft, attachedImages } from './state.js';
 import { phaseOf, phaseChip } from './phase.js';
+import { executorTag } from './settings.js';
 import { renderThread, renderChat } from './thread.js';
 import { initCompose } from './compose.js';
 import { flowBarSig, reviewBar } from './review.js';
@@ -121,7 +122,9 @@ function headSig(detail, card) {
   // now, so it has to be part of what makes the head repaint.
   const ph = phaseOf(card);
   return [detail.num, card.title, cardState(card), card.pinned ? 'p' : '',
-    ph ? `${ph.name}@${ph.since}${ph.overdue ? '!' : ''}` : ''].join('|');
+    ph ? `${ph.name}@${ph.since}${ph.overdue ? '!' : ''}` : '',
+    // the executor tag lives in the head too, so a re-dispatch on grok repaints it
+    card.executor || '', card.model || ''].join('|');
 }
 
 function composerSig(card) {
@@ -161,6 +164,10 @@ function cardHead(detail, card, app) {
   // one line that says what its agent is doing right now.
   const chip = card ? phaseChip(card) : null;
   if (chip) head.appendChild(chip);
+  // ...and, when this card is not running on the board's defaults, what it was
+  // dispatched as: "grok · tmux".
+  const exec = card ? executorTag(card) : null;
+  if (exec) head.appendChild(exec);
   if (card) head.appendChild(cardMenu(card, state, app));
   head.appendChild(h('button.rail-close', {
     type: 'button', onclick: () => app.closeCard(),
