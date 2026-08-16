@@ -277,6 +277,18 @@ STUCK_STATES = tuple(r[0] for r in STUCK_RULES)
 DEFAULT_SWEEP_BACKOFF = (600.0, 1800.0, 5400.0)   # 10m -> 30m -> 90m -> silence
 DEFAULT_SWEEP_MAX_REMINDERS = 3
 
+# `needs_you` is a different animal from the other four states (#67). Those
+# four are parked on the SESSION or the AGENT -- something that can act on a
+# repeat nag. `needs_you` is parked on the human, and a session re-reading its
+# own "waiting on you" reminder every ten minutes cannot do anything with it:
+# the gold square and the hub badge already carry the signal continuously, for
+# as long as the question stays open. So `needs_you` gets exactly one notice
+# per episode -- the normal opening delay, no repeats -- and then goes quiet
+# until the episode re-arms, which happens the same way it does for every
+# other state: the card leaving and re-entering `needs_you` (a new question)
+# writes a new `state` event, which moves `_episode_seq` forward.
+NEEDS_YOU_MAX_REMINDERS = 0
+
 # What each state's one-liner says. Plain English, no jargon, names the owed
 # action -- the session reads these straight off the tail.
 STUCK_TEXT = {
@@ -3809,8 +3821,11 @@ class App:
         priors = self._stuck_events_since(num, self._episode_seq(num))
         # One opening notice plus at most `sweep_max_reminders` repeats, then
         # this episode goes quiet for good. Nagging a card the user has decided
-        # to leave alone is how a signal turns back into noise.
-        if len(priors) > self.sweep_max_reminders:
+        # to leave alone is how a signal turns back into noise. `needs_you` is
+        # capped at zero repeats -- see NEEDS_YOU_MAX_REMINDERS above -- because
+        # a repeat nag there has no one who can act on it.
+        max_reminders = NEEDS_YOU_MAX_REMINDERS if state == "needs_you" else self.sweep_max_reminders
+        if len(priors) > max_reminders:
             return None
         if priors:
             gap = self.sweep_backoff[min(len(priors) - 1, len(self.sweep_backoff) - 1)]

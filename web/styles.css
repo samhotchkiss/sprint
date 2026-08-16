@@ -2942,6 +2942,16 @@ html.skin-chaos .banner.account {
 .pill .blockedby-mark { margin-left: 8px; }
 .blocked-row .blockedby-mark { margin-left: auto; padding-left: 10px; }
 
+/* ---- #67: needs_you face carries its own age, since the sweep nags once --- */
+
+.needsyou-wait {
+  display: block;
+  margin-top: 3px;
+  color: var(--faint);
+  font-size: 11.5px;
+  letter-spacing: .01em;
+}
+
 /* The rail's line. It is a fact about the card, so it reads as prose in the
    panel's own voice rather than as a control: no button shape, no fill, one
    hairline rule under the head to say it belongs to the head and not to the

@@ -422,6 +422,20 @@ events. Nothing was silent and nothing was broken — the work was simply *owed 
   (`SPRINT_SWEEP_INTEGRATING_SECONDS`, `SPRINT_SWEEP_QUEUED_SECONDS`, `SPRINT_SWEEP_BLOCKED_SECONDS`,
   `SPRINT_SWEEP_NEEDS_YOU_SECONDS`, `SPRINT_SWEEP_READY_SECONDS`, `SPRINT_SWEEP_TICK`,
   `SPRINT_SWEEP_MAX_REMINDERS`), which is the only honest way to test a ten-minute rule.
+- **`needs_you` is the one exception to the repeat cadence (#67).** The other four states are parked
+  on the session or the agent — something that can act on a repeat nag. `needs_you` is parked on the
+  human, and re-nagging the session every 10-30 minutes about a question only the user can answer
+  gives the session nothing to do with it; the gold square and the hub badge already carry the signal
+  for as long as the question stays open. So `needs_you` gets **at most one** `stuck` event per
+  episode — the normal opening delay, no 10m/30m/90m repeats — and then goes quiet. Answering the
+  question and getting asked a new one re-arms it for exactly one more, the same way any other state
+  change re-arms an episode. This cap is not env-tunable — it is `NEEDS_YOU_MAX_REMINDERS = 0` in
+  `bin/sprintd`, distinct from `SPRINT_SWEEP_MAX_REMINDERS` which still governs the other four states.
+  Because the timeline won't keep restating the age, an open question's card face carries its own
+  ticking "waiting Nm" line (`web/board.js`, `.needsyou-wait` in `web/styles.css`) built from the
+  card's `state_since` — a cheap, always-on stand-in for the reminder that no longer repeats.
+  `agent_silent` and the worker-gone clock are untouched: this cap is a `stuck`-event rule only, and
+  applies only while the card sits in `needs_you`.
 - `stuck` rides the normal stream, so the session's default `sprintd tail` wakes on it with no
   special casing. `--user-only` does NOT show it — that filter means "a human is waiting", and the
   point of the sweep is that no human is. SKILL.md's event-reaction table carries a per-state row.

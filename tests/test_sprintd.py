@@ -9218,6 +9218,133 @@ class TestBlockedBySweep(BlockedByBase):
         self.assertIn("dispatch it or say why not", self.stuck_texts(num)[0])
 
 
+# --------------------------------------------------------------------------
+# #67 -- needs_you gets at most one stuck reminder per episode
+# --------------------------------------------------------------------------
+
+class TestNeedsYouSweepBase(Base):
+    """The parked-card sweep, driven by hand, on a card the human owes."""
+
+    def setUp(self):
+        super().setUp()
+        self.app.sweep_thresholds["needs_you"] = 1.0
+        self.app.sweep_thresholds["queued"] = 1.0
+        # A short backoff so a suite asserting "still repeats" for the states
+        # that keep their cadence does not need to sleep for real minutes.
+        self.app.sweep_backoff = (0.5, 0.5, 0.5)
+
+    def age(self, num, seconds):
+        with self.app.lock:
+            self.app.conn.execute(
+                "UPDATE events SET ts=ts-? WHERE card_num=?", (seconds, num))
+            self.app.conn.execute(
+                "UPDATE cards SET updated_at=updated_at-? WHERE num=?", (seconds, num))
+
+    def ask(self, text="which one?"):
+        """queued -> in_progress -> needs_you, question kind."""
+        num = self.new_card("stuck")["num"]
+        self.to_in_progress(num)
+        status, body = self.post("/api/cards/%d/question" % num, {"text": text})
+        self.assertEqual(status, 201, body)
+        self.assertEqual(self.state_of(num), "needs_you")
+        return num, body["question"]["id"]
+
+    def answer(self, num, qid, text="ok"):
+        status, body = self.post("/api/cards/%d/answer" % num,
+                                 {"question_id": qid, "text": text})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def stuck_events(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return [e for e in detail["timeline"] if e["kind"] == "stuck"]
+
+
+class TestNeedsYouSweep(TestNeedsYouSweepBase):
+    def test_exactly_one_waiting_event_across_many_ticks(self):
+        num, _qid = self.ask()
+        self.age(num, 5.0)
+
+        # Many sweep ticks, with the clock pushed further stale between each
+        # one -- a repeat nag would show up as a second, third, fourth event.
+        for _ in range(6):
+            self.app.sweep_stuck()
+            self.age(num, 5.0)
+
+        events = self.stuck_events(num)
+        self.assertEqual(len(events), 1, "needs_you owes exactly one nag, ever")
+        self.assertIn("waiting on you", events[0]["payload"]["text"])
+        self.assertEqual(events[0]["payload"]["reminder"], 0, "the opening notice")
+
+    def test_the_card_goes_quiet_before_the_old_backoff_would_have_fired_again(self):
+        """Regression against the old shared cadence: even inside what used to
+        be the 10m repeat window, a second sweep_stuck() call must add nothing
+        once the opening notice has fired -- the cap, not the backoff gap, is
+        what is stopping it."""
+        num, _qid = self.ask()
+        self.age(num, 5.0)
+        self.assertEqual(self.app.sweep_stuck(), 1)
+        self.assertEqual(len(self.stuck_events(num)), 1)
+
+        # Advance past every backoff step in this test's shortened schedule --
+        # the old code would have fired reminder #2, #3, #4 by now.
+        self.age(num, 5.0)
+        self.assertEqual(self.app.sweep_stuck(), 0)
+        self.assertEqual(len(self.stuck_events(num)), 1)
+
+    def test_re_entry_re_arms_for_exactly_one_more(self):
+        num, qid = self.ask()
+        self.age(num, 5.0)
+        self.app.sweep_stuck()
+        self.assertEqual(len(self.stuck_events(num)), 1)
+
+        # The user answers; a new question is a new episode.
+        self.answer(num, qid)
+        status, body = self.post("/api/cards/%d/question" % num, {"text": "and this one?"})
+        self.assertEqual(status, 201, body)
+        self.assertEqual(self.state_of(num), "needs_you")
+
+        self.age(num, 5.0)
+        self.app.sweep_stuck()
+        events = self.stuck_events(num)
+        self.assertEqual(len(events), 2, "the re-ask re-arms one more nag")
+
+        # ...and the second question also gets exactly one, not a repeat cadence.
+        for _ in range(4):
+            self.age(num, 5.0)
+            self.app.sweep_stuck()
+        self.assertEqual(len(self.stuck_events(num)), 2)
+
+    def test_queued_cadence_is_unchanged(self):
+        """Regression: the shared sweep_max_reminders / backoff still govern a
+        state the change was not supposed to touch."""
+        num = self.new_card("nobody is on it")["num"]
+        self.age(num, 5.0)
+        self.assertEqual(self.app.sweep_stuck(), 1)
+        # Inside the (shortened) backoff gap: no second reminder yet.
+        self.assertEqual(self.app.sweep_stuck(), 0)
+        self.assertEqual(len(self.stuck_events(num)), 1)
+        # Past the backoff gap: queued still repeats, unlike needs_you.
+        self.age(num, 1.0)
+        self.assertEqual(self.app.sweep_stuck(), 1)
+        events = self.stuck_events(num)
+        self.assertEqual(len(events), 2, "queued keeps its old cadence")
+        self.assertEqual(events[1]["payload"]["reminder"], 1)
+
+    def test_in_progress_agent_silence_is_unchanged(self):
+        """Regression: needs_you's cap must not leak into agent_silent, which
+        watches in_progress on its own clock and is not part of this change."""
+        self.app.silence_seconds = 1.0
+        num = self.new_card("working")["num"]
+        self.to_in_progress(num)
+        self.age(num, 5.0)
+        self.assertEqual(self.app.sweep_silence(), 1)
+        status, detail = self.get("/api/cards/%d" % num)
+        kinds = [e["kind"] for e in detail["timeline"]]
+        self.assertIn("agent_silent", kinds)
+
+
 class TestBlockedByDocs(Base):
     """The orchestrator sets the link instead of writing a sentence about it."""
 

@@ -145,6 +145,16 @@ export function renderCardFace(card, app) {
   const waitingOn = blockedByMark(card);
   if (waitingOn) face.appendChild(waitingOn);
 
+  // #67: the sweep only nags once on a needs_you card, so the face itself has
+  // to carry "how long has this been sitting" instead of relying on a repeat
+  // reminder in the timeline. One ticking line, only for an open question
+  // (not the ready/signoff half of this column, which already says "Ready for
+  // review Nh" via faceTag/faceSub) — a marker on every card would say nothing.
+  if (state === 'needs_you' && needsKind(card) === 'question') {
+    face.appendChild(h('span.needsyou-wait',
+      timeEl(card.state_since, { suffix: false, prefix: 'waiting ' })));
+  }
+
   if (col === 'in_motion') {
     const st = motionState(card);
     face.appendChild(h('span.prog-track', { title: st.title },
