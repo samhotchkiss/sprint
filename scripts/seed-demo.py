@@ -23,6 +23,9 @@ import zlib
 SERVER = ""
 TOKEN = ""
 TITLE = "Board polish + billing bugs"
+# The session names ITSELF at launch (card #63); a seeded board does the same
+# so the sidebar reads the way a real one does.
+AGENT = "Chuck"
 
 
 def call(method, path, body=None):
@@ -362,6 +365,9 @@ def main():
          {"verdict": "reject", "notes": "not the tone we want — calm, not confetti"})
 
     # ---- the session channel ----------------------------------------------
+    # First thing a session does: say who it is, once.
+    call("PUT", "/api/settings", {"agent_name": AGENT, "actor": "session"})
+    say("I'm %s, running this sprint." % AGENT)
     say("Sprint open. Three agents running, cap is 3 — the rest are waiting their turn.")
     say("why have #%d, #%d and #%d been blocked for so long?" % (n123, n127, n128), actor="user")
     say("All three are downstream of one thing. #%d waits on main going green. #%d overlaps "

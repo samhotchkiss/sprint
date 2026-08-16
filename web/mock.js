@@ -51,6 +51,10 @@ const nextSeq = () => ++seq;
 const state = {
   sprint: { id: 3, title: 'Board polish + billing bugs', opened_at: iso(5 * HOUR), closed_at: null, hold_mode: false },
   sessionStatus: 'online',      // online | busy | offline
+  // The name the session gave ITSELF at launch (card #63). Not a card's
+  // `agent_name` (that is the worker subagent's) — this is the colleague
+  // running the board, and it signs every session line.
+  agentName: 'Chuck',
   cards: [],
   timelines: {},
   evidence: {},
@@ -309,6 +313,7 @@ timeline(129, [
 ]);
 
 state.sidebar = [
+  { seq: 400, card_num: null, ts: iso(3 * HOUR + MIN), actor: 'session', kind: 'chat', payload: { text: "I'm Chuck, running this sprint." } },
   { seq: 401, card_num: null, ts: iso(3 * HOUR), actor: 'session', kind: 'chat', payload: { text: 'Sprint open. Three agents running, cap is 3 — #140–#142 are waiting their turn.' } },
   { seq: 428, card_num: null, ts: iso(46 * MIN), actor: 'user', kind: 'chat', payload: { text: 'hey, why have #123, #127 and #128 been blocked for so long?' } },
   {
@@ -342,6 +347,7 @@ function sessionPayload() {
 function boardPayload() {
   return {
     sprint: state.sprint,
+    agent_name: state.agentName,
     session: sessionPayload(),
     seq,
     cards: state.cards.map((c) => ({ ...c, default_model: 'fable' })),

@@ -195,6 +195,15 @@ DEFAULT_SETTINGS = {
         "executors": dict(DEFAULT_EXECUTORS),
         "concurrency": 3,
     },
+    # What the session running this board CALLS ITSELF -- a first name, chosen
+    # by the session at launch, so the sidebar reads "Chuck: I've picked up #12"
+    # instead of "Session: ...". Empty means nobody has introduced themselves
+    # and every label falls back to the generic one.
+    #
+    # This is NOT the sprint's name (that is the open sprint's title). Two
+    # different things: the board is called "Billing week", the colleague
+    # running it is called Chuck.
+    "agent_name": "",
 }
 # `default_executor` accepts either a named executor or the bare kind
 # "subagent" -- the out-of-the-box board has no named executors worth typing.
@@ -1222,6 +1231,32 @@ def clean_sprint_name(value, limit: int = SPRINT_NAME_MAX) -> str:
     return text
 
 
+AGENT_NAME_MAX = 24             # a first name, not a job title
+
+
+def clean_agent_name(value, limit: int = AGENT_NAME_MAX) -> str:
+    """Normalize the session's own name, or "" for none.
+
+    The session picks this for itself at launch ("Chuck"), and it is rendered
+    wherever a session line is attributed -- the sidebar, a card thread, the
+    rail's header. So it is a NAME: one line, no newlines, short enough to sit
+    in front of a message without becoming the message. `null` and `""` both
+    mean "no name", which is how you take one back.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ApiError(400, "bad_agent_name", "agent_name must be a string",
+                       field="agent_name")
+    text = " ".join(value.split())
+    if len(text) > limit:
+        raise ApiError(400, "bad_agent_name",
+                       "agent_name must be %d characters or fewer (this one is "
+                       "%d) — it is a first name, not a description"
+                       % (limit, len(text)), field="agent_name")
+    return text
+
+
 def clean_model(value):
     """Normalize a model name, or None. Free-form on purpose: the board records
     what the session says it dispatched on and never adjudicates the list."""
@@ -1494,10 +1529,13 @@ def validate_settings(patch, base=None) -> dict:
         raise _bad("settings", "settings must be an object")
     current = normalize_settings(base)
     for key in patch:
-        if key != "worker":
+        if key not in ("worker", "agent_name"):
             raise ApiError(400, "unknown_key",
-                           "%s is not a settings section (only \"worker\" exists today)"
-                           % key, field=key)
+                           "%s is not a setting (\"worker\" and \"agent_name\" "
+                           "are the two that exist today)" % key, field=key)
+    agent_name = current["agent_name"]
+    if "agent_name" in patch:
+        agent_name = clean_agent_name(patch["agent_name"])
     worker_patch = patch.get("worker", {})
     if not isinstance(worker_patch, dict):
         raise _bad("worker", "worker must be an object")
@@ -1548,18 +1586,25 @@ def validate_settings(patch, base=None) -> dict:
                    "default_executor \"%s\" is not in worker.executors "
                    "(known: %s)" % (default, ", ".join(
                        sorted(list(worker["executors"].keys()) + [BUILTIN_EXECUTOR]))))
-    return {"worker": worker}
+    return {"worker": worker, "agent_name": agent_name}
 
 
 def normalize_settings(raw) -> dict:
     """Whatever is on disk, made whole. Unknown/broken content falls back to the
     default for that key rather than 500-ing the board -- a hand-edited file
     must never be able to take the sprint down."""
-    out = {"worker": dict(DEFAULT_SETTINGS["worker"])}
+    out = {"worker": dict(DEFAULT_SETTINGS["worker"]),
+           "agent_name": DEFAULT_SETTINGS["agent_name"]}
     out["worker"]["executors"] = {
         k: dict(v) for k, v in DEFAULT_SETTINGS["worker"]["executors"].items()}
     if not isinstance(raw, dict):
         return out
+    try:
+        out["agent_name"] = clean_agent_name(raw.get("agent_name"))
+    except ApiError:
+        # A hand-edited name that is too long or not a string is a nameless
+        # session, not a dead board.
+        out["agent_name"] = ""
     worker = raw.get("worker")
     if not isinstance(worker, dict):
         return out
@@ -1913,6 +1958,25 @@ class App:
             changed = [k for k in SETTINGS_KEYS
                        if merged["worker"].get(k) != current["worker"].get(k)]
             w = merged["worker"]
+            # Naming yourself is not a dispatch policy change, and saying so in
+            # the same sentence would be a lie. It gets its own line, in the
+            # session's own voice, because it is an introduction.
+            if merged["agent_name"] != current["agent_name"]:
+                was, now = current["agent_name"], merged["agent_name"]
+                if not now:
+                    text = "the session dropped the name “%s”" % was
+                elif not was:
+                    text = "the session is called “%s”" % now
+                else:
+                    text = "the session renamed itself “%s” → “%s”" % (was, now)
+                with self.lock:
+                    self._append_event(None, "server", "note", {
+                        "text": text, "agent_name": now, "was": was or None,
+                        "by": actor if actor in ACTORS else "user",
+                    })
+            if not changed:
+                self.notify()
+                return merged
             with self.lock:
                 self._append_event(None, "server", "note", {
                     "text": "settings changed: %s — in effect for the next dispatch"
@@ -2389,6 +2453,40 @@ class App:
                       "ORDER BY id DESC LIMIT 1")
         name = (row["title"] or "").strip() if row is not None else ""
         return name or self.default_sprint_title()
+
+    def agent_name(self) -> str:
+        """What the session running this board calls ITSELF, or "".
+
+        User ruling, verbatim: "I also meant that the session agent gave
+        themselves a name. Like "Chuck"". Different from `sprint_name`: the
+        board is named after the work, the session is named after nobody --
+        it picks a first name at launch so a line in the sidebar reads like a
+        colleague talking rather than like a system component.
+        """
+        return self.settings().get("agent_name") or ""
+
+    def claim_agent_name(self, name, actor: str = "session") -> dict:
+        """Take a name at launch -- but only if the session has not got one.
+
+        A name that changes every time the board restarts is not a name. The
+        rule ("keep it across restarts") is enforced HERE and not left to the
+        caller, because the caller is a fresh session that does not remember
+        the last one. So `sprintd start --agent-name` is first-write-wins: it
+        introduces a session that has never introduced itself, and it is a
+        no-op for one that has.
+
+        Renaming on purpose is a different act with a different door: PUT
+        /api/settings {"agent_name": ...}, which is what the settings panel
+        uses and always applies.
+        """
+        wanted = clean_agent_name(name)
+        current = self.agent_name()
+        if current and wanted and current != wanted:
+            return {"agent_name": current, "claimed": False, "wanted": wanted}
+        if current == wanted:
+            return {"agent_name": current, "claimed": False, "wanted": wanted}
+        self.save_settings({"agent_name": wanted}, actor=actor)
+        return {"agent_name": wanted, "claimed": True, "wanted": wanted}
 
     def rename_sprint(self, name, actor: str = "user") -> dict:
         """Name (or rename) the open sprint.
@@ -5295,6 +5393,12 @@ class App:
             # the hub all render this one string, and none of them should have
             # to know it is stored as the open sprint's title.
             "name": self.sprint_name(),
+            # ...and who is running it. "" until the session introduces itself;
+            # every label that would say "Session" says this instead. Note the
+            # level: THIS is the session's own name ("Chuck"), while a card's
+            # `agent_name` is the worker subagent working that card
+            # ("sprint-card-118"). Different things, different objects.
+            "agent_name": self.agent_name(),
             "hold_mode": bool(sprint["hold_mode"]) if sprint else False,
             "cards": cards,
             "counts": counts,
@@ -5693,6 +5797,9 @@ def make_handler(app: App):
                         # re-assert the registry row without flattening a name
                         # somebody set (and without holding a token).
                         "sprint_name": app.sprint_name(),
+                        # ...and who is already running it, so a re-launch can
+                        # see it already has a name and keep it.
+                        "agent_name": app.agent_name(),
                         "seq": app.max_seq()})
 
                 if not self.authed(query):
@@ -5782,6 +5889,10 @@ def make_handler(app: App):
                     "name": app.sprint_name(),
                     "name_max": SPRINT_NAME_MAX,
                     "name_default": app.default_sprint_title(),
+                    # The session's own name is IN settings (config.json), but
+                    # it is hoisted here too so a panel never has to know that.
+                    "agent_name": app.agent_name(),
+                    "agent_name_max": AGENT_NAME_MAX,
                     "defaults": DEFAULT_SETTINGS,
                     "choices": {
                         "model_policy": list(MODEL_POLICIES),
@@ -6012,6 +6123,8 @@ def make_handler(app: App):
             return 200, {"ok": True, "settings": settings,
                          "name": app.sprint_name(),
                          "name_max": SPRINT_NAME_MAX,
+                         "agent_name": settings.get("agent_name") or "",
+                         "agent_name_max": AGENT_NAME_MAX,
                          "sprint": app.sprint_json(app.open_sprint(create=True)),
                          "defaults": DEFAULT_SETTINGS}
 
@@ -6766,6 +6879,33 @@ def cmd_start(args) -> int:
                 except (OSError, http.client.HTTPException) as exc:
                     print("notice: could not name this sprint (%s)" % exc,
                           file=sys.stderr)
+            # `--agent-name` on a board that is already up is the opposite of a
+            # rename: whoever is running this board already introduced
+            # themselves, and a session that comes back after a restart keeps
+            # the name it had. So it is only sent when nobody has one.
+            live_agent = (health or {}).get("agent_name") or ""
+            if getattr(args, "agent_name", None):
+                if live_agent:
+                    if live_agent != " ".join(args.agent_name.split()):
+                        print("notice: this session is already called “%s” — "
+                              "keeping it (a name does not change on restart)"
+                              % live_agent, file=sys.stderr)
+                else:
+                    try:
+                        st, raw = http_put_json(
+                            "127.0.0.1", info.get("port"), "/api/settings",
+                            info.get("token"), {"agent_name": args.agent_name,
+                                                "actor": "session"})
+                        body = jload(raw.decode("utf-8", "replace"), {}) or {}
+                        if st == 200:
+                            live_agent = body.get("agent_name") or args.agent_name
+                        else:
+                            print("notice: could not set the session's name (%s)"
+                                  % (body.get("message") or "HTTP %s" % st),
+                                  file=sys.stderr)
+                    except (OSError, http.client.HTTPException) as exc:
+                        print("notice: could not set the session's name (%s)" % exc,
+                              file=sys.stderr)
             # Idempotent reuse -- and re-assert the registry row, so a board
             # that was already up before the hub existed still shows up on it.
             try:
@@ -6893,13 +7033,32 @@ def cmd_start(args) -> int:
             report(False, error=exc.message)
             app.close()
             return 1
+    # `--agent-name` is how the session introduces ITSELF (card #63). First
+    # write wins: a board whose session already has a name keeps it, so a
+    # restart is the same colleague coming back rather than a new hire.
+    if getattr(args, "agent_name", None):
+        try:
+            claim = app.claim_agent_name(args.agent_name, actor="session")
+            if not claim["claimed"] and claim["agent_name"] != claim["wanted"]:
+                print("notice: this session is already called “%s” — keeping it "
+                      "(a name does not change on restart)" % claim["agent_name"],
+                      file=sys.stderr)
+        except ApiError as exc:
+            print("error: %s" % exc.message, file=sys.stderr)
+            report(False, error=exc.message)
+            app.close()
+            return 1
     # Everything the board needs to replace itself when its code changes
     # (card #62). `--foreground` is added because this process is ALREADY the
     # daemon: exec keeps the pid, the log fds and the launchd job, and
     # daemonizing a second time would throw all three away. `--name` is dropped
     # because it is a LAUNCH act: the name is in the database by now, and
     # replaying the flag would undo a rename the user made since.
-    exec_argv = [sys.executable, app.code_path] + strip_flag(sys.argv[1:], "--name")
+    # `--agent-name` goes with it, for the stronger version of the same reason:
+    # the session's name is in config.json by now, and it must survive a
+    # restart untouched.
+    exec_argv = [sys.executable, app.code_path] + strip_flag(
+        strip_flag(sys.argv[1:], "--name"), "--agent-name")
     if "--foreground" not in exec_argv:
         exec_argv.append("--foreground")
     app.restart_argv = exec_argv
@@ -8324,6 +8483,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "Default: the project directory's name. Changing it later "
                         "is a rename, in the board's settings panel."
                         % SPRINT_NAME_MAX)
+    s.add_argument("--agent-name", default=None,
+                   help="what the SESSION running this board calls itself, as a "
+                        "short first name (e.g. \"Chuck\"); %d characters or "
+                        "fewer. Pick one, do not ask for one. First write wins: "
+                        "a board whose session already has a name keeps it, so "
+                        "a restart is the same colleague coming back. Rename on "
+                        "purpose from the board's settings panel."
+                        % AGENT_NAME_MAX)
     s.add_argument("--token", default=None, help="force a bearer token")
     s.add_argument("--new-token", action="store_true",
                    help="mint a fresh token (default: reuse the existing one so "

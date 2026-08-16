@@ -116,6 +116,10 @@ let jsonMode = false;
 // sprint's title on the server — but this is where a rename belongs, because
 // it is the user's call and this is the panel of the user's calls.
 let sprintName = { value: '', saved: '', max: 60, fallback: '' };
+// ...and the SESSION's own name — the one it gave itself ("Chuck"). A
+// different thing from the sprint's name and deliberately next to it, so the
+// panel reads "this board is called X, the colleague running it is called Y".
+let agentName = { value: '', saved: '', max: 24 };
 
 /** Wire the header link. Called once at boot. */
 export function installSettings(btn, afterSave) {
@@ -152,6 +156,11 @@ export async function openSettings() {
       saved: res.name || '',
       max: res.name_max || 60,
       fallback: res.name_default || '',
+    };
+    agentName = {
+      value: res.agent_name || '',
+      saved: res.agent_name || '',
+      max: res.agent_name_max || 24,
     };
     setStatus('');
     paint();
@@ -215,6 +224,23 @@ function paint() {
     'What this sprint is called, everywhere it appears: the title above, the '
     + 'switcher, and the hub. Name it after the work, not the folder. Leave it '
     + `as “${sprintName.fallback || 'the folder name'}” and it stays the folder name.`));
+
+  // 0b. who is running it. Normally the session sets this itself at launch;
+  // this is the door for changing it, and for taking it back (clear the box).
+  const agentInput = h('input.settings-text', {
+    id: 'settings-agent-name',
+    type: 'text',
+    maxlength: String(agentName.max),
+    value: agentName.value,
+    placeholder: 'Session',
+    spellcheck: false,
+    oninput: (e) => { agentName.value = e.target.value; },
+  });
+  els.body.appendChild(field('Session name', agentInput,
+    'What the session running this board calls itself — a first name, like '
+    + '“Chuck”. It signs every line the session writes, in the sidebar and in '
+    + 'card threads. The session picks one for itself at launch and keeps it '
+    + 'across restarts; empty it and its lines go back to “Session”.'));
 
   // 1. model policy
   const seg = h('div.seg.settings-seg', { role: 'group', 'aria-label': 'model policy' });
@@ -632,6 +658,10 @@ async function save() {
   // Only send a name when it actually changed: a rename writes an event to the
   // board, and saving the model policy is not a rename.
   if (wanted && wanted !== sprintName.saved) patch.name = wanted;
+  // The session's name, unlike the sprint's, CAN be emptied: "" is how you take
+  // it back, so this one is sent whenever it differs, blank included.
+  const wantedAgent = (agentName.value || '').trim();
+  if (wantedAgent !== agentName.saved) patch.agent_name = wantedAgent;
   setStatus('saving…');
   try {
     const res = await api.saveSettings(patch);
@@ -639,6 +669,8 @@ async function save() {
     draft = clone(res.settings);
     sprintName.value = res.name || wanted;
     sprintName.saved = sprintName.value;
+    agentName.value = typeof res.agent_name === 'string' ? res.agent_name : wantedAgent;
+    agentName.saved = agentName.value;
     setStatus('');
     closeSettings();
     if (onSaved) onSaved(res.settings);

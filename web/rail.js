@@ -15,7 +15,7 @@
 // be mid-sentence with a screenshot attached) is never thrown away unless what
 // it is for actually changed.
 import { h, clear, reconcile, autolink } from './util.js';
-import { store, cardState, isSilent, draft, attachedImages } from './state.js';
+import { store, cardState, isSilent, draft, attachedImages, sessionLabel } from './state.js';
 import { phaseOf, phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
 import { renderThread, renderChat } from './thread.js';
@@ -84,7 +84,10 @@ export function renderRail(root, app) {
     const box = syncPart(root, 'composer', composerKey(card), () => composer(card, app));
     if (box && box._tune) box._tune(card);
   } else {
-    syncPart(root, 'rail-head', store.session.online ? 'on' : 'off', () => chatHead());
+    // The name is part of the key: an introduction has to repaint the head,
+    // and nothing else about the head changes often enough to care.
+    syncPart(root, 'rail-head',
+      `${store.session.online ? 'on' : 'off'}|${store.agentName}`, () => chatHead());
     if (!thread.parentNode) root.appendChild(thread);
     renderChat(thread, store.sidebar.slice().sort(byOrder), app);
     const box = syncPart(root, 'composer', 'sidebar', () => chatComposer(app));
@@ -185,10 +188,15 @@ const byOrder = (a, b) => {
 
 function chatHead() {
   const online = store.session.online;
+  // Once the session has a name, the header says WHO you are talking to and the
+  // note underneath keeps saying WHAT the channel is — you should never have to
+  // work out that "Chuck" is the session. Nameless, this is exactly as it was.
+  const named = !!store.agentName;
+  const note = online ? 'the manager channel' : 'not reading right now';
   return h('div.rail-head',
     h('span.session-dot', { class: online ? 'session-dot' : 'session-dot off' }),
-    h('span.rail-title', 'Session'),
-    h('span.rail-note', online ? 'the manager channel' : 'not reading right now'));
+    h('span.rail-title', sessionLabel()),
+    h('span.rail-note', named ? `the session · ${note}` : note));
 }
 
 function cardHead(detail, card, app) {
@@ -304,16 +312,26 @@ function chatComposer(app) {
   const box = composerBox({
     id: 'sidebar-text',
     key: 'sidebar',
-    placeholder: 'Ask the session anything… (paste a screenshot too)',
+    // Named, the box asks you to talk to a person; nameless, it is exactly the
+    // sentence it always was.
+    placeholder: store.agentName
+      ? `Ask ${store.agentName} anything… (paste a screenshot too)`
+      : 'Ask the session anything… (paste a screenshot too)',
     hint: '',
     send: (text, images) => app.sessionChat(text, images),
   });
   // The session going offline changes one sentence under the box, and it used
-  // to change the whole box — with your half-written question inside it.
+  // to change the whole box — with your half-written question inside it. The
+  // name it wears can arrive late too, and it must not cost a half-written
+  // question either.
   box._tune = () => {
+    setText(box, 'textarea', 'placeholder', store.agentName
+      ? `Ask ${store.agentName} anything… (paste a screenshot too)`
+      : 'Ask the session anything… (paste a screenshot too)');
     setText(box, '.composer-hint', 'textContent', store.session.online
       ? 'Everything here appends — nothing is rewritten.'
-      : 'The session is not reading right now — what you send waits in the queue.');
+      : `${store.agentName || 'The session'} is not reading right now — what you `
+        + 'send waits in the queue.');
   };
   box._tune();
   return box;

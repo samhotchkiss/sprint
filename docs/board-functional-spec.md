@@ -134,6 +134,12 @@ The session can answer AND act (unblock, re-batch, approve) — replies referenc
 autolinked `#N`. Visually distinct from card chat: this is the manager channel. Session
 online/offline dot lives here (and topbar).
 
+**The session has a name.** It picks a short human first name for itself at launch ("Chuck") and
+introduces itself once. From then on that name signs every line it writes — in this sidebar, in
+card threads, and in the rail's chat header, so the user knows who they are talking to. It is not
+the sprint's name (the sprint is named after the work) and it never changes on a restart. A session
+that never named itself is labelled "Session", exactly as before.
+
 ## 8. Liveness & notifications
 
 - **Session offline** (terminal dead/asleep): one plain banner — "session offline — items will

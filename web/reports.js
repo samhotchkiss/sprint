@@ -27,6 +27,7 @@
 //     `Content-Security-Policy: sandbox`. Two independent walls.
 import { h, clear, ageSuffix, firstLine, timeEl } from './util.js';
 import { api, isReportRef, reportHash, reportTitle } from './api.js';
+import { actorLabel } from './state.js';
 
 const DOC_LABEL = { md: 'MD', html: 'HTML' };
 
@@ -209,7 +210,7 @@ function reportListRow(r, app) {
     meta.appendChild(h('span.report-card-link.is-none', 'sidebar'));
   }
   meta.appendChild(h('span.report-dot', '·'));
-  meta.appendChild(h('span.report-actor', ACTOR_LABEL[r.actor] || r.actor || 'agent'));
+  meta.appendChild(h('span.report-actor', reportActor(r.actor)));
   meta.appendChild(h('span.report-dot', '·'));
   meta.appendChild(timeEl(r.ts));
 
@@ -220,7 +221,12 @@ function reportListRow(r, app) {
     meta);
 }
 
-const ACTOR_LABEL = { user: 'You', session: 'Session', worker: 'Agent', server: 'Board' };
+// Same names the thread uses — including the one the session chose for
+// itself, so a report written by Chuck says Chuck in the library too.
+const KNOWN_ACTORS = ['user', 'session', 'worker', 'server'];
+function reportActor(actor) {
+  return KNOWN_ACTORS.includes(actor) ? actorLabel(actor) : (actor || 'agent');
+}
 
 // ---- one report on its own page -----------------------------------------
 
@@ -239,7 +245,7 @@ export function renderReportPage(root, app, state) {
         }, `#${d.card_num}`)
         : h('span.report-card-link.is-none', 'sidebar'),
       h('span.report-dot', '·'),
-      h('span.report-actor', ACTOR_LABEL[d.actor] || d.actor || 'agent'),
+      h('span.report-actor', reportActor(d.actor)),
       h('span.report-dot', '·'),
       h('span', ageSuffix(d.ts)),
       h('span.report-dot', '·'),

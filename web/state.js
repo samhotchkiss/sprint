@@ -97,6 +97,11 @@ export const STATE_LABEL = {
 
 export const store = {
   sprint: null,           // {title, hold_mode, opened_at, closed_at}
+  // What the session running this board calls ITSELF ("Chuck"), or '' if it
+  // never introduced itself. Not the sprint's name: the board is named after
+  // the work, this is the colleague doing it. Every place that would print
+  // "Session" prints this instead — see `sessionLabel`.
+  agentName: '',
   columnOf: null,         // server-advised state -> column map (board.column_of)
   settings: null,         // dispatch policy: model, executors, concurrency
   // `cursor` is the session's real drain cursor: every event with seq <= cursor
@@ -138,6 +143,24 @@ export const store = {
   chatOpen: false,        // session chat wants the rail
   unseen: false,          // a session line arrived while the rail was closed
 };
+
+// Who a line is FROM, as a human would say it. The session is the only actor
+// whose label is not fixed: user ruling, verbatim — "I also meant that the
+// session agent gave themselves a name. Like "Chuck"". Once it has, the board
+// calls it by that name everywhere a message is attributed, and falls straight
+// back to "Session" for a session that never introduced itself.
+const ACTOR_LABELS = { user: 'You', session: 'Session', worker: 'Agent', server: 'Board' };
+
+/** The session's name if it has one, else the generic label. */
+export function sessionLabel() {
+  return store.agentName || ACTOR_LABELS.session;
+}
+
+/** The label for any actor, with the session's chosen name folded in. */
+export function actorLabel(actor) {
+  if (actor === 'session') return sessionLabel();
+  return ACTOR_LABELS[actor] || ACTOR_LABELS.worker;
+}
 
 const VIEW_KEY = 'sprint.view';
 const CHAT_KEY = 'sprint.chat';
@@ -353,6 +376,9 @@ export function applyBoard(board) {
     hold_mode: !!(sprint.hold_mode != null ? sprint.hold_mode
       : (board.hold_mode != null ? board.hold_mode : sprint.hold)),
   };
+  // A name only ever arrives from the server, and an older board that does not
+  // send the field is not the same as a session that dropped its name.
+  if (typeof board.agent_name === 'string') store.agentName = board.agent_name.trim();
   const sess = normSession(board);
   // Keep the furthest cursor we've been told about: a board fetch that raced a
   // live cursor frame must not un-see messages the session has already read.

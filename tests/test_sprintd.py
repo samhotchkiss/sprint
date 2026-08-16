@@ -9215,6 +9215,197 @@ class TestSprintNames(Base):
         self.assertEqual(res["name_default"], "project")
 
 
+class TestAgentName(Base):
+    """The SESSION's own name.
+
+    User, verbatim: "This is good, but I also meant that the session agent gave
+    themselves a name. Like "Chuck"". Two different names live on one board --
+    the sprint is called after the work, and the session running it is called
+    after nobody in particular, because a colleague has a first name. This is
+    the second one.
+    """
+
+    def config_path(self):
+        return os.path.join(self.project_root, ".sprint", "config.json")
+
+    def put(self, patch, **kw):
+        return self.req("PUT", "/api/settings", patch, **kw)
+
+    def name_now(self):
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        return board["agent_name"]
+
+    # -- unset -----------------------------------------------------------
+
+    def test_nobody_has_a_name_until_somebody_takes_one(self):
+        self.assertEqual(self.name_now(), "")
+        self.assertEqual(self.get("/api/settings")[1]["agent_name"], "")
+        self.assertEqual(self.get("/api/settings")[1]["settings"]["agent_name"], "")
+        self.assertEqual(self.get("/healthz", token=None)[1]["agent_name"], "")
+        # and an unnamed session costs nothing on disk: no config, no write
+        self.assertFalse(os.path.exists(self.config_path()))
+
+    def test_the_sprint_name_is_a_different_field(self):
+        status, res = self.put({"name": "Billing week", "agent_name": "Chuck"})
+        self.assertEqual(status, 200, res)
+        status, board = self.get("/api/board")
+        self.assertEqual(board["name"], "Billing week")
+        self.assertEqual(board["agent_name"], "Chuck")
+        # naming the board does not name the session, or the other way round
+        self.put({"name": "Billing week two"})
+        self.assertEqual(self.name_now(), "Chuck")
+        self.put({"agent_name": "Dolores"})
+        self.assertEqual(self.get("/api/board")[1]["name"], "Billing week two")
+
+    # -- round trip ------------------------------------------------------
+
+    def test_a_name_round_trips_through_every_reader(self):
+        status, res = self.put({"agent_name": "Chuck", "actor": "session"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["agent_name"], "Chuck")
+        self.assertEqual(res["settings"]["agent_name"], "Chuck")
+        self.assertEqual(self.name_now(), "Chuck")
+        self.assertEqual(self.get("/api/settings")[1]["agent_name"], "Chuck")
+        self.assertEqual(self.get("/healthz", token=None)[1]["agent_name"], "Chuck")
+        with open(self.config_path(), "r", encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["agent_name"], "Chuck")
+
+    def test_post_is_the_same_write_as_put(self):
+        status, res = self.post("/api/settings", {"agent_name": "Chuck"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.name_now(), "Chuck")
+
+    def test_it_survives_a_restart_of_the_process(self):
+        self.put({"agent_name": "Chuck"})
+        app2 = sprintd.App(self.project_root, token="t")
+        self.addCleanup(app2.close)
+        self.assertEqual(app2.agent_name(), "Chuck")
+
+    def test_a_rename_propagates_to_everything_that_shows_it(self):
+        self.put({"agent_name": "Chuck"})
+        status, res = self.put({"agent_name": "Dolores"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["agent_name"], "Dolores")
+        self.assertEqual(self.name_now(), "Dolores")
+        self.assertEqual(self.get("/healthz", token=None)[1]["agent_name"], "Dolores")
+
+    def test_a_name_can_be_taken_back(self):
+        self.put({"agent_name": "Chuck"})
+        status, res = self.put({"agent_name": ""})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["agent_name"], "")
+        self.assertEqual(self.name_now(), "")
+
+    def test_null_means_no_name_in_this_request_not_clear_it(self):
+        self.put({"agent_name": "Chuck"})
+        status, res = self.put({"worker": {"concurrency": 4}})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.name_now(), "Chuck")
+
+    def test_a_name_only_write_leaves_dispatch_policy_alone(self):
+        self.put({"worker": {"concurrency": 4}})
+        status, res = self.put({"agent_name": "Chuck"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["settings"]["worker"]["concurrency"], 4)
+        self.assertEqual(res["agent_name"], "Chuck")
+
+    def test_a_name_and_a_policy_change_in_one_request(self):
+        status, res = self.put({"agent_name": "Chuck", "worker": {"concurrency": 5}})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["settings"]["worker"]["concurrency"], 5)
+        self.assertEqual(res["agent_name"], "Chuck")
+
+    # -- what a name is --------------------------------------------------
+
+    def test_whitespace_is_collapsed_not_preserved(self):
+        status, res = self.put({"agent_name": "  Chuck  the   Third \n"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["agent_name"], "Chuck the Third")
+
+    def test_a_name_that_is_not_a_name_is_refused_by_field(self):
+        for bad in ("x" * (sprintd.AGENT_NAME_MAX + 1), 7, [], {"a": 1}, True):
+            status, res = self.put({"agent_name": bad})
+            self.assertEqual(status, 400, (bad, res))
+            self.assertEqual(res["field"], "agent_name", (bad, res))
+        self.assertEqual(self.name_now(), "")
+
+    def test_a_junk_name_on_disk_is_a_nameless_session_not_a_dead_board(self):
+        os.makedirs(os.path.dirname(self.config_path()), exist_ok=True)
+        with open(self.config_path(), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"agent_name": ["not", "a", "name"],
+                                 "worker": {"concurrency": 4}}))
+        self.assertEqual(self.name_now(), "")
+        self.assertEqual(self.get("/api/board")[1]["settings"]["worker"]["concurrency"], 4)
+
+    def test_the_settings_panel_is_told_the_limit(self):
+        status, res = self.get("/api/settings")
+        self.assertEqual(res["agent_name_max"], sprintd.AGENT_NAME_MAX)
+        self.assertEqual(res["defaults"]["agent_name"], "")
+
+    # -- the log ---------------------------------------------------------
+
+    def notes(self):
+        rows = self.app.q("SELECT * FROM events WHERE card_num IS NULL "
+                          "AND kind='note' ORDER BY seq")
+        return [sprintd.jload(r["payload"], {}).get("text") for r in rows]
+
+    def test_an_introduction_is_one_quiet_line_of_its_own(self):
+        self.put({"agent_name": "Chuck", "actor": "session"})
+        self.put({"agent_name": "Dolores"})
+        self.put({"agent_name": ""})
+        said = [t for t in self.notes() if t and "session" in t]
+        self.assertEqual(said, [
+            "the session is called “Chuck”",
+            "the session renamed itself “Chuck” → “Dolores”",
+            "the session dropped the name “Dolores”",
+        ], self.notes())
+
+    def test_naming_yourself_is_not_a_settings_changed_line(self):
+        self.put({"agent_name": "Chuck"})
+        self.assertEqual([t for t in self.notes() if t and t.startswith("settings changed")],
+                         [])
+
+    def test_saving_the_same_name_writes_nothing(self):
+        self.put({"agent_name": "Chuck"})
+        before = self.get("/api/board")[1]["seq"]
+        self.put({"agent_name": "Chuck"})
+        self.assertEqual(self.get("/api/board")[1]["seq"], before)
+
+    # -- launch ----------------------------------------------------------
+
+    def test_the_first_launch_takes_the_name(self):
+        claim = self.app.claim_agent_name("Chuck")
+        self.assertEqual(claim, {"agent_name": "Chuck", "claimed": True,
+                                 "wanted": "Chuck"})
+        self.assertEqual(self.name_now(), "Chuck")
+
+    def test_a_restart_never_renames_the_session(self):
+        self.app.claim_agent_name("Chuck")
+        claim = self.app.claim_agent_name("Dolores")
+        self.assertEqual(claim, {"agent_name": "Chuck", "claimed": False,
+                                 "wanted": "Dolores"})
+        self.assertEqual(self.name_now(), "Chuck")
+        # ...and it is not a second line in the log either
+        self.assertEqual(len([t for t in self.notes() if t and "called" in t]), 1)
+
+    def test_a_deliberate_rename_still_works_after_a_claim(self):
+        self.app.claim_agent_name("Chuck")
+        status, res = self.put({"agent_name": "Dolores"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.name_now(), "Dolores")
+
+    def test_the_launch_flag_exists_and_says_what_it_is_for(self):
+        args = sprintd.build_parser().parse_args(["start", "--agent-name", "Chuck"])
+        self.assertEqual(args.agent_name, "Chuck")
+        self.assertIsNone(sprintd.build_parser().parse_args(["start"]).agent_name)
+
+    def test_a_self_restart_drops_the_launch_name(self):
+        argv = ["start", "--name", "Billing", "--agent-name", "Chuck", "--port", "8462"]
+        kept = sprintd.strip_flag(sprintd.strip_flag(argv, "--name"), "--agent-name")
+        self.assertEqual(kept, ["start", "--port", "8462"])
+
+
 class TestNamedBoardsOnTheHub(unittest.TestCase):
     """A live board is the authority on its own name; the registry is the
     fallback for one that is not answering."""
