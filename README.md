@@ -56,6 +56,13 @@ running inside the project you want a board for.
    stream where it arrived. Click **Chat** for the session itself; it's
    the same brain as the terminal, so it can act on what you say there,
    not just answer. The rail holds one or the other, never both.
+6. When an agent's output is a **document** rather than a line — an audit, a
+   findings write-up, a comparison — it attaches it as a report. It reads in
+   the thread as a title you can skim and expand, and a quiet **Reports** link
+   appears in the header, which is your library of everything this sprint
+   wrote. The link isn't there until there's something behind it. Markdown is
+   rendered by the board itself (raw HTML inside it is escaped, never run);
+   author-written HTML renders in a sandbox with scripts off.
 
 Dumping a bunch of issues at once? Say "hold" first — new cards land in
 a `held` column instead of dispatching immediately, so the session can

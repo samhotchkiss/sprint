@@ -2507,7 +2507,9 @@ html.skin-chaos .review-unit-error, html.skin-chaos .review-bar-unit { line-heig
    height rather than a fixed one that eats the whole screen. */
 @media (max-width: 1199px) {
   .reports-link { padding: 10px 10px; min-height: 44px; display: flex; align-items: center; }
-  .page { padding: 18px 0 40px 0; }
+  /* `.main` drops its own padding here (the Fold columns carry theirs), so a
+     page has to bring its gutters or it sits flush against the screen edge. */
+  .page { padding: 18px 22px 40px 22px; overflow-y: auto; }
   .report-head { min-height: 46px; }
   .report-row-main { min-height: 44px; }
   .report-frame { min-height: 60vh; }
@@ -2531,3 +2533,9 @@ html.skin-chaos .report-frame { border: 2px solid var(--border-chip); border-rad
 html.skin-chaos .report-row { border-top: 2px solid var(--rule-row); }
 html.skin-chaos .report-row:last-child { border-bottom: 2px solid var(--rule-row); }
 html.skin-chaos .page-sub, html.skin-chaos .page-empty { line-height: 1.8; }
+
+/* The phone fallback zeroes .main's padding too — same gutters, tighter. */
+@media (max-width: 600px) {
+  .page { padding: 16px 16px 40px 16px; }
+  .report-doc { font-size: 14.5px; }
+}

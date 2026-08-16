@@ -4507,6 +4507,20 @@ class TestReportAccept(ReportBase):
         self.assertEqual(ref["title"], "Author page")
         self.assertEqual(ref["mime"], "text/html; charset=utf-8")
 
+    def test_the_title_keeps_a_card_number_in_it(self):
+        """Markers that WRAP the line get stripped; a `#` inside the words does
+        not. "how card #33 shipped" is a title about card #33."""
+        num = self.working_card()
+        self.post_report(num, self.write_doc(
+            "t.md", "# Reports — how card #33 shipped\n\nbody"))
+        self.assertEqual(self.only_report(num)["title"],
+                         "Reports — how card #33 shipped")
+
+    def test_the_title_drops_a_trailing_closing_hash(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("t.md", "## Findings ##\n\nbody"))
+        self.assertEqual(self.only_report(num)["title"], "Findings")
+
     def test_a_report_with_no_heading_falls_back_to_its_first_line(self):
         num = self.working_card()
         self.post_report(num, self.write_doc("plain.md", "just a sentence\n\nand more"))
@@ -4750,6 +4764,51 @@ class TestReportRenderShape(ReportBase):
         html = self.html_of("```\n**not bold** and <b>not bold</b>\n```")
         self.assertNotIn("<strong>", html)
         self.assertIn("&lt;b&gt;", html)
+
+    def test_a_wrapped_list_item_stays_ONE_item(self):
+        """A real report wraps its prose. Before this, a wrapped item closed the
+        list and the next number restarted at 1."""
+        html = self.html_of(
+            "1. **First.** a line that keeps going\n"
+            "   onto a second source line\n"
+            "2. **Second.** and this one\n"
+            "   also wraps\n")
+        self.assertEqual(html.count("<ol>"), 1, html)
+        self.assertEqual(html.count("<li>"), 2, html)
+        self.assertIn("onto a second source line</li>", html)
+
+    def test_a_wrapped_paragraph_is_one_paragraph_not_a_stack_of_breaks(self):
+        """The author's 80-column wrap is not a design decision about the rail,
+        which is 480px wide."""
+        html = self.html_of("one line\nand its continuation\nand a third")
+        self.assertIn("<p>one line and its continuation and a third</p>", html)
+        self.assertNotIn("<br>", html)
+
+    def test_two_trailing_spaces_still_mean_a_hard_break(self):
+        html = self.html_of("first line  \nsecond line")
+        self.assertIn("first line<br>second line", html)
+
+    def test_a_trailing_backslash_is_a_hard_break_too(self):
+        html = self.html_of("first line\\\nsecond line")
+        self.assertIn("first line<br>second line", html)
+
+    def test_a_paragraph_still_stops_at_the_next_block(self):
+        html = self.html_of("some prose\n## A heading\nmore prose")
+        self.assertIn("<p>some prose</p>", html)
+        self.assertIn("<h2>A heading</h2>", html)
+
+    def test_control_bytes_are_refused(self):
+        """\x00 and \x01 are the renderer's own placeholders — a document must
+        never be able to carry them."""
+        for bad in (b"# ok\x00", b"# ok\x01"):
+            status, body = self.post("/api/cards", {"text": "x", "reports": [
+                {"name": "c.md", "data": base64.b64encode(bad).decode()}]})
+            self.assertEqual(status, 400, body)
+
+    def test_tabs_and_newlines_are_still_fine(self):
+        status, body = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "t.md", "text": "# ok\n\n\tindented\r\n"}]})
+        self.assertEqual(status, 201, body)
 
     def test_a_horizontal_rule(self):
         self.assertIn("<hr>", self.html_of("above\n\n---\n\nbelow"))

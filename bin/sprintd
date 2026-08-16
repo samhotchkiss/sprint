@@ -637,6 +637,16 @@ def render_inline(text: str) -> str:
     return re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], out)
 
 
+# The line-starts that END a paragraph or a list item. One definition, used by
+# both the paragraph loop and the list's lazy continuation, so they can never
+# disagree about where a block stops.
+_BLOCK_START_RE = re.compile(r"^\s*(#{1,6}\s|>|```|([-*+]|\d+[.)])\s|([-*_])\s*(\3\s*){2,}$)")
+
+
+def _starts_block(line: str) -> bool:
+    return bool(_BLOCK_START_RE.match(line))
+
+
 def _table_rows(line: str) -> list:
     cells = line.strip()
     if cells.startswith("|"):
@@ -744,18 +754,32 @@ def render_markdown(text: str) -> str:
                 out.append("</%s>" % otag)
                 stack.append((tag, oind, onest))
                 out.append("<%s>" % tag)
-            out.append("<li>%s</li>" % render_inline(m.group(3)))
+            # Lazy continuation: a list item that wraps onto the next line is
+            # still that item. Without this a wrapped item closed the list and
+            # the next number restarted at 1 -- which is what a real report,
+            # written with wrapped prose, looks like.
+            body = [m.group(3)]
             i += 1
+            while i < len(lines) and lines[i].strip() and not _starts_block(lines[i]):
+                body.append(lines[i].strip())
+                i += 1
+            out.append("<li>%s</li>" % render_inline(" ".join(body)))
             continue
 
         close_lists()
+        # A wrapped paragraph is ONE paragraph. Joining source lines with <br>
+        # bakes the author's 80-column wrap into the page, which reads as ragged
+        # nonsense at 480px in the rail. A hard break is the markdown way of
+        # asking for one: two trailing spaces, or a trailing backslash.
         para = []
-        while i < len(lines) and lines[i].strip() and \
-                not re.match(r"^(\s*)(#{1,6}\s|>|```|([-*+]|\d+[.)])\s)", lines[i]):
-            para.append(lines[i].strip())
+        while i < len(lines) and lines[i].strip() and not _starts_block(lines[i]):
+            raw_line = lines[i]
+            hard = raw_line.endswith("  ") or raw_line.rstrip().endswith("\\")
+            para.append(raw_line.strip().rstrip("\\") + ("\x01" if hard else ""))
             i += 1
         if para:
-            out.append("<p>%s</p>" % render_inline("\n".join(para)).replace("\n", "<br>"))
+            body = render_inline(" ".join(para)).replace("\x01 ", "<br>")
+            out.append("<p>%s</p>" % body.replace("\x01", ""))
         else:                              # a construct we just refused to eat
             out.append("<p>%s</p>" % render_inline(stripped))
             i += 1
@@ -780,10 +804,14 @@ def report_title(kind: str, text: str, name: str = None) -> str:
         line = raw.strip()
         if not line or line.startswith("```"):
             continue
+        # Strip the markers that WRAP the line, not every marker character in
+        # it: "how card #33 shipped" is a title about card #33, and a blanket
+        # strip renamed it "card 33".
+        line = re.sub(r"^\s*>+\s*", "", line)
         m = re.match(r"^#{1,6}\s+(.*)$", line)
         if m:
-            line = m.group(1)
-        line = re.sub(r"[*_`>#]+", "", line).strip()
+            line = m.group(1).rstrip("# ")
+        line = re.sub(r"[*_`]", "", line).strip()
         if line:
             return one_line(line, 120)
     return fallback
@@ -1373,9 +1401,14 @@ class App:
         if len(blob) > REPORT_MAX_BYTES:
             raise ApiError(413, "too_large",
                            "a report may not exceed %d bytes" % REPORT_MAX_BYTES)
-        if b"\x00" in blob:
+        # NUL is what "a binary wearing a .md" looks like. The rest of the C0
+        # controls are rejected for the same reason AND for a second one: the
+        # renderer uses \x00 and \x01 as its own internal placeholders, so a
+        # document that could contain them could confuse it. Tab, newline and
+        # carriage return are the only control characters a document may hold.
+        if any(b < 0x09 or b in (0x0b, 0x0c) or 0x0e <= b <= 0x1f for b in blob):
             raise ApiError(400, "bad_report",
-                           "report contains NUL bytes — that is not a text document")
+                           "report contains NUL or control bytes — that is not a text document")
         try:
             text = blob.decode("utf-8")
         except UnicodeDecodeError:

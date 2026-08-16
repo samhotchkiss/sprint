@@ -155,6 +155,16 @@ export function reportContent(detail) {
   // markup here — a `<script>` in the source is the characters `<script>`.
   const doc = h('div.report-doc.is-md');
   doc.innerHTML = (detail && detail.html) || '';
+  // The document's title is already the page heading (and the skim line), and a
+  // report that opens by repeating its own name reads as a mistake. If the very
+  // first thing in the body IS that title, drop it — once, and only on an exact
+  // match, so a document whose first heading says something else keeps it.
+  const first = doc.firstElementChild;
+  const title = String((detail && detail.title) || '').trim();
+  if (first && first.tagName === 'H1' && title
+      && first.textContent.trim() === title) {
+    first.remove();
+  }
   return doc;
 }
 
