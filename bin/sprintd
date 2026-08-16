@@ -718,7 +718,7 @@ class App:
 
         # Attachments are content-addressed and written to disk BEFORE the
         # event that references them.
-        attachments = [self.store_attachment(img) for img in images]
+        attachments = self.store_images(images)
 
         title = first_line_title(text) or "(image only)"
         ts = now()
@@ -795,6 +795,21 @@ class App:
         except (binascii.Error, ValueError):
             raise ApiError(400, "bad_image", "image is not valid base64")
         return self.store_blob(blob, name)
+
+    def store_images(self, images, field: str = "images") -> list:
+        """Store a submitted `images` list -- the ONE path every surface uses.
+
+        Card submission, card chat and the sidebar all take the same shape and
+        get the same guarantees: magic-byte sniffing, content-addressed dedupe,
+        the upload cap, and a ready-to-use `/api/attachments/...` url on the way
+        back out. Anything that is not a png/jpeg is a 400, never a silent drop.
+        """
+        if images is None:
+            return []
+        if not isinstance(images, list):
+            raise ApiError(400, "bad_image", "%s must be a list of images" % field,
+                           field=field)
+        return [self.store_attachment(img) for img in images]
 
     def ingest_ref(self, ref):
         """Turn any attachment/screenshot reference into one the browser can load.
@@ -1483,15 +1498,41 @@ class App:
         return {"ok": True, "event": self.event_row(seq),
                 "card": self.card_json(self.card_row(num), brief=True)}
 
-    def sidebar_post(self, text: str, actor: str, detail=None) -> dict:
+    def card_chat(self, num: int, text: str, images=None, actor: str = "user",
+                  detail=None) -> dict:
+        """A line to one card's thread -- text, images, or both.
+
+        Same deal as dropping work on the board: a screenshot with no words is a
+        complete message. Attachments land on disk BEFORE the event that names
+        them, and the refs go into the chat event's payload, so the timeline
+        read (`GET /api/cards/:num`) hands both the browser a url and the agent
+        an absolute path with no second fetch.
+        """
         text = (text or "").strip()
-        if not text:
-            raise ApiError(400, "missing_field", "text is required", field="text")
+        self.card_row(num)              # 404 before we write anything to disk
+        attachments = self.store_images(images)
+        if not text and not attachments:
+            raise ApiError(400, "empty_submission",
+                           "at least one of text or images is required")
+        payload = {"text": text or ("%d image(s)" % len(attachments))}
+        if attachments:
+            payload["attachments"] = attachments
+        if detail is not None:
+            payload["detail"] = detail
+        return self.card_event(num, "chat", payload, actor=actor)
+
+    def sidebar_post(self, text: str, actor: str, detail=None, images=None) -> dict:
+        text = (text or "").strip()
         if actor not in ("user", "session"):
             raise ApiError(400, "bad_actor", "sidebar actor must be user or session")
+        attachments = self.store_images(images)
+        if not text and not attachments:
+            raise ApiError(400, "missing_field", "text is required", field="text")
         # Same two-part shape as a card event: a line to skim, an optional
         # expanded version the session can park its working in.
-        payload = {"text": text}
+        payload = {"text": text or ("%d image(s)" % len(attachments))}
+        if attachments:
+            payload["attachments"] = attachments
         if detail is not None:
             payload["detail"] = detail
         with self.lock:
@@ -2227,7 +2268,8 @@ def make_handler(app: App):
                 return 201, app.sidebar_post(body.get("text"),
                                              actor_hint if actor_hint in ("user", "session")
                                              else "user",
-                                             detail=body.get("detail"))
+                                             detail=body.get("detail"),
+                                             images=body.get("images"))
 
             if path == "/api/batches":
                 return 201, app.make_batch(body.get("card_nums"), body.get("agent_name"),
@@ -2253,8 +2295,10 @@ def make_handler(app: App):
             num, verb = int(m.group(1)), m.group(2)
 
             if verb == "chat":
-                return 201, app.card_event(num, "chat", {"text": body.get("text")},
-                                           actor=actor_hint if actor_hint in ACTORS else "user")
+                return 201, app.card_chat(num, body.get("text"),
+                                          images=body.get("images"),
+                                          detail=body.get("detail"),
+                                          actor=actor_hint if actor_hint in ACTORS else "user")
             if verb == "answer":
                 qid = body.get("question_id")
                 if qid is None:
