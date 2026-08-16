@@ -18,8 +18,10 @@ behind the "Reports" link in the header:
 
   sprint-post 42 chat "findings are in the report" --report /abs/findings.md
 
-Markdown is rendered by the board itself, with raw HTML inside it escaped;
-author-written .html renders in a sandbox. Keep a report under 2 MB.
+PREFER .md. Markdown is rendered by the board itself, so a report picks up the
+board's own typography and skin, and raw HTML inside it is escaped. .html is
+supported for documents that arrive already-HTML, but it renders sandboxed and
+unstyled — don't author one when markdown will do. Keep a report under 2 MB.
 
 `phase` is sugar for a progress event that says what you are DOING right now
 rather than what you last finished:
@@ -119,9 +121,11 @@ def parse_args(argv):
                     help="read the expanded version from a file (e.g. a captured test log)")
     p.add_argument("--report", action="append", default=None, dest="reports",
                     metavar="PATH",
-                    help="attach a .md or .html document to this event (repeatable). "
-                         "It renders in the thread behind a skim line and lands in "
-                         "the sprint's Reports library.")
+                    help="attach a document to this event (repeatable). It renders "
+                         "in the thread behind a skim line and lands in the sprint's "
+                         "Reports library. Prefer .md — it renders with the board's "
+                         "own typography; .html is supported but renders sandboxed "
+                         "and unstyled.")
     p.add_argument("--long-running", action="store_true", dest="long_running",
                     help="mark this as a legit long-running step (suppresses the 5-minute silence timer)")
     p.add_argument("--server", default=os.environ.get("SPRINT_SERVER"),
@@ -191,6 +195,13 @@ def read_reports(paths):
             fail("report", f"{os.path.basename(path)} is not valid UTF-8 text")
         if b"\x00" in blob:
             fail("report", f"{os.path.basename(path)} has NUL bytes — that is not a text document")
+        if path.lower().endswith(".html"):
+            # Not an error — .html is supported on purpose, for documents that
+            # arrive already-HTML. It just renders sandboxed and unstyled, and
+            # an agent that had the choice should have written markdown.
+            notice(f"{os.path.basename(path)} is HTML — it renders sandboxed and "
+                   "unstyled. Prefer .md: markdown renders with the board's own "
+                   "typography. Attaching it anyway.")
         out.append(path)
     return out
 

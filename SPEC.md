@@ -199,6 +199,14 @@ while pasting it into `--detail` destroys the timeline.
   (rendered; `html` for markdown, `raw_url` + `sandboxed` for author HTML),
   `GET /api/attachments/<sha>.<ext>` (raw bytes). `reports` is accepted alongside `images` on
   `/api/cards`, `/api/cards/:num/chat`, `/api/sidebar`, worker events, and in an evidence packet.
+- **Markdown is the recommended format; HTML is the fallback.** User verbatim, on the bounce:
+  **"let's also advise agents that md reports are preferable to html. our html rendering isn't
+  great"**. `.md` renders with the board's own typography in both skins; author `.html` is
+  deliberately sandboxed and therefore unstyled, which is exactly why it looks worse. HTML support
+  stays — a document that arrives already-HTML still has a home — but every place an agent reads
+  (`agents/sprint-worker.md`, `sprint-post --help`, `sprint-ready --help`, this spec, the README)
+  says write `.md`, and both helpers print a one-line stderr notice when an `.html` report is passed.
+  A notice, never an error: the report still posts.
 - Workers: `sprint-post <num> chat "summary" --report path.md` (repeatable, validated client-side)
   and a `reports` field in the packet. A `phase` refuses a report — a phase is about the present, a
   document is not. Documented in `agents/sprint-worker.md`.

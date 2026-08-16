@@ -112,11 +112,11 @@ the `SPRINT_SERVER`/`SPRINT_TOKEN` environment variables your brief set.
   flattened into a one-liner, and pasting 400 lines into `--detail` destroys
   the timeline for everyone else. `--report` attaches a `.md` or a standalone
   `.html` file as a first-class attachment, exactly the way a screenshot is
-  one.
+  one. **Write it as `.md`** — see the format note below.
 
   ```
   sprint-post 42 chat "findings are in the report" --report /abs/findings.md
-  sprint-post 42 note "two audits" --report /abs/a.md --report /abs/b.html
+  sprint-post 42 note "two audits" --report /abs/a.md --report /abs/b.md
   ```
 
   - The board renders it in the thread as a **skim line** — the document's own
@@ -127,11 +127,16 @@ the `SPRINT_SERVER`/`SPRINT_TOKEN` environment variables your brief set.
   - Pass an **absolute path**; the server reads and content-addresses the file
     the same way it does your screenshots, so a report you delete later is
     still readable on the card.
-  - Markdown renders with a small in-house renderer (headings, lists, code
-    blocks, tables, blockquotes, links, emphasis). **Raw HTML inside a `.md`
-    is escaped, not rendered** — write markdown, not HTML-in-markdown.
-    Author-written `.html` is not rendered at all: it loads in a sandbox with
-    scripts off, so it keeps its own styling and can carry its own layout.
+  - **Write `.md`. Prefer it every time you have a choice.** Markdown renders
+    with the board's own typography — same type, same spacing, same skin as
+    everything else on the page, in both Calm and Chaos. The renderer covers
+    headings, lists, code blocks, tables, blockquotes, links, and emphasis,
+    which is everything a report needs. **Raw HTML inside a `.md` is escaped,
+    not rendered** — write markdown, not HTML-in-markdown.
+  - `.html` is still supported, for documents that arrive already-HTML (a tool
+    emitted it, someone handed it to you). It renders **sandboxed and
+    unstyled** — scripts off, none of the board's typography — so it looks
+    plainly worse. Don't author one; convert to markdown if you can.
   - Limits, all checked before the network call: `.md`/`.html` only, valid
     UTF-8, no NUL/control bytes, 2 MB.
   - A `phase` refuses a report on purpose — a phase says what you are doing
@@ -336,12 +341,13 @@ worktree root — not committed) shaped like:
   delete later is still visible on the card. A path that doesn't exist
   when you post is silently unviewable, so post the packet while the
   files are still on disk.
-- `reports` is **optional**: absolute paths to `.md`/`.html` documents your
-  work produced. They ride the same path screenshots do — the board reads them
-  off disk, renders each one in the packet behind a skim line, and adds it to
-  the sprint's Reports library. Use it when the *reasoning* is the deliverable
-  (an audit, a comparison, a design rationale) rather than something a
-  screenshot can show. It never replaces `validate`.
+- `reports` is **optional**: absolute paths to documents your work produced —
+  **write them as `.md`** (`.html` is accepted but renders sandboxed and
+  unstyled; see the `--report` note above). They ride the same path screenshots
+  do — the board reads them off disk, renders each one in the packet behind a
+  skim line, and adds it to the sprint's Reports library. Use it when the
+  *reasoning* is the deliverable (an audit, a comparison, a design rationale)
+  rather than something a screenshot can show. It never replaces `validate`.
 - If you were dispatched as a batch, add `per_card`: one entry per
   member card, `{"card_num": N, "claim": "...", "screenshots": [...]}`.
   Call `sprint-ready` once (any one member card number) with the full

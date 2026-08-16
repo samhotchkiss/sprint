@@ -5083,5 +5083,100 @@ class TestSprintPostReportFlag(ReportBase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("reports", r.stderr.decode())
 
+
+class TestMarkdownIsTheRecommendedFormat(ReportBase):
+    """User verbatim on the bounce: "let's also advise agents that md reports
+    are preferable to html. our html rendering isn't great."
+
+    HTML support does NOT go away — a document that arrives already-HTML still
+    has a home. What changes is what an agent is told: every surface an agent
+    reads says write .md, and both helpers say it out loud when an .html report
+    goes by. A notice on stderr, never an error: the report still posts."""
+
+    SPRINT_POST = os.path.join(os.path.dirname(HERE), "bin", "sprint-post")
+    SPRINT_READY = os.path.join(os.path.dirname(HERE), "bin", "sprint-ready")
+    ROOT = os.path.dirname(HERE)
+
+    def run_post(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_POST] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def run_ready(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_READY] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def read_repo_file(self, *parts):
+        with open(os.path.join(self.ROOT, *parts), encoding="utf-8") as fh:
+            return fh.read()
+
+    # --- the nudge is a notice, not a gate -------------------------------
+
+    def test_an_html_report_still_posts(self):
+        num = self.working_card()
+        path = self.write_doc("legacy.html", "<title>Legacy</title><p>body</p>")
+        r = self.run_post(num, "chat", "an already-HTML document", "--report", path)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(self.only_report(num)["doc"], "html")
+
+    def test_an_html_report_prints_a_notice_naming_md(self):
+        num = self.working_card()
+        path = self.write_doc("legacy.html", "<title>Legacy</title><p>body</p>")
+        err = self.run_post(num, "chat", "x", "--report", path).stderr.decode()
+        self.assertIn("legacy.html", err)
+        self.assertIn(".md", err)
+        self.assertNotIn("missing required field", err)
+
+    def test_a_markdown_report_is_not_nagged(self):
+        num = self.working_card()
+        r = self.run_post(num, "chat", "x", "--report",
+                          self.write_doc("findings.md", REPORT_MD))
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertNotIn("Prefer .md", r.stderr.decode())
+
+    def test_sprint_ready_notices_an_html_report_but_accepts_it(self):
+        num = self.working_card()
+        packet = dict(GOOD_PACKET)
+        packet["reports"] = [self.write_doc("legacy.html",
+                                            "<title>Legacy</title><p>body</p>")]
+        pfile = os.path.join(self.tmp, "packet.json")
+        with open(pfile, "w", encoding="utf-8") as fh:
+            json.dump(packet, fh)
+        r = self.run_ready(num, pfile)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn(".md", r.stderr.decode())
+        _, index = self.get("/api/reports")
+        self.assertEqual(index["count"], 1)
+
+    # --- every surface an agent reads says it ----------------------------
+
+    def test_the_helpers_own_help_recommends_md(self):
+        for helper in ("sprint-post", "sprint-ready"):
+            with open(os.path.join(self.ROOT, "bin", helper), encoding="utf-8") as fh:
+                doc = fh.read()
+            self.assertIn("refer .md", doc,
+                          "%s should tell an agent to prefer .md" % helper)
+
+    def test_the_worker_definition_recommends_md(self):
+        doc = self.read_repo_file("agents", "sprint-worker.md")
+        self.assertIn("sandboxed", doc)
+        self.assertIn("Write `.md`", doc)
+
+    def test_the_spec_and_readme_record_the_preference(self):
+        spec = self.read_repo_file("SPEC.md")
+        self.assertIn("md reports are preferable to html", spec)
+        readme = self.read_repo_file("README.md")
+        self.assertIn("sandboxed", readme)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

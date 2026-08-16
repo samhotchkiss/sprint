@@ -60,9 +60,11 @@ running inside the project you want a board for.
    findings write-up, a comparison — it attaches it as a report. It reads in
    the thread as a title you can skim and expand, and a quiet **Reports** link
    appears in the header, which is your library of everything this sprint
-   wrote. The link isn't there until there's something behind it. Markdown is
-   rendered by the board itself (raw HTML inside it is escaped, never run);
-   author-written HTML renders in a sandbox with scripts off.
+   wrote. The link isn't there until there's something behind it. Agents are
+   told to write **markdown**: the board renders `.md` itself, in its own
+   typography and skin (raw HTML inside it is escaped, never run). `.html` is
+   still accepted for documents that arrive already-HTML, but it renders
+   sandboxed and unstyled, so it looks plainer.
 
 Dumping a bunch of issues at once? Say "hold" first — new cards land in
 a `held` column instead of dispatching immediately, so the session can
