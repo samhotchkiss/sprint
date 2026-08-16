@@ -113,9 +113,10 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 - **needs_you**: a question the user can answer fixes it. **blocked**: external wall (CI red, overlaps
   another card, dependency) — machine-named reason required; distinct column; nothing the user types
   fixes it; the session re-checks blocked cards periodically.
-- **needs_you vs ready — the user's definition, verbatim**: *"needs you is where we talk through
-  things. review means the session genuinely thinks the card is 100% complete. needs you is that the
-  card is waiting for my input before it can keep moving forward."* So an agent has **two** handoffs
+- **needs_you vs ready — the user's definition, verbatim**:
+  *"needs you is where we talk through things. review means the session genuinely thinks the card
+  is 100% complete. needs you is that the card is waiting for my input before it can keep moving
+  forward."* So an agent has **two** handoffs
   and they mean different things: an **evidence packet** (`sprint-ready` → `ready`) says "I believe
   this is done", and a **decision request** (`sprint-ask` → `needs_you`) says "I need you to
   choose/answer before I continue". Mockups to pick between, a design call, "which of these three",

@@ -6577,5 +6577,291 @@ class TestPortSurvivesStopAndStart(unittest.TestCase):
         self.assertEqual(self._run("stop").returncode, 0)
 
 
+# --------------------------------------------------------------------------
+# Decision requests (#50) -- an agent asking for a DECISION, not a verdict.
+#
+# User's rule, verbatim: "needs you is where we talk through things. review
+# means the session genuinely thinks the card is 100% complete. needs you is
+# that the card is waiting for my input before it can keep moving forward."
+#
+# So the two handoffs must land in different places and stay that way: a
+# question with artifacts is `needs_you`, never `ready`, and the gate is
+# untouched by any of it.
+# --------------------------------------------------------------------------
+
+
+class DecisionBase(Base):
+    def working_card(self, text="which header do you want"):
+        num = self.new_card(text)["num"]
+        self.to_in_progress(num)
+        return num
+
+    def write_png(self, name="mock.png"):
+        path = os.path.join(self.tmp, name)
+        with open(path, "wb") as fh:
+            fh.write(base64.b64decode(PNG_B64))
+        return path
+
+    def question_of(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return detail["card"]["question"]
+
+
+class TestDecisionRequest(DecisionBase):
+    def test_a_decision_request_lands_needs_you_not_ready(self):
+        num = self.working_card()
+        status, body = self.post("/api/cards/%d/question" % num, {
+            "text": "Which of these three headers?",
+            "options": ["A", "B", "C"],
+            "artifacts": {"url": "http://127.0.0.1:8450/preview",
+                          "attachments": [self.write_png()],
+                          "notes": "All three keep the 44px targets."},
+        })
+        self.assertEqual(status, 201, body)
+        self.assertEqual(self.state_of(num), "needs_you")
+        self.assertNotEqual(self.state_of(num), "ready")
+
+    def test_artifacts_survive_the_round_trip(self):
+        num = self.working_card()
+        png = self.write_png()
+        self.post("/api/cards/%d/question" % num, {
+            "text": "Pick one",
+            "artifacts": {"url": "http://127.0.0.1:8450/preview",
+                          "attachments": [png],
+                          "notes": "  context  "},
+        })
+        arts = self.question_of(num)["artifacts"]
+        self.assertEqual(arts["url"], "http://127.0.0.1:8450/preview")
+        self.assertEqual(arts["notes"], "context")
+        self.assertEqual(len(arts["attachments"]), 1)
+        att = arts["attachments"][0]
+        # ...ingested exactly like a packet's screenshot: content-addressed,
+        # on disk, and servable back to the browser.
+        self.assertRegex(att["sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(os.path.isfile(att["path"]))
+        status, blob = self.get(att["url"])
+        self.assertEqual(status, 200)
+        self.assertEqual(blob, base64.b64decode(PNG_B64))
+
+    def test_the_question_event_carries_them_too(self):
+        """Answering must not erase what you were asked to look at."""
+        num = self.working_card()
+        self.post("/api/cards/%d/question" % num,
+                  {"text": "Pick one", "artifacts": {"notes": "two options below"}})
+        _, detail = self.get("/api/cards/%d" % num)
+        q = [e for e in detail["timeline"] if e["kind"] == "question"][-1]
+        self.assertEqual(q["payload"]["artifacts"]["notes"], "two options below")
+
+    def test_answering_a_decision_request_unblocks_the_card(self):
+        num = self.working_card()
+        self.post("/api/cards/%d/question" % num,
+                  {"text": "Pick one", "options": ["A", "B"],
+                   "artifacts": {"url": "http://127.0.0.1:8450/x"}})
+        qid = self.question_of(num)["id"]
+        status, _ = self.post("/api/cards/%d/answer" % num,
+                              {"question_id": qid, "text": "B"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_a_plain_question_still_has_no_artifacts(self):
+        num = self.working_card()
+        self.post("/api/cards/%d/question" % num, {"text": "what colour?"})
+        self.assertIsNone(self.question_of(num)["artifacts"])
+        self.assertEqual(self.state_of(num), "needs_you")
+
+    def test_a_malformed_artifacts_payload_names_itself(self):
+        num = self.working_card()
+        for bad, field in (
+            ("not an object", "artifacts"),
+            ({}, "artifacts"),
+            ({"url": "ftp://nope"}, "artifacts.url"),
+            ({"url": ""}, "artifacts.url"),
+            ({"notes": 7}, "artifacts.notes"),
+            ({"attachments": "shot.png"}, "artifacts.attachments"),
+        ):
+            status, body = self.post("/api/cards/%d/question" % num,
+                                     {"text": "hm", "artifacts": bad})
+            self.assertEqual(status, 400, (bad, body))
+            self.assertEqual(body.get("field"), field, (bad, body))
+        # ...and none of those left the card waiting on a question
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_the_gate_is_untouched_by_any_of_this(self):
+        """A decision request is not a back door into `ready`."""
+        num = self.working_card()
+        self.post("/api/cards/%d/question" % num,
+                  {"text": "Pick one", "artifacts": {"notes": "x"}})
+        status, body = self.post("/api/cards/%d/state" % num, {"state": "ready"})
+        self.assertEqual(status, 422, body)
+
+    def test_an_older_board_gets_the_column_added(self):
+        """CREATE TABLE IF NOT EXISTS does nothing to an existing table."""
+        self.assertIn(("questions", "artifacts", "TEXT"),
+                      [(t, c, d) for t, c, d in sprintd.App.ADDED_COLUMNS])
+
+
+class TestSprintAskArtifactFlags(DecisionBase):
+    """bin/sprint-ask is how a worker actually posts one."""
+
+    SPRINT_ASK = os.path.join(os.path.dirname(HERE), "bin", "sprint-ask")
+
+    def run_ask(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_ASK] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def test_the_flags_post_a_decision_request(self):
+        num = self.working_card()
+        png = self.write_png()
+        r = self.run_ask(num, "Which header?", "--options", '["A","B"]',
+                         "--url", "http://127.0.0.1:8450/preview",
+                         "--attach", png, "--notes", "B costs a request")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        out = r.stdout.decode()
+        self.assertIn("decision request", out)
+        self.assertIn("needs_you", out)
+        self.assertEqual(self.state_of(num), "needs_you")
+        arts = self.question_of(num)["artifacts"]
+        self.assertEqual(arts["url"], "http://127.0.0.1:8450/preview")
+        self.assertEqual(arts["notes"], "B costs a request")
+        self.assertEqual(len(arts["attachments"]), 1)
+
+    def test_a_plain_ask_is_exactly_what_it_was(self):
+        num = self.working_card()
+        r = self.run_ask(num, "what colour?")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertNotIn("decision request", r.stdout.decode())
+        self.assertIsNone(self.question_of(num)["artifacts"])
+
+    def test_a_missing_attachment_fails_before_the_network(self):
+        num = self.working_card()
+        r = self.run_ask(num, "pick", "--attach", os.path.join(self.tmp, "nope.png"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("attach", r.stderr.decode())
+        self.assertIn("no such file", r.stderr.decode())
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_a_relative_attachment_path_fails_by_name(self):
+        num = self.working_card()
+        r = self.run_ask(num, "pick", "--attach", "shot.png")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("absolute", r.stderr.decode())
+
+    def test_a_non_http_url_fails_by_name(self):
+        num = self.working_card()
+        r = self.run_ask(num, "pick", "--url", "/tmp/preview")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("url", r.stderr.decode())
+
+    def test_the_worker_contract_states_the_rule(self):
+        root = os.path.dirname(HERE)
+        with open(os.path.join(root, "agents", "sprint-worker.md"), encoding="utf-8") as fh:
+            doc = fh.read()
+        self.assertIn("needs you is where we talk through things", doc)
+        self.assertIn("--attach", doc)
+        with open(os.path.join(root, "SPEC.md"), encoding="utf-8") as fh:
+            spec = fh.read()
+        self.assertIn("needs you is where we talk through things", spec)
+        with open(os.path.join(root, "skills", "sprint", "SKILL.md"), encoding="utf-8") as fh:
+            skill = fh.read()
+        self.assertIn("decision request", skill)
+
+
+class TestSprintReadyDecisionNotice(DecisionBase):
+    """The cheap guard: a packet that is really a question says so on stderr.
+
+    Advisory, deliberately. The packet has already passed every real rule; this
+    is judgment, and a gate made of judgment is a gate that blocks good work.
+    """
+
+    SPRINT_READY = os.path.join(os.path.dirname(HERE), "bin", "sprint-ready")
+
+    def run_ready(self, num, packet):
+        import subprocess
+        path = os.path.join(self.tmp, "packet-%s.json" % num)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(packet, fh)
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_READY, str(num), path],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def test_a_packet_carrying_options_is_named_and_still_posts(self):
+        num = self.working_card()
+        packet = dict(GOOD_PACKET)
+        packet["options"] = ["A", "B"]
+        r = self.run_ready(num, packet)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        err = r.stderr.decode()
+        self.assertIn("options", err)
+        self.assertIn("sprint-ask", err)
+        self.assertEqual(self.state_of(num), "ready")   # advisory, not a gate
+
+    def test_a_validate_step_that_is_a_question_is_named(self):
+        num = self.working_card()
+        packet = dict(GOOD_PACKET)
+        packet["validate"] = ["Which of these two layouts do you want?"]
+        err = self.run_ready(num, packet).stderr.decode()
+        self.assertIn("validate", err)
+        self.assertIn("sprint-ask", err)
+
+    def test_a_claim_that_is_a_question_is_named(self):
+        num = self.working_card()
+        packet = dict(GOOD_PACKET)
+        packet["claim"] = "Should the header be sticky?"
+        err = self.run_ready(num, packet).stderr.decode()
+        self.assertIn("claim", err)
+
+    def test_an_ordinary_packet_is_not_nagged(self):
+        num = self.working_card()
+        r = self.run_ready(num, dict(GOOD_PACKET))
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertNotIn("sprint-ask", r.stderr.decode())
+        self.assertEqual(self.state_of(num), "ready")
+
+
+# --------------------------------------------------------------------------
+# Clickable links (#54). User verbatim: "make links clickable and should auto
+# open in a new tab." The browser half lives in web/util.js; this is the half
+# the server renders -- markdown reports.
+# --------------------------------------------------------------------------
+
+
+class TestBareUrlsAutolink(Base):
+    def test_a_bare_url_in_a_report_becomes_a_new_tab_link(self):
+        html = sprintd.render_markdown("see http://127.0.0.1:8450/preview for it")
+        self.assertIn('href="http://127.0.0.1:8450/preview"', html)
+        self.assertIn('target="_blank"', html)
+        self.assertIn('rel="noreferrer noopener nofollow"', html)
+
+    def test_trailing_punctuation_is_the_sentence_not_the_url(self):
+        html = sprintd.render_markdown("open http://example.com/x.")
+        self.assertIn('href="http://example.com/x"', html)
+
+    def test_a_markdown_link_is_not_double_wrapped(self):
+        html = sprintd.render_markdown("[the preview](http://example.com/x)")
+        self.assertEqual(html.count("<a "), 1)
+        self.assertIn(">the preview<", html)
+
+    def test_a_url_in_inline_code_stays_text(self):
+        html = sprintd.render_markdown("run `curl http://example.com/x`")
+        self.assertNotIn("<a ", html)
+
+    def test_a_url_in_a_fenced_block_stays_text(self):
+        html = sprintd.render_markdown("```\ncurl http://example.com/x\n```")
+        self.assertNotIn("<a ", html)
+
+    def test_a_javascript_url_is_not_linked(self):
+        html = sprintd.render_markdown("javascript:alert(1) and data:text/html,x")
+        self.assertNotIn("<a ", html)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
