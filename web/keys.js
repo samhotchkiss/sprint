@@ -73,7 +73,9 @@ export function keysSheetOpen() { return !!(keysWrap && !keysWrap.hidden); }
 
 export function toggleKeysSheet() {
   if (!keysWrap) return;
-  if (keysSheetOpen()) closeKeysSheet();
+  // Closing it puts the keyboard back on the highlighted card, so `?` twice in
+  // a row leaves you exactly where you started.
+  if (keysSheetOpen()) { closeKeysSheet(); focusNavCursor(); }
   else {
     keysWrap.hidden = false;
     const close = keysWrap.querySelector('#keys-close');
@@ -273,7 +275,12 @@ export function handleKey(e, { isTyping, emptyTextTarget }) {
   // "." — the sprint switcher, numbered.
   if (e.key === '.' && (!isTyping(a) || emptyTextTarget(a))) {
     e.preventDefault();
-    if (siblingMenuOpen()) { closeSiblingMenu(); app.render(); return true; }
+    if (siblingMenuOpen()) {
+      closeSiblingMenu();
+      app.render();
+      requestAnimationFrame(() => focusNavCursor());
+      return true;
+    }
     if (openSiblingMenu()) {
       app.render();
       requestAnimationFrame(() => {
@@ -290,9 +297,21 @@ export function handleKey(e, { isTyping, emptyTextTarget }) {
 
   // With the switcher open the digits belong to it — that is what the numbers
   // beside the sprint names are for.
+  //
+  // The number goes to the ROW ON SCREEN, by clicking it, rather than to the
+  // nth entry of the list the page last fetched. Those are usually the same
+  // thing and occasionally are not: the server sorts the menu by who is waiting
+  // on you and for how long, and a board that appears, disappears or starts
+  // needing you reorders it. Between that poll and the next paint the array has
+  // moved and the drawn numbers have not — press 2 in that window and you would
+  // land on a sprint that was never labelled 2. Clicking the row you can see
+  // cannot be wrong: the number is printed on it.
   if (siblingMenuOpen()) {
     if (digit && digit <= siblingCount()) {
       e.preventDefault();
+      const rows = document.querySelectorAll('.sprint-menu .menu-item');
+      const row = rows[digit - 1];
+      if (row) { row.click(); return true; }
       closeSiblingMenu();
       gotoSibling(digit - 1);
       app.render();

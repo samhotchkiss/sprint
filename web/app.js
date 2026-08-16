@@ -424,6 +424,14 @@ function normDetail(res, num) {
     if (!card.question && boardCard.question) card.question = boardCard.question;
     if (!card.evidence && boardCard.evidence) card.evidence = boardCard.evidence;
     if (!card.last_activity_at) card.last_activity_at = boardCard.last_activity_at;
+    // Where the card sits in the Queued pile is a property of the WHOLE list,
+    // so an older server only ever puts it on `/api/board`. Reading one card
+    // must not be able to erase it: a card with no queue position sorts to the
+    // bottom of Queued, and card #57's arrow-preview reads every card you pass
+    // — which reshuffled the pile under the cursor, one card per keystroke.
+    if (card.queue_position == null && boardCard.queue_position != null) {
+      card.queue_position = boardCard.queue_position;
+    }
   }
   if (card) store.cards.set(card.num, { ...(boardCard || {}), ...card });
   const rawTl = (res && (res.timeline || res.events)) || (raw && raw.timeline) || [];
@@ -998,9 +1006,18 @@ function toggleChat(force, opts) {
  */
 function escape(e) {
   const a = document.activeElement;
-  if (closeKeysSheet()) return;
-  if (closeSettings()) return;
-  if (closeSiblingMenu()) { render(); return; }
+  // Closing a sheet hands the keyboard back to the card you were standing on.
+  // A sheet takes focus when it opens (its Close button, the switcher's first
+  // row), so without this you come out of it with the highlight still painted
+  // and Return doing nothing — the board looks like it lost the plot.
+  if (closeKeysSheet()) { focusNavCursor(); return; }
+  if (closeSettings()) { focusNavCursor(); return; }
+  if (closeSiblingMenu()) {
+    render();
+    // After the repaint, not before: the menu's row is about to be replaced.
+    requestAnimationFrame(() => focusNavCursor());
+    return;
+  }
   if (!el.lightbox.hidden) { closeLightbox(el.lightbox); return; }
   if (!el.composeWrap.hidden) { closeCompose(); return; }
   // The bounce box owns its own Escape (review.js / thread.js cancel the bounce).

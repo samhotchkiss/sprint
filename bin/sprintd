@@ -4686,10 +4686,31 @@ class App:
             self._siblings_snap = snap
         return snap
 
+    def queue_position(self, row) -> int:
+        """Where this card sits in the queued pile — 1-based, or None if it is
+        not queued.
+
+        The board computes this for the whole list in one pass; a single card
+        has to be able to answer it too. Without that, a client that re-reads
+        one card (opening it, arrowing onto it) gets a card object with no
+        queue position in it, overwrites the one it had, and the card drops to
+        the bottom of the Queued pile in front of the user. Same number, same
+        ordering (`ORDER BY num`) as `board()`, so the two can never disagree.
+        """
+        if row["state"] != "queued":
+            return None
+        rows = self.q("SELECT num FROM cards WHERE sprint_id=? AND state='queued' ORDER BY num",
+                      (row["sprint_id"],))
+        for i, r in enumerate(rows, start=1):
+            if r["num"] == row["num"]:
+                return i
+        return None
+
     def card_detail(self, num: int) -> dict:
         """{card, timeline, evidence, attachments, ...} -- the drawer's whole payload."""
         row = self.card_row(num)
         card = self.card_json(row)
+        card["queue_position"] = self.queue_position(row)
         timeline = self.events_after(0, limit=5000, card_num=num)
         return {
             "num": num,
