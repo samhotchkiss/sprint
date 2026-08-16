@@ -7,6 +7,7 @@ temp data dir. Port 8377 (the real default) is never touched.
 
 import base64
 import datetime
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -2653,6 +2654,255 @@ class TestChatImages(Base):
         status, body = self.chat(num, {"text": "x", "images": PNG_B64})
         self.assertEqual(status, 400, body)
         self.assertEqual(body["error"], "bad_image")
+
+
+class TestPasteIntoAnyBox(Base):
+    """Card #66, user verbatim: "i need to be able to paste images into ANY text
+    entry area-- I just tried to bounce a card with a screenshot showing the
+    issue, it wouldn't let me paste an image in."
+
+    Card chat and the sidebar already took pictures. These are the two surfaces
+    that did not: the bounce (his exact failing case) and the answer box. Both
+    go through the SAME content-addressed store submit uses, get the same size
+    and type refusals, and hand the agent an absolute path off the timeline."""
+
+    JPEG_B64 = base64.b64encode(
+        b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + b"\x00" * 40 + b"\xff\xd9").decode()
+
+    def ready_card(self, text="fix the header"):
+        num = self.new_card(text)["num"]
+        self.to_in_progress(num)
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200, body)
+        return num
+
+    def open_question(self, num, text="Which header?"):
+        self.to_in_progress(num)
+        status, body = self.post("/api/cards/%d/question" % num, {"text": text})
+        self.assertEqual(status, 201, body)
+        return body["question"]["id"]
+
+    def verdict_event(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        evs = [e for e in detail["timeline"] if e["kind"] == "verdict"]
+        self.assertTrue(evs, "no verdict on the timeline")
+        return evs[-1], detail
+
+    # -- the bounce: his exact case ------------------------------------
+
+    def test_bounce_with_notes_and_a_screenshot_carries_the_image(self):
+        num = self.ready_card()
+        status, body = self.post("/api/cards/%d/verdict" % num,
+                                 {"verdict": "bounce",
+                                  "notes": "the header still overlaps — see this",
+                                  "images": [PNG_B64]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "in_progress")
+
+        ev, detail = self.verdict_event(num)
+        atts = ev["payload"]["attachments"]
+        self.assertEqual(len(atts), 1)
+        att = atts[0]
+        self.assertEqual(att["mime"], "image/png")
+        self.assertEqual(att["url"], "/api/attachments/%s.png" % att["sha256"])
+        # content-addressed, on disk, and the agent gets a path it can Read
+        self.assertTrue(os.path.isfile(att["path"]), att["path"])
+        self.assertTrue(os.path.isabs(att["path"]))
+        with open(att["path"], "rb") as fh:
+            self.assertEqual(fh.read(), base64.b64decode(PNG_B64))
+        self.assertEqual(att["sha256"],
+                         hashlib.sha256(base64.b64decode(PNG_B64)).hexdigest())
+        # servable to the browser, and rolled up on the card
+        status, blob = self.get(att["url"])
+        self.assertEqual(status, 200)
+        self.assertEqual(blob, base64.b64decode(PNG_B64))
+        self.assertIn(att["sha256"], [a["sha256"] for a in detail["attachments"]])
+        # the notes are still the words on the line
+        self.assertIn("still overlaps", ev["payload"]["text"])
+        self.assertEqual(ev["payload"]["notes"],
+                         "the header still overlaps — see this")
+
+    def test_a_screenshot_with_no_words_is_a_complete_bounce(self):
+        num = self.ready_card()
+        status, body = self.post("/api/cards/%d/verdict" % num,
+                                 {"verdict": "bounce", "images": [PNG_B64]})
+        self.assertEqual(status, 200, body)
+        ev, _ = self.verdict_event(num)
+        self.assertEqual(len(ev["payload"]["attachments"]), 1)
+        self.assertTrue(ev["payload"]["text"].strip(),
+                        "every event needs a line the card face can show")
+        self.assertIn("screenshot", ev["payload"]["text"])
+
+    def test_approve_and_reject_take_pictures_too(self):
+        for kind, end in (("approve", "integrating"), ("reject", "rejected")):
+            num = self.ready_card("card for %s" % kind)
+            status, body = self.post("/api/cards/%d/verdict" % num,
+                                     {"verdict": kind, "notes": "look",
+                                      "images": [PNG_B64]})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(self.state_of(num), end)
+            ev, _ = self.verdict_event(num)
+            self.assertEqual(len(ev["payload"]["attachments"]), 1)
+
+    def test_one_picture_bounced_at_two_cards_is_stored_once(self):
+        a, b = self.ready_card("one"), self.ready_card("two")
+        shas = set()
+        for num in (a, b):
+            status, _ = self.post("/api/cards/%d/verdict" % num,
+                                  {"verdict": "bounce", "notes": "same problem",
+                                   "images": [PNG_B64]})
+            self.assertEqual(status, 200)
+            shas.add(self.verdict_event(num)[0]["payload"]["attachments"][0]["sha256"])
+        self.assertEqual(len(shas), 1)
+        self.assertEqual(len(os.listdir(self.app.attach_dir)), 1,
+                         "the same bytes are stored exactly once")
+
+    def test_verdict_takes_a_data_url_and_a_jpeg(self):
+        num = self.ready_card()
+        status, body = self.post("/api/cards/%d/verdict" % num,
+                                 {"verdict": "bounce",
+                                  "images": ["data:image/png;base64," + PNG_B64,
+                                             "data:image/jpeg;base64," + self.JPEG_B64]})
+        self.assertEqual(status, 200, body)
+        atts = self.verdict_event(num)[0]["payload"]["attachments"]
+        self.assertEqual([a["mime"] for a in atts], ["image/png", "image/jpeg"])
+        self.assertTrue(atts[1]["url"].endswith(".jpg"))
+
+    def test_a_verdict_without_pictures_carries_no_attachments_field(self):
+        num = self.ready_card()
+        status, _ = self.post("/api/cards/%d/verdict" % num,
+                              {"verdict": "bounce", "notes": "words only"})
+        self.assertEqual(status, 200)
+        self.assertNotIn("attachments", self.verdict_event(num)[0]["payload"])
+
+    # -- the same refusals submit makes ---------------------------------
+
+    def test_verdict_refuses_a_non_image_and_stores_nothing(self):
+        num = self.ready_card()
+        status, body = self.post(
+            "/api/cards/%d/verdict" % num,
+            {"verdict": "bounce", "notes": "here",
+             "images": [base64.b64encode(b"not an image at all").decode()]})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "bad_image")
+        self.assertEqual(os.listdir(self.app.attach_dir), [],
+                         "a rejected attachment leaves nothing behind")
+        self.assertEqual(self.state_of(num), "ready",
+                         "and the card was not bounced")
+
+    def test_oversize_verdict_attachment_is_a_413_and_stores_nothing(self):
+        num = self.ready_card()
+        self.app.max_upload = 512
+        big = base64.b64encode(b"\x89PNG\r\n\x1a\n" + os.urandom(2048)).decode()
+        status, body = self.post("/api/cards/%d/verdict" % num,
+                                 {"verdict": "bounce", "images": [big]})
+        self.assertEqual(status, 413, body)
+        self.assertEqual(body["error"], "too_large")
+        self.assertEqual(os.listdir(self.app.attach_dir), [])
+        self.assertEqual(self.state_of(num), "ready")
+
+    def test_a_verdict_the_board_refuses_stores_no_bytes(self):
+        # approve only ever moves a card out of `ready`; this one is still
+        # queued, so the board says no before anything is written.
+        num = self.new_card("never went to review")["num"]
+        status, body = self.post("/api/cards/%d/verdict" % num,
+                                 {"verdict": "approve", "images": [PNG_B64]})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(os.listdir(self.app.attach_dir), [],
+                         "an illegal transition must not leave a blob behind")
+
+    def test_a_verdict_on_a_missing_card_stores_nothing(self):
+        status, body = self.post("/api/cards/9999/verdict",
+                                 {"verdict": "bounce", "images": [PNG_B64]})
+        self.assertEqual(status, 404, body)
+        self.assertEqual(os.listdir(self.app.attach_dir), [])
+
+    # -- the answer box -------------------------------------------------
+
+    def test_an_answer_carries_its_screenshot(self):
+        num = self.new_card("which one")["num"]
+        qid = self.open_question(num)
+        status, body = self.post("/api/cards/%d/answer" % num,
+                                 {"question_id": qid, "text": "this one",
+                                  "images": [PNG_B64]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "in_progress")
+        _, detail = self.get("/api/cards/%d" % num)
+        ans = [e for e in detail["timeline"] if e["kind"] == "answer"][-1]
+        att = ans["payload"]["attachments"][0]
+        self.assertEqual(ans["payload"]["text"], "this one")
+        self.assertTrue(os.path.isabs(att["path"]))
+        self.assertTrue(os.path.isfile(att["path"]))
+        self.assertEqual(self.get(att["url"])[0], 200)
+        self.assertIn(att["sha256"], [a["sha256"] for a in detail["attachments"]])
+        # one event, not a chat line and then an answer
+        self.assertEqual(self.kinds_for(num).count("chat"), 0)
+
+    def test_an_answer_that_is_only_a_screenshot_still_unblocks_the_card(self):
+        num = self.new_card("which one")["num"]
+        qid = self.open_question(num)
+        status, body = self.post("/api/cards/%d/answer" % num,
+                                 {"question_id": qid, "images": [PNG_B64]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "in_progress")
+        _, detail = self.get("/api/cards/%d" % num)
+        ans = [e for e in detail["timeline"] if e["kind"] == "answer"][-1]
+        self.assertTrue(ans["payload"]["text"].strip())
+        self.assertEqual(len(ans["payload"]["attachments"]), 1)
+
+    def test_an_answer_with_neither_words_nor_pictures_is_still_refused(self):
+        num = self.new_card("which one")["num"]
+        qid = self.open_question(num)
+        status, body = self.post("/api/cards/%d/answer" % num,
+                                 {"question_id": qid, "text": "   "})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "missing_field")
+        self.assertEqual(self.state_of(num), "needs_you")
+
+    def test_an_answer_refuses_a_non_image_and_stores_nothing(self):
+        num = self.new_card("which one")["num"]
+        qid = self.open_question(num)
+        status, body = self.post(
+            "/api/cards/%d/answer" % num,
+            {"question_id": qid, "text": "look",
+             "images": [base64.b64encode(b"nope").decode()]})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "bad_image")
+        self.assertEqual(os.listdir(self.app.attach_dir), [])
+        self.assertEqual(self.state_of(num), "needs_you",
+                         "the question is still open")
+
+    def test_an_answer_on_a_missing_card_stores_nothing(self):
+        status, body = self.post("/api/cards/9999/answer",
+                                 {"question_id": 1, "text": "hi",
+                                  "images": [PNG_B64]})
+        self.assertEqual(status, 404, body)
+        self.assertEqual(os.listdir(self.app.attach_dir), [])
+
+    # -- one wire shape across every surface ----------------------------
+
+    def test_attachments_is_accepted_as_a_name_for_images_everywhere(self):
+        """A caller who reads a card back sees the pictures under `attachments`;
+        posting them back under the same word must not be a silent drop."""
+        card = self.post("/api/cards", {"text": "dropped", "attachments": [PNG_B64]})[1]
+        self.assertEqual(len(card["attachments"]), 1)
+        num = card["num"]
+        status, res = self.post("/api/cards/%d/chat" % num,
+                                {"text": "and this", "attachments": [PNG_B64]})
+        self.assertEqual(status, 201, res)
+        self.assertEqual(len(res["event"]["payload"]["attachments"]), 1)
+        status, res = self.post("/api/sidebar",
+                                {"text": "and this", "attachments": [PNG_B64],
+                                 "actor": "user"})
+        self.assertEqual(status, 201, res)
+        self.assertEqual(len(res["event"]["payload"]["attachments"]), 1)
+
+        ready = self.ready_card("for the bounce")
+        status, _ = self.post("/api/cards/%d/verdict" % ready,
+                              {"verdict": "bounce", "notes": "look",
+                               "attachments": [PNG_B64]})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.verdict_event(ready)[0]["payload"]["attachments"]), 1)
 
 
 class TestEventPayloadContract(Base):
@@ -5892,6 +6142,25 @@ class TestSprintRecover(Base):
                   {"kind": "progress",
                    "payload": {"text": "read the sweep, found the missing guard"}})
         return num
+
+    def test_it_prints_the_paths_of_screenshots_so_the_agent_can_read_them(self):
+        """Card #66. A bounce that says "look at this" is useless to the agent
+        that cannot find "this", so every picture on the card comes back as an
+        absolute path — on the line it belongs to, and again in one list."""
+        wt = self.seeded_worktree("sprint-card-1", commits=1, dirty=False)
+        num = self.dead_card(wt, "sprint-card-1")
+        status, res = self.post("/api/cards/%d/chat" % num,
+                                {"text": "here is the broken header",
+                                 "images": [PNG_B64]})
+        self.assertEqual(status, 201, res)
+        path = res["event"]["payload"]["attachments"][0]["path"]
+
+        out = self.run_recover(num).stdout.decode()
+        self.assertIn("image: %s" % path, out,
+                      "the timeline line must name the file")
+        self.assertIn("screenshots on this card", out)
+        self.assertEqual(out.count(path), 2)
+        self.assertTrue(os.path.isabs(path))
 
     def test_it_reports_state_branch_worktree_commits_and_dirtiness(self):
         wt = self.seeded_worktree("sprint-card-1", commits=2, dirty=True)
