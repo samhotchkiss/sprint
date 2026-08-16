@@ -95,7 +95,11 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
   attachments first, then the card+`submitted` event. At least one of text/images required.
 - `GET /api/board` — open sprint, all cards w/ latest state + last event + queue positions + session
   liveness (see below). `GET /api/cards/:num` — full interleaved timeline + evidence + attachments.
-- `POST /api/cards/:num/chat` `{text}` (user→card). `POST /api/cards/:num/answer`
+- `POST /api/cards/:num/chat` `{text?, images?: [base64 png/jpeg or data: URL]}` (user→card) — same
+  attachment path as submission (magic-byte sniff, content-addressed dedupe, 25 MB cap); at least one
+  of text/images required; stored refs land in the chat event's `payload.attachments` with a
+  ready-to-use `url` (and the on-disk `path`, so a relayed message gives the agent something to Read).
+  `POST /api/cards/:num/answer`
   `{question_id, text}` — flips needs_you→in_progress optimistically.
 - `POST /api/cards/:num/action` `{action: pin|unpin|cancel|hold|release|duplicate_of|retry|reopen}`.
   `reopen` is the user's undo for a card closed too early: any terminal state → `queued` with a
@@ -111,7 +115,8 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
   `POST /api/cards/:num/ready` `{packet}` (the gate); `POST /api/cards/:num/state`
   `{state: triaging|in_progress|blocked, reason?, title?}`; `{long_running: true, note}` flag via
   events to suppress the silence timer during legit long jobs.
-- Session surface: `POST /api/sidebar` `{text, actor: user|session}`; `POST /api/batches`
+- Session surface: `POST /api/sidebar` `{text?, images?, actor: user|session}` (images exactly as on
+  card chat — one attachment path for every surface); `POST /api/batches`
   `{card_nums[], agent_name, branch}`; `POST /api/cards/:num/assign`
   `{agent_name, worktree, branch, title?}` — assigning a **queued** card also flips it
   queued→triaging in the same transaction (state event reads "assigned to sprint-card-N — picking

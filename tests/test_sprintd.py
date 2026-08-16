@@ -1852,6 +1852,152 @@ class TestPinIsExplicit(Base):
         self.assertFalse(self.get("/api/cards/%d" % num)[1]["card"]["pinned"])
 
 
+class TestChatImages(Base):
+    """Pasting a screenshot into a card's chat is a first-class message.
+
+    Same attachment path as dropping work on the board: sniffed, deduped,
+    capped, and referenced from the event so both the browser (url) and the
+    agent (absolute path) get what they need out of one timeline read.
+    """
+
+    JPEG_B64 = base64.b64encode(
+        b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + b"\x00" * 40 + b"\xff\xd9").decode()
+
+    def chat(self, num, body):
+        return self.post("/api/cards/%d/chat" % num, body)
+
+    def test_chat_with_images_stores_them_and_refs_them_in_the_event(self):
+        num = self.new_card("a card")["num"]
+        status, res = self.chat(num, {"text": "looks like this", "images": [PNG_B64]})
+        self.assertEqual(status, 201, res)
+
+        atts = res["event"]["payload"]["attachments"]
+        self.assertEqual(len(atts), 1)
+        att = atts[0]
+        self.assertEqual(att["mime"], "image/png")
+        self.assertEqual(att["url"], "/api/attachments/%s.png" % att["sha256"])
+        self.assertTrue(os.path.isfile(att["path"]),
+                        "chat attachment must be on disk: %s" % att["path"])
+        self.assertTrue(os.path.isabs(att["path"]),
+                        "the agent gets an absolute path to Read")
+
+        # servable as-is
+        status, blob = self.get(att["url"])
+        self.assertEqual(status, 200)
+        self.assertEqual(blob, base64.b64decode(PNG_B64))
+
+        # and visible in the timeline read, both on the event and on the card
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200)
+        chat_ev = [e for e in detail["timeline"] if e["kind"] == "chat"][0]
+        self.assertEqual(chat_ev["payload"]["attachments"][0]["sha256"], att["sha256"])
+        self.assertEqual(chat_ev["payload"]["text"], "looks like this")
+        self.assertIn(att["sha256"], [a["sha256"] for a in detail["attachments"]])
+
+    def test_chat_images_are_content_addressed_and_deduped(self):
+        num = self.new_card("a card", images=[PNG_B64])["num"]
+        _, res = self.chat(num, {"text": "again", "images": [PNG_B64]})
+        _, res2 = self.chat(num, {"text": "and again",
+                                  "images": ["data:image/png;base64," + PNG_B64]})
+        shas = {res["event"]["payload"]["attachments"][0]["sha256"],
+                res2["event"]["payload"]["attachments"][0]["sha256"]}
+        self.assertEqual(len(shas), 1)
+        self.assertEqual(len(os.listdir(self.app.attach_dir)), 1,
+                         "the same bytes are stored exactly once")
+        # the card's attachment roll-up does not repeat one image per event
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(len(detail["attachments"]), 1)
+
+    def test_image_only_chat_is_a_complete_message(self):
+        num = self.new_card("a card")["num"]
+        status, res = self.chat(num, {"images": [PNG_B64]})
+        self.assertEqual(status, 201, res)
+        payload = res["event"]["payload"]
+        self.assertEqual(len(payload["attachments"]), 1)
+        self.assertTrue(payload["text"].strip(),
+                        "an image-only line still needs a skim line")
+
+    def test_empty_chat_is_rejected(self):
+        num = self.new_card("a card")["num"]
+        status, body = self.chat(num, {"text": "  ", "images": []})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "empty_submission")
+
+    def test_non_image_chat_attachment_is_rejected(self):
+        num = self.new_card("a card")["num"]
+        status, body = self.chat(
+            num, {"text": "here", "images": [base64.b64encode(b"not an image").decode()]})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "bad_image")
+        self.assertEqual(os.listdir(self.app.attach_dir), [],
+                         "a rejected attachment leaves nothing behind")
+        # and the rejected line never reached the timeline
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual([e for e in detail["timeline"] if e["kind"] == "chat"], [])
+
+    def test_jpeg_chat_attachment_is_accepted(self):
+        num = self.new_card("a card")["num"]
+        status, res = self.chat(num, {"images": ["data:image/jpeg;base64," + self.JPEG_B64]})
+        self.assertEqual(status, 201, res)
+        att = res["event"]["payload"]["attachments"][0]
+        self.assertEqual(att["mime"], "image/jpeg")
+        self.assertTrue(att["url"].endswith(".jpg"))
+
+    def test_oversize_chat_attachment_is_a_413_and_stores_nothing(self):
+        num = self.new_card("a card")["num"]
+        self.app.max_upload = 512          # tiny cap, so the test stays cheap
+        big = base64.b64encode(
+            b"\x89PNG\r\n\x1a\n" + os.urandom(2048)).decode()
+        status, body = self.chat(num, {"text": "big one", "images": [big]})
+        self.assertEqual(status, 413, body)
+        self.assertEqual(body["error"], "too_large")
+        self.assertEqual(os.listdir(self.app.attach_dir), [])
+
+    def test_chat_to_a_missing_card_stores_nothing(self):
+        status, body = self.chat(9999, {"text": "hi", "images": [PNG_B64]})
+        self.assertEqual(status, 404, body)
+        self.assertEqual(os.listdir(self.app.attach_dir), [],
+                         "we check the card exists before writing bytes")
+
+    def test_text_only_chat_still_works_and_carries_no_attachments(self):
+        num = self.new_card("a card")["num"]
+        status, res = self.chat(num, {"text": "just words"})
+        self.assertEqual(status, 201, res)
+        self.assertNotIn("attachments", res["event"]["payload"])
+
+    def test_sidebar_takes_images_too(self):
+        status, res = self.post("/api/sidebar",
+                                {"text": "see this", "images": [PNG_B64], "actor": "user"})
+        self.assertEqual(status, 201, res)
+        att = res["event"]["payload"]["attachments"][0]
+        self.assertEqual(att["url"], "/api/attachments/%s.png" % att["sha256"])
+        self.assertEqual(self.get(att["url"])[0], 200)
+        # and it comes back on the board's sidebar thread
+        line = self.get("/api/board")[1]["sidebar"][-1]
+        self.assertEqual(line["payload"]["attachments"][0]["sha256"], att["sha256"])
+
+    def test_image_only_sidebar_line_is_valid_and_empty_is_not(self):
+        status, res = self.post("/api/sidebar", {"images": [PNG_B64], "actor": "user"})
+        self.assertEqual(status, 201, res)
+        self.assertTrue(res["event"]["payload"]["text"].strip())
+        status, body = self.post("/api/sidebar", {"text": "   ", "actor": "user"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "missing_field")
+
+    def test_non_image_sidebar_attachment_is_rejected(self):
+        status, body = self.post(
+            "/api/sidebar",
+            {"text": "x", "images": [base64.b64encode(b"nope").decode()], "actor": "user"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "bad_image")
+
+    def test_images_must_be_a_list(self):
+        num = self.new_card("a card")["num"]
+        status, body = self.chat(num, {"text": "x", "images": PNG_B64})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "bad_image")
+
+
 class TestEventPayloadContract(Base):
     """One field set, every event: `text` always; state carries from/to."""
 
