@@ -135,6 +135,20 @@ function isTyping(node) {
   return !!(node.isContentEditable);
 }
 
+/**
+ * An empty box is not a message yet — card #30, user verbatim: "Typing / should
+ * open the light box even when my focus is in a chat entry box unless there's
+ * already other text in that box (i should be able to type a / in the middle of
+ * a message, but not at the beginning)". So a caret parked in a blank composer
+ * does not swallow the shortcut; one keystroke into a real message does.
+ * Whitespace alone is still blank — nobody meant to send three spaces.
+ */
+function emptyTextTarget(node) {
+  if (!isTyping(node)) return false;
+  if (node.isContentEditable) return !String(node.textContent || '').trim();
+  return !String(node.value || '').trim();
+}
+
 function captureFocus() {
   const a = document.activeElement;
   if (!a || !a.id || !(a instanceof HTMLTextAreaElement || a instanceof HTMLInputElement)) return null;
@@ -406,7 +420,14 @@ async function sessionChat(text, images, key, reuse) {
   }
 }
 
-async function verdict(card, kind, notes, key) {
+/**
+ * `opts.quiet` suppresses the per-card toast — one Approve on a work unit is
+ * one decision, and six toasts saying the same sentence about six cards is the
+ * noise card #26 was about. The unit says one thing when it finishes; a FAILED
+ * verdict still speaks, quiet or not.
+ */
+async function verdict(card, kind, notes, key, opts) {
+  const quiet = !!(opts && opts.quiet);
   const before = card.state;
   const idem = key || uid();
   const word = kind === 'approve' ? 'Approve' : kind === 'bounce' ? 'Bounce' : 'Reject';
@@ -416,9 +437,11 @@ async function verdict(card, kind, notes, key) {
   render();
   try {
     await api.verdict(card.num, kind, notes, idem);
-    toast(kind === 'approve' ? `#${card.num} approved — merging now; it moves to Done when the branch lands.`
-      : kind === 'bounce' ? `#${card.num} bounced back with your notes.`
-        : `#${card.num} rejected.`);
+    if (!quiet) {
+      toast(kind === 'approve' ? `#${card.num} approved — merging now; it moves to Done when the branch lands.`
+        : kind === 'bounce' ? `#${card.num} bounced back with your notes.`
+          : `#${card.num} rejected.`);
+    }
     refreshBoard();
     if (store.detail && store.detail.num === card.num) refreshDetail();
     // Whether the verdict actually landed — the Review-next walkthrough only
@@ -749,13 +772,17 @@ async function boot() {
   });
 
   document.addEventListener('keydown', (e) => {
-    // "/" is the shortcut to drop work — unless you are already typing, where a
-    // slash is just a slash. Nothing else on this page claims a bare key.
-    if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey
-        && el.composeWrap.hidden && !isTyping(document.activeElement)) {
-      e.preventDefault();
-      openCompose();
-      return;
+    // "/" is the shortcut to drop work — from anywhere on the board, and from a
+    // text box that is still empty. Once there are words in the box a slash is
+    // just a slash, and inside the Drop-work sheet itself it always is.
+    if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey && el.composeWrap.hidden) {
+      const a = document.activeElement;
+      const inSheet = !!(a && el.composeWrap.contains(a));
+      if (!inSheet && (!isTyping(a) || emptyTextTarget(a))) {
+        e.preventDefault();
+        openCompose();
+        return;
+      }
     }
     if (e.key === 'Escape') {
       if (closeSiblingMenu()) { render(); return; }

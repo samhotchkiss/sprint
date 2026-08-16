@@ -284,6 +284,34 @@ member cards (bounced stay with the agent; approved subset merges).
 Bounce discipline: `bounce_count == 2` → server tags the event `escalate`; session stops blind
 retries and brings it to the user for co-design.
 
+### Awaiting review — the signoff surface (SHIPPED)
+
+Ready cards are reviewed **by work unit**, not one identical row at a time. A unit is a batch, or
+failing that an agent, and it renders as one expandable row; a card on its own is a unit of one and
+renders as it always did. Every row leads with the packet's claim and its first "Check it yourself"
+step, carries the first screenshot as a thumbnail plus the live link, and puts Approve / Bounce
+right on the row — the drawer is one click away, never the price of an easy yes. **Review next** is
+a filled button in its own bar above the stack (never another row) and walks the queue oldest-first
+in the rail, one STEP at a time with a running "3 of 13".
+
+- **Naming.** A unit row is named after the WORK in it: the member cards' own condensed titles
+  joined ("Restart-proof tabs + reply routing · 2 cards"), falling back to the branch's claim, then
+  to a descriptive branch name. **Never the agent** — "Agent card-23 · 2 cards" names a process, not
+  the thing you are being asked about, and the agent belongs in the row's metadata beside the
+  timestamp. A singleton row leads with the card's own title, never with a control's label.
+- **See-and-ack is per WORK UNIT for shared-packet groups, per card otherwise.** User verbatim:
+  *"i feel like i just hit approve way too many time"*, and his GO on the fix: *"ONE Approve per
+  work unit when the unit shipped as one branch with one packet (the six design cards = one click);
+  per-card records still written underneath, and you can still expand a group to bounce a single
+  member."* So a unit with ONE branch and ONE packet covering every member gets a single **Approve
+  all N** button; anything looser keeps per-card verdicts. The single button is not a bulk approve
+  and not a new endpoint: it issues the same per-card `POST /api/cards/:num/verdict` for every
+  member in order, so every card keeps its own verdict event and its own record. It reports
+  "approving 3 of 6…" in words (no spinner) and **stops on the first failure**, saying which card it
+  stopped at and that nothing after it was sent. Expanding the unit still offers per-member Approve
+  and Bounce, and the walkthrough treats a shared-packet unit as one step: approve the unit, bounce
+  the member you are reading, or skip.
+
 ## Batching & hold mode
 
 User verbatim: "I may say 'hey, I'm going to dump a bunch of issues — don't start working on them
@@ -415,7 +443,11 @@ your assigned worktree; one branch; never push to main; never touch other cards'
 - **Submit**: a "+ Drop work" modal sheet — textarea + paste-to-attach multiple images (thumbnails,
   removable) + `<input type=file multiple accept="image/*">` fallback + Hold toggle. Return submits,
   Shift+Return makes a new line (Cmd/Ctrl+Enter still submits). Pasting an image anywhere opens it,
-  and so does pressing `/` — unless the caret is already in a text field, where a slash is a slash.
+  and so does pressing `/` — including from a text box that is still **empty** (user, verbatim:
+  *"Typing / should open the light box even when my focus is in a chat entry box unless there's
+  already other text in that box (i should be able to type a / in the middle of a message, but not
+  at the beginning)"*). Once the box holds any non-whitespace text a slash is just a slash, and
+  inside the Drop-work sheet's own textarea it always is.
 - **Chat button**: the product's single notification surface, with four states — closed, open
   (sage dot), **gold when a session line arrived while you were not looking** (Chaos pulses it with
   `goldFlash`; Calm holds the gold steady), and dimmed because a card has taken the rail. No

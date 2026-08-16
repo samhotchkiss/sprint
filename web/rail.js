@@ -18,7 +18,7 @@ import { h, clear, reconcile } from './util.js';
 import { store, cardState, isSilent, draft, attachedImages } from './state.js';
 import { renderThread, renderChat } from './thread.js';
 import { initCompose } from './compose.js';
-import { flowActive, reviewFlow, reviewBar } from './review.js';
+import { flowBarSig, reviewBar } from './review.js';
 
 export function renderRail(root, app) {
   const owner = railOwner();
@@ -105,11 +105,13 @@ function syncOptional(root, cls, sig, build) {
   return node;
 }
 
-/** Null unless the walkthrough is standing on this exact card, ready for a verdict. */
+/**
+ * Null unless the walkthrough is standing on this exact card, ready for a
+ * verdict. review.js owns the signature: a unit step's bar also changes while
+ * its members are being approved one after another.
+ */
 function barSig(card) {
-  if (!card || !flowActive(card.num) || cardState(card) !== 'ready') return null;
-  const f = reviewFlow();
-  return [card.num, f.i, f.queue.length, card.bounce_count].join('|');
+  return flowBarSig(card);
 }
 
 function headSig(detail, card) {
