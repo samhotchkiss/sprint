@@ -174,12 +174,21 @@ function message(ev, app) {
   const when = h('span.msg-when');
   item.appendChild(h('div.msg-head', h('span.msg-who', who.label), status, when));
 
-  const bubble = h('div.bubble', h('p', richText(eventText(ev), app.openCard)));
-  // Only a line with real detail gets an affordance — a chevron over nothing is
-  // a promise the history cannot keep.
+  // A message that is only pictures gets no bubble: the tiles underneath ARE
+  // the message, and "sent a screenshot" over a screenshot is a caption nobody
+  // asked for. The line still exists in the log — it is what the card face and
+  // the session's relay read.
   const more = detailBlock(ev, app);
-  if (more) bubble.appendChild(more);
-  item.appendChild(bubble);
+  if (!(ev.payload && ev.payload.images_only) || more) {
+    const bubble = h('div.bubble');
+    if (!(ev.payload && ev.payload.images_only)) {
+      bubble.appendChild(h('p', richText(eventText(ev), app.openCard)));
+    }
+    // Only a line with real detail gets an affordance — a chevron over nothing
+    // is a promise the history cannot keep.
+    if (more) bubble.appendChild(more);
+    item.appendChild(bubble);
+  }
 
   // Delivery state moves under the message ("sending…" → "landed" → "session is
   // on it") while the message itself never changes. That transition is the most
