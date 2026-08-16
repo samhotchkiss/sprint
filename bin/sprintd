@@ -839,7 +839,15 @@ class App:
         last = self.q1(
             "SELECT * FROM events WHERE card_num=? ORDER BY seq DESC LIMIT 1", (num,))
         out["last_event"] = self.event_json(last) if last else None
-        out["last_activity_at"] = last["ts"] if last else row["updated_at"]
+        # The sweep's own reminders are NOT activity. Counting them would reset
+        # the card's age to "just now" at the exact moment the board is trying
+        # to say "this has been sitting here too long" -- the amber and the
+        # number would contradict each other on the same line. (The browser's
+        # reducer already ignores server events here; this makes the server
+        # agree.)
+        act = self.q1("SELECT ts FROM events WHERE card_num=? AND kind!='stuck' "
+                      "ORDER BY seq DESC LIMIT 1", (num,))
+        out["last_activity_at"] = act["ts"] if act else row["updated_at"]
         out["silent"] = self.card_is_silent(num, row)
         out["stuck"] = self.card_is_stuck(num, row)
         oq = self.q1(

@@ -1323,6 +1323,20 @@ class TestStaleSweep(SweepBase):
         self.assertFalse(self.board_card(num)["stuck"],
                          "moving the card clears the flag")
 
+    def test_a_reminder_does_not_count_as_activity(self):
+        """Otherwise the card face reads 'just now' in amber — the age and the
+        colour contradicting each other on one line."""
+        num = self.an_integrating_card()
+        self.backdate(num, 11 * 60)
+        before = self.board_card(num)["last_activity_at"]
+        self.app.sweep_stuck()
+        after = self.board_card(num)
+        self.assertTrue(after["stuck"])
+        self.assertEqual(after["last_activity_at"], before,
+                         "the sweep's own reminder is not activity")
+        self.assertEqual(after["last_event"]["kind"], "stuck",
+                         "it is still the latest event, just not activity")
+
     def test_thresholds_are_env_tunable(self):
         """The SPRINT_SWEEP_* knobs the tests (and a ten-second demo) rely on."""
         names = {state: envname for state, envname, _d in sprintd.STUCK_RULES}

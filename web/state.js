@@ -195,6 +195,10 @@ export function normCard(c) {
     evidence: c.evidence ? (c.evidence.packet || c.evidence) : null,
     attachments: Array.isArray(c.attachments) ? c.attachments : [],
     silent: c.silent != null ? !!c.silent : null,
+    // The staleness sweep's verdict, straight from the server (this normalizer
+    // builds an explicit shape, so a field it doesn't name simply doesn't exist
+    // in the tab).
+    stuck: !!c.stuck,
     state_since: c.state_since || c.updated_at || null,
   };
 }
