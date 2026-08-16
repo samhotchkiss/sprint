@@ -1188,6 +1188,35 @@ class TestHoldMode(Base):
         # after the flip, new cards queue again
         self.assertEqual(self.new_card("fresh")["state"], "queued")
 
+    def test_card_detail_carries_the_same_queue_position_as_the_board(self):
+        """One card's own payload has to agree with the board about where it sits.
+
+        The board is the only place that used to say this, so a client that
+        re-read a single card got a card object with no queue position on it,
+        overwrote the one it had, and watched the card drop to the bottom of the
+        Queued pile. Card #57's arrow-preview reads every card you pass, which
+        turned that into the whole pile reshuffling under the cursor.
+        """
+        nums = [self.new_card("queued %d" % i)["num"] for i in range(3)]
+        _, board = self.get("/api/board")
+        on_board = {c["num"]: c["queue_position"] for c in board["cards"]}
+        self.assertEqual([on_board[n] for n in nums], [1, 2, 3])
+        for n in nums:
+            _, detail = self.get("/api/cards/%d" % n)
+            self.assertEqual(detail["card"]["queue_position"], on_board[n],
+                             "card %d disagrees with the board" % n)
+        # A card that is not queued has no position at all, on either endpoint.
+        self.post("/api/cards/%d/action" % nums[0], {"action": "hold"})
+        _, detail = self.get("/api/cards/%d" % nums[0])
+        self.assertIsNone(detail["card"]["queue_position"])
+        # ...and the cards behind it close the gap, in both places at once.
+        _, board = self.get("/api/board")
+        on_board = {c["num"]: c["queue_position"] for c in board["cards"]}
+        self.assertEqual([on_board[n] for n in nums[1:]], [1, 2])
+        for n in nums[1:]:
+            _, detail = self.get("/api/cards/%d" % n)
+            self.assertEqual(detail["card"]["queue_position"], on_board[n])
+
     def test_hold_action_on_queued_card(self):
         num = self.new_card("queued then held")["num"]
         status, body = self.post("/api/cards/%d/action" % num, {"action": "hold"})

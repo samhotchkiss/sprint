@@ -35,6 +35,9 @@ export function renderDone(col, app) {
     list.appendChild(h('button.done-row', {
       type: 'button',
       class: `done-row is-${st}`,
+      // the keyboard's Review column (card #57) walks these too, once you have
+      // opened the list — it is the same set of cards the Board draws there
+      'data-num': card.num,
       title: STATE_LABEL[st] || st,
       onclick: () => app.openCard(card.num),
     },

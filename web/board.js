@@ -232,6 +232,7 @@ function elsewhereStrip(app) {
     strip.appendChild(h('button.pill', {
       type: 'button',
       class: `pill${mark === 'held' ? ' is-held' : ''}${blocked ? ' is-blocked' : ''}`,
+      'data-num': card.num,        // the keyboard's Waiting column, on the Fold
       title: card.title,
       onclick: () => app.openCard(card.num),
     },
