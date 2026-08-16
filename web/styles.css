@@ -2669,3 +2669,61 @@ html.skin-chaos .banner.limit {
   border: 2px dashed var(--border);
   border-radius: 0;
 }
+
+/* ==========================================================================
+   APPENDED — the account-limit banner (card #47, bounce)
+
+   The other direction from the quiet line above. A model window means work
+   moved down a tier; an ACCOUNT window means nothing on this machine can run
+   at all, and the fix is a thing only the user can do: log out, sign in with
+   another Claude session, press Resume. So this one is allowed to be loud —
+   accent border, accent headline, and the one button on the page.
+
+   Still a banner, not a modal, and it takes the user's own words for why: he
+   must be able to read cards and type underneath it. Nothing is dimmed and
+   nothing is blocked.
+   ========================================================================== */
+
+.banner.account {
+  align-items: flex-start;
+  gap: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--accent);
+  /* A wash of the accent rather than a fill: loud enough to be the first thing
+     read, quiet enough that the board underneath is still the page. */
+  background: linear-gradient(0deg, rgba(216, 164, 92, .07), rgba(216, 164, 92, .07)), var(--panel);
+  color: var(--body-ink);
+}
+.banner.account .account-words { flex: 1 1 auto; min-width: 0; }
+.banner.account .account-headline {
+  color: var(--accent-hi);
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.banner.account .account-detail { margin-top: 3px; color: var(--body-ink); }
+/* What to DO is the half of this the user came for, so it is not the faintest
+   line in the box — it sits level with the detail, one shade back. */
+.banner.account .account-action { margin-top: 3px; color: var(--dim); }
+.banner.account .account-resume {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 0 18px;
+  align-self: center;
+}
+.banner.account .account-resume[disabled] { opacity: .6; cursor: default; }
+
+/* Fold (980×740) and narrower: the button drops under the words rather than
+   squeezing three sentences into a column two words wide. */
+@media (max-width: 1199px) {
+  .banner.account { flex-direction: column; align-items: stretch; gap: 10px; }
+  .banner.account .account-resume { align-self: flex-start; }
+}
+
+/* Chaos: hard outline, no radius, like every other plate in that skin. */
+html.skin-chaos .banner.account {
+  border: 2px solid var(--accent);
+  border-radius: 0;
+  background: var(--panel);
+}

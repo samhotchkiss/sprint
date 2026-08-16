@@ -120,6 +120,10 @@ export const store = {
   // board-level line each, and nothing else — the cards that got moved are
   // already wearing their model tag.
   limits: [],
+  // The account window, if the whole Claude account is out: the big banner
+  // every board on the machine shows, and the Resume button in it. Null means
+  // the server said there is none.
+  accountLimit: null,
 
   // ---- rail + layout (client only) ----------------------------------------
   // Only one thing owns the rail at a time: a card, or the session chat.
@@ -355,6 +359,12 @@ export function applyBoard(board) {
   // actual list replaces it.
   if (Array.isArray(board.limits)) {
     store.limits = board.limits.map(normLimit).filter(Boolean);
+  }
+  // The account window, hoisted by the server with its words and the id the
+  // Resume button posts to. `undefined` means an older server (leave what we
+  // have); `null` means the server looked and there is none.
+  if (board.account_limit !== undefined) {
+    store.accountLimit = board.account_limit ? normLimit(board.account_limit) : null;
   }
 
   const seq = num(board.seq != null ? board.seq : board.last_seq);
@@ -854,8 +864,18 @@ export function normLimit(l) {
   if (resets == null) return null;
   return {
     id: l.id != null ? l.id : null,
+    // "model" (one model went away, quiet line) or "account" (the whole Claude
+    // account is out and NOTHING runs — the big banner). An older server sends
+    // neither, and the thing it could only have meant is the quiet one.
+    kind: l.kind === 'account' ? 'account' : 'model',
     model: l.model || '',
     resetsAt: resets,
+    // Copy composed by the server, so the banner, the event log and the CLI
+    // cannot tell the user three different stories. Absent on a model window.
+    headline: l.headline || null,
+    action: l.action || null,
+    resumeLabel: l.resume_label || 'Resume',
+    detail: l.detail || null,
     // The server's own rendering of the reset time, kept as the fallback for
     // the browser's — they agree unless the two are in different timezones,
     // and in that case the one in front of the user is the honest one.
@@ -872,7 +892,21 @@ export function normLimit(l) {
  * than no line at all.
  */
 export function activeLimits(now = Date.now()) {
-  return store.limits.filter((l) => l.resetsAt > now);
+  return store.limits.filter((l) => l.resetsAt > now && l.kind !== 'account');
+}
+
+/**
+ * The account window, or null. Same clock re-check as the quiet lines: a
+ * banner saying everything is stopped until a time that has already passed
+ * would be the worst one on the page to leave up.
+ *
+ * `account_limit` is the server's hoisted copy; the array is the fallback, so
+ * a board answering an older payload shape still raises the banner.
+ */
+export function accountLimit(now = Date.now()) {
+  const live = (l) => l && l.kind === 'account' && l.resetsAt > now;
+  if (live(store.accountLimit)) return store.accountLimit;
+  return store.limits.find(live) || null;
 }
 
 /**

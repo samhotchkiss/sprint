@@ -289,8 +289,8 @@ and the table is prose.
 | worker | `question` | Server already flipped to `needs_you`. Nothing to do — the card face shows the question; you'll see the `answer` event when the user responds. |
 | worker | `evidence` (ready) | Card (or whole batch) just entered `ready`. Nothing required from you — it's now waiting on the user's verdict. Optional: a short sidebar note if the user seems to be waiting on it. |
 | server | `agent_silent` | See step 5 — go investigate. |
-| server | `limit_cleared` | A provider limit window just ended (`payload.model` names the model, `payload.reason` says whether the clock got there or somebody cleared it early). **This is a work signal, not a notification.** Re-dispatch everything you downgraded or parked for that limit, back on the original model — see step 5b's "When the window ends". |
-| server | `limit_declared` | Your own limit declaration, echoed. Nothing to do; the board is now showing the line. |
+| server | `limit_cleared` | A provider limit window just ended. **This is a work signal, not a notification.** `payload.kind` says which procedure: `"model"` — re-dispatch what you downgraded, back on the model named in `payload.model`; `"account"` — the whole Claude account came back (the user pressed Resume after signing in with another session), so **re-dispatch every card parked or killed during the window, briefing each with its own timeline**. `payload.reason` says whether the clock got there or somebody cleared it early. See step 5b. |
+| server | `limit_declared` | A limit declaration — yours, or (for `kind: "account"`) one another board on this machine made. Nothing to do; the board is now showing the line or the banner. |
 | server | `stuck` | The board's staleness sweep: a card parked in a state somebody owes an action on. `payload.state` names which, and that is what you act on — see the row below. Nothing is broken; something is owed, and it's usually owed by you. |
 | server | `state` (blocked) | Note the reason; you'll re-check blocked cards periodically (not driven by an event — see "Blocked sweep" below). |
 
@@ -796,6 +796,75 @@ On `limit_cleared`, in the same wakeup:
 Then it is over: the board's limit line is already gone (it goes off the
 clock, not off your reaction), and no card is left wearing a reason that
 is no longer true.
+
+### The OTHER kind: the whole account is out
+
+Everything above is one model going away and the work moving down a
+tier. The account-level limit is a different animal: **the overall
+Claude weekly limit, where nothing can run at all and there is no next
+model down.** You will usually find out by dying yourself.
+
+Declare it the moment you see it — before re-dispatching anything,
+because there is nothing to re-dispatch onto:
+
+```
+bin/sprint-limit declare --account --resets "11:50pm" --source "kill message"
+```
+
+That does three things the model-kind declaration does not:
+
+- **Every board on this machine** grows a big banner at the top —
+  including boards in other projects, and boards started after the
+  declaration. It is machine-wide state (one file beside the registry),
+  not a message from you, so it survives your session dying, which it
+  is about to.
+- The banner says what happened, when it lifts, and what to do: **log
+  out of Claude, sign in with another Claude session, then press
+  Resume.** That is the user's move, not yours.
+- The **Resume button** in that banner clears the window and emits
+  `limit_cleared` with `payload.kind == "account"`. It works with no
+  session attached — which is the point, because while an account limit
+  is on there is no session.
+
+Before you go: park what is in flight. Any card you cannot dispatch
+gets `model_reason` set ("account limit until 11:50pm") exactly as in
+step 3 above — a parked card without one is a card nobody will find
+when the account comes back.
+
+### Reacting to an account-kind `limit_cleared`
+
+When the user presses Resume, a new session (his second Claude login)
+picks the board up. `payload.kind` tells you which procedure you are in:
+
+- `kind: "model"` — the procedure above: put downgraded cards back on
+  the original model.
+- `kind: "account"` — **re-dispatch every card that was parked or
+  killed while the window was on.** Not a tier change: these cards were
+  not running at all.
+
+For the account kind, in the same wakeup:
+
+1. **Build the list.** `GET /api/board`, and take every non-terminal
+   card whose `model_reason` mentions the account limit, plus every
+   card that went `failed` with a `worker gone:` reason during the
+   window (`GET /api/limits` gives you the window's `declared_at` and
+   `cleared_at` — anything that died between them belongs to it).
+2. **Brief each one with its OWN timeline.** `bin/sprint-recover <num>`
+   per card, pasted into that card's brief — never one shared summary
+   across the batch. A card's agent was killed mid-thought and the next
+   agent has to know what its predecessor had already committed; that
+   is per-card knowledge and it does not survive being averaged.
+   Include the two other lines from step 5b: a previous agent was
+   killed by a limit, and it must read `git log origin/main..HEAD` and
+   `git status` before redoing anything.
+3. **Dispatch on the normal model** — the account came back, not a
+   tier. Clear the parking reason with `"model_reason": ""` on the
+   assign.
+4. **One sidebar line for the batch**: the account limit is over and
+   which cards went back out.
+
+The banner is gone off the board already (it clears off the shared
+state, not off your reaction), on every board on the machine.
 
 ---
 

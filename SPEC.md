@@ -93,7 +93,7 @@ recovery must be easy. The user always runs claude inside tmux.
 - `cursors(name PRIMARY KEY, seq)` — the session persists its drain cursor here (`orchestrator`).
 - `questions(id, card_num, text, options JSON NULL, answered_at NULL)` — answer idempotency: second
   answer to the same question id is a 409, surfaced gently in UI.
-- `limits(id, model, resets_at, declared_at, cleared_at NULL, source NULL, note NULL)` — provider
+- `limits(id, kind, model, resets_at, declared_at, cleared_at NULL, source NULL, note NULL)` — provider
   usage limit windows (see below). `cards.model_reason` is the other half: free text saying WHY a
   card is not on the default model ("fable limited until 23:50"), which is what makes "downgraded
   because of a limit" a queryable fact rather than something the session has to remember.
@@ -412,7 +412,8 @@ resets"**. The incident behind it: three workers killed at once by a usage limit
   card. `POST /api/limits/:id/clear` ends one early; `limit_declared` is emitted on declaration.
 - **The sweep is a third rule on the existing sweep tick**, beside staleness and worker-gone.
 - API: `POST /api/limits`, `GET /api/limits` (`{active, recent, server_time}`),
-  `POST /api/limits/:id/clear`; `/api/board` carries `limits: [...]` (open windows only).
+  `POST /api/limits/:id/clear`; `/api/board` carries `limits: [...]` (open windows only) and
+  `account_limit` (the account window with its words, or null).
   `assign` accepts `model_reason` — `""` clears it, omitting it leaves it alone.
 - **UI: one quiet board-level line per open window**, in the session-offline banner's slot and
   register — *"fable is rate-limited until 11:50pm — work is running on opus"*. Not a modal, not a
@@ -423,6 +424,44 @@ resets"**. The incident behind it: three workers killed at once by a usage limit
 - **SKILL.md owns the reaction** (step 5b): declare the window → dispatch the fallback with
   `model` + `model_reason` → on `limit_cleared`, re-dispatch everything downgraded or parked for it
   back on the original model and clear the reason with `"model_reason": ""`.
+
+### The account-level window (`kind: "account"`)
+
+User verbatim: **"i'm about to hit my overall claude weekly limit... once i do, I need a big warning
+on top of every board, and then I'm going to go to the session, log out, log back in with a
+different claude session, then I should be able to hit a button in the big notice to have it
+auto-resume"**.
+
+- **Two kinds, one table.** `kind ∈ {model, account}` (default `model`, so every row that existed
+  before this is what it always was). A model window is one model going away; an ACCOUNT window is
+  the whole Claude account, where nothing runs at all and there is no next model down. An account
+  window carries no model — saying one would be a lie the banner then repeats.
+- **One active account window at a time**, keyed on the kind alone, because there is one account.
+  Everything already proved for model windows holds unchanged: activeness computed, exactly one
+  `limit_cleared` per window per board (`payload.kind` says which kind cleared).
+- **Machine-wide, via one shared file** (`account-limit.json`, beside `registry.json`, moved by the
+  same `--registry`/`$SPRINT_REGISTRY` override). The declaring board publishes; every board pulls
+  it into its OWN `limits` row on its next read of `/api/board`, `/api/limits`, or the sweep tick.
+  Chosen over pushing the declaration to siblings over HTTP for two reasons: no board holds another
+  board's bearer token, and a push cannot reach a board that STARTS after the declaration — which is
+  exactly what happens when a wedged project gets restarted mid-limit. Mirroring rather than
+  rendering someone else's row is what keeps every board's `limit_cleared` its own, which is right:
+  each board has its own parked cards to re-dispatch.
+- **It must work with NO session attached**, because a dead session is the precondition. The board
+  server and the browser are the only two things still moving: the banner is served off
+  `/api/board`, propagation happens on that same read, and Resume is one POST.
+- **UI: a big banner at the top of EVERY board** — accent-bordered, three lines and a button, in the
+  same slot as the quiet lines and directly above them (both kinds render together). Not a modal and
+  not a toast: the user must still be able to read cards and type. Copy is composed server-side
+  (`headline`, `detail`, `action`, `resume_label`, `resume_url`) so the board, the event log and the
+  CLI cannot drift — *"Claude account limit reached — nothing can run" / "Every sprint board on this
+  machine is stopped until 11:50pm." / "Log out of Claude, sign in with another Claude session, then
+  press Resume."*
+- **The Resume button** POSTs `/api/limits/:id/clear` — the same single-writer clear, so a double
+  press cannot fire two `limit_cleared` events — and every other board drops its banner on its next
+  tick.
+- CLI: `sprint-limit declare --account --resets "11:50pm"`; `list` shows `ACCOUNT` in the subject
+  column; `clear <id>` is the same button by another door.
 
 ## Evidence gate ("ready")
 

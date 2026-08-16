@@ -58,6 +58,15 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="sprintd-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        # EVERY board test points machine-wide state at a temp dir, not just
+        # the registry ones: an account limit is read off a shared file beside
+        # the registry on every board read, and a suite that read the real
+        # ~/.sprint would either invent a banner from the developer's own live
+        # limit or write one into it.
+        self.registry = os.path.join(self.tmp, "hubstate", "registry.json")
+        self._old_registry_env = os.environ.get("SPRINT_REGISTRY")
+        os.environ["SPRINT_REGISTRY"] = self.registry
+        self.addCleanup(self._restore_registry_env)
         self.project_root = os.path.join(self.tmp, "project")
         os.makedirs(self.project_root)
         self.logfh = open(os.path.join(self.tmp, "server.log"), "a", encoding="utf-8")
@@ -83,6 +92,12 @@ class Base(unittest.TestCase):
         if self.START_BACKGROUND:
             self.app.start_background()
         self.addCleanup(self._teardown)
+
+    def _restore_registry_env(self):
+        if self._old_registry_env is None:
+            os.environ.pop("SPRINT_REGISTRY", None)
+        else:
+            os.environ["SPRINT_REGISTRY"] = self._old_registry_env
 
     def _teardown(self):
         try:
@@ -7000,6 +7015,333 @@ class TestLimitColumnsMigrate(unittest.TestCase):
                          "fable limited until 23:50")
 
 
+# --------------------------------------------------------------------------
+# The ACCOUNT limit (card #47, bounce)
+#
+# The second incident, verbatim: "i'm about to hit my overall claude weekly
+# limit... once i do, I need a big warning on top of every board, and then I'm
+# going to go to the session, log out, log back in with a different claude
+# session, then I should be able to hit a button in the big notice to have it
+# auto-resume".
+#
+# So: a kind of window where nothing runs at all, visible on EVERY board on the
+# machine including ones in other projects, with a button that ends it — and
+# all of it has to work with NO session attached, because a dead session is the
+# precondition, not an edge case.
+# --------------------------------------------------------------------------
+
+
+class AccountLimitBase(LimitBase):
+    def declare_account(self, resets="11:50pm", **kw):
+        body = {"kind": "account", "resets_at": resets}
+        body.update(kw)
+        status, out = self.post("/api/limits", body)
+        self.assertIn(status, (200, 201), out)
+        return status, out
+
+    def sibling(self, name="other-project"):
+        """A second board, another project, same machine — the case the user
+        will actually be in: he declares on whichever board is in front of him
+        and the OTHER ones have to say so too. Same $SPRINT_REGISTRY (Base
+        points it at this test's temp dir), which is the whole channel."""
+        root = os.path.join(self.tmp, name)
+        os.makedirs(root, exist_ok=True)
+        app = sprintd.App(root, log=self.logfh, token="test-token")
+        self.addCleanup(app.close)
+        return app
+
+
+class TestAccountLimitWindows(AccountLimitBase):
+    def test_declare_read_and_resume(self):
+        status, out = self.declare_account(source="weekly limit",
+                                           note="hit at 4pm")
+        self.assertEqual(status, 201)
+        lim = out["limit"]
+        self.assertEqual(lim["kind"], "account")
+        self.assertIsNone(lim["model"])       # an account is not a model
+        self.assertTrue(lim["active"])
+
+        status, board = self.get("/api/board")
+        banner = board["account_limit"]
+        self.assertEqual(banner["id"], lim["id"])
+        # what happened, when it lifts, and what to DO — the three the user asked
+        self.assertIn("account limit", banner["headline"].lower())
+        self.assertIn(banner["resets_at_label"], banner["detail"])
+        self.assertIn("another Claude session", banner["action"])
+        self.assertIn("Resume", banner["action"])
+        self.assertEqual(banner["resume_label"], "Resume")
+        self.assertEqual(banner["resume_url"], "/api/limits/%d/clear" % lim["id"])
+
+        # ...and the Resume button's one POST ends it
+        status, out = self.post("/api/limits/%d/clear" % lim["id"])
+        self.assertEqual(status, 200)
+        self.assertTrue(out["cleared"])
+        status, board = self.get("/api/board")
+        self.assertIsNone(board["account_limit"])
+        self.assertEqual(board["limits"], [])
+        cleared = self.limit_events("limit_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0]["payload"]["kind"], "account")
+        self.assertEqual(cleared[0]["payload"]["reason"], "cleared_early")
+        self.assertIn("re-dispatch", cleared[0]["payload"]["text"])
+
+    def test_one_account_window_at_a_time(self):
+        """Every dead agent reports the same weekly limit. One window, one
+        banner — the same rule model windows already have, keyed on the kind
+        because there is only one account."""
+        _, first = self.declare_account()
+        _, second = self.declare_account(note="and a second session died")
+        self.assertEqual(second["limit"]["id"], first["limit"]["id"])
+        self.assertFalse(second["created"])
+        status, body = self.get("/api/limits")
+        self.assertEqual(len(body["active"]), 1)
+        self.assertEqual(len(self.limit_events("limit_declared")), 1)
+
+    def test_both_kinds_at_once(self):
+        """A model window and an account window are different facts and both
+        stay true: the quiet dashed line keeps its meaning under the banner."""
+        _, model = self.declare(model="fable", resets="11:50pm")
+        _, account = self.declare_account(resets="9pm")
+        status, board = self.get("/api/board")
+        kinds = sorted(l["kind"] for l in board["limits"])
+        self.assertEqual(kinds, ["account", "model"])
+        self.assertEqual(board["account_limit"]["id"], account["limit"]["id"])
+        quiet = [l for l in board["limits"] if l["kind"] == "model"]
+        self.assertEqual([l["model"] for l in quiet], ["fable"])
+        # clearing the account one leaves the model one exactly where it was
+        self.post("/api/limits/%d/clear" % account["limit"]["id"])
+        status, board = self.get("/api/board")
+        self.assertIsNone(board["account_limit"])
+        self.assertEqual([l["id"] for l in board["limits"]],
+                         [model["limit"]["id"]])
+
+    def test_exactly_once_holds_for_the_account_kind_too(self):
+        """The signal the session re-dispatches EVERYTHING on. Two of these is
+        two agents per parked card, so the same guard is proved from the same
+        three directions: repeated sweeps, a manual clear racing them, threads.
+        """
+        _, out = self.declare_account(resets=sprintd.now() - 1)
+        limit_id = out["limit"]["id"]
+        errors = []
+
+        def hammer(fn):
+            def run():
+                try:
+                    for _ in range(10):
+                        fn()
+                except Exception as exc:
+                    errors.append(exc)
+            return run
+
+        threads = [threading.Thread(target=hammer(self.app.sweep_limits))
+                   for _ in range(4)]
+        threads += [threading.Thread(
+            target=hammer(lambda: self.app.clear_limit(limit_id)))
+            for _ in range(4)]
+        # the reconciler is a third writer racing both, and it must not add one
+        threads += [threading.Thread(
+            target=hammer(self.app.reconcile_account_limit)) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        cleared = self.limit_events("limit_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0]["payload"]["kind"], "account")
+
+    def test_activeness_is_still_computed_not_stored(self):
+        """A board asleep across the reset time comes back up knowing it is
+        over — no sweep has to have run."""
+        _, out = self.declare_account(resets=sprintd.now() + 0.4)
+        status, board = self.get("/api/board")
+        self.assertIsNotNone(board["account_limit"])
+        time.sleep(0.6)
+        status, board = self.get("/api/board")
+        self.assertIsNone(board["account_limit"])
+        self.assertEqual(board["limits"], [])
+
+    def test_a_bad_kind_is_a_named_400(self):
+        status, body = self.post("/api/limits",
+                                 {"kind": "everything", "resets_at": "11:50pm"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "bad_kind")
+        self.assertEqual(body["field"], "kind")
+        # and a model window still needs its model
+        status, body = self.post("/api/limits", {"resets_at": "11:50pm"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "model")
+
+    def test_an_account_window_needs_no_model_and_keeps_none(self):
+        status, out = self.declare_account(model="fable")
+        self.assertIsNone(out["limit"]["model"])
+        status, board = self.get("/api/board")
+        # nothing here can be mistaken for "fable is limited" — no model is
+        self.assertIsNone(board["account_limit"]["model"])
+
+
+class TestAccountLimitIsMachineWide(AccountLimitBase):
+    """The banner has to reach boards that did not declare it — the user is
+    looking at whichever project's tab is in front of him when the account
+    dies, and that is rarely the one that noticed.
+
+    The channel is one file beside the registry, not a push to siblings: no
+    board holds another's bearer token, and a push cannot reach a board that
+    STARTS after the declaration — which is the case that happens every time a
+    wedged project gets restarted mid-limit.
+    """
+
+    def test_a_sibling_board_in_another_project_raises_the_same_banner(self):
+        other = self.sibling()
+        self.assertIsNone(other.board()["account_limit"])
+        _, out = self.declare_account(resets="11:50pm")
+
+        board = other.board()          # one read is all it takes
+        banner = board["account_limit"]
+        self.assertIsNotNone(banner)
+        self.assertEqual(banner["kind"], "account")
+        self.assertAlmostEqual(banner["resets_at"], out["limit"]["resets_at"],
+                               places=0)
+        self.assertIn("account limit", banner["headline"].lower())
+        # It is the sibling's OWN row in the sibling's OWN database — not a
+        # rendering of somebody else's — which is what lets it emit its own
+        # single limit_cleared for its own parked cards later.
+        self.assertEqual([l["kind"] for l in other.active_limits()], ["account"])
+        self.assertEqual(other.limit_row(banner["id"])["kind"], "account")
+        declared = [e for e in other.events_after(0)
+                    if e["kind"] == "limit_declared"]
+        self.assertEqual(len(declared), 1)
+        self.assertEqual(declared[0]["payload"]["kind"], "account")
+        # and it says where it came from, so the banner is not from nowhere
+        self.assertIn("declared on", (banner["source"] or ""))
+
+    def test_a_board_that_starts_mid_limit_still_shows_it(self):
+        """The case a push would miss entirely."""
+        self.declare_account(resets="11:50pm")
+        latecomer = self.sibling("started-late")
+        self.assertIsNotNone(latecomer.board()["account_limit"])
+
+    def test_resume_on_one_board_lifts_it_on_all_of_them(self):
+        other = self.sibling()
+        _, out = self.declare_account(resets="11:50pm")
+        mirrored = other.board()["account_limit"]["id"]
+
+        # the user presses Resume on the SIBLING, not on the declaring board
+        other.clear_limit(mirrored)
+        self.assertIsNone(other.board()["account_limit"])
+
+        status, board = self.get("/api/board")
+        self.assertIsNone(board["account_limit"])
+        cleared = self.limit_events("limit_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0]["payload"]["kind"], "account")
+        # each board emits exactly one, for its own cards
+        theirs = [e for e in other.events_after(0) if e["kind"] == "limit_cleared"]
+        self.assertEqual(len(theirs), 1)
+
+    def test_reading_a_sibling_board_twice_does_not_re_declare(self):
+        other = self.sibling()
+        self.declare_account(resets="11:50pm")
+        for _ in range(5):
+            other.board()
+        declared = [e for e in other.events_after(0)
+                    if e["kind"] == "limit_declared"]
+        self.assertEqual(len(declared), 1)
+
+    def test_a_model_window_stays_local(self):
+        """Only the account is machine-wide. One project running out of fable
+        says nothing about another project's board."""
+        other = self.sibling()
+        self.declare(model="fable", resets="11:50pm")
+        board = other.board()
+        self.assertIsNone(board["account_limit"])
+        self.assertEqual(board["limits"], [])
+        self.assertFalse(os.path.exists(sprintd.account_limit_path()))
+
+    def test_a_corrupt_shared_file_is_no_banner_not_a_500(self):
+        path = sprintd.account_limit_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json at all")
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200)
+        self.assertIsNone(board["account_limit"])
+
+    def test_the_real_home_state_is_never_touched(self):
+        """The suite points $SPRINT_REGISTRY at a temp dir; this proves the
+        account file follows it, because a test that declared into the
+        developer's own ~/.sprint would put a banner on his live boards."""
+        self.assertEqual(os.path.dirname(sprintd.account_limit_path()),
+                         os.path.dirname(os.path.abspath(self.registry)))
+        home = os.path.join(os.path.expanduser("~"), ".sprint",
+                            "account-limit.json")
+        before = os.path.exists(home)
+        self.declare_account()
+        self.assertTrue(os.path.exists(sprintd.account_limit_path()))
+        self.assertEqual(os.path.exists(home), before)
+
+
+class TestAccountLimitWithNoSession(AccountLimitBase):
+    """The point of the whole feature: while the account is out the
+    orchestrating session is DEAD. Server and browser are the only two things
+    still moving, so everything here runs with nothing polling /api/wait, no
+    cursor ever moving, and no background threads started (START_BACKGROUND is
+    False on this class, so not even the sweep tick exists).
+    """
+
+    def assert_no_session(self):
+        status, board = self.get("/api/board")
+        sess = board["session"]
+        self.assertFalse(sess["waiter_polling"])
+        self.assertFalse(sess["waiter_alive"])
+        self.assertIsNone(sess["waiter_seen_at"])
+        self.assertEqual(board["cursor"], 0)     # nothing has drained anything
+        self.assertIsNone(self.app._sweep_thread)
+        return board
+
+    def test_the_banner_renders_and_resume_clears_with_nothing_attached(self):
+        _, out = self.declare_account(resets="11:50pm")
+        board = self.assert_no_session()
+        self.assertIsNotNone(board["account_limit"])
+        self.assertEqual(board["account_limit"]["resume_url"],
+                         "/api/limits/%d/clear" % out["limit"]["id"])
+
+        # exactly what the button does: one POST, no session in the loop
+        status, cleared = self.post(board["account_limit"]["resume_url"])
+        self.assertEqual(status, 200)
+        self.assertTrue(cleared["cleared"])
+        board = self.assert_no_session()
+        self.assertIsNone(board["account_limit"])
+        self.assertEqual(len(self.limit_events("limit_cleared")), 1)
+
+    def test_a_sibling_board_gets_it_from_the_browser_poll_alone(self):
+        """FALSIFICATION of the "no session needed" claim. The sibling has no
+        session, no waiter and no sweep thread — the ONLY thing that happens to
+        it is the GET a browser tab makes. Take that GET away and it has no way
+        to know; make it, and the banner is there. If this ever passes without
+        the board read, the propagation has quietly grown a dependency on
+        something that is not running when it matters.
+        """
+        other = self.sibling()
+        self.assertIsNone(other._sweep_thread)
+        self.declare_account(resets="11:50pm")
+
+        # before any read: the sibling's own table knows nothing
+        self.assertEqual(other.active_limits(), [])
+        self.assertEqual([e for e in other.events_after(0)
+                          if e["kind"].startswith("limit_")], [])
+
+        board = other.board()          # the browser's poll, and nothing else
+        self.assertIsNotNone(board["account_limit"])
+        self.assertFalse(board["session"]["waiter_alive"])
+        self.assertEqual(board["cursor"], 0)
+
+        # and Resume from that same sessionless board really ends it
+        other.clear_limit(board["account_limit"]["id"])
+        self.assertIsNone(other.board()["account_limit"])
+        self.assertIsNone(self.get("/api/board")[1]["account_limit"])
+
+
 class TestSprintLimitCli(Base):
     """`bin/sprint-limit` — what the session actually types when it reads a
     kill message. Thin by design: the server owns the parsing."""
@@ -7037,6 +7379,35 @@ class TestSprintLimitCli(Base):
         self.assertIn("available again", r.stdout.decode())
         status, body = self.get("/api/limits")
         self.assertEqual(body["active"], [])
+
+    def test_declare_the_whole_account(self):
+        r = self.run_limit("declare", "--account", "--resets", "11:50pm")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        out = r.stdout.decode()
+        self.assertIn("ACCOUNT is limited until", out)
+        # it says the thing the user has to do, not just the fact
+        self.assertIn("another session", out)
+        self.assertIn("Resume", out)
+        status, board = self.get("/api/board")
+        self.assertIsNotNone(board["account_limit"])
+        limit_id = board["account_limit"]["id"]
+
+        r = self.run_limit("list")
+        self.assertIn("ACCOUNT", r.stdout.decode())
+
+        r = self.run_limit("clear", str(limit_id))
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("account is available again", r.stdout.decode())
+        self.assertIsNone(self.get("/api/board")[1]["account_limit"])
+
+    def test_it_will_not_guess_between_a_model_and_the_account(self):
+        r = self.run_limit("declare", "--resets", "11:50pm")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--account", r.stderr.decode())
+        r = self.run_limit("declare", "--account", "--model", "fable",
+                           "--resets", "11:50pm")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.get("/api/limits")[1]["active"], [])
 
     def test_a_bad_time_fails_loudly_and_records_nothing(self):
         r = self.run_limit("declare", "--model", "fable", "--resets", "soonish")
