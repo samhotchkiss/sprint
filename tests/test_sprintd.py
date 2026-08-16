@@ -4791,5 +4791,139 @@ class TestDispatchModel(Base):
         self.assertIsNone(app.card_json(app.card_row(1), brief=True)["model"])
 
 
+class TestSprintRecover(Base):
+    """`sprint-recover 41 42` — the "inspect before you redo anything" step,
+    as one command instead of five. Seeded against a real git repo, because
+    the whole value of the thing is that it reports what git actually says."""
+
+    SPRINT_RECOVER = os.path.join(os.path.dirname(HERE), "bin", "sprint-recover")
+
+    def run_recover(self, *argv, token="test-token"):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN=token)
+        return subprocess.run([sys.executable, self.SPRINT_RECOVER]
+                              + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=90)
+
+    def git(self, cwd, *args):
+        import subprocess
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        r = subprocess.run(("git", "-C", cwd) + args, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        return r.stdout.decode()
+
+    def seeded_worktree(self, name, commits=1, dirty=True):
+        """A real repo with a `main`, a branch off it, N commits on the branch
+        and (optionally) an uncommitted edit — the exact state a killed agent
+        leaves behind."""
+        path = os.path.join(self.tmp, name)
+        os.makedirs(path)
+        self.git(path, "init", "-q", "-b", "main")
+        with open(os.path.join(path, "README"), "w") as fh:
+            fh.write("base\n")
+        self.git(path, "add", "-A")
+        self.git(path, "commit", "-qm", "base")
+        self.git(path, "checkout", "-qb", name)
+        for i in range(commits):
+            with open(os.path.join(path, "work-%d.txt" % i), "w") as fh:
+                fh.write("committed work %d\n" % i)
+            self.git(path, "add", "-A")
+            self.git(path, "commit", "-qm", "half-finished thing %d" % i)
+        if dirty:
+            with open(os.path.join(path, "scratch.txt"), "w") as fh:
+                fh.write("uncommitted work the dead agent left\n")
+        return path
+
+    def dead_card(self, worktree, branch, text="the agent on this died"):
+        num = self.new_card(text)["num"]
+        status, _ = self.post("/api/cards/%d/assign" % num,
+                              {"agent_name": "sprint-card-%d" % num,
+                               "worktree": worktree, "branch": branch,
+                               "model": "opus"})
+        self.assertEqual(status, 200)
+        self.post("/api/cards/%d/state" % num, {"state": "in_progress"})
+        self.post("/api/cards/%d/events" % num,
+                  {"kind": "progress",
+                   "payload": {"text": "read the sweep, found the missing guard"}})
+        return num
+
+    def test_it_reports_state_branch_worktree_commits_and_dirtiness(self):
+        wt = self.seeded_worktree("sprint-card-1", commits=2, dirty=True)
+        num = self.dead_card(wt, "sprint-card-1")
+        r = self.run_recover(num)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        out = r.stdout.decode()
+        self.assertIn("#%d" % num, out)
+        self.assertIn("state: in_progress", out)
+        self.assertIn("agent: sprint-card-%d" % num, out)
+        self.assertIn("model: opus", out)
+        self.assertIn("branch:   sprint-card-1", out)
+        self.assertIn(wt, out)
+        self.assertIn("commits ahead of main: 2", out)
+        self.assertIn("half-finished thing 1", out)
+        self.assertIn("dirty: YES", out)
+        self.assertIn("scratch.txt", out)
+        self.assertIn("read the sweep, found the missing guard", out,
+                      "the timeline IS the brief")
+        self.assertIn("inspect the branch and the worktree", out,
+                      "the point of the header is the instruction, not the data")
+
+    def test_a_clean_branch_with_nothing_on_it_says_so_plainly(self):
+        wt = self.seeded_worktree("sprint-card-2", commits=0, dirty=False)
+        num = self.dead_card(wt, "sprint-card-2")
+        out = self.run_recover(num).stdout.decode()
+        self.assertIn("committed NOTHING", out)
+        self.assertIn("dirty: no", out)
+
+    def test_a_worktree_that_is_gone_is_a_finding_not_a_crash(self):
+        num = self.dead_card(os.path.join(self.tmp, "pruned-already"),
+                             "sprint-card-3")
+        r = self.run_recover(num)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("GONE", r.stdout.decode())
+
+    def test_several_cards_in_one_go(self):
+        a = self.dead_card(self.seeded_worktree("wt-a"), "wt-a", "card A")
+        b = self.dead_card(self.seeded_worktree("wt-b"), "wt-b", "card B")
+        out = self.run_recover(a, b).stdout.decode()
+        self.assertIn("#%d, #%d" % (a, b), out)
+        self.assertIn("#%d —" % a, out)
+        self.assertIn("#%d —" % b, out)
+
+    def test_the_last_ten_lines_are_the_last_ten(self):
+        num = self.dead_card(self.seeded_worktree("wt-c"), "wt-c")
+        for i in range(15):
+            self.post("/api/cards/%d/events" % num,
+                      {"kind": "progress", "payload": {"text": "step number %d" % i}})
+        out = self.run_recover(num).stdout.decode()
+        self.assertIn("step number 14", out)
+        self.assertNotIn("step number 3", out, "only the last ten")
+
+    def test_it_never_writes_anything_to_the_card(self):
+        num = self.dead_card(self.seeded_worktree("wt-d"), "wt-d")
+        before = self.get("/api/cards/%d" % num)[1]["timeline"]
+        self.run_recover(num)
+        after = self.get("/api/cards/%d" % num)[1]["timeline"]
+        self.assertEqual(len(before), len(after),
+                         "safe to run on a live board")
+
+    def test_it_fails_named_without_a_card_number(self):
+        r = self.run_recover()
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("card number", r.stderr.decode())
+
+    def test_a_bad_token_is_a_clear_failure_not_a_traceback(self):
+        num = self.dead_card(self.seeded_worktree("wt-e"), "wt-e")
+        r = self.run_recover(num, token="wrong")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("401", r.stderr.decode())
+        self.assertNotIn("Traceback", r.stderr.decode())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
