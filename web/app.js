@@ -47,7 +47,17 @@ let railQueued = false;
 function paintRail() {
   if (renderQueued || railQueued) return;
   railQueued = true;
-  requestAnimationFrame(() => { railQueued = false; renderRail(el.rail, app); });
+  requestAnimationFrame(() => {
+    railQueued = false;
+    // This is the most frequent paint on the page (a live session moves its
+    // cursor about once a second) and it lands squarely on the box you are
+    // typing in. It has to preserve the caret exactly like the full paint does
+    // — it used to preserve nothing at all.
+    const focus = captureFocus();
+    renderRail(el.rail, app);
+    restoreFocus(focus);
+    applyPendingFocus();
+  });
 }
 
 function paint() {
@@ -90,6 +100,7 @@ function paint() {
 
   renderSessionBanner();
   restoreFocus(focus);
+  applyPendingFocus();
 }
 
 /**
@@ -149,18 +160,59 @@ function emptyTextTarget(node) {
   return !String(node.value || '').trim();
 }
 
+/**
+ * Where the caret was before we touched the DOM. Every text surface on this page
+ * carries a stable id for exactly this reason — the composers (`composer-<num>`,
+ * `sidebar-text`, `compose-text`) and the bounce-notes box (`bounce-<num>`) —
+ * because an id is the only thing that survives a node being replaced.
+ */
 function captureFocus() {
   const a = document.activeElement;
   if (!a || !a.id || !(a instanceof HTMLTextAreaElement || a instanceof HTMLInputElement)) return null;
-  return { id: a.id, start: a.selectionStart, end: a.selectionEnd };
+  return { id: a.id, start: a.selectionStart, end: a.selectionEnd, len: (a.value || '').length };
 }
 
 function restoreFocus(f) {
   if (!f) return;
   const next = document.getElementById(f.id);
   if (!next || next === document.activeElement) return;
-  next.focus();
-  try { next.setSelectionRange(f.start, f.end); } catch {}
+  next.focus({ preventScroll: true });
+  // The words come back from the draft store, so the text is usually identical —
+  // but clamp anyway rather than throw and leave the caret at 0.
+  const len = (next.value || '').length;
+  const at = (n) => Math.max(0, Math.min(len, n == null ? len : n));
+  try { next.setSelectionRange(at(f.start), at(f.end)); } catch {}
+}
+
+// ---- put the caret where you just asked for it ---------------------------
+
+/**
+ * Card #46, the user's own design, verbatim: "I click a card, it loads in the
+ * sidebar, and it focuses my cursor in the reply box." So opening a card asks
+ * for the caret, once — and only on OPEN. Nothing else on this page ever moves
+ * focus, because a board that grabs your cursor on a live update is the bug this
+ * card was filed about.
+ */
+let pendingFocus = null;
+
+function askFocus(num, kind) {
+  pendingFocus = { num: Number(num), kind: kind || 'composer', at: Date.now() };
+}
+
+function applyPendingFocus() {
+  const f = pendingFocus;
+  if (!f) return;
+  // The rail may still be waiting on the card's timeline; try again next paint,
+  // but never so long that a slow fetch yanks the cursor out of something else.
+  const stale = Date.now() - f.at > 4000;
+  if (!store.detail || store.detail.num !== f.num) { pendingFocus = null; return; }
+  let node = f.kind === 'bounce' ? document.getElementById('bounce-' + f.num) : null;
+  if (!node) node = document.getElementById('composer-' + f.num);
+  if (!node) { if (stale) pendingFocus = null; return; }
+  pendingFocus = null;
+  node.focus({ preventScroll: false });
+  const end = (node.value || '').length;
+  try { node.setSelectionRange(end, end); } catch {}
 }
 
 // ---- data ----------------------------------------------------------------
@@ -433,6 +485,7 @@ async function verdict(card, kind, notes, key, opts) {
   const word = kind === 'approve' ? 'Approve' : kind === 'bounce' ? 'Bounce' : 'Reject';
   // Approve does not mean Done: the card sits in Ready as "merging" until the branch lands.
   patch(card.num, kind === 'approve' ? 'integrating' : kind === 'bounce' ? 'in_progress' : 'rejected');
+  if (store.bounceOpen === card.num) store.bounceOpen = null;
   clearVerdictError(card.num);
   render();
   try {
@@ -579,20 +632,37 @@ function failPending(line, retry) {
 
 // ---- the rail ------------------------------------------------------------
 
-function openCard(num) {
+/**
+ * Open a card in the rail. `opts.focus` says which box wants the caret —
+ * 'composer' (the default: the reply box, every entry point) or 'bounce' (you
+ * pressed Bounce on a review row, so it is the notes box you meant).
+ *
+ * Re-opening the card that is already open keeps its thread as it stands: the
+ * pending and failed lines in it are the user's own words, and throwing them
+ * away to re-focus a box would be a worse bug than the one we are fixing.
+ */
+function openCard(num, opts) {
   if (num == null) return;
-  const card = store.cards.get(Number(num)) || null;
-  store.detail = {
-    num: Number(num), card, timeline: [], evidence: card && card.evidence,
-    pendingLines: [], justAnswered: false, error: null,
-  };
-  if (location.hash !== `#/c/${num}`) history.replaceState(null, '', `#/c/${num}`);
+  const n = Number(num);
+  const kind = (opts && opts.focus) || 'composer';
+  const card = store.cards.get(n) || null;
+  if (!store.detail || store.detail.num !== n) {
+    store.detail = {
+      num: n, card, timeline: [], evidence: card && card.evidence,
+      pendingLines: [], justAnswered: false, error: null,
+    };
+  }
+  store.bounceOpen = kind === 'bounce' ? n : null;
+  askFocus(n, kind);
+  if (location.hash !== `#/c/${n}`) history.replaceState(null, '', `#/c/${n}`);
   render();
   refreshDetail();
 }
 
 function closeCard() {
   store.detail = null;
+  store.bounceOpen = null;
+  pendingFocus = null;
   if (location.hash.startsWith('#/c/')) history.replaceState(null, '', location.pathname + location.search);
   render();
 }

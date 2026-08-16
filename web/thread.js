@@ -19,7 +19,7 @@
 // what keeps the rail still while the session's cursor ticks past underneath.
 import { h, ageSuffix, richText, firstLine, reconcile, timeEl } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
-import { SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, draft } from './state.js';
+import { store, SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, draft } from './state.js';
 import { detailBlock } from './detail.js';
 import { flowActive } from './review.js';
 
@@ -129,7 +129,8 @@ export function threadItems(detail, app) {
     out.push({
       key: 'packet',
       ver: `${state}:${card ? card.bounce_count : 0}:${(packet && packet.claim) || ''}`.length
-        + ':' + state + ':' + (card ? card.bounce_count : 0) + ':' + (walking ? 'w' : ''),
+        + ':' + state + ':' + (card ? card.bounce_count : 0) + ':' + (walking ? 'w' : '')
+        + ':' + (card && store.bounceOpen === card.num ? 'b' : ''),
       make: () => evidencePacket(packet, card, state, app, walking),
     });
   }
@@ -430,7 +431,12 @@ function verdictBar(card, app) {
       'Bounced twice. The session stops retrying blind here and brings it to you to co-design.'));
   }
 
+  // Bounce notes are typed here, in the rail, with the packet you are bouncing
+  // right above them (card #46). The id is what lets the caret be put back
+  // exactly where it was after any re-render.
+  const wantOpen = !!draft(key) || store.bounceOpen === card.num;
   const notes = h('textarea.bounce-notes', {
+    id: 'bounce-' + card.num,
     rows: '2',
     placeholder: 'What has to change? (goes straight to the agent)',
     oninput: (e) => draft(key, e.target.value),
@@ -439,7 +445,7 @@ function verdictBar(card, app) {
     },
   });
   notes.value = draft(key);
-  const notesWrap = h('div', { hidden: !draft(key) }, notes);
+  const notesWrap = h('div', { hidden: !wantOpen }, notes);
 
   function sendBounce() {
     const text = notes.value.trim();
@@ -459,7 +465,7 @@ function verdictBar(card, app) {
       }
       sendBounce();
     },
-  }, notesWrap.hidden ? 'Bounce' : 'Send bounce');
+  }, wantOpen ? 'Send bounce' : 'Bounce');
 
   wrap.appendChild(notesWrap);
   wrap.appendChild(h('div.verdicts',

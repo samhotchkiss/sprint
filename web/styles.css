@@ -2290,3 +2290,38 @@ html.skin-chaos .packet-readback {
   border-radius: 0;
   line-height: 1.7;
 }
+
+/* ============================================================================
+   Card #46 — you type in the rail, and what you type stays put.
+   User verbatim: "when I'm typing a response into a card and the board moves,
+   it takes my cursor focus out so I keep typing but it goes nowhere", and his
+   design: "I click a card, it loads in the sidebar, and it focuses my cursor in
+   the reply box."  Everything below is about making that focus VISIBLE — the
+   mechanics live in app.js/rail.js.
+   ========================================================================== */
+
+/* A composer that has the caret should look like it does. The border colour on
+   its own is a 1px difference you have to hunt for on a dark panel; the ring
+   says "type here" from across the room, in both skins. */
+.composer textarea:focus,
+.bounce-notes:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* Answering a question is a different job from chatting to the agent, and the
+   question is directly above this box — so the box it belongs to is marked. */
+.composer.is-answering textarea {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+}
+
+/* The bounce-notes box now only ever appears in the rail, where it is a real
+   part of the panel rather than a popover squeezed into a list row. */
+.review-notes { display: block; }
+.review-notes .bounce-notes { width: 100%; }
+
+html.skin-chaos .composer textarea:focus,
+html.skin-chaos .bounce-notes:focus {
+  box-shadow: 0 0 0 3px var(--accent);
+  border-radius: 0;
+}

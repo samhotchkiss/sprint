@@ -333,6 +333,7 @@ export function flowBarSig(card) {
   const s = step();
   const p = unitProgress(s.key);
   return [card.num, flow.i, flow.steps.length, card.bounce_count,
+    store.bounceOpen === card.num ? 'b' : '',
     p ? `${p.done}/${p.total}${p.error ? 'e' + p.error : ''}` : ''].join('|');
 }
 
@@ -429,14 +430,20 @@ export function reviewBar(card, app) {
   const many = unit && members.length > 1;
   const prog = s ? unitProgress(s.key) : null;
 
+  // The one bounce-notes box on screen, and it is in the rail — never on a card
+  // face (card #46). It carries the card's id so focus and caret can be put back
+  // on it after any re-render, and it opens by itself when you arrived here by
+  // pressing Bounce on a review row.
+  const wantOpen = !!draft(key) || store.bounceOpen === card.num;
   const notes = h('textarea.bounce-notes', {
+    id: 'bounce-' + card.num,
     rows: '2',
     placeholder: 'What has to change? (goes straight to the agent)',
     oninput: (e) => draft(key, e.target.value),
     onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } },
   });
   notes.value = draft(key);
-  const notesWrap = h('div.review-notes', { hidden: !draft(key) }, notes);
+  const notesWrap = h('div.review-notes', { hidden: !wantOpen }, notes);
 
   function send() {
     const text = notes.value.trim();
@@ -456,9 +463,7 @@ export function reviewBar(card, app) {
       }
       send();
     },
-  }, notesWrap.hidden
-    ? (many ? `Bounce #${card.num}` : 'Bounce')
-    : 'Send bounce');
+  }, wantOpen ? 'Send bounce' : (many ? `Bounce #${card.num}` : 'Bounce'));
 
   bar.appendChild(h('div.review-bar-head',
     h('span.review-count', `${flow.i + 1} of ${flow.steps.length}`),
@@ -740,7 +745,6 @@ function thumbFor(p, app) {
 }
 
 function actionsRow(card, p, app, merging, shared) {
-  const key = `bounce:${card.num}`;
   const row = h('div.review-acts');
 
   if (merging) {
@@ -751,39 +755,21 @@ function actionsRow(card, p, app, merging, shared) {
     return row;
   }
 
-  const notes = h('textarea.bounce-notes', {
-    rows: '2',
-    placeholder: 'What has to change? (goes straight to the agent)',
-    oninput: (e) => draft(key, e.target.value),
-    onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } },
-  });
-  notes.value = draft(key);
-  const pop = h('div.bounce-pop', { hidden: !draft(key) },
-    notes,
-    h('div.bounce-pop-acts',
-      h('button.btn.tiny.bounce', { type: 'button', onclick: () => send() }, 'Send bounce'),
-      h('button.btn.tiny.ghost', {
-        type: 'button',
-        onclick: () => { draft(key, null); notes.value = ''; pop.hidden = true; },
-      }, 'Cancel')));
-
-  function send() {
-    const text = notes.value.trim();
-    if (!text) { notes.focus(); return; }
-    draft(key, null);
-    pop.hidden = true;
-    app.verdict(card, 'bounce', text);
-  }
-
   row.appendChild(h('button.btn.approve.tiny', {
     type: 'button',
     title: `approve #${card.num} — the session rebases, gates and merges the branch`,
     onclick: (e) => { e.stopPropagation(); app.verdict(card, 'approve'); },
   }, 'Approve'));
+  // Card #46, user verbatim: "when I'm typing a response into a card and the
+  // board moves, it takes my cursor focus out so I keep typing but it goes
+  // nowhere." Approve is one tap and stays on the row; bounce is a SENTENCE, and
+  // a sentence is typed in the rail with the thread under it — never into a box
+  // sitting in a list that the next board frame rebuilds. So this button opens
+  // the card and puts the caret in the notes box there.
   row.appendChild(h('button.btn.bounce.tiny', {
     type: 'button',
-    title: 'send it back with notes',
-    onclick: (e) => { e.stopPropagation(); pop.hidden = !pop.hidden; if (!pop.hidden) notes.focus(); },
+    title: 'open it and send it back with notes',
+    onclick: (e) => { e.stopPropagation(); app.openCard(card.num, { focus: 'bounce' }); },
   }, 'Bounce'));
   if (p.live_url && !shared) {
     row.appendChild(h('a.btn.tiny.ghost.review-live', {
@@ -795,8 +781,7 @@ function actionsRow(card, p, app, merging, shared) {
   row.appendChild(h('span.review-meta', metaLine(card, p, shared), ' · ',
     timeEl(card.last_activity_at, { suffix: false })));
 
-  const wrap = h('div.review-actwrap', row, pop);
-  return wrap;
+  return h('div.review-actwrap', row);
 }
 
 function metaLine(card, p, shared) {

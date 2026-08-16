@@ -117,6 +117,10 @@ export const store = {
   view: 'list',           // 'list' | 'board' — persisted
   chatOpen: false,        // session chat wants the rail
   unseen: false,          // a session line arrived while the rail was closed
+  // Bounce is typed in the RAIL, never on a card face (card #46). This is the
+  // card whose bounce-notes box is open and waiting for words; it survives the
+  // re-render because it lives here rather than in a DOM node's `hidden`.
+  bounceOpen: null,
 };
 
 const VIEW_KEY = 'sprint.view';
