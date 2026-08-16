@@ -60,7 +60,8 @@ recovery must be easy. The user always runs claude inside tmux.
   the open sprint; past sprints listable.
 - `cards(num INTEGER PRIMARY KEY AUTOINCREMENT, sprint_id, state, title, body, batch_id NULL,
   agent_name NULL, worktree NULL, branch NULL, bounce_count DEFAULT 0, pinned DEFAULT 0,
-  dup_of NULL, long_running DEFAULT 0, created_at, updated_at)` — **`num` is global across sprints**;
+  dup_of NULL, long_running DEFAULT 0, external_agent DEFAULT 0, work_kind DEFAULT 'code',
+  created_at, updated_at)` — **`num` is global across sprints**;
   the UI renders `#num` and #num means the same card forever.
 - `batches(id, sprint_id, agent_name, worktree, branch, created_at)`.
 - `events(seq INTEGER PRIMARY KEY AUTOINCREMENT, card_num NULL, ts, actor, kind, payload JSON)` —
@@ -74,6 +75,19 @@ recovery must be easy. The user always runs claude inside tmux.
   answer belong"), replacing prose in SKILL.md. It is a biconditional: stamped on every user event,
   **stripped** from every worker/session/server event, and workers cannot forge it — so `reply_to`
   present means "a human said this and is waiting."
+
+  **Actor attribution (who wrote it).** A card the SESSION filed over the API used to show its
+  `submitted` event as the user's, so `reply_to` claimed a human was waiting behind the session's own
+  writing. `POST /api/cards`, `/api/cards/bulk`, `/api/sidebar` and the per-card write routes
+  therefore accept an optional `actor` from `{user, session, worker}` (never `server` — that is the
+  board's own voice). It is honoured **only when the request is not from a browser**, decided off the
+  headers page JavaScript is forbidden to set or remove on `fetch` — `Cookie`, `Origin`,
+  `Sec-Fetch-Site`, `Sec-Fetch-Mode`, `Sec-Fetch-Dest`. The board's own SPA sends a bearer token
+  exactly like a worker does, so the Authorization header cannot answer this; the forbidden-header
+  list can, and cannot be forged away from the page. It fails CLOSED both ways: no claim means the
+  route's own default (never an upgrade), and a browser's claim is dropped in favour of `user`. The
+  biconditional above is untouched — a session-authored card still routes the user's later chat and
+  verdict as `card:<num>`, because attribution says who WROTE a card, never who owns it.
 - `evidence(card_num, packet JSON, created_at)`.
 - `cursors(name PRIMARY KEY, seq)` — the session persists its drain cursor here (`orchestrator`).
 - `questions(id, card_num, text, options JSON NULL, answered_at NULL)` — answer idempotency: second
@@ -107,8 +121,19 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 
 - `GET /` + static `web/` assets. `GET /healthz` (no auth) — carries `generation`, one id per server
   **process**, alongside pid/started_at/seq.
-- `POST /api/cards` `{text?, images?: [base64 png/jpeg], hold?: bool}` → card. Server stores
-  attachments first, then the card+`submitted` event. At least one of text/images required.
+- `POST /api/cards` `{text?, images?: [base64 png/jpeg], hold?: bool, actor?: user|session|worker}`
+  → card. Server stores attachments first, then the card+`submitted` event. At least one of
+  text/images required. **`actor` is honoured only for a non-browser caller** — see "Actor
+  attribution" below; a browser is always `user`.
+- `POST /api/cards/bulk` `{items: [{text?, images?} | "text", …], hold?: bool, actor?}` → every card
+  in ONE transaction. **`hold` defaults to `true`**: importing N issues used to mean N POSTs and a
+  board flooded against intent (14 unwanted cards, then 14 hand-written cancels), so the held pile IS
+  the preview and the user releases it. All-or-nothing — one bad item creates nothing — and capped at
+  50 items (`413 too_many` over it). Returns `{ok, count, hold, state, card_nums, cards}`.
+- `POST /api/cards/bulk-action` `{card_nums: [...], action: cancel|release|hold}` — the undo, in one
+  call. Deliberately only the flood-control verbs. Every card must EXIST (404 for the whole call
+  otherwise), then each is applied independently: `{ok, action, applied: [...], failed:
+  [{card_num, error, message}], count}`. Same 50-card cap.
 - `GET /api/board` — open sprint, all cards w/ latest state + last event + queue positions + session
   liveness (see below). `GET /api/cards/:num` — full interleaved timeline + evidence + attachments.
 - `POST /api/cards/:num/chat` `{text?, images?: [base64 png/jpeg or data: URL]}` (user→card) — same
@@ -117,7 +142,13 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
   ready-to-use `url` (and the on-disk `path`, so a relayed message gives the agent something to Read).
   `POST /api/cards/:num/answer`
   `{question_id, text}` — flips needs_you→in_progress optimistically.
-- `POST /api/cards/:num/action` `{action: pin|unpin|cancel|hold|release|duplicate_of|retry|reopen}`.
+- `POST /api/cards/:num/action`
+  `{action: pin|unpin|cancel|hold|release|duplicate_of|retry|reopen|long_running|external_agent}`.
+  The last two are **session-only** (`403 session_only` from a browser — both turn the silence timer
+  off, and the user has no way to know whether an agent is legitimately quiet); each takes
+  `{value?: bool (default true), note?: str}`. `long_running` is a stretch; `external_agent` marks an
+  assignee that emits no worker telemetry at all, so `agent_silent` never runs on that card and the
+  session owns checking it.
   `reopen` is the user's undo for a card closed too early: any terminal state → `queued` with a
   "reopened" state event (409 on a non-terminal card). **Closing is a user verb — the session never
   puts a card in a terminal state on its own; work with no code change goes to `ready` with an
@@ -134,7 +165,8 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 - Session surface: `POST /api/sidebar` `{text?, images?, actor: user|session}` (images exactly as on
   card chat — one attachment path for every surface); `POST /api/batches`
   `{card_nums[], agent_name, branch}`; `POST /api/cards/:num/assign`
-  `{agent_name, worktree, branch, title?}` — assigning a **queued** card also flips it
+  `{agent_name, worktree?, branch?, title?, work_kind?: code|ops, external_agent?: bool}`
+  (worktree/branch are optional: **ops work has neither**) — assigning a **queued** card also flips it
   queued→triaging in the same transaction (state event reads "assigned to sprint-card-N — picking
   it up"); assigning a card in any other state only records the agent and never regresses state;
   `POST /api/sprint` `{action: open|close|set_hold_mode, ...}`; `POST /api/cursors/orchestrator` `{seq}`.
@@ -149,6 +181,10 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
   prints exactly ONE compact JSON line per event to stdout —
   `{seq, card, actor, kind, reply_to, text (120 chars)}` — for a streaming monitor to wake on.
   `--after` catches up from the cursor first; `--user-only` narrows to `actor: "user"`.
+  **`actor: "session"` events are suppressed by DEFAULT** (`--include-self` restores them): the
+  session's own posts came back down its own ingress and woke it to read what it had just said,
+  which is the same class of non-event as a heartbeat. The event still rides the stream and the
+  cursor drain still sees it — only the wakeup is dropped.
   Heartbeats and cursor frames are consumed, never printed (they would wake the monitor for
   nothing); a generation change prints `{"restart": true, …}`. Reconnects with backoff and
   resumes from the last seq on a drop, printing nothing extra; after 60s unreachable prints ONE
@@ -239,8 +275,12 @@ construction, and the silence amber that follows says "broken" about work that i
 User verbatim: "i shouldn't need to hit the nudge button. if there's no update for 5 minutes, the
 master session should get nudged and it should check on the subagent."
 
-- Server timer: any `in_progress` card with no worker event for **5 min** (and `long_running` not
-  set) → server appends `agent_silent` event (once; re-arm only after new worker activity). The
+- Server timer: any `in_progress` card with no worker event for **5 min** (and neither
+  `long_running` nor `external_agent` set) → server appends `agent_silent` event (once; re-arm only
+  after new activity). **A `session` event counts as activity** alongside a worker's: the session
+  posting its findings on a card IS the check this event asked for, and re-nagging it five minutes
+  later nags it about work it already did. (`server` events never count — the sweep's own reminders
+  must not reset the clock they are complaining about.) The
   session drains it, investigates the agent (SendMessage ping / transcript inspection), posts what it
   found to the card as a `note`, and acts: annotate long-running work (set `long_running`), restart a
   wedged agent, or flip to needs_you/failed.
@@ -299,7 +339,19 @@ url for the branch."** Every ready card must be validatable with zero code readi
 Packet: `{claim (one sentence), diffstat, branch, test_cmd, test_result ("N pass, 0 fail" — counts,
 never "tests pass"), validate (REQUIRED: 1-3 plain-English steps a human follows to confirm the fix
 without reading code), ui_change (REQUIRED bool), screenshots?: [attachment refs], live_url?,
-per_card?: [{card_num, claim, screenshots?}] }`.
+work_kind?: code|ops, readback? (ops), per_card?: [{card_num, claim, screenshots?}] }`.
+
+**Ops cards — the same bar, a different shape of proof.** Non-code work (reprocess a mailbox, rotate
+a key, rerun a job) has no diff, no branch and no preview, and demanding them made ops cards either
+liars or second-class. `work_kind: "ops"` therefore SWAPS the required set rather than relaxing it:
+**claim, validate, readback**, where `readback` is the observed evidence — a log excerpt or command
+output, string or array of lines — rendered verbatim and preformatted in the packet block.
+`diffstat`, `branch`, `ui_change` and `screenshots` are not required; `test_cmd`/`test_result` are
+optional and still need real counts when present; an ops packet that volunteers `ui_change: true`
+still owes screenshots. The kind is taken from the packet, else from the card
+(`assign {work_kind: "ops"}`), and an accepted packet stamps it onto the card so a second packet
+after a bounce is judged by the same rules. Ops cards need no worktree and no branch, and `assign`
+may omit them.
 - `ui_change: true` → `screenshots` REQUIRED (before/after, light+dark, from the worker's OWN
   worktree preview, never a shared dev server) and `live_url` strongly encouraged: the worker starts
   its preview bound to the tailnet IP (loopback fallback) on a deterministic port
