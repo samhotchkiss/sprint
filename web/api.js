@@ -67,7 +67,7 @@ async function req(method, path, body, opts = {}) {
   const text = await res.text();
   if (text) { try { payload = JSON.parse(text); } catch { payload = { raw: text }; } }
   noteGeneration(payload);
-  noteApiVersion(payload);
+  noteApiVersion(payload, path);
   if (!res.ok) throw new ApiError(res.status, payload, path);
   return payload;
 }
@@ -120,14 +120,19 @@ export const UI_API_VERSION = 2;
 let serverApi = null;                // null = nothing has answered yet
 const staleListeners = new Set();
 
-function noteApiVersion(payload) {
+// Only two endpoints promise to carry the number, so only those two are read.
+// Inferring "no api_version, therefore old" from any response at all was wrong
+// in exactly one place and it mattered: /api/events carries `generation` and
+// never carried a version, so a perfectly current board accused itself of being
+// out of date on its first poll.
+const VERSIONED_PATHS = new Set(['/healthz', '/api/board']);
+
+function noteApiVersion(payload, path) {
   if (!payload || typeof payload !== 'object') return;
-  // A server old enough to lack the field entirely is, by definition, older
-  // than the version that introduced it.
-  const v = Number.isFinite(payload.api_version) ? payload.api_version
-    : (payload.generation ? 0 : null);
-  if (v == null) return;
-  setServerApi(v);
+  if (!VERSIONED_PATHS.has(String(path).split('?')[0])) return;
+  // A server old enough to lack the field on THESE paths is, by definition,
+  // older than the version that introduced it.
+  setServerApi(Number.isFinite(payload.api_version) ? payload.api_version : 0);
 }
 
 function setServerApi(v) {
