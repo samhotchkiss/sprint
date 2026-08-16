@@ -27,6 +27,22 @@ name. Terminal (done) cards don't get messages this way, since your
 worktree may already be pruned — don't expect one after you've called
 `sprint-ready` and gone quiet.
 
+## You may not be a subagent at all
+
+The board can run a card on a different executor — a CLI agent (grok,
+codex, whatever the user configured) driven in its own tmux window
+instead of a Claude subagent. If that is you, everything below still
+applies word for word: the same helpers, the same phase/progress
+protocol, the same evidence packet, the same boundaries. Two practical
+differences, both of which your brief spells out:
+
+- Nobody can `SendMessage` you. The session types into your pane, so a
+  follow-up arrives as a plain message in your terminal — read it the
+  same way you would a resumed turn.
+- Nothing puts these helpers on your `PATH` automatically. Your brief
+  gives you their absolute paths and exports `SPRINT_SERVER` /
+  `SPRINT_TOKEN` in your window; use them exactly as written.
+
 ## Pre-allowed tool profile — no prompts, ever
 
 You run unattended. Nobody is at the keyboard to click "allow." Treat

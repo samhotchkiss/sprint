@@ -61,7 +61,8 @@ recovery must be easy. The user always runs claude inside tmux.
 - `cards(num INTEGER PRIMARY KEY AUTOINCREMENT, sprint_id, state, title, body, batch_id NULL,
   agent_name NULL, worktree NULL, branch NULL, bounce_count DEFAULT 0, pinned DEFAULT 0,
   dup_of NULL, long_running DEFAULT 0, external_agent DEFAULT 0, work_kind DEFAULT 'code',
-  created_at, updated_at)` — **`num` is global across sprints**;
+  executor NULL, model NULL, created_at, updated_at)` — `executor`/`model` are the per-card
+  dispatch choice (NULL = the board's defaults); **`num` is global across sprints**;
   the UI renders `#num` and #num means the same card forever.
 - `batches(id, sprint_id, agent_name, worktree, branch, created_at)`.
 - `events(seq INTEGER PRIMARY KEY AUTOINCREMENT, card_num NULL, ts, actor, kind, payload JSON)` —
@@ -165,11 +166,13 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 - Session surface: `POST /api/sidebar` `{text?, images?, actor: user|session}` (images exactly as on
   card chat — one attachment path for every surface); `POST /api/batches`
   `{card_nums[], agent_name, branch}`; `POST /api/cards/:num/assign`
-  `{agent_name, worktree?, branch?, title?, work_kind?: code|ops, external_agent?: bool}`
-  (worktree/branch are optional: **ops work has neither**) — assigning a **queued** card also flips it
+  `{agent_name, worktree?, branch?, title?, work_kind?: code|ops, external_agent?: bool,
+  executor?, model?}` (worktree/branch are optional: **ops work has neither**; executor/model are the
+  per-card dispatch choice — see Settings & executors) — assigning a **queued** card also flips it
   queued→triaging in the same transaction (state event reads "assigned to sprint-card-N — picking
   it up"); assigning a card in any other state only records the agent and never regresses state;
-  `POST /api/sprint` `{action: open|close|set_hold_mode, ...}`; `POST /api/cursors/orchestrator` `{seq}`.
+  `POST /api/sprint` `{action: open|close|set_hold_mode, ...}`; `POST /api/cursors/orchestrator` `{seq}`;
+  `GET /api/settings` + `PUT /api/settings` (dispatch policy — see Settings & executors).
 - `GET /api/events?after=SEQ&limit=N` — the drain endpoint. `GET /api/stream` — SSE (browser),
   heartbeat comment every 15s, browsers auto-reconnect with Last-Event-ID. The stream opens with a
   named `hello` frame (`generation`, `started_at`, `cursor`, `head`) and every `cursor` frame carries
@@ -574,6 +577,46 @@ Plugin root = repo root: `.claude-plugin/plugin.json` (name `sprint`), `skills/s
 python3 stdlib or POSIX sh only), `web/`, `README.md`. Install: `claude --plugin-dir` for testing,
 `/plugin install sprint@<marketplace>` for distribution; `claude plugin validate` must pass. Deps:
 python3 ≥3.9 + git; tailscale optional (loopback-only degrade); everything else stdlib.
+
+## Settings & executors (SHIPPED)
+
+User verbatim: *"we need some sprint settings options here … our standing instructions should be to
+use the lowest feasible model (sonnet by default, opus if the orchestrator deems that necessary) …
+but we also need to support an alternate setup, which is where, instead of subagents, we use
+additional tmux sessions and tmux-send — so I may want it to use grok subagents via tmux, for
+example."* Scope ruling: *"Peer per card — mix grok-via-tmux and claude subagents"*.
+
+- **Store**: `.sprint/config.json` (a file, not a table — hand-editable, survives `stop`, diffs in a
+  terminal). `{"worker": {"model_policy", "default_executor", "executors", "concurrency"}}`.
+  `model_policy ∈ {lowest_feasible (default), always_opus, always_sonnet}`; `executors` is
+  name → `{kind: subagent|tmux, command?, session?, model?, note?}` (a `tmux` executor REQUIRES a
+  command; `session` defaults to `sprint-workers`); `concurrency` is 1–20, default 3.
+- **API**: `GET /api/settings` → `{settings, defaults, choices}`; `PUT` (and `POST`) merges a patch
+  and rewrites the file atomically. **Unknown keys and bad enums are a 400 naming the exact field** —
+  a settings file is read hours later by the session, so a silently-accepted typo reads back as "the
+  defaults are fine". `worker.executors` replaces wholesale (there is no honest merge-delete);
+  everything else merges per key. A hand-edited broken file falls back to defaults rather than taking
+  the board down, and a change appends a `note` event (`actor: "server"`, carrying the new settings)
+  so the session's own tail sees it. Read on demand, cached on mtime: `$EDITOR .sprint/config.json`
+  needs no restart.
+- **Per card**: `cards.executor`/`cards.model` (both nullable; NULL = the board's defaults), set via
+  `POST /api/cards/:num/assign {executor?, model?}`, which refuses an executor that is not declared.
+  Every card payload carries `dispatch: {executor, kind, command, session, model, source,
+  is_default}` — the server's resolution of card-over-policy, so no surface has to redo it.
+- **UI**: a quiet `Settings` link in the header opens a sheet (model policy segmented control, default
+  executor select, concurrency, executors as JSON) whose standing sentence is *a change takes effect
+  for the NEXT dispatch — cards already running keep the executor and model they started with*. Card
+  faces, List rows and the rail head carry a small `grok · tmux` tag **only when that card is not on
+  the defaults**; the model is on the tooltip and the rail head, not on the crowded face.
+- **Orchestration** (SKILL.md owns the procedure, since the session drives, not the server): lowest
+  feasible model, opus only for a nameable reason, and the chosen model **stamped on the card at
+  dispatch**. A tmux worker gets the same worktree, the same `assign`, and the SAME brief contract,
+  delivered into `tmux new-window -t <session> -n sprint-card-<num>` with the tmux-send skill's
+  verified send (never raw `send-keys` — the Enter gets swallowed and the brief sits unsent).
+  Follow-ups are `tmux-send` instead of `SendMessage`. Liveness is the pane plus the board's own
+  events: a window whose `pane_current_command` fell back to a shell is a dead worker, and a
+  non-terminal card there is `failed` + Retry (the tmux analogue of killed-agent detection). Terminal
+  states kill the window, never the shared session.
 
 ## Non-goals (v1)
 
