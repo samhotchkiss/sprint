@@ -2829,7 +2829,6 @@ html.skin-chaos .bounce-notes:focus {
   border-radius: 0;
 }
 
-<<<<<<< HEAD
 /* ============================================================================
    Cards #50 / #52 / #53 / #54 — where interaction lives.
    #50  an agent can ask for a DECISION, handing over artifacts with the
@@ -2954,7 +2953,6 @@ html.skin-chaos .artifacts {
 }
 html.skin-chaos .review-item:focus-visible { outline-offset: 0; }
 html.skin-chaos .extlink { text-decoration-thickness: 2px; }
-=======
 /* ==========================================================================
    APPENDED — provider limit line (card #47)
    "fable is rate-limited until 11:50pm — work is running on opus", in the same
@@ -3046,4 +3044,3 @@ html.skin-chaos .banner.account {
   border-radius: 0;
   background: var(--panel);
 }
->>>>>>> sprint/card-47
