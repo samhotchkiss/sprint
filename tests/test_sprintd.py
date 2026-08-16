@@ -4930,6 +4930,13 @@ class TestExternalAgentsAndLongRunning(Base):
         time.sleep(0.5)
         self.assertEqual(len(self.silent_events(num)), before,
                          "a session note on an assigned card resets the clock")
+        # The proof the clock RESET rather than merely stayed quiet: the next
+        # episode arms off the note, so silence fires again after it.
+        deadline = time.time() + 10.0
+        while time.time() < deadline and len(self.silent_events(num)) <= before:
+            time.sleep(0.1)
+        self.assertGreater(len(self.silent_events(num)), before,
+                           "the note re-armed the episode")
 
     def test_a_server_reminder_never_counts_as_activity(self):
         """The sweep's own noise must not reset the clock it is complaining
