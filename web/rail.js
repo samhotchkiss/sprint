@@ -18,6 +18,7 @@ import { h, clear, reconcile } from './util.js';
 import { store, cardState, isSilent, draft, attachedImages } from './state.js';
 import { renderThread, renderChat } from './thread.js';
 import { initCompose } from './compose.js';
+import { flowActive, reviewFlow, reviewBar } from './review.js';
 
 export function renderRail(root, app) {
   const owner = railOwner();
@@ -46,6 +47,11 @@ export function renderRail(root, app) {
     } else {
       renderThread(thread, { ...detail, state: cardState(card) }, app);
     }
+    // The walkthrough's action bar, when this card is the one it is on. It sits
+    // between the thread and the composer and it is the ONLY verdict on screen
+    // while it is up — the packet drops its own buttons rather than showing you
+    // two Approves that do the same thing.
+    syncOptional(root, 'review-bar', barSig(card), () => reviewBar(card, app));
     syncPart(root, 'composer', composerSig(card), () => composer(card, app));
   } else {
     syncPart(root, 'rail-head', store.session.online ? 'on' : 'off', () => chatHead());
@@ -77,6 +83,33 @@ function syncPart(root, cls, sig, build) {
   if (found) root.replaceChild(node, found);
   else root.appendChild(node);
   return node;
+}
+
+/**
+ * A part that is sometimes not there at all. Same signature contract as
+ * `syncPart`; a null signature removes it. It has to be placed before the
+ * composer, so it is inserted rather than appended.
+ */
+function syncOptional(root, cls, sig, build) {
+  const found = root.querySelector('.' + cls);
+  if (sig == null) {
+    if (found) root.removeChild(found);
+    return null;
+  }
+  const want = String(sig);
+  if (found && found.dataset.sig === want) return found;
+  const node = build();
+  node.dataset.sig = want;
+  if (found) root.replaceChild(node, found);
+  else root.insertBefore(node, root.querySelector('.composer') || null);
+  return node;
+}
+
+/** Null unless the walkthrough is standing on this exact card, ready for a verdict. */
+function barSig(card) {
+  if (!card || !flowActive(card.num) || cardState(card) !== 'ready') return null;
+  const f = reviewFlow();
+  return [card.num, f.i, f.queue.length, card.bounce_count].join('|');
 }
 
 function headSig(detail, card) {

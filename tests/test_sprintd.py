@@ -1321,6 +1321,44 @@ class TestBatches(Base):
             self.assertEqual(self.state_of(num), "integrating",
                              "no member may be half-completed")
 
+    def test_board_carries_what_awaiting_review_groups_on(self):
+        """The Awaiting-review list groups cards into work units client-side, so
+        the board payload has to say -- on every ready card, with no second
+        fetch -- which batch it belongs to, which agent carried it, which branch
+        it is on, and what its OWN claim inside a shared batch packet is."""
+        nums, batch = self._batch_of_three()
+        full = dict(GOOD_PACKET,
+                    per_card=[{"card_num": n, "claim": "fixed #%d" % n} for n in nums])
+        self.post("/api/cards/%d/ready" % nums[0], {"packet": full})
+
+        # a singleton on its own branch, same sprint
+        solo = self.new_card("its own thing")["num"]
+        self.post("/api/cards/%d/assign" % solo,
+                  {"agent_name": "sprint-card-%d" % solo, "worktree": "/tmp/wt-solo",
+                   "branch": "sprint/card-%d" % solo})
+        self.post("/api/cards/%d/state" % solo, {"state": "in_progress"})
+        self.post("/api/cards/%d/ready" % solo, {"packet": dict(GOOD_PACKET)})
+
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        cards = {c["num"]: c for c in board["cards"]}
+        for num in nums:
+            c = cards[num]
+            self.assertEqual(c["state"], "ready")
+            self.assertEqual(c["batch_id"], batch["id"], "the work unit's key")
+            self.assertEqual(c["agent_name"], "sprint-batch-1")
+            self.assertEqual(c["branch"], "sprint/batch-1", "the work unit's name")
+            packet = c["evidence"]["packet"]
+            mine = [e for e in packet["per_card"] if e["card_num"] == num]
+            self.assertEqual(mine[0]["claim"], "fixed #%d" % num,
+                             "a member row leads with its own claim, not the branch's")
+
+        c = cards[solo]
+        self.assertIsNone(c["batch_id"], "a singleton is a work unit of one")
+        self.assertEqual(c["agent_name"], "sprint-card-%d" % solo)
+        self.assertEqual(c["branch"], "sprint/card-%d" % solo)
+        self.assertNotIn("per_card", c["evidence"]["packet"])
+
 
 class StreamReader:
     """Read an SSE stream line by line. Shared by every test that reads frames."""
