@@ -2260,7 +2260,13 @@ html.skin-chaos .review-unit-error, html.skin-chaos .review-bar-unit { line-heig
   font-size: 12px;
   line-height: 1.6;
   color: var(--ink);
-  white-space: pre;
+  /* pre-WRAP, not pre: a command line that runs off the right edge of a 480px
+     rail is evidence the user cannot read, and a horizontal scrollbar they
+     have to discover is not an answer. Whitespace and newlines are still
+     preserved verbatim -- only overlong lines soft-wrap. overflow-x stays as
+     a safety net for genuinely unbreakable content. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   overflow-x: auto;
   max-height: 320px;
   overflow-y: auto;
