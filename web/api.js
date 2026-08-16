@@ -67,6 +67,7 @@ async function req(method, path, body, opts = {}) {
   const text = await res.text();
   if (text) { try { payload = JSON.parse(text); } catch { payload = { raw: text }; } }
   noteGeneration(payload);
+  noteApiVersion(payload);
   if (!res.ok) throw new ApiError(res.status, payload, path);
   return payload;
 }
@@ -99,6 +100,69 @@ function noteGeneration(payload) {
   if (payload && typeof payload === 'object' && payload.generation) {
     rememberGeneration(payload.generation);
   }
+}
+
+// ---- is this server as new as this page? ---------------------------------
+//
+// A board is a long-running process and web/ is read off disk per request, so a
+// tab can be running today's JS against a server that started weeks ago. Before
+// this, that just meant features quietly missing: the title switcher fetched
+// /api/siblings, got a 404 from a server that had never heard of it, swallowed
+// the error and rendered a plain title — and the user reported it as a bug in
+// the switcher. The server publishes `api_version` (what it knows how to
+// serve); the page carries its own; if the server is behind, the page says so
+// in one sentence instead of degrading in silence.
+//
+// Bump BOTH numbers in the same commit whenever web/ starts requiring an
+// endpoint or field a running server might not have.
+export const UI_API_VERSION = 2;
+
+let serverApi = null;                // null = nothing has answered yet
+const staleListeners = new Set();
+
+function noteApiVersion(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  // A server old enough to lack the field entirely is, by definition, older
+  // than the version that introduced it.
+  const v = Number.isFinite(payload.api_version) ? payload.api_version
+    : (payload.generation ? 0 : null);
+  if (v == null) return;
+  setServerApi(v);
+}
+
+function setServerApi(v) {
+  if (serverApi === v) return;
+  const was = serverIsStale();
+  serverApi = v;
+  if (serverIsStale() !== was) {
+    for (const fn of staleListeners) { try { fn(serverIsStale()); } catch {} }
+  }
+}
+
+/** The board's server is older than the page it is serving. */
+export function serverIsStale() {
+  return serverApi != null && serverApi < UI_API_VERSION;
+}
+
+export function serverApiVersion() { return serverApi; }
+
+/** Notified when "this board needs a restart" starts or stops being true. */
+export function onServerStale(fn) {
+  staleListeners.add(fn);
+  return () => staleListeners.delete(fn);
+}
+
+/**
+ * A 404 on an endpoint this page knows exists is the same news as a low
+ * api_version, from a server too old to carry the number at all. Callers that
+ * tolerate a missing endpoint (siblings.js) report it here rather than
+ * swallowing it.
+ */
+export function noteMissingEndpoint(path) {
+  if (serverApi == null || serverApi >= UI_API_VERSION) {
+    setServerApi(UI_API_VERSION - 1);
+  }
+  return path;
 }
 
 /** Record a generation seen anywhere. Returns true if it is a NEW server. */
