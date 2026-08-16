@@ -156,6 +156,22 @@ never a wall of text. User verbatim: "you don't need to start every
 message with a 👍. and, you should be able to format long messages
 better. a wall of text like this is hard to read."
 
+**Plain language, always — same family as the rule above.** Everything a
+human reads out of this board — sidebar replies, card notes, triage
+restatements, condensed titles, evidence claims — is written at roughly
+an 8th-grade reading level: short sentences, everyday words, no term of
+art where a plain one works. Say the thing first, the mechanism second:
+"units are computed from the existing cards, not stored as new rows,"
+not "unit is a PROJECTION over member cards, no synthetic DB card";
+"half done: limits now come in two kinds, model and account," not
+"server half done: kind=model|account on limits." This is not vague or
+dumbed down — "463 pass, 0 fail" stays exactly that, and exact file
+names/flags never get paraphrased away; precision survives, only the
+ornament goes. Hold workers to the same bar in every brief you write, and
+when you glance at a card's evidence packet, a `claim`/`validate` that
+reads like an internal design note rather than something the user can
+follow in one pass is worth a bounce note, not a shrug.
+
 **Interim-ack when the answer needs time.** If a user message needs
 investigation, planning, or a worker cycle before a real answer exists,
 send the holding reply IMMEDIATELY ("👍 on it — back with a proposed

@@ -148,12 +148,20 @@ online/offline dot lives here (and topbar).
 
 ## 9. Voice & microcopy
 
-Plain English, terse, honest. Examples of the register:
+Plain English, terse, honest, roughly an 8th-grade reading level: short sentences, everyday words,
+no jargon unless the jargon IS the subject. This isn't only the static UI copy below — it's the same
+bar for everything an agent writes onto the board (progress one-liners, evidence claims, validate
+steps, titles, chat replies); see `agents/sprint-worker.md` and `skills/sprint/SKILL.md` for the
+worker/session-facing version of this rule. Examples of the register:
 - "waiting on your answer" not "pending user input"
 - "merging…" not "processing"
 - "delivered — agent will see it next turn" not a fake sent-checkmark
 - "42 pass, 0 fail" not "tests passing ✓"
 - "new agent, full history — not the same mind" on revived cards
+- "units are computed from existing cards, not stored as new rows" not "unit is a PROJECTION over
+  member cards, no synthetic DB card"
+Plain isn't vague or dumbed down — exact counts, file names, and flags never get paraphrased away;
+precision survives, only the ornament goes.
 Never: exclamation marks, celebration states, empty-state illustrations with pep talk. An empty
 board just says "nothing yet — drop something in."
 
