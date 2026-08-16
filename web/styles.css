@@ -1075,6 +1075,19 @@ body.rail-open .rail { display: flex; }
 .btn.bounce:hover { border-color: var(--accent); color: var(--accent-hi); }
 .btn.reject { flex: 0 0 84px; color: var(--faint); font-weight: 400; }
 .btn.reject:hover { color: #d99a9a; border-color: #4a3236; }
+/* Mid-bounce (card #44): two buttons, and the one that sends is the filled one.
+   Approve and Reject are not here to be dimmed — they are not rendered at all
+   while you are writing, because the slip being prevented is clicking Approve
+   with a half-finished bounce in the box above it. */
+.verdicts.is-bouncing .btn.bounce {
+  background: var(--accent);
+  color: var(--send-fg);
+  border-color: transparent;
+  font-weight: 500;
+}
+.verdicts.is-bouncing .btn.bounce:hover { background: var(--accent-hi); color: var(--send-fg); }
+.verdicts.is-bouncing .btn.ghost { flex: 0 0 96px; color: var(--faint); font-weight: 400; }
+.verdicts.is-bouncing .btn.ghost:hover { color: var(--ink); }
 .bounce-notes {
   width: 100%;
   background: var(--input);

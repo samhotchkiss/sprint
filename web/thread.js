@@ -19,7 +19,9 @@
 // what keeps the rail still while the session's cursor ticks past underneath.
 import { h, ageSuffix, richText, firstLine, reconcile, timeEl } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
-import { SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, draft } from './state.js';
+import {
+  SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, draft, bounceComposing,
+} from './state.js';
 import { detailBlock } from './detail.js';
 import { flowActive } from './review.js';
 import { splitAttachments, docsVer, reportRow } from './reports.js';
@@ -124,8 +126,12 @@ export function threadItems(detail, app) {
     const walking = !!card && flowActive(card.num);
     out.push({
       key: 'packet',
+      // ...and whether you are mid-bounce, which is what swaps the three
+      // verdict buttons for "Submit bounce / Cancel". A version that ignored it
+      // would leave Approve on screen after you pressed Bounce.
       ver: `${state}:${card ? card.bounce_count : 0}:${(packet && packet.claim) || ''}`.length
-        + ':' + state + ':' + (card ? card.bounce_count : 0) + ':' + (walking ? 'w' : ''),
+        + ':' + state + ':' + (card ? card.bounce_count : 0) + ':' + (walking ? 'w' : '')
+        + ':' + (card && bounceComposing(card.num) ? 'b' : ''),
       make: () => evidencePacket(packet, card, state, app, walking),
     });
   }
@@ -455,41 +461,55 @@ function verdictBar(card, app) {
       'Bounced twice. The session stops retrying blind here and brings it to you to co-design.'));
   }
 
+  // Card #44. Hitting Bounce is already the decision; from that moment the row
+  // offers exactly two things — send it, or back out. Approve and Reject are
+  // not dimmed, they are GONE, because the failure being prevented is hitting
+  // Approve with a half-written bounce in the box under it.
+  const composing = bounceComposing(card.num) || !!draft(key);
+
   const notes = h('textarea.bounce-notes', {
     rows: '2',
     placeholder: 'What has to change? (goes straight to the agent)',
     oninput: (e) => draft(key, e.target.value),
     onkeydown: (e) => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendBounce(); }
+      if (e.key === 'Escape') { e.preventDefault(); cancelBounce(); }
     },
   });
   notes.value = draft(key);
-  const notesWrap = h('div', { hidden: !draft(key) }, notes);
 
   function sendBounce() {
     const text = notes.value.trim();
     if (!text) { notes.focus(); return; }
     draft(key, null);
+    bounceComposing(card.num, false);
     app.verdict(card, 'bounce', text);
   }
 
-  const bounceBtn = h('button.btn.bounce', {
-    type: 'button',
-    onclick: () => {
-      if (notesWrap.hidden) {
-        notesWrap.hidden = false;
-        bounceBtn.textContent = 'Send bounce';
-        notes.focus();
-        return;
-      }
-      sendBounce();
-    },
-  }, notesWrap.hidden ? 'Bounce' : 'Send bounce');
+  function cancelBounce() {
+    // Cancel puts the three buttons back. It drops only what you typed HERE —
+    // every other composer on the page keeps its draft.
+    draft(key, null);
+    bounceComposing(card.num, false);
+    app.render();
+  }
 
-  wrap.appendChild(notesWrap);
+  if (composing) {
+    wrap.appendChild(h('div', notes));
+    wrap.appendChild(h('div.verdicts.is-bouncing',
+      h('button.btn.bounce', { type: 'button', onclick: () => sendBounce() }, 'Submit bounce'),
+      h('button.btn.ghost', { type: 'button', onclick: () => cancelBounce() }, 'Cancel')));
+    setTimeout(() => notes.focus(), 0);
+    return wrap;
+  }
+
   wrap.appendChild(h('div.verdicts',
     h('button.btn.approve', { type: 'button', onclick: () => app.verdict(card, 'approve') }, 'Approve'),
-    bounceBtn,
+    h('button.btn.bounce', {
+      type: 'button',
+      title: 'send it back with notes',
+      onclick: () => { bounceComposing(card.num, true); app.render(); },
+    }, 'Bounce'),
     h('button.btn.reject', {
       type: 'button',
       title: 'this should not have been built — the branch is dropped',

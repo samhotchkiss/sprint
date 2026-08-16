@@ -5813,6 +5813,208 @@ class TestMigratedColumns(unittest.TestCase):
         card = app2.card_json(app2.card_row(1))
         self.assertFalse(card["external_agent"])
         self.assertEqual(card["work_kind"], "code")
+class TestSprintIsNamedAfterTheProject(Base):
+    """A board's title defaults to the PROJECT, never the literal "sprint".
+
+    User report: the russ board's header read "sprint" — which says nothing at
+    all when three boards are open in three tmux windows, and is the one string
+    every auto-opened sprint shared.
+    """
+
+    def test_auto_opened_sprint_takes_the_project_basename(self):
+        self.app.open_sprint(create=True)
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        self.assertEqual(board["sprint"]["title"], "project")   # basename of project_root
+
+    def test_open_without_a_title_takes_the_project_basename(self):
+        status, res = self.post("/api/sprint", {"action": "open"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["sprint"]["title"], "project")
+
+    def test_an_explicit_title_still_wins(self):
+        status, res = self.post("/api/sprint", {"action": "open", "title": "Billing week"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["sprint"]["title"], "Billing week")
+
+    def test_a_board_still_carrying_the_old_literal_default_is_renamed_once(self):
+        """Every board opened before this change is sitting under "sprint"."""
+        self.app.open_sprint(create=True)
+        with self.app.lock:
+            self.app.conn.execute("UPDATE sprints SET title='sprint'")
+        self.assertEqual(self.get("/api/board")[1]["sprint"]["title"], "sprint")
+        self.app.name_untitled_sprint()
+        self.assertEqual(self.get("/api/board")[1]["sprint"]["title"], "project")
+
+    def test_a_title_somebody_chose_is_never_touched(self):
+        self.post("/api/sprint", {"action": "open", "title": "Billing week"})
+        self.app.name_untitled_sprint()
+        self.assertEqual(self.get("/api/board")[1]["sprint"]["title"], "Billing week")
+
+    def test_the_registry_name_is_unchanged_by_any_of_this(self):
+        """The switcher labels boards from the registry; this only names sprints."""
+        entry = sprintd.registry_entry(self.project_root, 8399, "127.0.0.1")
+        self.assertEqual(entry["name"], "project")
+
+
+class TestApiVersionIsPublished(Base):
+    """A page can tell it is talking to a server older than itself."""
+
+    def test_healthz_and_board_both_carry_the_api_version(self):
+        status, health = self.get("/healthz", token=None)
+        self.assertEqual(status, 200, health)
+        self.assertEqual(health["api_version"], sprintd.API_VERSION)
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        self.assertEqual(board["api_version"], sprintd.API_VERSION)
+
+    def test_the_version_is_an_integer_that_only_goes_up(self):
+        self.assertIsInstance(sprintd.API_VERSION, int)
+        self.assertGreaterEqual(sprintd.API_VERSION, 2)
+
+
+class TestPortChoice(unittest.TestCase):
+    """`sprintd start` must never need --port: not on a restart, and not when
+    somebody else's board is already sitting on the default."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-port-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "project")
+        os.makedirs(self.root)
+
+    def hold(self, port=0):
+        """Occupy a port for the length of the test and return it."""
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        s.listen(1)
+        self.addCleanup(s.close)
+        return s.getsockname()[1]
+
+    def test_port_file_round_trips(self):
+        p = os.path.join(self.tmp, "port")
+        sprintd.write_port_file(p, 8378)
+        self.assertEqual(sprintd.read_port_file(p), 8378)
+
+    def test_a_junk_or_missing_port_file_reads_as_nothing(self):
+        p = os.path.join(self.tmp, "port")
+        self.assertIsNone(sprintd.read_port_file(p))
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("not a port\n")
+        self.assertIsNone(sprintd.read_port_file(p))
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("99999\n")
+        self.assertIsNone(sprintd.read_port_file(p))
+
+    def test_a_free_port_is_simply_taken(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        free = s.getsockname()[1]
+        s.close()
+        self.assertEqual(sprintd.choose_port(free, self.root), free)
+
+    def test_a_held_port_moves_up_to_the_next_free_one(self):
+        held = self.hold()
+        got = sprintd.choose_port(held, self.root)
+        self.assertNotEqual(got, held)
+        self.assertGreater(got, held)
+        self.assertTrue(sprintd.port_is_free(got))
+
+    def test_an_explicit_port_is_obeyed_even_when_it_is_taken(self):
+        """--port means that port. Silently moving would be the worse bug."""
+        held = self.hold()
+        self.assertEqual(sprintd.choose_port(held, self.root, explicit=True), held)
+
+    def test_it_says_which_port_it_moved_to_and_why(self):
+        held = self.hold()
+        said = []
+        got = sprintd.choose_port(held, self.root, say=said.append)
+        self.assertEqual(len(said), 1)
+        self.assertIn(str(held), said[0])
+        self.assertIn(str(got), said[0])
+
+
+class TestPortSurvivesStopAndStart(unittest.TestCase):
+    """The live failure this fixes: the russ board had been serving on 8378 for
+    weeks; a restart tried the compiled default 8377, found ANOTHER project's
+    board there, and died with "cannot bind 127.0.0.1:8377"."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-portcli-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "project")
+        os.makedirs(self.root)
+        self.server_json = os.path.join(self.root, ".sprint", sprintd.SERVER_JSON)
+        self.port_file = os.path.join(self.root, ".sprint", sprintd.PORT_FILENAME)
+        self.registry = os.path.join(self.tmp, "registry.json")
+        self.addCleanup(self._kill_leftovers)
+
+    def _kill_leftovers(self):
+        info = sprintd.read_server_json(self.server_json)
+        if info and isinstance(info.get("pid"), int):
+            try:
+                os.kill(info["pid"], 15)
+            except OSError:
+                pass
+
+    def _run(self, *argv, timeout=60):
+        import subprocess
+        return subprocess.run(
+            [sys.executable, SPRINTD_PATH, "--project-root", self.root,
+             "--registry", self.registry] + list(argv),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
+    def _free_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def test_restart_reuses_the_port_without_being_told(self):
+        port = self._free_port()
+        r = self._run("start", "--port", str(port), "--token", "keeps-its-port",
+                      "--no-tailscale")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(sprintd.read_port_file(self.port_file), port)
+
+        self.assertEqual(self._run("stop").returncode, 0)
+        self.assertFalse(os.path.exists(self.server_json))
+        self.assertTrue(os.path.exists(self.port_file),
+                        "stop must not take the port with it")
+
+        # no --port this time: the board must come back where it was
+        r2 = self._run("start", "--no-tailscale")
+        self.assertEqual(r2.returncode, 0, r2.stderr.decode())
+        self.assertIn("http://127.0.0.1:%d/?t=keeps-its-port" % port, r2.stdout.decode())
+        self.assertEqual(sprintd.read_server_json(self.server_json)["port"], port)
+        self.assertEqual(self._run("stop").returncode, 0)
+
+    def test_a_default_port_held_by_another_project_does_not_stop_the_start(self):
+        """No recorded port, and something else on the one we would have used:
+        take the next free port and say so, instead of refusing to start."""
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        held = s.getsockname()[1]
+        self.addCleanup(s.close)
+
+        self.assertIsNone(sprintd.read_port_file(self.port_file))
+        # --port is deliberately NOT passed; the preferred port is seeded the
+        # way a fresh board seeds it, through the port file.
+        os.makedirs(os.path.dirname(self.port_file), exist_ok=True)
+        sprintd.write_port_file(self.port_file, held)
+        r = self._run("start", "--no-tailscale", "--token", "moves-over")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        landed = sprintd.read_server_json(self.server_json)["port"]
+        self.assertNotEqual(landed, held)
+        self.assertEqual(sprintd.read_port_file(self.port_file), landed)
+        self.assertIn("is held by", r.stderr.decode())
+        self.assertEqual(sprintd.http_get("127.0.0.1", landed, "/healthz")[0], 200)
+        self.assertEqual(self._run("stop").returncode, 0)
 
 
 if __name__ == "__main__":
