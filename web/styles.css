@@ -3338,7 +3338,13 @@ html.skin-chaos {
 /* The handle spans the whole viewport height (it has no grid row of its own to
    stop at), so the two things it would otherwise pass in front of are lifted
    above it. Nothing about how they look changes. */
-.topbar, .banner-slot { position: relative; z-index: 40; }
+.topbar, .banner-slot { position: relative; }
+.banner-slot { z-index: 40; }
+/* …and the header sits above the banner, not merely above the handle. Giving
+   both the SAME z-index made the banner (later in the DOM) win, and the first
+   two rows of the open switcher menu — including the board you are on —
+   disappeared behind "session offline". */
+.topbar { z-index: 50; }
 
 /* --------------------------------------------------------------------------
    #56 — the switcher's square: gold, green, or split
