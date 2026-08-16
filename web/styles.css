@@ -1942,6 +1942,17 @@ html.skin-chaos .review-claim { line-height: 1.6; }
    =========================================================================== */
 
 .title-wrap { position: relative; display: flex; align-items: center; min-width: 0; }
+/* With a menu on it the clamp moves OUT to the wrap: the <h1> must not clip its
+   own button (that would cut the caret off mid-glyph on the Fold), and the
+   ellipsis belongs to the words, not to the control around them. */
+.title-wrap.has-menu { max-width: 46ch; }
+.title-wrap.has-menu .sprint-name {
+  display: flex;
+  align-items: center;
+  max-width: none;
+  min-width: 0;
+  overflow: visible;
+}
 
 /* the h1 is unchanged when there is nothing to switch to */
 .title-btn {
@@ -1955,8 +1966,8 @@ html.skin-chaos .review-claim { line-height: 1.6; }
   padding: 2px 8px 2px 9px;
   margin-left: -9px;               /* the words stay put; only the hit area grows */
   min-height: 44px;
-  max-width: 100%;
   min-width: 0;
+  overflow: hidden;
   display: inline-flex;
   align-items: center;
   gap: 9px;
@@ -1965,7 +1976,7 @@ html.skin-chaos .review-claim { line-height: 1.6; }
 }
 .title-btn:hover { border-color: var(--border-chip); background: var(--chip); }
 .title-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 0 1 auto; }
 .title-caret { font-size: 13px; color: var(--faint); line-height: 1; flex: none; }
 .title-btn[aria-expanded="true"] { border-color: var(--border-chip); background: var(--chip); }
 .title-btn[aria-expanded="true"] .title-caret { color: var(--dim); }
@@ -2023,14 +2034,21 @@ html.skin-chaos .review-claim { line-height: 1.6; }
 @media (max-width: 1199px) {
   /* the Fold: the header is 54px, so the switcher stops being taller than it */
   .title-btn { min-height: 44px; padding: 2px 7px; }
-  .sprint-menu { min-width: 280px; }
+  .title-wrap.has-menu { max-width: 300px; }
+  .sprint-menu { min-width: 320px; }
 }
 @media (max-width: 600px) {
   .sprint-menu { min-width: 0; width: calc(100vw - 24px); }
 }
 
-/* ---- Chaos: hard edges, no soft halo ------------------------------------- */
-html.skin-chaos .title-btn { border: 2px solid transparent; padding: 4px 8px; }
+/* ---- Chaos: hard edges, no soft halo -------------------------------------
+   Press Start 2P is wide: today's Chaos title WRAPS to a second line rather
+   than truncating, and putting a menu on it must not change that. So the words
+   keep wrapping and the clamp (26ch, set beside the rest of the Chaos header)
+   comes off the wrap. */
+html.skin-chaos .title-wrap.has-menu { max-width: 32ch; }  /* 26ch of words + the dot and caret */
+html.skin-chaos .title-text { white-space: normal; overflow: visible; }
+html.skin-chaos .title-btn { border: 2px solid transparent; padding: 4px 8px; overflow: visible; }
 html.skin-chaos .title-btn:hover,
 html.skin-chaos .title-btn[aria-expanded="true"] { border-color: var(--border-chip); }
 html.skin-chaos .title-dot,
