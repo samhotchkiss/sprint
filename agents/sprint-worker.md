@@ -65,6 +65,12 @@ the `SPRINT_SERVER`/`SPRINT_TOKEN` environment variables your brief set.
   `progress`/`chat`/`note` event triggers the board's silence timer and
   the session will come investigate you — post before that happens, not
   after.
+  **Never let "committed" be your last word.** To the user, "committed"
+  reads as done, but your card stays In motion until the evidence packet
+  is accepted. The moment you commit, the same one-liner must say what's
+  still ahead: "committed — verifying next (tests, screenshots, packet)".
+  User verbatim when this confused him: "some say committed but still in
+  motion".
   Also used for `chat`/`note`/`error` kinds:
   `sprint-post <num> note "..."`, `sprint-post <num> error "..."`.
 
