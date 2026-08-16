@@ -162,6 +162,13 @@ export function renderTitle(wrap, title) {
     // Card #57: "each session has a number next to it, i can hit the number to
     // go to the session". The number is drawn even for a mouse user, because a
     // shortcut nobody can see is a shortcut nobody uses.
+    //
+    // It is the row's position and nothing else, because the server already
+    // guarantees the position holds still — registry order, first seen first,
+    // never re-sorted by who is waiting on you (user: "so I can count on .1
+    // always going to session a"). Do not sort `sprints` here, for any reason:
+    // the numbering is a server-side contract precisely so that every board on
+    // the machine draws the same list in the same order.
     i < 9 ? h('span.si-key', { 'aria-hidden': 'true' }, String(i + 1)) : null,
     h('span.si-dot', { class: s.needs_you ? 'is-on' : null, 'aria-hidden': 'true' }),
     h('span.si-body',

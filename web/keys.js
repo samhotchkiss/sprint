@@ -313,14 +313,17 @@ export function handleKey(e, { isTyping, emptyTextTarget }) {
   // With the switcher open the digits belong to it — that is what the numbers
   // beside the sprint names are for.
   //
-  // The number goes to the ROW ON SCREEN, by clicking it, rather than to the
-  // nth entry of the list the page last fetched. Those are usually the same
-  // thing and occasionally are not: the server sorts the menu by who is waiting
-  // on you and for how long, and a board that appears, disappears or starts
-  // needing you reorders it. Between that poll and the next paint the array has
-  // moved and the drawn numbers have not — press 2 in that window and you would
-  // land on a sprint that was never labelled 2. Clicking the row you can see
-  // cannot be wrong: the number is printed on it.
+  // Those numbers hold still now: the server hands the list back in registry
+  // order, so a sprint keeps its number for as long as it is running, however
+  // much it starts or stops wanting your attention (card #57). What can still
+  // change it is a board going away or a new one appearing — the list only
+  // holds boards you can actually reach, so a death closes the gap behind it.
+  //
+  // Which is why the number goes to the ROW ON SCREEN, by clicking it, rather
+  // than to the nth entry of the array the page last fetched. In the window
+  // between a poll landing and the next paint, the array has moved and the
+  // drawn numbers have not. Clicking the row you can see cannot be wrong: the
+  // number is printed on it.
   if (siblingMenuOpen()) {
     if (digit && digit <= siblingCount()) {
       e.preventDefault();

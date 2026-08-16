@@ -6563,20 +6563,109 @@ def registry_entry(project_root: str, port: int, host: str, hosts=None,
         "pid": int(pid if pid is not None else os.getpid()),
         "data_dir": data_dir or os.path.join(root, DATA_DIRNAME),
         "started_at": float(started_at if started_at is not None else now()),
+        # Deliberately no "ordinal": that number belongs to the registry, which
+        # hands one out the first time it sees this project and never again.
+        # If a fresh entry carried one, every restart would overwrite the place
+        # the board already has (see `registry_register`).
     }
+
+
+# ---- where a board sits in a numbered list ---------------------------------
+#
+# Card #57, user verbatim: "the order of sprints should stay the same in the
+# list, so I can count on .1 always going to session a, .2 always going to
+# session b, etc, and not have to reassess the list each time."
+#
+# So position is a property of the BOARD, not of how much it currently wants
+# your attention. The registry stamps each project with an `ordinal` the first
+# time it registers; that number never changes again, restarts included, and a
+# board that appears later gets a bigger one. Every numbered listing sorts by
+# it, so all of them agree and none of them move under the user's fingers.
+# Attention is still shown -- the dot and the counts on each row -- it just
+# stopped being allowed to REORDER anything.
+
+
+def entry_ordinal(entry: dict):
+    """The row's place in line, or None for a row written before ordinals."""
+    try:
+        ordinal = int(entry.get("ordinal"))
+    except (TypeError, ValueError):
+        return None
+    return ordinal if ordinal >= 0 else None
+
+
+def entry_started_at(entry: dict) -> float:
+    """`started_at` as a number, and 0.0 for anything unreadable -- a garbled
+    field must never crash the read path that draws the switcher."""
+    try:
+        return float(entry.get("started_at"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def next_ordinal(entries: dict) -> int:
+    """One past the highest ordinal in the registry: the end of the line.
+
+    Never reuses the number of a board that unregistered. Reuse is how a new
+    sprint would silently inherit somebody else's muscle memory.
+    """
+    seen = [n for n in (entry_ordinal(e) for e in entries.values())
+            if n is not None]
+    return (max(seen) + 1) if seen else 0
+
+
+def registry_backfill_ordinals(entries: dict) -> dict:
+    """Number any rows that predate ordinals. Mutates and returns `entries`.
+
+    Runs once, inside the register lock. Oldest board first, ties broken on
+    project_root, so it is a pure function of the registry's contents: two
+    boards doing this one after the other reach the same answer, and the order
+    it produces is the same one `registry_order_key` was already reporting for
+    un-numbered rows -- nobody gets renumbered by the upgrade itself.
+    """
+    missing = [k for k, e in entries.items() if entry_ordinal(e) is None]
+    if not missing:
+        return entries
+    missing.sort(key=lambda k: (entry_started_at(entries[k]), k))
+    n = next_ordinal(entries)
+    for k in missing:
+        entries[k] = dict(entries[k], ordinal=n)
+        n += 1
+    return entries
+
+
+def registry_order_key(key: str, entry: dict):
+    """Sort key for every numbered listing of boards: first-seen order.
+
+    A row with no ordinal yet sorts by when it started, behind everything
+    numbered -- exactly where the backfill above is about to put it -- and
+    ties break on project_root so two readers can never disagree.
+    """
+    ordinal = entry_ordinal(entry)
+    if ordinal is None:
+        return (1, entry_started_at(entry), key)
+    return (0, ordinal, key)
 
 
 def registry_register(entry: dict, registry: str = None) -> dict:
     """Add/replace this project's row. Keyed by project_root, so restarting the
-    same board never produces a second row for it."""
+    same board never produces a second row for it.
+
+    The row also earns its `ordinal` here, the first time this project is ever
+    seen, and keeps it for good: a restart re-registers the same project_root,
+    finds the number already sitting there, and drops back into the same slot
+    in the switcher instead of jumping to the end of it.
+    """
     path = registry_path(registry)
     with _FileLock(path):
-        entries = read_registry(registry)
+        entries = registry_backfill_ordinals(read_registry(registry))
         key = os.path.realpath(entry["project_root"])
         prev = entries.get(key) or {}
         merged = dict(prev)
-        merged.update(entry)
+        merged.update(entry)               # `entry` carries no ordinal of its own
         merged.pop("last_seen", None)      # a fresh start re-earns its liveness
+        if entry_ordinal(merged) is None:
+            merged["ordinal"] = next_ordinal(entries)
         entries[key] = merged
         write_registry(entries, registry)
     return entries[key]
@@ -7623,6 +7712,13 @@ def hub_sort_key(row: dict):
 # Self is always in the list (flagged `self: true`) so the menu renders the
 # full set with the current board marked, and rolled up straight from
 # `app.board()` rather than by asking ourselves over HTTP.
+#
+# The one place the two lists differ is ORDER. The hub sorts by what is waiting
+# on you (`hub_sort_key`): it is a landing page you arrive at cold, you read it
+# top to bottom, and nothing on it is keyed to a number. The switcher does not:
+# its rows are numbered, `.` then `2` is supposed to be a reflex, and a list
+# that re-sorts itself between two glances makes that reflex a coin flip. So it
+# renders in registry order and never moves (`registry_order_key`).
 
 DEFAULT_SIBLINGS_TTL = 10.0     # server-side cache; the browser polls every 30s
 
@@ -7647,44 +7743,54 @@ def sibling_row(row: dict, is_self: bool = False) -> dict:
     }
 
 
-def sibling_sort_key(row: dict):
-    """Current board first (it is where you already are), then whatever is
-    waiting on you, longest wait first, then alphabetical."""
-    if row.get("self"):
-        return (0, 0, 0, "")
-    tier = 1 if row.get("needs_you") else 2
-    return (tier, -(row.get("stuck_seconds") or 0), -(row.get("needs_you") or 0),
-            (row.get("name") or "").lower())
-
-
 def siblings_snapshot(app, registry: str = None, timeout: float = 1.5) -> dict:
-    """Every LIVE board on this machine, including this one.
+    """Every LIVE board on this machine, including this one, in a STABLE order.
 
-    Dead/unreachable rows are dropped rather than greyed: unlike the hub, whose
-    job is to tell you a board died, this list exists to be clicked -- a row you
-    cannot navigate to is noise in a menu. The port-recycling guard is the hub's
-    (`/healthz` + `project_root` match), so a registry row whose port was taken
-    by some other project never shows up wearing that project's name.
+    Registry order -- when each board was first seen -- and nothing else. The
+    numbers beside these rows are meant to become muscle memory, so what "2"
+    points at has to be what it pointed at last time you looked. Nothing here
+    re-sorts by who is waiting on you: attention is still on every row, in the
+    dot and the counts beside it, it just no longer MOVES anybody.
+
+    That holds for this board's own row too, which sits in its registry place
+    rather than floating to the top. Otherwise "2" would mean a different
+    sprint depending on which board you happened to be looking at, and the
+    whole point is that it doesn't. The row is still marked `self`, and the
+    menu still says "here" next to it.
+
+    Dead/unreachable rows are dropped rather than greyed, and the survivors
+    close the gap. Unlike the hub, whose job is to tell you a board died, this
+    list exists to be clicked: a row you cannot navigate to is noise, and a
+    number that goes nowhere is worse than one that shifted. The survivors keep
+    their order among themselves, and a board that comes back gets its old
+    place back, because the ordinal is stamped on the project and not on the
+    run. The port-recycling guard is the hub's (`/healthz` + `project_root`
+    match), so a registry row whose port was taken by some other project never
+    shows up wearing that project's name.
     """
     self_root = os.path.realpath(app.project_root)
-    rows, saw_self = [], False
+    ranked, saw_self = [], False
     for key, entry in read_registry(registry).items():
         entry = dict(entry)
         entry.setdefault("project_root", key)
+        order = registry_order_key(key, entry)
         if os.path.realpath(entry.get("project_root") or key) == self_root:
-            rows.append(self_sibling_row(app, entry))
+            ranked.append((order, self_sibling_row(app, entry)))
             saw_self = True
             continue
         row = hub_summarize(entry, timeout=timeout)
         if not row.get("reachable"):
             continue
-        rows.append(sibling_row(row))
+        ranked.append((order, sibling_row(row)))
     if not saw_self:
-        # No registry row for us (registry write failed, or a board started
-        # before the registry existed). We are demonstrably alive -- we are
-        # answering this request -- so we list ourselves anyway.
-        rows.append(self_sibling_row(app, None))
-    rows.sort(key=sibling_sort_key)
+        # No registry row for us (the registry write failed, or this board
+        # started before the registry existed). We are demonstrably alive --
+        # we are answering this request -- so we list ourselves anyway, and at
+        # the very end: a board with no number of its own must never land in
+        # the middle and push everyone else's number along.
+        ranked.append(((2, 0.0, self_root), self_sibling_row(app, None)))
+    ranked.sort(key=lambda pair: pair[0])
+    rows = [row for _, row in ranked]
     others = [r for r in rows if not r["self"]]
     return {
         "sprints": rows,
