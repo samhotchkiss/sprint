@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""sprint-serve-setup — publish the sprint hub on the tailnet under a NAME.
+
+    sprint-serve-setup                 # print what it would do, change nothing
+    sprint-serve-setup --apply         # actually run the tailscale commands
+    sprint-serve-setup --verify        # just check the published name answers
+
+The goal is the one the card asked for: type `sprint` in a browser on any
+device on the tailnet and land on the project picker, instead of remembering
+`http://100.67.2.108:8300/`.
+
+MECHANISM: a Tailscale Service. `tailscale serve --service=svc:sprint` gives
+the service its own virtual IP and its own MagicDNS name —
+`sprint.<your-tailnet>.ts.net` — and proxies it to the hub on loopback.
+Tailscale provisions the TLS certificate for that name itself.
+
+Why a service and not plain `tailscale serve 8300`:
+
+  - plain serve publishes under the MACHINE's name (`mac-studio…`), and the
+    machine hosts other things; taking its `/` on :443 would evict whatever is
+    already mounted there.
+  - a service name is the machine-independent noun the card asked for, and it
+    moves with the hub if the hub ever moves to another box.
+
+WHAT THIS SCRIPT DOES NOT DO: it cannot define the service or grant access to
+it — those live in the tailnet's admin console / policy file, which is not a
+CLI-from-this-machine thing. It prints exactly what to click and paste, checks
+whether it's been done, and refuses to run the serve commands until it has.
+
+BOARDS ARE DELIBERATELY NOT PROXIED. The hub links out to each board at its
+raw `http://<tailnet-ip>:<port>/?t=…`, which already works from every device
+on the tailnet — those links are absolute, so they keep working no matter how
+you reached the hub. Path-mounting the boards behind the service would break
+them (their pages fetch from `/api/…`, and their sign-in cookie is keyed per
+port); serving each board on its own port would mean re-running serve every
+time a board starts or stops. One name for the picker, raw addresses for the
+boards it links to, is the arrangement that stays true on its own.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.parse
+
+DEFAULT_SERVICE = "sprint"
+DEFAULT_HUB_PORT = 8300
+MIN_TAILSCALE = (1, 86, 0)
+
+BOLD, DIM, RED, GREEN, YELLOW, OFF = (
+    ("\033[1m", "\033[2m", "\033[31m", "\033[32m", "\033[33m", "\033[0m")
+    if sys.stdout.isatty() else ("", "", "", "", "", ""))
+
+
+def say(msg=""):
+    print(msg)
+
+
+def ok(msg):
+    say("  %s✓%s %s" % (GREEN, OFF, msg))
+
+
+def bad(msg):
+    say("  %s✗%s %s" % (RED, OFF, msg))
+
+
+def warn(msg):
+    say("  %s!%s %s" % (YELLOW, OFF, msg))
+
+
+def head(msg):
+    say("\n%s%s%s" % (BOLD, msg, OFF))
+
+
+# ---------------------------------------------------------------------------
+# reading the world (all read-only)
+# ---------------------------------------------------------------------------
+
+
+def tailscale_exe(override=None):
+    if override:
+        return override if os.path.exists(override) else None
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    mac = "/Applications/Tailscale.app/Contents/MacOS/tailscale"
+    return mac if os.path.exists(mac) else None
+
+
+def run(argv, timeout=20):
+    """-> (returncode, stdout, stderr). Never raises."""
+    try:
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, "", str(exc)
+    return (p.returncode,
+            p.stdout.decode("utf-8", "replace"),
+            p.stderr.decode("utf-8", "replace"))
+
+
+def version_tuple(text):
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(g) for g in m.groups()) if m else (0, 0, 0)
+
+
+def hub_dir(registry=None):
+    reg = registry or os.environ.get("SPRINT_REGISTRY")
+    if reg:
+        return os.path.dirname(os.path.abspath(reg))
+    return os.path.join(os.path.expanduser("~"), ".sprint")
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def read_line(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def hub_facts(registry=None, port_override=None):
+    """Where the hub is and what its token is, straight off disk."""
+    d = hub_dir(registry)
+    info = read_json(os.path.join(d, "hub.json")) or {}
+    port = port_override or info.get("port") or DEFAULT_HUB_PORT
+    token = info.get("token") or read_line(os.path.join(d, "hub-token"))
+    return {"dir": d, "port": int(port), "token": token,
+            "pid": info.get("pid"),
+            "canonical_file": os.path.join(d, "hub-canonical")}
+
+
+def hub_alive(port, timeout=3.0):
+    """-> (True, detail) only if something on that port says it IS the hub."""
+    import http.client
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        conn.request("GET", "/healthz")
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", "replace")
+        conn.close()
+    except Exception as exc:  # noqa: BLE001 - a probe never fails the script
+        return False, str(exc)
+    if resp.status != 200:
+        return False, "HTTP %s" % resp.status
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return False, "that port did not answer JSON"
+    if not data.get("hub"):
+        return False, "that port is a board, not the hub"
+    return True, "pid %s" % data.get("pid")
+
+
+def tailnet_facts(exe):
+    rc, out, err = run([exe, "status", "--json"])
+    if rc != 0:
+        return {"error": (err or out).strip() or "tailscale status failed"}
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return {"error": "could not parse `tailscale status --json`"}
+    self_node = data.get("Self") or {}
+    return {
+        "suffix": data.get("MagicDNSSuffix") or "",
+        "tags": self_node.get("Tags") or [],
+        "dns_name": (self_node.get("DNSName") or "").rstrip("."),
+        "cert_domains": data.get("CertDomains") or [],
+        "caps": sorted((self_node.get("CapMap") or {}).keys()),
+        "backend": data.get("BackendState"),
+    }
+
+
+def serve_config(exe):
+    rc, out, _ = run([exe, "serve", "status", "--json"])
+    if rc != 0:
+        return {}
+    try:
+        return json.loads(out) or {}
+    except ValueError:
+        return {}
+
+
+def existing_service_mounts(cfg, service, hub_port):
+    """What this node already serves for svc:<service>, as {port: proxy-target}.
+
+    `tailscale serve status --json` keys web handlers by `<host>:<port>`, and a
+    service's handlers are keyed by the service's own name.
+    """
+    found = {}
+    for key, block in (cfg.get("Web") or {}).items():
+        host, _, port = key.rpartition(":")
+        if host not in ("svc:" + service, service):
+            continue
+        for _, handler in (block.get("Handlers") or {}).items():
+            found[port] = handler.get("Proxy") or ""
+    return found
+
+
+# ---------------------------------------------------------------------------
+# the plan
+# ---------------------------------------------------------------------------
+
+
+def serve_commands(exe, service, hub_port, https_port, http_port):
+    target = "http://127.0.0.1:%d" % hub_port
+    cmds = [[exe, "serve", "--service=svc:%s" % service,
+             "--https=%d" % https_port, "--yes", target]]
+    if http_port:
+        cmds.append([exe, "serve", "--service=svc:%s" % service,
+                     "--http=%d" % http_port, "--yes", target])
+    return cmds
+
+
+def quoted(cmd):
+    out = []
+    for part in cmd:
+        out.append(part if re.match(r"^[A-Za-z0-9_@%+=:,./-]+$", part)
+                   else "'" + part.replace("'", "'\\''") + "'")
+    return " ".join(out)
+
+
+def console_steps(service, tags, https_port, http_port):
+    ports = ['"tcp:%d"' % https_port] + (['"tcp:%d"' % http_port] if http_port else [])
+    tag = tags[0] if tags else "tag:server"
+    grant_ports = ", ".join('"tcp:%d"' % p for p in [https_port] + ([http_port] if http_port else []))
+    return [
+        ("1. Define the service",
+         "https://login.tailscale.com/admin/services -> Advertise -> Define a "
+         "Service.\n"
+         "   Name: %s\n"
+         "   Endpoints: %s" % (service, ", ".join(ports))),
+        ("2. Let members reach it (tailnet policy file)",
+         '"grants": [\n'
+         '  {"src": ["autogroup:member"], "dst": ["svc:%s"], "ip": [%s]}\n'
+         "]" % (service, grant_ports)),
+        ("3. Auto-approve this machine as its host (same policy file)",
+         '"autoApprovers": {\n'
+         '  "services": {\n'
+         '    "svc:%s": ["%s"]\n'
+         "  }\n"
+         "}" % (service, tag)),
+    ]
+
+
+def verify(url, timeout=8.0):
+    """Fetch <url>/healthz through the published name. -> (ok, detail)."""
+    import ssl
+    import urllib.error
+    import urllib.request
+    target = url.rstrip("/") + "/healthz"
+    try:
+        with urllib.request.urlopen(target, timeout=timeout,
+                                    context=ssl.create_default_context()) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        return False, "HTTP %s from %s" % (exc.code, target)
+    except Exception as exc:  # noqa: BLE001
+        return False, "%s (%s)" % (exc, target)
+    if status != 200:
+        return False, "HTTP %s from %s" % (status, target)
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return False, "%s did not answer JSON" % target
+    if not data.get("hub"):
+        return False, "%s answered, but it is not the hub" % target
+    return True, "%s -> hub pid %s" % (target, data.get("pid"))
+
+
+# ---------------------------------------------------------------------------
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="sprint-serve-setup",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__)
+    ap.add_argument("--service", default=DEFAULT_SERVICE,
+                    help="service name, i.e. the hostname you will type "
+                         "(default: %(default)s)")
+    ap.add_argument("--port", type=int, default=None,
+                    help="hub port (default: whatever ~/.sprint/hub.json says, "
+                         "else %d)" % DEFAULT_HUB_PORT)
+    ap.add_argument("--registry", default=None,
+                    help="registry.json path; moves the whole machine-wide "
+                         "state (same override sprintd takes)")
+    ap.add_argument("--https-port", type=int, default=443)
+    ap.add_argument("--http-port", type=int, default=80,
+                    help="also serve plain HTTP here, which is what makes the "
+                         "BARE name (`sprint/`) work; 0 to skip")
+    ap.add_argument("--apply", action="store_true",
+                    help="run the tailscale commands (default: print them)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print only — the default, accepted for symmetry")
+    ap.add_argument("--verify", action="store_true",
+                    help="skip straight to checking the published name answers")
+    ap.add_argument("--tailscale", default=None, help="path to the tailscale binary")
+    args = ap.parse_args(argv)
+
+    exe = tailscale_exe(args.tailscale)
+    if not exe:
+        bad("no `tailscale` binary on PATH (or in /Applications/Tailscale.app)")
+        return 1
+
+    hub = hub_facts(args.registry, args.port)
+    net = tailnet_facts(exe)
+    if net.get("error"):
+        bad(net["error"])
+        return 1
+    suffix = net["suffix"]
+    fqdn = "%s.%s" % (args.service, suffix) if suffix else None
+    origin = "https://%s" % fqdn if fqdn else None
+
+    if args.verify:
+        head("Checking the published name")
+        if not origin:
+            bad("no MagicDNS suffix — is MagicDNS enabled on this tailnet?")
+            return 1
+        good, detail = verify(origin)
+        (ok if good else bad)(detail)
+        if not good:
+            say("\n  A service can take a moment to propagate, and it only "
+                "answers once\n  the host advertisement is approved in the "
+                "admin console.")
+        return 0 if good else 1
+
+    # ---- preflight ---------------------------------------------------------
+    head("Preflight")
+    fatal = []
+
+    ver = version_tuple(run([exe, "version"])[1])
+    if ver >= MIN_TAILSCALE:
+        ok("tailscale %s (services need %s+)"
+           % (".".join(map(str, ver)), ".".join(map(str, MIN_TAILSCALE))))
+    else:
+        bad("tailscale %s is too old for services (need %s+)"
+            % (".".join(map(str, ver)), ".".join(map(str, MIN_TAILSCALE))))
+        fatal.append("upgrade tailscale")
+
+    if suffix:
+        ok("MagicDNS suffix %s — the name will be %s" % (suffix, fqdn))
+    else:
+        bad("no MagicDNS suffix; a service has no name to answer to")
+        fatal.append("enable MagicDNS")
+
+    alive, detail = hub_alive(hub["port"])
+    if alive:
+        ok("hub answering on 127.0.0.1:%d (%s)" % (hub["port"], detail))
+    else:
+        bad("nothing is the hub on 127.0.0.1:%d (%s) — run `sprintd hub` first"
+            % (hub["port"], detail))
+        fatal.append("start the hub")
+
+    if net["tags"]:
+        ok("this node is tagged %s (a service host wants tag identity)"
+           % ", ".join(net["tags"]))
+    else:
+        warn("this node has no tags — auto-approval keys off a tag, so you "
+             "will have to approve the host by hand in the admin console")
+
+    defined = ("services/%s" % args.service) in net["caps"]
+    if defined:
+        ok("svc:%s is already defined and this node may host it" % args.service)
+    else:
+        warn("svc:%s is not defined yet (or this node is not approved for it)"
+             % args.service)
+
+    if fatal:
+        say("\n%sStopping: %s%s" % (RED, "; ".join(fatal), OFF))
+        return 1
+
+    # ---- what the console still needs --------------------------------------
+    if not defined:
+        head("Do this first, in the admin console (nothing here can do it for you)")
+        for title, block in console_steps(args.service, net["tags"],
+                                          args.https_port, args.http_port):
+            say("  %s%s%s" % (BOLD, title, OFF))
+            for line in block.splitlines():
+                say("    " + line)
+            say()
+
+    # ---- idempotency -------------------------------------------------------
+    cfg = serve_config(exe)
+    mounted = existing_service_mounts(cfg, args.service, hub["port"])
+    want = "http://127.0.0.1:%d" % hub["port"]
+    wanted_ports = [str(args.https_port)] + (
+        [str(args.http_port)] if args.http_port else [])
+    already = all(mounted.get(p, "").rstrip("/") == want for p in wanted_ports)
+
+    head("Serve config")
+    if already:
+        ok("svc:%s already proxies %s to the hub — nothing to change"
+           % (args.service, "/".join(wanted_ports)))
+    else:
+        for p in wanted_ports:
+            cur = mounted.get(p)
+            if cur and cur.rstrip("/") != want:
+                warn("svc:%s:%s currently proxies to %s; it will be repointed "
+                     "at the hub" % (args.service, p, cur))
+        cmds = serve_commands(exe, args.service, hub["port"],
+                              args.https_port, args.http_port)
+        say("  These are the commands (safe to re-run; serve config is "
+            "declarative):")
+        for c in cmds:
+            say("    %s%s%s" % (BOLD, quoted(c), OFF))
+
+        if not args.apply:
+            say("\n  %s--dry-run (default). Nothing was changed. Re-run with "
+                "--apply.%s" % (DIM, OFF))
+        else:
+            if not defined:
+                warn("svc:%s is not defined/approved yet. `tailscale serve` "
+                     "initialises a service it does not find, but the tailnet "
+                     "still has to grant access to it and approve this host "
+                     "(steps 2 and 3 above). Undo with `%s serve clear "
+                     "svc:%s`." % (args.service, exe, args.service))
+            for c in cmds:
+                say("\n  $ %s" % quoted(c))
+                rc, out, err = run(c, timeout=60)
+                for line in (out + err).splitlines():
+                    say("    " + line)
+                if rc != 0:
+                    bad("that command exited %d — stopping" % rc)
+                    return 1
+            ok("serve config applied")
+
+    # ---- teach the hub its own name ---------------------------------------
+    head("The hub's own name")
+    current = read_line(hub["canonical_file"])
+    if current == origin:
+        ok("%s already records %s" % (hub["canonical_file"], origin))
+    elif args.apply:
+        try:
+            with open(hub["canonical_file"] + ".tmp", "w", encoding="utf-8") as fh:
+                fh.write(origin + "\n")
+            os.replace(hub["canonical_file"] + ".tmp", hub["canonical_file"])
+            os.chmod(hub["canonical_file"], 0o600)
+            ok("wrote %s -> %s (the hub re-reads it within seconds; no restart)"
+               % (hub["canonical_file"], origin))
+        except OSError as exc:
+            warn("could not write %s (%s) — the bare name will still work, it "
+                 "just won't redirect to the FQDN" % (hub["canonical_file"], exc))
+    else:
+        say("  would write %s -> %s" % (hub["canonical_file"], origin))
+        say("  %s(that is what makes `sprint/` bounce to the https name, so one "
+            "sign-in covers both)%s" % (DIM, OFF))
+
+    # ---- verify ------------------------------------------------------------
+    if args.apply:
+        head("Verifying through the published name")
+        good, detail = verify(origin)
+        (ok if good else warn)(detail)
+        if not good:
+            say("  A brand new service takes a moment, and it stays dark until "
+                "the host\n  advertisement is approved. Re-check any time with "
+                "`sprint-serve-setup --verify`.")
+
+    # ---- what to type ------------------------------------------------------
+    head("What to type in a browser")
+    token = hub["token"]
+    if token:
+        say("  First time on a device (this link signs you in and the cookie "
+            "lasts a year):")
+        say("    %s%s/?t=%s%s" % (BOLD, origin, urllib.parse.quote(token), OFF))
+    else:
+        warn("no hub token on disk yet — run `sprintd hub` and use the URL it "
+             "prints, with this host swapped in")
+    say("\n  Every time after that:")
+    say("    %s%s/%s" % (BOLD, origin, OFF))
+    if args.http_port:
+        say("    %s%s/%s   %s(bare name — works where the device honours the "
+            "tailnet search domain;\n              it is plain http and bounces "
+            "to the https name above)%s"
+            % (BOLD, args.service, OFF, DIM, OFF))
+    say()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
