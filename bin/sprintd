@@ -3586,12 +3586,10 @@ def make_handler(app: App):
                 self.drain_body()
                 raise ApiError(404, "no_such_route", "no route for PUT %s" % path)
             body = self.json_body()
-            actor_hint = body.get("actor")
             patch = body.get("settings", body)
             if isinstance(patch, dict):
                 patch = {k: v for k, v in patch.items() if k != "actor"}
-            settings = app.save_settings(
-                patch, actor=actor_hint if actor_hint in ACTORS else "user")
+            settings = app.save_settings(patch, actor=self.actor_or(body, "user"))
             return self.json_out(200, {"ok": True, "settings": settings,
                                        "defaults": DEFAULT_SETTINGS})
 
@@ -3605,8 +3603,7 @@ def make_handler(app: App):
                 patch = body.get("settings", body)
                 if isinstance(patch, dict):
                     patch = {k: v for k, v in patch.items() if k != "actor"}
-                settings = app.save_settings(
-                    patch, actor=actor_hint if actor_hint in ACTORS else "user")
+                settings = app.save_settings(patch, actor=self.actor_or(body, "user"))
                 return 200, {"ok": True, "settings": settings,
                              "defaults": DEFAULT_SETTINGS}
 
