@@ -25,8 +25,14 @@
 import { store, cardState, BOARD_COLUMNS } from './state.js';
 import { siblingMenuOpen, openSiblingMenu, closeSiblingMenu, siblingCount, gotoSibling } from './siblings.js';
 
-/** Everything on the board you can put the cursor on, in DOM order. */
-const NAV_SEL = '.card[data-num], .row[data-num], .review-lead[data-num], .pill[data-num],'
+/**
+ * Everything on the board you can put the cursor on, in DOM order.
+ *
+ * Card #53 made the whole review row the click target (`.review-item`), so that
+ * is the node that now carries `data-num` there — it is the same row, one
+ * wrapper further out than it used to be.
+ */
+const NAV_SEL = '.card[data-num], .row[data-num], .review-item[data-num], .pill[data-num],'
   + ' .done-row[data-num]';
 
 /** The four numbered columns, in the order the Board draws them. */
@@ -252,6 +258,12 @@ function openCursor() {
  */
 export function handleKey(e, { isTyping, emptyTextTarget }) {
   if (e.metaKey || e.ctrlKey || e.altKey) return false;
+  // Whatever the key landed ON gets first refusal. Card #53 gave every List and
+  // review row its own Enter/Space ("the whole row is one click target"), and
+  // that handler runs before this one does — it opens the same card with the
+  // same caret this would, so the right thing here is to stand down rather than
+  // do it a second time.
+  if (e.defaultPrevented) return false;
   const a = document.activeElement;
 
   // The shortcut map. `?` is Shift+/, so it can never collide with `/` itself.

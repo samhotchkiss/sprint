@@ -38,9 +38,15 @@ port).
 All of your own (session-level) API calls use `curl` with
 `-H "Authorization: Bearer $SPRINT_TOKEN"`. The three worker helpers
 (`sprint-post`, `sprint-ask`, `sprint-ready`) are for workers, not you —
-you have the full API, they get the narrow card-scoped slice. There is
-one helper that is yours and not theirs: `bin/sprint-recover <num…>`,
-which prints the recovery brief for a card whose agent died (step 5b).
+you have the full API, they get the narrow card-scoped slice. Two
+helpers are yours and not theirs, and both belong to step 5b:
+
+- `bin/sprint-recover <num…>` — the recovery brief for a card whose
+  agent died: state, last 10 timeline lines, worktree, branch, what is
+  dirty.
+- `bin/sprint-limit declare --model fable --resets "11:50pm"` — record
+  the reset time a provider's kill message gave you, so the board can
+  show it and tell you when it is over. `list` and `clear <id>` too.
 
 ## Card state machine (reference)
 
@@ -280,10 +286,12 @@ and the table is prose.
 | session | `integrated` (ok: true) | Your own echo from step 6 — card is now `completed`. No further action beyond the cleanup you already did as part of calling it (kill preview server, prune worktree). |
 | session | `integrated` (ok: false) | Your own echo from step 6 — card is back in `in_progress` with an `error` note. You already told the agent what failed when you posted it; nothing further here. |
 | worker | `progress`/`note`/`error` | Telemetry. No action required (the board shows it); read it if you're specifically checking on a card (step 5) or if `error` looks fatal, in which case flip it to `failed` yourself: `POST /api/cards/:num/state {"state":"failed","actor":"session","reason":"<machine-named>"}`. **`failed` and `stale` are session-only states** — a worker's own state route can only reach `triaging`/`in_progress`/`blocked`, so a dead agent can only be declared dead by you. |
-| worker | `question` | Server already flipped to `needs_you`. Nothing to do — the card face shows the question; you'll see the `answer` event when the user responds. |
+| worker | `question` | Server already flipped to `needs_you`. Nothing to do — the card face shows the question; you'll see the `answer` event when the user responds. A question with `payload.artifacts` is a **decision request** (mockups, a live URL, notes for a choice the agent cannot make itself); the rail renders them above the answer box, so still nothing to relay — but if you re-surface it after 30 minutes, say what is attached ("#42 wants you to pick one of three headers — screenshots and a preview are on the card"). |
 | worker | `evidence` (ready) | Card (or whole batch) just entered `ready`. Nothing required from you — it's now waiting on the user's verdict. Optional: a short sidebar note if the user seems to be waiting on it. |
 | server | `note` with `payload.settings` | The user changed the board's dispatch policy in the Settings panel (model, executors, concurrency). Nothing is owed in reply — but your next dispatch reads the new values, including a concurrency cap that may have just gone up (dispatch now) or down (don't start another until you are back under it). |
 | server | `agent_silent` | See step 5 — go investigate. |
+| server | `limit_cleared` | A provider limit window just ended. **This is a work signal, not a notification.** `payload.kind` says which procedure: `"model"` — re-dispatch what you downgraded, back on the model named in `payload.model`; `"account"` — the whole Claude account came back (the user pressed Resume after signing in with another session), so **re-dispatch every card parked or killed during the window, briefing each with its own timeline**. `payload.reason` says whether the clock got there or somebody cleared it early. See step 5b. |
+| server | `limit_declared` | A limit declaration — yours, or (for `kind: "account"`) one another board on this machine made. Nothing to do; the board is now showing the line or the banner. |
 | server | `stuck` | The board's staleness sweep: a card parked in a state somebody owes an action on. `payload.state` names which, and that is what you act on — see the row below. Nothing is broken; something is owed, and it's usually owed by you. |
 | server | `state` (blocked) | Note the reason; you'll re-check blocked cards periodically (not driven by an event — see "Blocked sweep" below). |
 
@@ -579,6 +587,29 @@ you don't block on a worker, you find out what happened through the
 board and through `SendMessage` replies. Don't pass `isolation:
 "worktree"` — you already built the exact worktree it needs; the
 brief's job is to tell it where.
+
+Brief contents, every time:
+- The card's full text (all member cards' text, for a batch).
+- Absolute paths to any attachments (workers `Read` images directly —
+  never re-upload or re-describe them).
+- `SPRINT_SERVER`, `SPRINT_TOKEN`, and its card number(s).
+- Its assigned worktree path and branch.
+- A pointer to the worker contract (`agents/sprint-worker.md` — the
+  agent definition already carries this, but restate the non-negotiables
+  inline: no `rm`, no prompting commands, one branch, never push main,
+  report via the three helpers, screenshot light+dark from its own
+  worktree preview on any UI change).
+- **Which handoff it owes, if the card could go either way.** User
+  ruling, verbatim: *"needs you is where we talk through things. review
+  means the session genuinely thinks the card is 100% complete. needs
+  you is that the card is waiting for my input before it can keep moving
+  forward."* A card that asks for a design call, a pick between options,
+  or "is this what you meant" is a **decision request** — `sprint-ask
+  <num> "…" --options … --url … --attach … --notes …`, which lands it in
+  `needs_you` with the mockups/preview rendered above the answer box. It
+  is NOT a `sprint-ready` packet, and a packet is not a way to ask a
+  question. Say so in the brief when the card is that shape, so the
+  agent doesn't build one arbitrary answer and submit it as finished.
 
 A subagent gets `agents/sprint-worker.md` for free (it IS its agent
 definition), so the inline restatement of the contract is belt-and-
@@ -882,6 +913,38 @@ You find out one of three ways, and any one of them is enough:
 If you hit a provider limit dispatching one agent, assume it hit the
 others too. **Check every live card, not just the one you noticed.**
 
+### Read the reset time off the kill message FIRST
+
+The message that killed the agent usually says when it ends:
+
+```
+You've hit your session limit · resets 11:50pm (America/Denver)
+```
+
+**That sentence is the most valuable thing in the incident and it is
+gone the moment you scroll past it.** Record it before you do anything
+else — one command, and it can take the provider's wording verbatim:
+
+```
+bin/sprint-limit declare --model fable --resets "11:50pm" --source "kill message"
+```
+
+`--resets` also takes `"11:50pm (America/Denver)"`, an ISO 8601
+timestamp, or an epoch. A bare clock time means the **next** time it
+comes round, which at 11:52pm is tomorrow — the answer you meant. The
+command prints back the exact instant it landed on; read that line, it
+is how you catch a typo before the board acts on it.
+
+Declaring it does three things you would otherwise be doing by hand:
+the board shows a quiet line while the window is open ("fable is
+rate-limited until 11:50pm — work is running on opus"), `GET
+/api/limits` (and `/api/board`'s `limits`) can be asked what is
+limited, and when the window passes the board emits exactly one
+`limit_cleared` event — your cue to put the work back.
+
+If you cannot find a reset time, skip this and carry on; everything
+below still works. But look before you decide you cannot find it.
+
 ### The required response
 
 **Re-dispatch the same card(s) immediately, on the next model down.**
@@ -915,20 +978,141 @@ For each card:
      `git log origin/main..HEAD` and `git status` first, always. Redoing
      work on top of a half-finished commit is how a recoverable mess
      becomes a conflicted one.
-3. **Record the model** on the assign call so the user can see it:
-   `POST /api/cards/:num/assign {"agent_name":…, "worktree":…,
-   "branch":…, "model":"opus"}`. The card face shows the model **only
-   when it differs from the sprint default**, so an ordinary dispatch
-   stays quiet and a fallback is visible at a glance. The timeline note
-   reads "assigned to sprint-card-42 on opus".
+3. **Record the model AND why** on the assign call:
+
+   ```
+   POST /api/cards/:num/assign {"agent_name": …, "worktree": …, "branch": …,
+                                "model": "opus",
+                                "model_reason": "fable limited until 11:50pm"}
+   ```
+
+   The card face shows the model **only when it differs from the sprint
+   default**, so an ordinary dispatch stays quiet and a fallback is
+   visible at a glance. The timeline note reads "assigned to
+   sprint-card-42 on opus — fable limited until 11:50pm".
+
+   **`model_reason` is not decoration — it is how you find these cards
+   again.** When the window ends you will be re-reading `/api/board`,
+   possibly in a different session after a restart, and the cards that
+   were downgraded have to be knowable from the payload rather than
+   from your memory of what you did last night. Set it on every
+   limit-driven dispatch, and set it on anything you PARK for the limit
+   too (a card you left `queued` rather than dispatch): a queued card
+   with a `model_reason` is a card you owe a dispatch to.
 4. **Say it in the sidebar, once, for the batch**: which cards were
-   killed, what limit did it, and what they are now running on. One
-   line. The user should never be the one who notices that agents died.
+   killed, what limit did it, when it resets, and what they are now
+   running on. One line. The user should never be the one who notices
+   that agents died.
 
 If a card was already moved to `failed` by the board, the same procedure
 applies — the user's Retry and your re-dispatch are the same act; you do
 not need to wait for them to click it. `failed` preserves the timeline,
 the evidence, the branch and the worktree precisely so this works.
+
+### When the window ends — the `limit_cleared` reaction
+
+The board emits **one** `limit_cleared` event when a declared window
+passes (or when someone clears it early with `bin/sprint-limit clear
+<id>`). It is `card_num: null`, `actor: "server"`, and it names the
+model in `payload.model`. Your standing tail wakes on it like any other
+server event, and it is the second half of this procedure — without it,
+"downgrade now, restore later" is just "downgrade".
+
+On `limit_cleared`, in the same wakeup:
+
+1. **Find what was downgraded.** `GET /api/board` and take every
+   non-terminal card whose `model_reason` is set and whose `model` is
+   not the model that just came back. That is the list; there is no
+   filter endpoint and none is needed.
+2. **Put each one back on its original model.** For a card still in
+   flight, that means re-dispatching it on the model it should have had
+   — same worktree, same branch, and the same "inspect before you redo
+   anything" brief you used on the way down (`bin/sprint-recover <num>`
+   still prints it). For a card you parked in `queued`, dispatch it now.
+   Judgement applies to one case only: a downgraded agent that is nearly
+   done. Finishing beats switching horses — leave it, and clear the
+   reason when it lands.
+3. **Record the switch back**, the same way you recorded the switch
+   down: `assign` with the original `"model"` and `"model_reason": ""`.
+   The empty string is how you say "this is not a downgrade any more" —
+   omitting the field leaves the old reason on the card, which would
+   make it look downgraded forever. The timeline note is what tells the
+   user this card came home.
+4. **One sidebar line for the whole batch**: the window ended, and which
+   cards went back on which model.
+
+Then it is over: the board's limit line is already gone (it goes off the
+clock, not off your reaction), and no card is left wearing a reason that
+is no longer true.
+
+### The OTHER kind: the whole account is out
+
+Everything above is one model going away and the work moving down a
+tier. The account-level limit is a different animal: **the overall
+Claude weekly limit, where nothing can run at all and there is no next
+model down.** You will usually find out by dying yourself.
+
+Declare it the moment you see it — before re-dispatching anything,
+because there is nothing to re-dispatch onto:
+
+```
+bin/sprint-limit declare --account --resets "11:50pm" --source "kill message"
+```
+
+That does three things the model-kind declaration does not:
+
+- **Every board on this machine** grows a big banner at the top —
+  including boards in other projects, and boards started after the
+  declaration. It is machine-wide state (one file beside the registry),
+  not a message from you, so it survives your session dying, which it
+  is about to.
+- The banner says what happened, when it lifts, and what to do: **log
+  out of Claude, sign in with another Claude session, then press
+  Resume.** That is the user's move, not yours.
+- The **Resume button** in that banner clears the window and emits
+  `limit_cleared` with `payload.kind == "account"`. It works with no
+  session attached — which is the point, because while an account limit
+  is on there is no session.
+
+Before you go: park what is in flight. Any card you cannot dispatch
+gets `model_reason` set ("account limit until 11:50pm") exactly as in
+step 3 above — a parked card without one is a card nobody will find
+when the account comes back.
+
+### Reacting to an account-kind `limit_cleared`
+
+When the user presses Resume, a new session (his second Claude login)
+picks the board up. `payload.kind` tells you which procedure you are in:
+
+- `kind: "model"` — the procedure above: put downgraded cards back on
+  the original model.
+- `kind: "account"` — **re-dispatch every card that was parked or
+  killed while the window was on.** Not a tier change: these cards were
+  not running at all.
+
+For the account kind, in the same wakeup:
+
+1. **Build the list.** `GET /api/board`, and take every non-terminal
+   card whose `model_reason` mentions the account limit, plus every
+   card that went `failed` with a `worker gone:` reason during the
+   window (`GET /api/limits` gives you the window's `declared_at` and
+   `cleared_at` — anything that died between them belongs to it).
+2. **Brief each one with its OWN timeline.** `bin/sprint-recover <num>`
+   per card, pasted into that card's brief — never one shared summary
+   across the batch. A card's agent was killed mid-thought and the next
+   agent has to know what its predecessor had already committed; that
+   is per-card knowledge and it does not survive being averaged.
+   Include the two other lines from step 5b: a previous agent was
+   killed by a limit, and it must read `git log origin/main..HEAD` and
+   `git status` before redoing anything.
+3. **Dispatch on the normal model** — the account came back, not a
+   tier. Clear the parking reason with `"model_reason": ""` on the
+   assign.
+4. **One sidebar line for the batch**: the account limit is over and
+   which cards went back out.
+
+The banner is gone off the board already (it clears off the shared
+state, not off your reaction), on every board on the machine.
 
 ---
 

@@ -166,10 +166,65 @@ the `SPRINT_SERVER`/`SPRINT_TOKEN` environment variables your brief set.
   card to `needs_you`. **Then END YOUR TURN.** Don't keep working, don't
   guess and proceed — the whole point of `needs_you` is that guessing is
   worse than waiting. You'll be resumed with the answer once it lands.
+
+  **A question can hand over ARTIFACTS.** If what you need is a decision
+  rather than a fact — pick one of these three mockups, is this the layout
+  you meant, which of these two behaviours — then give the user the thing
+  he is deciding about, in the same motion:
+
+  ```
+  sprint-ask 42 "Which of these three headers do you want me to build out?" \
+    --options '["A — flat","B — split","C — sticky"]' \
+    --url http://100.x.x.x:8442/preview \
+    --attach /abs/a.png --attach /abs/b.png --attach /abs/c.png \
+    --notes "All three keep the 44px touch targets. B costs an extra request."
+  ```
+
+  - `--url` a live preview he can open (http/https). `--attach` an absolute
+    path to a .png/.jpg, repeatable — read off disk and stored exactly like a
+    packet's screenshots, so deleting the file later doesn't break the card.
+    `--notes` a short paragraph of context.
+  - The board renders all of it **above the answer box** in the rail, so what
+    you are asking about is on screen while he types the answer.
+  - The card lands in **`needs_you`**, never `ready`. That is the whole point:
+    see the next section.
 - `sprint-ready <num> packet.json` — when the work is done and verified.
   Client-side validated before it ever hits the network; if it 422s
   anyway, fix the exact named field it complains about and retry. See
   "Evidence packet" below.
+
+## Two handoffs, and they are not interchangeable
+
+User ruling, verbatim: **"needs you is where we talk through things. review
+means the session genuinely thinks the card is 100% complete. needs you is
+that the card is waiting for my input before it can keep moving forward."**
+
+You have exactly two ways to hand a card back, and which one you pick is a
+statement about the work, not a matter of taste:
+
+| | you are saying | command | lands in |
+|---|---|---|---|
+| **Evidence packet** | "I believe this is done." | `sprint-ready` | `ready` — Awaiting review |
+| **Decision request** | "I need you to choose/answer before I continue." | `sprint-ask` | `needs_you` |
+
+So: mockups to pick between, a design call, "which of these three", "is this
+the behaviour you meant", an approach that could go two ways — **all of those
+are `sprint-ask`, with `--url`/`--attach`/`--notes` so he can see what he is
+choosing between.** None of them is a packet. A packet whose `claim` is really
+a question asks the user to sign off on work you have just told him is
+unfinished, and it lands in the wrong column with the wrong verb on it
+("Approve" is not an answer to "which one?").
+
+`sprint-ready` prints a notice on stderr when a packet looks like a question in
+disguise — a `validate` step that ends in a question mark, a `claim` that is a
+question, an `options` field a packet has no room for. It is a **notice, not a
+gate**: the packet still posts. If you see one, you almost certainly wanted
+`sprint-ask`.
+
+Nothing about this weakens the packet gate. A decision request is not a way to
+finish a card without evidence — the card comes back to you in `in_progress`
+the moment he answers, and it still has to go through `sprint-ready` when the
+work is actually done.
 
 ## First act on pickup
 

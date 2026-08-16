@@ -58,6 +58,10 @@ try {
 
   <div class="banner-slot" id="banner-slot" hidden>
     <div class="banner" id="banner"></div>
+    <!-- one quiet line per open provider limit window ("fable is rate-limited
+         until 11:50pm — work is running on opus"). Same slot, same register as
+         the offline banner; app.js fills it from the board's `limits`. -->
+    <div class="limit-banners" id="limit-banners" hidden></div>
   </div>
 
   <main class="main" id="main" aria-label="board"></main>
@@ -103,14 +107,20 @@ try {
       <dt><kbd>.</kbd></dt><dd>Switch sprint — the menu numbers itself, press a number to go</dd>
       <dt><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>4</kbd></dt>
       <dd>Waiting · In progress · Needs you · Review — the same four in either layout</dd>
-      <dt><kbd>↑</kbd><kbd>↓</kbd></dt><dd>Move through that column — each card previews in the rail</dd>
-      <dt><kbd>Return</kbd></dt><dd>Open the highlighted card and start typing a reply</dd>
+      <dt><kbd>↑</kbd><kbd>↓</kbd></dt><dd>Move through that column — each card you land on opens in the rail</dd>
+      <dt><kbd>Return</kbd></dt><dd>Open the highlighted card and put the cursor in its reply box</dd>
       <dt><kbd>Esc</kbd></dt>
-      <dd>Out of the box, out of the card, back to the session chat — then it
-        toggles the chat closed and open again</dd>
+      <dd>One step back, every time you press it:
+        <span class="keys-ladder">
+          <span>writing a bounce → drop it</span>
+          <span>in a reply box → leave the box, the card stays open</span>
+          <span>a card in the rail → back to the session chat</span>
+          <span>on the session chat → close the rail; press it again to bring it back</span>
+        </span></dd>
       <dt><kbd>?</kbd></dt><dd>This list</dd>
     </dl>
-    <p class="keys-note">Nothing here fires while you are typing — Esc excepted.</p>
+    <p class="keys-note">None of these fire while you are typing. Esc is the exception — it is
+      how you stop typing.</p>
   </div>
 </div>
 

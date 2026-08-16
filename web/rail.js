@@ -20,7 +20,7 @@ import { phaseOf, phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
 import { renderThread, renderChat } from './thread.js';
 import { initCompose } from './compose.js';
-import { flowBarSig, reviewBar } from './review.js';
+import { flowBarSig, reviewBar, verdictBarSig, packetVerdictBar } from './review.js';
 
 export function renderRail(root, app) {
   const owner = railOwner();
@@ -54,6 +54,14 @@ export function renderRail(root, app) {
     // while it is up — the packet drops its own buttons rather than showing you
     // two Approves that do the same thing.
     syncOptional(root, 'review-bar', barSig(card), () => reviewBar(card, app));
+    // ...and, when the walkthrough is NOT on this card, the card's own verdict.
+    // Card #53: every verdict lives in the rail now, and it is pinned here
+    // rather than sitting at the bottom of the packet, so a packet with six
+    // screenshots in it can never push Approve below the fold. Exactly one of
+    // the two bars is ever up — `verdictBarSig` returns null while the
+    // walkthrough owns the card.
+    syncOptional(root, 'verdict-bar', card ? verdictBarSig(card) : null,
+      () => packetVerdictBar(card, app));
     // The composer is the ONE thing on this page you may be mid-sentence in, so
     // it is keyed on the card alone and never rebuilt for anything else: a state
     // flip, a silence, a question arriving all *tune* it in place. Rebuilding it

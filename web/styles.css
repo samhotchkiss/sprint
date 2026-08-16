@@ -2829,6 +2829,222 @@ html.skin-chaos .bounce-notes:focus {
   border-radius: 0;
 }
 
+/* ============================================================================
+   Cards #50 / #52 / #53 / #54 — where interaction lives.
+   #50  an agent can ask for a DECISION, handing over artifacts with the
+        question. User verbatim: "needs you is where we talk through things.
+        review means the session genuinely thinks the card is 100% complete.
+        needs you is that the card is waiting for my input before it can keep
+        moving forward."
+   #52  "when I'm looking at a report, the sidebar should be the card that
+        created it, not the session chat."
+   #53  "get the actions out of cards. I click the card, it loads in the
+        sidebar, and that's where I review and act."
+   #54  "make links clickable and should auto open in a new tab."
+   ========================================================================== */
+
+/* ---- #50: what a decision request handed over --------------------------- */
+
+.artifacts {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  margin-top: 14px;
+  padding: 13px 14px 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-ctl);
+  background: var(--input);
+}
+.artifacts-label {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+}
+.artifacts-label.accent { color: var(--accent); }
+.artifacts-notes {
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--dim);
+  text-wrap: pretty;
+  max-width: 70ch;
+}
+.artifacts-live { align-self: flex-start; }
+/* The same panel, once the question has been answered: it is history now, so it
+   stops asking for the eye it wanted while the answer was owed. */
+.artifacts.is-past {
+  border-left-color: var(--border-chip);
+  background: none;
+}
+.artifacts.is-past .artifacts-label { color: var(--faint); }
+
+/* The row only says a decision is waiting; the deciding happens in the rail. */
+.row-optnote {
+  display: block;
+  margin-top: 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+}
+.row-optnote.is-artifacts { color: var(--faint); }
+
+/* ---- #53: a review row is a click target, not a control panel ----------- */
+
+.review-item {
+  cursor: pointer;
+  text-align: left;
+}
+.review-item:hover { border-color: var(--border-chip); }
+.review-item:hover .review-claim { color: var(--accent-hi); }
+.review-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* The lead is no longer its own button — the whole row is the one. */
+.review-lead { cursor: inherit; }
+/* ...and the thumbnail is a picture again: the lightbox is on the packet, in
+   the rail, one click further in. */
+.review-thumb { cursor: inherit; display: inline-block; }
+.review-thumb:hover .review-thumb-frame { border-color: var(--border); }
+
+.review-open-hint,
+.review-composing {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+.review-composing { color: var(--accent); }
+.review-item:hover .review-open-hint { color: var(--dim); }
+
+/* The verdict, pinned in the rail above the composer. Same bar as the
+   walkthrough's, so a verdict is always given in the same square inch of
+   screen — and never scrolled off by a packet with six screenshots in it. */
+.review-bar.is-verdict .verdicts .btn { min-height: 46px; }
+
+/* ---- #52: which conversation is beside the report you are reading ------- */
+
+.report-rail-note {
+  margin: -6px 0 18px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+/* ---- #54: a URL in prose is a link, and it leaves the board ------------- */
+
+.extlink {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  word-break: break-word;
+}
+.extlink:hover { color: var(--accent-hi); }
+.packet-readback .extlink,
+.detail-body .extlink { color: var(--accent); }
+
+/* ---- Chaos: same words, hard edges -------------------------------------- */
+
+html.skin-chaos .artifacts {
+  border: 2px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 0;
+}
+html.skin-chaos .review-item:focus-visible { outline-offset: 0; }
+html.skin-chaos .extlink { text-decoration-thickness: 2px; }
+/* ==========================================================================
+   APPENDED — provider limit line (card #47)
+   "fable is rate-limited until 11:50pm — work is running on opus", in the same
+   slot and the same restrained register as the session-offline banner. It is
+   deliberately the QUIETEST thing that can be said out loud: nothing is broken
+   and nothing is waiting on the user, so it borrows `.banner`'s shape and then
+   steps further back than `.banner.dim` does. Not a modal, not a toast, and
+   there is no per-card chrome to go with it — a card that was moved onto a
+   fallback model already wears its model tag.
+   ========================================================================== */
+
+.limit-banners { display: flex; flex-direction: column; }
+
+.banner.limit {
+  color: var(--dim);
+  border-color: var(--border);
+  /* A dashed edge reads as "a temporary condition" without spending any colour
+     on it — the accent belongs to things that need you. */
+  border-style: dashed;
+}
+
+/* The model and the time are the two words anyone actually reads off this
+   line, but underlining or colouring them would make a status line look like a
+   control. It stays one sentence. */
+.banner.limit span { overflow-wrap: anywhere; }
+
+/* Chaos: hard ink outline, no radius, like every other plate in the skin.
+   Dashed survives — it is what makes this one quieter than the warn banner
+   sitting directly above it. */
+html.skin-chaos .banner.limit {
+  border: 2px dashed var(--border);
+  border-radius: 0;
+}
+
+/* ==========================================================================
+   APPENDED — the account-limit banner (card #47, bounce)
+
+   The other direction from the quiet line above. A model window means work
+   moved down a tier; an ACCOUNT window means nothing on this machine can run
+   at all, and the fix is a thing only the user can do: log out, sign in with
+   another Claude session, press Resume. So this one is allowed to be loud —
+   accent border, accent headline, and the one button on the page.
+
+   Still a banner, not a modal, and it takes the user's own words for why: he
+   must be able to read cards and type underneath it. Nothing is dimmed and
+   nothing is blocked.
+   ========================================================================== */
+
+.banner.account {
+  align-items: flex-start;
+  gap: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--accent);
+  /* A wash of the accent rather than a fill: loud enough to be the first thing
+     read, quiet enough that the board underneath is still the page. */
+  background: linear-gradient(0deg, rgba(216, 164, 92, .07), rgba(216, 164, 92, .07)), var(--panel);
+  color: var(--body-ink);
+}
+.banner.account .account-words { flex: 1 1 auto; min-width: 0; }
+.banner.account .account-headline {
+  color: var(--accent-hi);
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.banner.account .account-detail { margin-top: 3px; color: var(--body-ink); }
+/* What to DO is the half of this the user came for, so it is not the faintest
+   line in the box — it sits level with the detail, one shade back. */
+.banner.account .account-action { margin-top: 3px; color: var(--dim); }
+.banner.account .account-resume {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 0 18px;
+  align-self: center;
+}
+.banner.account .account-resume[disabled] { opacity: .6; cursor: default; }
+
+/* Fold (980×740) and narrower: the button drops under the words rather than
+   squeezing three sentences into a column two words wide. */
+@media (max-width: 1199px) {
+  .banner.account { flex-direction: column; align-items: stretch; gap: 10px; }
+  .banner.account .account-resume { align-self: flex-start; }
+}
+
+/* Chaos: hard outline, no radius, like every other plate in that skin. */
+html.skin-chaos .banner.account {
+  border: 2px solid var(--accent);
+  border-radius: 0;
+  background: var(--panel);
+}
+
 /* ==========================================================================
    CARD #57 — keyboard navigation, and CARD #59 — independently scrolling
    Board columns. Appended section: several agents are in this file at once.
@@ -2953,3 +3169,8 @@ html.skin-chaos .si-key { border: 2px solid var(--border-chip); border-radius: 0
 }
 .keys-note { font-size: 12.5px; color: var(--faint); }
 html.skin-chaos .keys-list kbd { border: 2px solid var(--border-chip); border-radius: 0; }
+
+/* The Esc rungs, one per line, so the ladder reads as a ladder rather than a
+   sentence with four clauses in it. */
+.keys-ladder { display: block; margin-top: 4px; }
+.keys-ladder span { display: block; color: var(--faint); font-size: 12.5px; line-height: 1.6; }

@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""sprint-limit — tell the board a provider limit window, and read it back.
+
+Usage:
+  sprint-limit declare --model fable --resets "11:50pm" [--source ...] [--note ...]
+  sprint-limit declare --account --resets "11:50pm" [--source ...] [--note ...]
+  sprint-limit list
+  sprint-limit clear <id>
+
+Two kinds. `--model` is one model going away and the work moving down a tier:
+a quiet line on the board, everything keeps running. `--account` is the whole
+Claude account hitting its weekly limit — NOTHING can run, on any board on this
+machine, so every board grows a big banner saying what happened, when it lifts,
+and what to do about it: log out, sign in with another Claude session, then
+press Resume. That button clears the window and emits the `limit_cleared` the
+session reads to re-dispatch everything that was parked while it was on.
+
+An account window is machine-wide: it is written to one shared file beside the
+registry, and every board — including boards in other projects, and boards
+started AFTER the declaration — picks it up on its next tick, with no session
+attached anywhere. That last part is the point: when the account is out, the
+session is dead, and the board server and the browser are all that is left.
+
+For the moment an agent dies with a message like:
+
+  You've hit your session limit · resets 11:50pm (America/Denver)
+
+That sentence is the only thing anyone knows about when work can go back to
+normal, and until this existed nothing captured it: three workers were killed
+at once, the cards sat in In motion for hours, and the user was the one who
+noticed. Declaring the window does three things at once —
+
+  1. the board shows a quiet line while it is open ("fable is rate-limited
+     until 11:50pm — work is running on opus");
+  2. the session has a fact to hang its fallback dispatches off, via
+     `assign {"model": "opus", "model_reason": "fable limited until 11:50pm"}`;
+  3. when the window passes, the board emits ONE `limit_cleared` event, which
+     is the session's cue to put that work back on the original model.
+
+`--resets` takes what the provider actually said. A bare clock time means the
+NEXT time it comes round — at 11:52pm, "11:50pm" is tomorrow, which is the
+answer you wanted and not the one arithmetic gives you. The provider's own
+zone in parentheses is understood too, so the kill message can be pasted
+verbatim:
+
+  sprint-limit declare --model fable --resets "11:50pm"
+  sprint-limit declare --model fable --resets "11:50pm (America/Denver)"
+  sprint-limit declare --model fable --resets 2026-08-16T23:50:00
+  sprint-limit declare --model fable --resets 1786945800
+
+The server owns the parsing (one parser, so the board and this agree by
+construction) and this prints back the time it landed on — read that line, it
+is how you catch a typo before the board acts on it.
+
+Reads --server/--token or SPRINT_SERVER/SPRINT_TOKEN, exactly like the other
+helpers. Stdlib only. Nothing here dispatches anything: declaring a limit
+records a fact, it does not move a card.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+
+def die(msg, code=2):
+    print("sprint-limit: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="sprint-limit",
+        description="Record, list and end provider limit windows.")
+    p.add_argument("--server", default=os.environ.get("SPRINT_SERVER"),
+                   help="server base URL (or SPRINT_SERVER env)")
+    p.add_argument("--token", default=os.environ.get("SPRINT_TOKEN"),
+                   help="bearer token (or SPRINT_TOKEN env)")
+    sub = p.add_subparsers(dest="cmd")
+
+    d = sub.add_parser("declare", help="record a limit window")
+    d.add_argument("--model", default=None,
+                   help="which model is limited, e.g. fable")
+    d.add_argument("--account", action="store_true",
+                   help="the whole Claude account is limited — nothing can "
+                        "run, and every board on this machine says so")
+    d.add_argument("--resets", required=True,
+                   help='when it ends: "11:50pm", "11:50pm (America/Denver)", '
+                        'an ISO 8601 timestamp, or an epoch')
+    d.add_argument("--source", default=None,
+                   help='where the time came from, e.g. "kill message"')
+    d.add_argument("--note", default=None, help="anything else worth keeping")
+
+    sub.add_parser("list", help="active and recent limit windows")
+
+    c = sub.add_parser("clear", help="end a window early")
+    c.add_argument("id", help="the limit id (see `sprint-limit list`)")
+    return p.parse_args(argv)
+
+
+def call(server, token, method, path, body=None):
+    url = server.rstrip("/") + path
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {"Authorization": "Bearer " + token}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            obj = json.loads(raw)
+            msg = obj.get("message") or obj.get("error") or raw[:200]
+        except ValueError:
+            msg = raw[:200]
+        die("server said %s — %s" % (exc.code, msg))
+    except urllib.error.URLError as exc:
+        die("cannot reach %s (%s)" % (server, exc.reason))
+
+
+def when(ts):
+    """The reset time in full, local — the line you proof-read."""
+    return time.strftime("%a %d %b %H:%M %Z", time.localtime(float(ts)))
+
+
+def span(seconds):
+    seconds = int(round(float(seconds)))
+    if seconds <= 0:
+        return "now"
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm" % (seconds // 60)
+    return "%dh%02dm" % (seconds // 3600, (seconds % 3600) // 60)
+
+
+def subject(lim):
+    """What this window is about, in one column: a model, or the account."""
+    return "ACCOUNT" if lim.get("kind") == "account" else (lim.get("model") or "?")
+
+
+def limit_line(lim):
+    tail = ("active, %s to go" % span(lim.get("resets_in_seconds") or 0)
+            if lim.get("active") else "over")
+    return "  #%s  %-12s until %s  (%s)" % (
+        lim.get("id"), subject(lim), when(lim.get("resets_at")), tail)
+
+
+def cmd_declare(args):
+    account = bool(getattr(args, "account", False))
+    out = call(args.server, args.token, "POST", "/api/limits",
+               {"kind": "account" if account else "model",
+                "model": None if account else args.model,
+                "resets_at": args.resets,
+                "source": args.source, "note": args.note})
+    lim = out["limit"]
+    verb = "recorded" if out.get("created") else "updated"
+    if account:
+        print("%s: the Claude ACCOUNT is limited until %s (in %s)"
+              % (verb, when(lim["resets_at"]),
+                 span(lim.get("resets_in_seconds") or 0)))
+        print("limit #%s — every board on this machine is now showing the big "
+              "notice, session or no session." % lim["id"])
+        print("To resume before then: log out of Claude, sign in with another "
+              "session, then press Resume in the notice")
+        print("  (or: POST /api/limits/%s/clear — same thing, same single "
+              "limit_cleared)." % lim["id"])
+        return 0
+    print("%s: %s is limited until %s (in %s)"
+          % (verb, lim["model"], when(lim["resets_at"]),
+             span(lim.get("resets_in_seconds") or 0)))
+    print("limit #%s — the board is showing it now, and will emit ONE "
+          "limit_cleared when it passes." % lim["id"])
+    print("Dispatch the fallback with:")
+    print('  POST /api/cards/<num>/assign {"agent_name": "...", "model": '
+          '"<next model down>", "model_reason": "%s limited until %s"}'
+          % (lim["model"], lim.get("resets_at_label") or when(lim["resets_at"])))
+    return 0
+
+
+def cmd_list(args):
+    out = call(args.server, args.token, "GET", "/api/limits")
+    active = out.get("active") or []
+    recent = out.get("recent") or []
+    if active:
+        print("active:")
+        for lim in active:
+            print(limit_line(lim))
+    else:
+        print("active: none — nothing is limited right now")
+    if recent:
+        print("recent:")
+        for lim in recent:
+            print(limit_line(lim))
+    return 0
+
+
+def cmd_clear(args):
+    try:
+        limit_id = int(args.id)
+    except ValueError:
+        die("limit id must be an integer, got %r" % args.id)
+    out = call(args.server, args.token, "POST",
+               "/api/limits/%d/clear" % limit_id)
+    lim = out["limit"]
+    if out.get("cleared"):
+        if lim.get("kind") == "account":
+            print("cleared #%s — the account is available again; every board "
+                  "drops its notice and limit_cleared is on the log."
+                  % lim["id"])
+        else:
+            print("cleared #%s — %s is available again; limit_cleared is on the log."
+                  % (lim["id"], lim["model"]))
+    else:
+        print("#%s was already over (nothing emitted)." % lim["id"])
+    return 0
+
+
+def main(argv):
+    args = parse_args(argv)
+    if not args.cmd:
+        die("say what to do: declare, list or clear "
+            '(e.g. sprint-limit declare --model fable --resets "11:50pm")')
+    if not args.server:
+        die("pass --server or set SPRINT_SERVER")
+    if not args.token:
+        die("pass --token or set SPRINT_TOKEN")
+    if args.cmd == "declare":
+        if args.account and (args.model or "").strip():
+            die("--account is the whole account, not one model: drop --model")
+        if not args.account and not (args.model or "").strip():
+            die("say which: --model <name> for one model, or --account for the "
+                "whole Claude account")
+        if not (args.resets or "").strip():
+            die("--resets cannot be empty")
+        return cmd_declare(args)
+    if args.cmd == "list":
+        return cmd_list(args)
+    return cmd_clear(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
