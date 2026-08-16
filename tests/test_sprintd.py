@@ -4240,14 +4240,23 @@ class TestSiblingsEndpoint(SiblingsBase):
     def test_a_port_stolen_by_another_project_is_never_offered(self):
         """Ports get recycled. Without the /healthz project_root guard the menu
         would offer one project's board wearing another project's name."""
-        a = self.board("alpha")
+        a = self.board("alpha", token="a-shared-token")
+        self.card_needs_you(a, "alpha's own question")
+        # A stale row for a project that is gone, still pointing at a port that
+        # something else now owns -- and (worst case) holding a token that port
+        # accepts, so nothing downstream of the guard would notice.
         impostor_root = os.path.join(self.tmp, "impostor")
-        os.makedirs(impostor_root, exist_ok=True)
+        os.makedirs(os.path.join(impostor_root, ".sprint"), exist_ok=True)
+        sprintd.write_token_file(
+            os.path.join(impostor_root, ".sprint", "token"), "a-shared-token")
         sprintd.registry_register(sprintd.registry_entry(
             impostor_root, a["port"], "127.0.0.1", pid=999999))
         body = self.siblings(a)[1]
-        self.assertEqual([r["name"] for r in body["sprints"]], ["alpha"])
+        self.assertEqual([r["name"] for r in body["sprints"]], ["alpha"],
+                         "the /healthz project_root check is what rejects this row")
         self.assertEqual(body["count"], 1)
+        self.assertEqual(body["needs_you_elsewhere"], 0,
+                         "alpha's own question must never count as a sibling's")
 
     def test_a_board_missing_from_the_registry_still_lists_itself(self):
         a = self.board("alpha")

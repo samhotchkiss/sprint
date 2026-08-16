@@ -126,6 +126,9 @@ export const api = {
   board: () => req('GET', '/api/board'),
   card: (num) => req('GET', `/api/cards/${num}`),
   events: (after, limit = 500) => req('GET', `/api/events?after=${after || 0}&limit=${limit}`),
+  // Every live sprint on this machine, this one flagged `self` — the title
+  // switcher. Server-cached; the browser polls it every 30s, never SSE.
+  siblings: () => req('GET', '/api/siblings', undefined, { timeoutMs: 8000 }),
   // No auth, tiny deadline: this is the "is anyone home, and is it still the
   // same anyone" probe we run when the transport falls over.
   health: () => req('GET', '/healthz', undefined, { timeoutMs: 5000 }),

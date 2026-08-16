@@ -1930,3 +1930,112 @@ html.skin-chaos .review-bar { border-top: 2px solid var(--border); box-shadow: v
 html.skin-chaos .btn.review-next { border: 2px solid var(--border-chip); }
 html.skin-chaos .review-group-title { line-height: 1.5; }
 html.skin-chaos .review-claim { line-height: 1.6; }
+
+/* ===========================================================================
+   Title switcher (card #31) — appended section, self-contained.
+
+   More than one sprint on this machine and the board's name becomes a menu of
+   them; one sprint and it stays the plain <h1> it always was. A dot on the
+   title means ANOTHER sprint is waiting on you, and the same dot sits beside
+   that sprint in the open menu. Structure only — every colour is a token, so
+   Chaos re-skins it for free (its overrides are the last block here).
+   =========================================================================== */
+
+.title-wrap { position: relative; display: flex; align-items: center; min-width: 0; }
+
+/* the h1 is unchanged when there is nothing to switch to */
+.title-btn {
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-ctl);
+  padding: 2px 8px 2px 9px;
+  margin-left: -9px;               /* the words stay put; only the hit area grows */
+  min-height: 44px;
+  max-width: 100%;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+  text-align: left;
+}
+.title-btn:hover { border-color: var(--border-chip); background: var(--chip); }
+.title-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.title-caret { font-size: 13px; color: var(--faint); line-height: 1; flex: none; }
+.title-btn[aria-expanded="true"] { border-color: var(--border-chip); background: var(--chip); }
+.title-btn[aria-expanded="true"] .title-caret { color: var(--dim); }
+
+/* "somewhere else on this box wants you" */
+.title-dot {
+  width: 9px; height: 9px; flex: none;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+}
+
+.sprint-menu { left: 0; right: auto; min-width: 320px; max-width: 90vw; padding: 6px; }
+.menu-head {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--faint);
+  padding: 8px 10px 7px;
+}
+.sprint-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 44px;                /* touch target — the Fold is a real target */
+  padding: 8px 11px;
+}
+.sprint-item .si-dot {
+  width: 9px; height: 9px; flex: none;
+  border-radius: var(--radius-pill);
+  background: transparent;
+}
+.sprint-item .si-dot.is-on {
+  background: var(--accent);
+}
+.si-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.si-name {
+  font-size: 14px; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.si-counts { font-size: 12px; color: var(--faint); }
+.sprint-item.is-current .si-name { color: var(--ink); font-weight: 500; }
+.si-here {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--faint);
+  border: 1px solid var(--border-chip);
+  border-radius: var(--radius-pill);
+  padding: 3px 8px;
+  flex: none;
+}
+
+@media (max-width: 1199px) {
+  /* the Fold: the header is 54px, so the switcher stops being taller than it */
+  .title-btn { min-height: 44px; padding: 2px 7px; }
+  .sprint-menu { min-width: 280px; }
+}
+@media (max-width: 600px) {
+  .sprint-menu { min-width: 0; width: calc(100vw - 24px); }
+}
+
+/* ---- Chaos: hard edges, no soft halo ------------------------------------- */
+html.skin-chaos .title-btn { border: 2px solid transparent; padding: 4px 8px; }
+html.skin-chaos .title-btn:hover,
+html.skin-chaos .title-btn[aria-expanded="true"] { border-color: var(--border-chip); }
+html.skin-chaos .title-dot,
+html.skin-chaos .sprint-item .si-dot.is-on { border-radius: 0; }
+html.skin-chaos .si-here { border: 2px solid var(--border-chip); border-radius: 0; }
+html.skin-chaos .si-name { font-size: 12px; line-height: 1.5; }
+html.skin-chaos .si-counts { font-size: 11px; line-height: 1.6; }
+html.skin-chaos .title-caret { font-size: 10px; }
