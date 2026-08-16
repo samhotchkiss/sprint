@@ -538,7 +538,9 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
 .chip-btn:hover { border-color: var(--accent); color: var(--ink); }
 
 /* in motion */
-.work-row { grid-template-columns: 52px 1fr 128px 96px; }
+/* 168px, not 128: the third column carries the phase chip now, and "testing ·
+   2m" needs the room the bare "active · 4m" never did. */
+.work-row { grid-template-columns: 52px 1fr 168px 96px; }
 .row-prog { display: flex; flex-direction: column; gap: 7px; }
 .prog-track {
   height: 2px;
@@ -575,14 +577,21 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
   white-space: nowrap;
   overflow: hidden;
 }
+/* The name is the whole point of the chip, so it is the LAST thing to give way:
+   the clock and the separator never shrink, the "(expected 5m)" annotation
+   shrinks eight times faster than the name, and only then does the name
+   ellipsize. Before this, a narrow column shrank the name to nothing and an
+   overdue chip read "· 6m (expected 1m)" — amber, urgent, and silent about
+   what the agent is actually doing. */
 .phase-chip .phase-name {
   min-width: 0;
+  flex-shrink: 1;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.phase-chip .phase-sep { opacity: .5; }
-.phase-chip .t { font-variant-numeric: tabular-nums; }
-.phase-chip .phase-expected { opacity: .8; }
+.phase-chip .phase-sep { opacity: .5; flex: none; }
+.phase-chip .t { font-variant-numeric: tabular-nums; flex: none; }
+.phase-chip .phase-expected { opacity: .8; min-width: 0; flex-shrink: 8; overflow: hidden; }
 .phase-chip.is-late {
   color: var(--phase-late-ink);
   background: var(--phase-late-bg);
@@ -592,7 +601,10 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
    shrink, but the clock inside it never wraps. */
 .card-top .phase-chip { flex: 0 1 auto; }
 .rail-head .phase-chip { flex: none; }
-.row-prog .phase-chip { align-self: flex-start; }
+/* In the List row the chip sits in a narrow fixed column, and an overdue chip
+   is the longest thing it ever holds. It wraps onto a second line rather than
+   dropping a word: a row that grew 14px is cheaper than a chip that lies. */
+.row-prog .phase-chip { align-self: flex-start; flex-wrap: wrap; white-space: normal; }
 .row-agent { font-family: var(--font-mono); font-size: 11.5px; color: var(--faint); text-align: right; }
 
 /* blocked — same shape, deliberately dimmer */
