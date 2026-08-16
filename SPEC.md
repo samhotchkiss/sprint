@@ -39,6 +39,12 @@ recovery must be easy. The user always runs claude inside tmux.
 - Auth: random bearer token generated at first start, stored in `.sprint/token` (and mirrored into
   `server.json` while running). `start` reuses it across stop/start; `--token` forces a value,
   `--new-token` rotates. Browser: `/?t=TOKEN` sets a cookie. API: `Authorization: Bearer` or cookie.
+  Credential precedence is `Authorization` → `?t=` → cookie, and ANY of them matching authenticates.
+  **`?t=` outranks the cookie deliberately**: cookies are scoped by host and ignore the port, so every
+  board on one machine shares a jar; preferring the ambient cookie made a valid link into a second
+  board 401. For the same reason the cookie name carries the port (`sprint_token_<port>`), with the
+  legacy bare name still accepted so existing browsers aren't logged out. A 401 on a *browser
+  navigation* renders a short sign-in page pointing at the hub; `/api/*` keeps its JSON.
   Workers get the token via their brief.
 - `sprintd start` is idempotent: if a live server owns the port (health check + token match), exit 0
   saying so. Handles stale PID files after power loss (PID recycling: verify the process is actually

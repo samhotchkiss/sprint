@@ -120,6 +120,14 @@ Details worth knowing:
   every board on the machine, so it's effectively a keyring — it is
   never left unauthenticated. Its cookie name is deliberately different
   from a board's, so signing into the hub never signs you out of a board.
+- **Every link signs you in, whichever board you were on last.** Browser
+  cookies are scoped by host and ignore the port, so all your boards
+  share one jar. A link carrying `?t=…` always wins over whatever cookie
+  is already there, and each board keeps its own cookie
+  (`sprint_token_<port>`) — so signing into one board never signs you out
+  of another. If you do land unauthorized (a rotated token, a link from
+  before a restart), you get a short page telling you where to get a
+  working link, not a wall of JSON.
 - **Boards register themselves.** `sprintd start` writes a row into
   `~/.sprint/registry.json` (one row per project root, so restarting a
   board updates its row rather than adding a second one); `sprintd stop`
