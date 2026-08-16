@@ -23,7 +23,11 @@ try {
 <div id="app">
 
   <header class="topbar" id="topbar">
-    <h1 class="sprint-name" id="sprint-title">loading…</h1>
+    <!-- plain <h1> on a one-sprint machine; siblings.js swaps in the switcher
+         when the registry says another board is up (see /api/siblings) -->
+    <div class="title-wrap menu-wrap" id="title-wrap">
+      <h1 class="sprint-name" id="sprint-title">loading…</h1>
+    </div>
     <p class="headline" id="headline"></p>
     <span class="grow"></span>
     <div class="seg" id="skin-seg" role="group" aria-label="skin">

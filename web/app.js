@@ -13,6 +13,7 @@ import { renderRail, openLightbox, closeLightbox } from './rail.js';
 import { initCompose, toBase64List, imageFiles } from './compose.js';
 import { installNotifications, attention, armNotifications, clearBadge } from './notify.js';
 import { loadSkin, installSkinToggle, installBlip } from './skin.js';
+import { startSiblings, renderTitle, closeSiblingMenu } from './siblings.js';
 
 const el = {};
 let compose = null;
@@ -53,8 +54,10 @@ function paint() {
   const focus = captureFocus();
   const secs = sections();
 
+  // Plain <h1> on a one-sprint machine; a switcher (with a dot when another
+  // sprint on this box is waiting on you) when there is more than one.
   const title = store.sprint ? store.sprint.title : 'starting up…';
-  if (el.sprintTitle.textContent !== title) el.sprintTitle.textContent = title;
+  renderTitle(el.titleWrap, title);
   // On the Fold the header is 54px and the whole headline will not fit; the one
   // number that changes what you do next survives, in the accent colour.
   const needs = secs.needs_you.cards.length;
@@ -690,7 +693,7 @@ async function boot() {
   el.lightbox = $('#lightbox');
   el.toasts = $('#toasts');
   el.authwall = $('#authwall');
-  el.sprintTitle = $('#sprint-title');
+  el.titleWrap = $('#title-wrap');
   el.headline = $('#headline');
   el.hold = $('#hold-toggle');
   el.chatBtn = $('#chat-btn');
@@ -755,6 +758,7 @@ async function boot() {
       return;
     }
     if (e.key === 'Escape') {
+      if (closeSiblingMenu()) { render(); return; }
       if (!el.lightbox.hidden) { closeLightbox(el.lightbox); return; }
       if (!el.composeWrap.hidden) { closeCompose(); return; }
       if (store.detail) { closeCard(); return; }
@@ -782,6 +786,10 @@ async function boot() {
     if (q.addEventListener) q.addEventListener('change', render);
     else if (q.addListener) q.addListener(render);
   }
+
+  // The other sprints on this machine are not on our event log, so they are
+  // polled (every 30s) rather than streamed.
+  startSiblings(render);
 
   setInterval(() => tickTimes(document), 20000);
   setInterval(() => render(), 30000);          // the recency hairlines drain live

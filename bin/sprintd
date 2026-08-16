@@ -610,6 +610,18 @@ class App:
         row = self.q1("SELECT * FROM cursors WHERE name=?", (WAITER_CURSOR,))
         self._waiter_seen_at = float(row["updated_at"]) if row else None
         self._waiter_persisted_at = self._waiter_seen_at or 0.0
+        # Machine-wide context for `/api/siblings` (the title dropdown): which
+        # other sprints are up on this box. `port`/`hosts` are stamped by
+        # `cmd_start` once the socket is really bound; `registry` is the
+        # `--registry` / $SPRINT_REGISTRY override, so a test never reads the
+        # real ~/.sprint. The snapshot is cached because a dozen browser tabs
+        # must not turn into a dozen health-check sweeps.
+        self.registry = None
+        self.port = None
+        self.hosts = []
+        self.siblings_ttl = env_float("SPRINT_SIBLINGS_TTL", DEFAULT_SIBLINGS_TTL)
+        self._siblings_lock = threading.Lock()
+        self._siblings_snap = None
 
     # -- infra ------------------------------------------------------------
 
@@ -2215,6 +2227,23 @@ class App:
             "server_time": now(),
         }
 
+    def siblings(self, max_age: float = None) -> dict:
+        """Every live sprint on this machine, this one included (`self: true`).
+
+        Cached for `siblings_ttl` (10s by default): the browser polls this every
+        30s per tab, and each miss health-checks every registered board.
+        """
+        if max_age is None:
+            max_age = self.siblings_ttl
+        with self._siblings_lock:
+            snap = self._siblings_snap
+        if snap and (now() - snap["server_time"]) <= max_age:
+            return snap
+        snap = siblings_snapshot(self, self.registry)
+        with self._siblings_lock:
+            self._siblings_snap = snap
+        return snap
+
     def card_detail(self, num: int) -> dict:
         """{card, timeline, evidence, attachments, ...} -- the drawer's whole payload."""
         row = self.card_row(num)
@@ -2520,6 +2549,11 @@ def make_handler(app: App):
             if path == "/api/sidebar":
                 after = int((query.get("after") or ["0"])[0] or 0)
                 return self.json_out(200, {"events": app.sidebar_thread(after)})
+            if path == "/api/siblings":
+                # The title dropdown: every live sprint on this machine, this
+                # one flagged `self`. `?fresh=1` skips the 10s cache (tests).
+                fresh = (query.get("fresh") or ["0"])[0] in ("1", "true", "yes")
+                return self.json_out(200, app.siblings(max_age=0 if fresh else None))
             if path == "/api/sprints":
                 rows = app.q("SELECT * FROM sprints ORDER BY id DESC")
                 return self.json_out(200, {"sprints": [app.sprint_json(r) for r in rows]})
@@ -3280,6 +3314,12 @@ def cmd_start(args) -> int:
             app.log("could not bind tailnet ip %s:%s (%s) -- loopback only"
                     % (ts_ip, actual_port, exc))
 
+    # Where we actually ended up listening, so `/api/siblings` can put this
+    # board in its own list with a working signed URL.
+    app.registry = getattr(args, "registry", None)
+    app.port = actual_port
+    app.hosts = list(hosts)
+
     app.open_sprint(create=True)
     app.start_background()
     write_server_json(p["server_json"], {
@@ -3821,6 +3861,52 @@ def board_token_for(entry: dict):
     return info.get("token")
 
 
+def board_rollup(board: dict) -> dict:
+    """Reduce one `/api/board` payload to the numbers a listing row shows.
+
+    Shared by the hub (which fetches that payload over HTTP from every
+    registered board) and by a board's own `/api/siblings` (which rolls ITSELF
+    up straight from `app.board()`, no round trip). One counter, two callers:
+    the dropdown and the hub can never drift apart on what "2 need you" means.
+    """
+    cards = board.get("cards") or []
+    column_of = board.get("column_of") or COLUMN_OF
+    ts = now()
+    counts = {}
+    last_at, last_text, stuck_at, stuck_card = None, None, None, None
+    for c in cards:
+        col = column_of.get(c.get("state"), "queued")
+        counts[col] = counts.get(col, 0) + 1
+        at = c.get("last_activity_at")
+        if isinstance(at, (int, float)) and (last_at is None or at > last_at):
+            last_at = at
+            ev = c.get("last_event") or {}
+            text = (ev.get("payload") or {}).get("text") or ev.get("kind") or ""
+            last_text = "#%s %s" % (c.get("num"), one_line(str(text), 70)) if text \
+                else "#%s" % c.get("num")
+        if col == "needs_you":
+            q = c.get("question") or c.get("open_question") or {}
+            asked = q.get("created_at") or c.get("state_since") or c.get("updated_at")
+            if isinstance(asked, (int, float)) and (stuck_at is None or asked < stuck_at):
+                stuck_at, stuck_card = asked, c.get("num")
+    sprint = board.get("sprint") or {}
+    return {
+        "needs_you": counts.get("needs_you", 0),
+        "ready": counts.get("ready", 0),
+        "in_motion": counts.get("in_progress", 0),
+        "queued": counts.get("queued", 0) + counts.get("held", 0),
+        "blocked": counts.get("blocked", 0),
+        "done": counts.get("done", 0),
+        "total": len(cards),
+        "session": (board.get("session") or {}).get("status"),
+        "sprint_title": sprint.get("title"),
+        "last_activity_at": last_at,
+        "last_activity": last_text,
+        "stuck_seconds": None if stuck_at is None else max(0.0, ts - stuck_at),
+        "stuck_card": stuck_card,
+    }
+
+
 def hub_summarize(entry: dict, timeout: float = 2.5) -> dict:
     """Poll one registered board and reduce it to a row on the landing page.
 
@@ -3887,44 +3973,11 @@ def hub_summarize(entry: dict, timeout: float = 2.5) -> dict:
         row["detail"] = "board returned HTTP %s" % status
         return row
     board = jload(raw.decode("utf-8", "replace"), {}) or {}
-    cards = board.get("cards") or []
-    column_of = board.get("column_of") or COLUMN_OF
-    ts = now()
-    counts = {}
-    last_at, last_text, stuck_at, stuck_card = None, None, None, None
-    for c in cards:
-        col = column_of.get(c.get("state"), "queued")
-        counts[col] = counts.get(col, 0) + 1
-        at = c.get("last_activity_at")
-        if isinstance(at, (int, float)) and (last_at is None or at > last_at):
-            last_at = at
-            ev = c.get("last_event") or {}
-            text = (ev.get("payload") or {}).get("text") or ev.get("kind") or ""
-            last_text = "#%s %s" % (c.get("num"), one_line(str(text), 70)) if text \
-                else "#%s" % c.get("num")
-        if col == "needs_you":
-            q = c.get("question") or c.get("open_question") or {}
-            asked = q.get("created_at") or c.get("state_since") or c.get("updated_at")
-            if isinstance(asked, (int, float)) and (stuck_at is None or asked < stuck_at):
-                stuck_at, stuck_card = asked, c.get("num")
-    sprint = board.get("sprint") or {}
+    row.update(board_rollup(board))
     row.update({
         "reachable": True,
         "status": "live",
-        "needs_you": counts.get("needs_you", 0),
-        "ready": counts.get("ready", 0),
-        "in_motion": counts.get("in_progress", 0),
-        "queued": counts.get("queued", 0) + counts.get("held", 0),
-        "blocked": counts.get("blocked", 0),
-        "done": counts.get("done", 0),
-        "total": len(cards),
-        "session": (board.get("session") or {}).get("status"),
-        "sprint_title": sprint.get("title"),
-        "last_activity_at": last_at,
-        "last_activity": last_text,
-        "stuck_seconds": None if stuck_at is None else max(0.0, ts - stuck_at),
-        "stuck_card": stuck_card,
-        "last_seen": ts,
+        "last_seen": now(),
         "url": board_url(hosts[0], port, token),
         "detail": None,
     })
@@ -3942,6 +3995,112 @@ def hub_sort_key(row: dict):
         tier = 1
     return (tier, -(row.get("stuck_seconds") or 0), -(row.get("needs_you") or 0),
             (row.get("name") or "").lower())
+
+
+# --------------------------------------------------------------------------
+# Siblings: the other sprints on this machine, seen from INSIDE one board
+# --------------------------------------------------------------------------
+#
+# The hub answers "what is running on this computer" from its own process, on
+# its own port. `/api/siblings` answers the same question from inside a board,
+# so the board's title can become a switcher without the user going out to the
+# hub and back. Same registry, same health checks, same `board_rollup` counts --
+# only the shape of the row is smaller, because a dropdown needs a name, a
+# link and two numbers, not a whole landing page.
+#
+# Self is always in the list (flagged `self: true`) so the menu renders the
+# full set with the current board marked, and rolled up straight from
+# `app.board()` rather than by asking ourselves over HTTP.
+
+DEFAULT_SIBLINGS_TTL = 10.0     # server-side cache; the browser polls every 30s
+
+
+def sibling_row(row: dict, is_self: bool = False) -> dict:
+    """One hub row, narrowed to what a title dropdown actually renders."""
+    return {
+        "name": row.get("name"),
+        "project_root": row.get("project_root"),
+        "port": row.get("port"),
+        "url": row.get("url"),
+        "self": bool(is_self),
+        "alive": bool(row.get("reachable")),
+        "needs_you": int(row.get("needs_you") or 0),
+        "ready": int(row.get("ready") or 0),
+        "in_motion": int(row.get("in_motion") or 0),
+        "blocked": int(row.get("blocked") or 0),
+        "queued": int(row.get("queued") or 0),
+        "session": row.get("session"),
+        "sprint_title": row.get("sprint_title"),
+        "stuck_seconds": row.get("stuck_seconds"),
+    }
+
+
+def sibling_sort_key(row: dict):
+    """Current board first (it is where you already are), then whatever is
+    waiting on you, longest wait first, then alphabetical."""
+    if row.get("self"):
+        return (0, 0, 0, "")
+    tier = 1 if row.get("needs_you") else 2
+    return (tier, -(row.get("stuck_seconds") or 0), -(row.get("needs_you") or 0),
+            (row.get("name") or "").lower())
+
+
+def siblings_snapshot(app, registry: str = None, timeout: float = 1.5) -> dict:
+    """Every LIVE board on this machine, including this one.
+
+    Dead/unreachable rows are dropped rather than greyed: unlike the hub, whose
+    job is to tell you a board died, this list exists to be clicked -- a row you
+    cannot navigate to is noise in a menu. The port-recycling guard is the hub's
+    (`/healthz` + `project_root` match), so a registry row whose port was taken
+    by some other project never shows up wearing that project's name.
+    """
+    self_root = os.path.realpath(app.project_root)
+    rows, saw_self = [], False
+    for key, entry in read_registry(registry).items():
+        entry = dict(entry)
+        entry.setdefault("project_root", key)
+        if os.path.realpath(entry.get("project_root") or key) == self_root:
+            rows.append(self_sibling_row(app, entry))
+            saw_self = True
+            continue
+        row = hub_summarize(entry, timeout=timeout)
+        if not row.get("reachable"):
+            continue
+        rows.append(sibling_row(row))
+    if not saw_self:
+        # No registry row for us (registry write failed, or a board started
+        # before the registry existed). We are demonstrably alive -- we are
+        # answering this request -- so we list ourselves anyway.
+        rows.append(self_sibling_row(app, None))
+    rows.sort(key=sibling_sort_key)
+    others = [r for r in rows if not r["self"]]
+    return {
+        "sprints": rows,
+        "count": len(rows),
+        # The one number the title dot reads: needs_you ANYWHERE BUT HERE.
+        # This board's own needs-you pile is already on the page behind it.
+        "needs_you_elsewhere": sum(r["needs_you"] for r in others),
+        "server_time": now(),
+    }
+
+
+def self_sibling_row(app, entry: dict = None) -> dict:
+    """This board's own row -- counted from the live database, not over HTTP."""
+    entry = entry or {}
+    hosts = list(getattr(app, "hosts", None) or [])
+    if not hosts:
+        hosts = entry.get("hosts") or [entry.get("host") or "127.0.0.1"]
+    port = int(getattr(app, "port", None) or entry.get("port") or 0)
+    root = os.path.realpath(app.project_root)
+    row = dict(board_rollup(app.board()))
+    row.update({
+        "name": entry.get("name") or os.path.basename(root.rstrip("/")) or root,
+        "project_root": root,
+        "port": port,
+        "reachable": True,
+        "url": board_url(hosts[0], port, app.token) if port else None,
+    })
+    return sibling_row(row, is_self=True)
 
 
 class HubApp:
