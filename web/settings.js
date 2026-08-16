@@ -15,6 +15,7 @@
 // changes under you. That sentence is in the panel, not in a doc.
 import { h, clear, $ } from './util.js';
 import { api, ApiError } from './api.js';
+import { modelTag } from './state.js';
 
 const POLICY_LABEL = {
   lowest_feasible: 'Lowest feasible',
@@ -243,7 +244,11 @@ export function executorTag(card, { compact = false } = {}) {
   // too, so the model drops off there — "grok · tmux" is what makes this card
   // different, and the full "grok · tmux · grok-4" is on the tag's tooltip and
   // in the rail head. A card whose ONLY difference is the model still says so.
-  if (card.model && (!compact || !bits.length)) bits.push(d.model);
+  //
+  // `modelTag` is the arbiter of "worth saying" (#41): a card dispatched
+  // explicitly ON the sprint default is not an exception, so it gets no badge.
+  const model = modelTag(card);
+  if (model && (!compact || !bits.length)) bits.push(d.model);
   if (!bits.length) return null;
   return h('span.exec-tag', {
     title: `dispatched as ${d.executor} (${d.kind}) with ${d.model}`,

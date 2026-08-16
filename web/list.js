@@ -158,7 +158,8 @@ export function motionRow(card, app) {
     h('span.prog-track', h('span.prog-fill', { style: { width: st.pct + '%', background: st.color } })),
     chip || h('span.prog-label', { style: { color: st.color } }, st.label)));
   // The agent's name, and — only when this card is not on the board's default
-  // executor/model — how it was dispatched: "grok · tmux".
+  // executor/model — how it was dispatched: "grok · tmux", or just "opus" for
+  // a card whose only exception is the fallback model it was re-dispatched on.
   row.appendChild(h('span.row-agent', shortAgent(card.agent_name), executorTag(card, { compact: true })));
   return row;
 }

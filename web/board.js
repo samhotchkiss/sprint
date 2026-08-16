@@ -133,7 +133,8 @@ export function renderCardFace(card, app) {
   // here too long", so that is where the sweep's amber goes. No new chrome.
   // "grok · tmux" sits with the agent name, and only when this card was
   // dispatched differently from the board's default — a tag on every card
-  // would say nothing.
+  // would say nothing. It is one tag, not two: a card whose only exception is
+  // the model (#41's "on opus because fable ran out") still reads there.
   face.appendChild(h('div.card-foot',
     h('span', shortAgent(card.agent_name)),
     executorTag(card, { compact: true }),

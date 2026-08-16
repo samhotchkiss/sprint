@@ -122,6 +122,45 @@ the `SPRINT_SERVER`/`SPRINT_TOKEN` environment variables your brief set.
   Don't put a `reply_to` in your own payloads — a worker's is stripped,
   deliberately: the field is only trustworthy because exactly one writer
   sets it.
+- `sprint-post <num> chat "summary" --report path.md` — when what you have
+  to hand over is a **document**, not a line. A findings write-up, a
+  comparison table, a migration plan, an audit: these do not survive being
+  flattened into a one-liner, and pasting 400 lines into `--detail` destroys
+  the timeline for everyone else. `--report` attaches a `.md` or a standalone
+  `.html` file as a first-class attachment, exactly the way a screenshot is
+  one. **Write it as `.md`** — see the format note below.
+
+  ```
+  sprint-post 42 chat "findings are in the report" --report /abs/findings.md
+  sprint-post 42 note "two audits" --report /abs/a.md --report /abs/b.md
+  ```
+
+  - The board renders it in the thread as a **skim line** — the document's own
+    title — that expands into the whole rendered page, and lists it in the
+    sprint's report library behind the quiet **Reports** link in the header.
+    That link is only there once the sprint has a report, so attaching one is
+    what puts it on screen.
+  - Pass an **absolute path**; the server reads and content-addresses the file
+    the same way it does your screenshots, so a report you delete later is
+    still readable on the card.
+  - **Write `.md`. Prefer it every time you have a choice.** Markdown renders
+    with the board's own typography — same type, same spacing, same skin as
+    everything else on the page, in both Calm and Chaos. The renderer covers
+    headings, lists, code blocks, tables, blockquotes, links, and emphasis,
+    which is everything a report needs. **Raw HTML inside a `.md` is escaped,
+    not rendered** — write markdown, not HTML-in-markdown.
+  - `.html` is still supported, for documents that arrive already-HTML (a tool
+    emitted it, someone handed it to you). It renders **sandboxed and
+    unstyled** — scripts off, none of the board's typography — so it looks
+    plainly worse. Don't author one; convert to markdown if you can.
+  - Limits, all checked before the network call: `.md`/`.html` only, valid
+    UTF-8, no NUL/control bytes, 2 MB.
+  - A `phase` refuses a report on purpose — a phase says what you are doing
+    right now, which a document is not.
+
+  A packet takes the same thing as a `reports` field (see "Evidence packet").
+  **A report is not a substitute for `validate`**: the packet still has to say
+  how a human confirms the work without reading anything long.
 - `sprint-ask <num> "question" [--options '["a","b"]']` — when you're
   genuinely stuck on something only the user can resolve. This flips the
   card to `needs_you`. **Then END YOUR TURN.** Don't keep working, don't
@@ -284,6 +323,7 @@ worktree root — not committed) shaped like:
   "validate": ["Run `curl localhost:8080/api/widgets/42`", "Confirm the response has \"status\": \"active\""],
   "ui_change": true,
   "screenshots": ["/absolute/path/to/before-light.png", "/absolute/path/to/after-light.png", "/absolute/path/to/after-dark.png"],
+  "reports": ["/absolute/path/to/findings.md"],
   "live_url": "http://100.x.x.x:8442/whatever"
 }
 ```
@@ -317,6 +357,13 @@ worktree root — not committed) shaped like:
   delete later is still visible on the card. A path that doesn't exist
   when you post is silently unviewable, so post the packet while the
   files are still on disk.
+- `reports` is **optional**: absolute paths to documents your work produced —
+  **write them as `.md`** (`.html` is accepted but renders sandboxed and
+  unstyled; see the `--report` note above). They ride the same path screenshots
+  do — the board reads them off disk, renders each one in the packet behind a
+  skim line, and adds it to the sprint's Reports library. Use it when the
+  *reasoning* is the deliverable (an audit, a comparison, a design rationale)
+  rather than something a screenshot can show. It never replaces `validate`.
 - If you were dispatched as a batch, add `per_card`: one entry per
   member card, `{"card_num": N, "claim": "...", "screenshots": [...]}`.
   Call `sprint-ready` once (any one member card number) with the full

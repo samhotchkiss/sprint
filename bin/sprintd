@@ -27,6 +27,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -41,7 +42,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # --------------------------------------------------------------------------
 
 DEFAULT_PORT = 8377
+PORT_SCAN_LIMIT = 40            # how far past a taken port to look for a free one
 DEFAULT_HUB_PORT = 8300         # one hub per machine, fixed so the URL is memorable
+
+# What this server can DO, as one number the page can compare itself against.
+# The generation says WHICH process answered; this says what that process knows
+# how to serve. Bump it whenever web/ starts depending on an endpoint or a field
+# a running server might not have, and bump UI_API_VERSION in web/api.js in the
+# same commit: an old server + a new page is exactly the silent degrade this
+# number exists to turn into a sentence ("this board needs a restart").
+#   1 — the board through the hub/siblings work
+#   2 — phases (/api/board carries phase, phase_since, phase_expected_seconds)
+API_VERSION = 2
 DATA_DIRNAME = ".sprint"
 HUB_DIRNAME = ".sprint"         # under $HOME: the machine-wide (cross-project) state
 REGISTRY_FILENAME = "registry.json"
@@ -55,6 +67,9 @@ DEFAULT_HUB_PRUNE_SECONDS = 900.0      # unreachable + pid gone this long -> for
 DB_FILENAME = "sprint.db"
 SERVER_JSON = "server.json"
 TOKEN_FILENAME = "token"       # survives `stop`; server.json does not
+PORT_FILENAME = "port"         # ditto: which port this board answers on is an
+                               # IDENTITY (it is in every URL anyone saved), and
+                               # server.json is only a liveness record
 SERVER_LOG = "server.log"
 ATTACH_DIRNAME = "attachments"
 COOKIE_NAME = "sprint_token"
@@ -198,6 +213,44 @@ STUCK_TEXT = {
     "needs_you": "waiting on you for %s — the question is still unanswered",
     "ready": "ready for review %s — it is waiting on a verdict",
 }
+
+# --------------------------------------------------------------------------
+# Killed-agent detection
+#
+# Three workers were killed mid-flight when the session hit a provider usage
+# limit. Nothing recovered them: their cards sat in In motion for hours until
+# the user counted nine open cards and asked why. `agent_silent` had already
+# fired and said its piece at five minutes -- but saying "quiet" forever is
+# exactly what a dead agent looks like, and amber is not an escalation.
+#
+# So the sweep keeps a second, much longer clock on the same cards. Past
+# `worker_gone_seconds` it says out loud that the worker is probably dead; past
+# `worker_dead_seconds` it stops guessing and moves the card to `failed` with a
+# machine reason, which is the one state that carries a Retry the user can hit.
+# `failed` preserves the timeline, the evidence, the branch and the worktree --
+# Retry re-dispatches a fresh agent with all of it as the brief.
+#
+# The bar for "provably gone" is deliberately high, because declaring a working
+# agent dead is worse than waiting: the card must have an agent on it, must have
+# no live phase claim, must not be an external agent, and its quiet stretch is
+# measured per AGENT (any worker event on any of its cards counts), never per
+# card.
+DEFAULT_WORKER_GONE_SECONDS = 1200.0     # 20 min: say the worker may be dead
+DEFAULT_WORKER_DEAD_SECONDS = 2400.0     # 40 min total: declare it failed
+# A `long_running` card promised in advance that it would be quiet, so the
+# clock is stretched rather than switched off -- an agent killed in the middle
+# of a long test run is the exact shape of the incident this rule exists for,
+# and an exemption with no end would be a hole big enough to drive it through.
+DEFAULT_WORKER_LONGRUN_FACTOR = 6.0      # 2 h notice, 4 h failed
+WORKER_GONE_STATES = ("triaging", "in_progress", "needs_you")
+
+# Which model the session dispatches on unless something went wrong. Recorded
+# per card at assign time so that a fallback -- "fable hit its usage limit, this
+# one is running on opus" -- is a fact on the board and not a thing the user has
+# to remember. The face shows the model ONLY when it differs from this, because
+# a badge that is on every card says nothing.
+DEFAULT_MODEL = "fable"
+MODEL_MAX = 40
 
 STATES = (
     "held", "queued", "triaging", "in_progress", "needs_you", "blocked",
@@ -604,6 +657,304 @@ def image_line(n: int) -> str:
     return "sent a screenshot" if n == 1 else "sent %d screenshots" % n
 
 
+def report_line(n: int) -> str:
+    return "attached a report" if n == 1 else "attached %d reports" % n
+
+
+# --------------------------------------------------------------------------
+# Reports: markdown/HTML documents as first-class attachments
+#
+# An agent's real output is often a DOCUMENT -- a findings write-up, a
+# comparison table, a migration plan -- and pasting 400 lines of it into a chat
+# one-liner destroys both the document and the timeline. So a report rides the
+# exact same content-addressed attachment store an image does, and renders in
+# the thread as a skim line (its title) that expands into the whole rendered
+# page.
+#
+# Two document kinds, two safety stories:
+#
+#   .md    We render it OURSELVES, server-side, with the small renderer below.
+#          Raw HTML inside a .md is ESCAPED, never passed through -- a report
+#          that contains `<script>` renders the characters `<script>`, inert.
+#          There is no sanitizer to get wrong because no author markup is ever
+#          treated as markup.
+#   .html  We do NOT render or rewrite it. It is served back under a
+#          `Content-Security-Policy: sandbox` header (unique opaque origin, no
+#          scripts, no same-origin access) AND displayed only inside an iframe
+#          carrying a restrictive `sandbox` attribute. Belt and braces: even a
+#          direct navigation to the raw URL cannot touch the board's session.
+#
+# Reports are TEXT. There are no magic bytes to sniff, so the check is: the
+# name carries a known document extension, the bytes decode as strict UTF-8,
+# and there are no NULs (that is what "a binary wearing a .md" looks like).
+REPORT_KIND_BY_EXT = {
+    "md": "md", "markdown": "md", "mdown": "md",
+    "html": "html", "htm": "html",
+}
+REPORT_EXT_OF_KIND = {"md": "md", "html": "html"}
+REPORT_MIME_OF_KIND = {"md": "text/markdown; charset=utf-8",
+                       "html": "text/html; charset=utf-8"}
+# A report is prose, not a payload. 2 MB is a very long document and still an
+# order of magnitude under the request cap; past that it is not a report.
+REPORT_MAX_BYTES = 2 * 1024 * 1024
+REPORT_NAME_RE = re.compile(r"^([0-9a-f]{64})\.(md|html)$")
+REPORT_URL_RE = re.compile(r"^/api/attachments/([0-9a-f]{64})\.(md|html)$")
+# Which link targets survive rendering. Anything else (javascript:, data:,
+# vbscript:) is dropped to plain text -- a link you cannot see is better than
+# one that runs.
+SAFE_URL_RE = re.compile(r"^(https?://|mailto:|/|#|\./|\.\./)", re.I)
+
+
+def report_kind_for_name(name) -> str:
+    """'md' | 'html' | None -- decided by extension alone, deliberately."""
+    base = os.path.basename(str(name or "")).strip().lower()
+    if "." not in base:
+        return None
+    return REPORT_KIND_BY_EXT.get(base.rsplit(".", 1)[1])
+
+
+def esc(text) -> str:
+    """The whole safety story of the markdown renderer, in one function.
+
+    Everything an author wrote becomes text BEFORE any tag is generated, so no
+    author-supplied markup ever reaches the browser as markup."""
+    return (str("" if text is None else text)
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def safe_url(url) -> str:
+    u = str(url or "").strip()
+    if not u or not SAFE_URL_RE.match(u):
+        return ""
+    return esc(u)
+
+
+def render_inline(text: str) -> str:
+    """Inline markdown over ALREADY-ESCAPED text.
+
+    Order matters: code spans are lifted out first (their contents are never
+    re-scanned for emphasis), then links/images, then emphasis. Placeholders
+    are NUL-delimited, and NUL can never appear in a stored report -- that is
+    exactly what `store_document` rejects."""
+    out = esc(text)
+    stash = []
+
+    def keep(html: str) -> str:
+        stash.append(html)
+        return "\x00%d\x00" % (len(stash) - 1)
+
+    out = re.sub(r"`([^`]+)`", lambda m: keep("<code>%s</code>" % m.group(1)), out)
+    # The URL may itself carry one level of balanced parens (`alert(1)`,
+    # `Foo_(disambiguation)`). Without that the trailing `)` escapes the match
+    # and a dropped link leaves a stray bracket in the prose.
+    url_re = r"((?:[^()\s]|\([^()\s]*\))+)"
+    out = re.sub(
+        r"!\[([^\]]*)\]\(" + url_re + r"\)",
+        lambda m: keep('<img src="%s" alt="%s">' % (safe_url(m.group(2)), m.group(1)))
+        if safe_url(m.group(2)) else m.group(1),
+        out)
+    out = re.sub(
+        r"\[([^\]]+)\]\(" + url_re + r"\)",
+        lambda m: keep('<a href="%s" rel="noreferrer noopener nofollow" target="_blank">%s</a>'
+                       % (safe_url(m.group(2)), m.group(1)))
+        if safe_url(m.group(2)) else m.group(1),
+        out)
+    out = re.sub(r"~~(.+?)~~", r"<del>\1</del>", out)
+    out = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", out)
+    out = re.sub(r"__(.+?)__", r"<strong>\1</strong>", out)
+    out = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<em>\1</em>", out)
+    out = re.sub(r"(?<![\w_])_([^_\n]+)_(?![\w_])", r"<em>\1</em>", out)
+    return re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], out)
+
+
+# The line-starts that END a paragraph or a list item. One definition, used by
+# both the paragraph loop and the list's lazy continuation, so they can never
+# disagree about where a block stops.
+_BLOCK_START_RE = re.compile(r"^\s*(#{1,6}\s|>|```|([-*+]|\d+[.)])\s|([-*_])\s*(\3\s*){2,}$)")
+
+
+def _starts_block(line: str) -> bool:
+    return bool(_BLOCK_START_RE.match(line))
+
+
+def _table_rows(line: str) -> list:
+    cells = line.strip()
+    if cells.startswith("|"):
+        cells = cells[1:]
+    if cells.endswith("|"):
+        cells = cells[:-1]
+    return [c.strip() for c in cells.split("|")]
+
+
+def render_markdown(text: str) -> str:
+    """A small, deliberate markdown subset -- no dependencies, ever.
+
+    Headings, fenced code, blockquotes, nested lists, tables, rules, links,
+    images, emphasis, inline code. Everything else is a paragraph. Raw HTML is
+    escaped, never emitted: see `esc`."""
+    lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out, i = [], 0
+    # open list stack: (tag, indent, nested_in_li) -- a deeper list is opened
+    # INSIDE the <li> above it, which is what makes it indent correctly.
+    stack = []
+
+    def close_lists(to_indent=-1):
+        while stack and stack[-1][1] > to_indent:
+            tag, _, nested = stack.pop()
+            out.append("</%s>%s" % (tag, "</li>" if nested else ""))
+
+    while i < len(lines):
+        raw = lines[i]
+        line = raw.rstrip()
+        stripped = line.strip()
+
+        if not stripped:
+            close_lists()
+            i += 1
+            continue
+
+        m = re.match(r"^(\s*)```+\s*([\w.+-]*)\s*$", line)
+        if m:
+            close_lists()
+            lang, body, i = m.group(2), [], i + 1
+            while i < len(lines) and not re.match(r"^\s*```+\s*$", lines[i]):
+                body.append(lines[i])
+                i += 1
+            i += 1                       # the closing fence (or EOF)
+            cls = ' class="lang-%s"' % esc(lang) if lang else ""
+            out.append("<pre><code%s>%s</code></pre>" % (cls, esc("\n".join(body))))
+            continue
+
+        if re.match(r"^\s*([-*_])\s*(\1\s*){2,}$", line):
+            close_lists()
+            out.append("<hr>")
+            i += 1
+            continue
+
+        m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if m:
+            close_lists()
+            level = len(m.group(1))
+            out.append("<h%d>%s</h%d>" % (level, render_inline(m.group(2).rstrip("#").strip()), level))
+            i += 1
+            continue
+
+        if stripped.startswith(">"):
+            close_lists()
+            quote = []
+            while i < len(lines) and lines[i].strip().startswith(">"):
+                quote.append(lines[i].strip()[1:].lstrip())
+                i += 1
+            out.append("<blockquote>%s</blockquote>" % render_markdown("\n".join(quote)))
+            continue
+
+        # table: a header row followed by a |---|---| separator
+        if "|" in stripped and i + 1 < len(lines) and \
+                re.match(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$", lines[i + 1]) and \
+                "|" in lines[i + 1]:
+            close_lists()
+            head = _table_rows(stripped)
+            i += 2
+            body = []
+            while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                body.append(_table_rows(lines[i]))
+                i += 1
+            cells = "".join("<th>%s</th>" % render_inline(c) for c in head)
+            rows = "".join(
+                "<tr>%s</tr>" % "".join("<td>%s</td>" % render_inline(c) for c in r)
+                for r in body)
+            out.append("<table><thead><tr>%s</tr></thead><tbody>%s</tbody></table>"
+                       % (cells, rows))
+            continue
+
+        m = re.match(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$", line)
+        if m:
+            indent = len(m.group(1).expandtabs(4))
+            tag = "ul" if m.group(2) in ("-", "*", "+") else "ol"
+            close_lists(indent)
+            if not stack or stack[-1][1] < indent:
+                # reopen the <li> above so the sub-list lives inside it
+                nested = bool(stack) and out and out[-1].endswith("</li>")
+                if nested:
+                    out[-1] = out[-1][: -len("</li>")]
+                stack.append((tag, indent, nested))
+                out.append("<%s>" % tag)
+            elif stack[-1][0] != tag:
+                otag, oind, onest = stack.pop()
+                out.append("</%s>" % otag)
+                stack.append((tag, oind, onest))
+                out.append("<%s>" % tag)
+            # Lazy continuation: a list item that wraps onto the next line is
+            # still that item. Without this a wrapped item closed the list and
+            # the next number restarted at 1 -- which is what a real report,
+            # written with wrapped prose, looks like.
+            body = [m.group(3)]
+            i += 1
+            while i < len(lines) and lines[i].strip() and not _starts_block(lines[i]):
+                body.append(lines[i].strip())
+                i += 1
+            out.append("<li>%s</li>" % render_inline(" ".join(body)))
+            continue
+
+        close_lists()
+        # A wrapped paragraph is ONE paragraph. Joining source lines with <br>
+        # bakes the author's 80-column wrap into the page, which reads as ragged
+        # nonsense at 480px in the rail. A hard break is the markdown way of
+        # asking for one: two trailing spaces, or a trailing backslash.
+        para = []
+        while i < len(lines) and lines[i].strip() and not _starts_block(lines[i]):
+            raw_line = lines[i]
+            hard = raw_line.endswith("  ") or raw_line.rstrip().endswith("\\")
+            para.append(raw_line.strip().rstrip("\\") + ("\x01" if hard else ""))
+            i += 1
+        if para:
+            body = render_inline(" ".join(para)).replace("\x01 ", "<br>")
+            out.append("<p>%s</p>" % body.replace("\x01", ""))
+        else:                              # a construct we just refused to eat
+            out.append("<p>%s</p>" % render_inline(stripped))
+            i += 1
+    close_lists()
+    return "\n".join(out)
+
+
+def report_title(kind: str, text: str, name: str = None) -> str:
+    """The skim line: what this document calls itself."""
+    fallback = os.path.basename(str(name or "")) or "report"
+    body = str(text or "")
+    if kind == "html":
+        m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S) or \
+            re.search(r"<h1[^>]*>(.*?)</h1>", body, re.I | re.S)
+        if m:
+            title = re.sub(r"<[^>]+>", " ", m.group(1))
+            title = html_unescape_lite(" ".join(title.split()))
+            if title:
+                return one_line(title, 120)
+        return fallback
+    for raw in body.split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("```"):
+            continue
+        # Strip the markers that WRAP the line, not every marker character in
+        # it: "how card #33 shipped" is a title about card #33, and a blanket
+        # strip renamed it "card 33".
+        line = re.sub(r"^\s*>+\s*", "", line)
+        m = re.match(r"^#{1,6}\s+(.*)$", line)
+        if m:
+            line = m.group(1).rstrip("# ")
+        line = re.sub(r"[*_`]", "", line).strip()
+        if line:
+            return one_line(line, 120)
+    return fallback
+
+
+def html_unescape_lite(text: str) -> str:
+    for a, b in (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'),
+                 ("&#39;", "'"), ("&amp;", "&")):
+        text = text.replace(a, b)
+    return text
+
+
 class ApiError(Exception):
     def __init__(self, status: int, code: str, message: str = "", **extra):
         super().__init__(message or code)
@@ -634,6 +985,19 @@ def clean_title(value, limit: int = 90) -> str:
     return text
 
 
+def clean_model(value):
+    """Normalize a model name, or None. Free-form on purpose: the board records
+    what the session says it dispatched on and never adjudicates the list."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApiError(400, "bad_model", "model must be a string", field="model")
+    text = " ".join(value.split())
+    if not text:
+        return None
+    return text[:MODEL_MAX]
+
+
 # --------------------------------------------------------------------------
 # Settings validation
 #
@@ -659,9 +1023,13 @@ def clean_executor_name(value, field: str = "executor") -> str:
     return name
 
 
-def clean_model(value, field: str = "model") -> str:
+def clean_model_name(value, field: str = "model") -> str:
     """A model is a free-form label (`sonnet`, `opus`, `grok-4`) -- we do not
-    keep a whitelist of somebody else's product names, we just keep it sane."""
+    keep a whitelist of somebody else's product names, we just keep it sane.
+
+    The strict sibling of `clean_model`: settings and an explicit per-card
+    dispatch have a human on the other end of the 400, so a blank or a number
+    is refused by name rather than quietly recorded as "no model"."""
     if not isinstance(value, str) or not value.strip():
         raise _bad(field, "%s must be a non-empty string" % field)
     model = " ".join(value.split())
@@ -702,7 +1070,7 @@ def validate_executor(name: str, spec) -> dict:
         raise _bad("%s.command" % field,
                    "command/session only apply to a tmux executor")
     if spec.get("model") is not None:
-        out["model"] = clean_model(spec["model"], "%s.model" % field)
+        out["model"] = clean_model_name(spec["model"], "%s.model" % field)
     if spec.get("note") is not None:
         if not isinstance(spec["note"], str):
             raise _bad("%s.note" % field, "note must be a string")
@@ -852,6 +1220,10 @@ class App:
                  sse_heartbeat: float = None, max_upload: int = None,
                  sweep_tick: float = None, sweep_thresholds: dict = None,
                  sweep_backoff=None, sweep_max_reminders: int = None,
+                 worker_gone_seconds: float = None,
+                 worker_dead_seconds: float = None,
+                 worker_longrun_factor: float = None,
+                 default_model: str = None,
                  log=None):
         self.project_root = os.path.realpath(project_root)
         self.data_dir = os.path.realpath(data_dir or os.path.join(self.project_root, DATA_DIRNAME))
@@ -915,6 +1287,22 @@ class App:
             int(sweep_max_reminders) if sweep_max_reminders is not None
             else env_int("SPRINT_SWEEP_MAX_REMINDERS", DEFAULT_SWEEP_MAX_REMINDERS))
 
+        # Killed-agent detection. Same reasoning as the sweep thresholds: a
+        # twenty-minute rule is only testable if twenty minutes can be two
+        # seconds.
+        self.worker_gone_seconds = (
+            worker_gone_seconds if worker_gone_seconds is not None
+            else env_float("SPRINT_WORKER_GONE_SECONDS", DEFAULT_WORKER_GONE_SECONDS))
+        self.worker_dead_seconds = (
+            worker_dead_seconds if worker_dead_seconds is not None
+            else env_float("SPRINT_WORKER_DEAD_SECONDS", DEFAULT_WORKER_DEAD_SECONDS))
+        self.worker_longrun_factor = (
+            worker_longrun_factor if worker_longrun_factor is not None
+            else env_float("SPRINT_WORKER_LONGRUN_FACTOR", DEFAULT_WORKER_LONGRUN_FACTOR))
+        self.default_model = clean_model(
+            default_model if default_model is not None
+            else os.environ.get("SPRINT_DEFAULT_MODEL", DEFAULT_MODEL)) or DEFAULT_MODEL
+
         self._log = log
         self.lock = threading.RLock()
         self.cond = threading.Condition()
@@ -957,6 +1345,8 @@ class App:
         ("cards", "work_kind", "TEXT NOT NULL DEFAULT 'code'"),
         # the per-card dispatch choice: NULL means "the board's defaults"
         ("cards", "executor", "TEXT"),
+        # Which model the agent on this card was dispatched on. NULL means
+        # "the sprint default" -- the face only ever shows the exception.
         ("cards", "model", "TEXT"),
     )
 
@@ -971,6 +1361,32 @@ class App:
                 continue
             self.conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, decl))
             seen[table].add(column)
+        # Anything cached from before the ALTERs is now a lie.
+        self._columns = {}
+
+    def columns(self, table: str = "cards") -> set:
+        """What this database's table actually has, cached.
+
+        Read by anything that must cope with a column it did not create --
+        `external_agent` lands from another change, and a rule that guards on
+        it has to degrade to "no such flag" rather than crash on an older DB.
+        """
+        cached = getattr(self, "_columns", None)
+        if cached is None:
+            cached = self._columns = {}
+        if table not in cached:
+            cached[table] = {r["name"] for r in
+                             self.q("PRAGMA table_info(%s)" % table)}
+        return cached[table]
+
+    def card_flag(self, row, name: str) -> bool:
+        """A boolean column that may not exist in this database yet."""
+        if name not in self.columns("cards"):
+            return False
+        try:
+            return bool(row[name])
+        except (IndexError, KeyError):
+            return False
 
     def log(self, msg: str):
         line = "%s sprintd %s" % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg)
@@ -1129,6 +1545,14 @@ class App:
         for key in ("attachments", "images", "screenshots"):
             if isinstance(out.get(key), list) and out[key]:
                 out[key] = self.ingest_refs(out[key])
+        # `reports` on a worker event is a list of .md/.html paths, and it lands
+        # in `attachments` beside any images so the thread has ONE list to read.
+        if isinstance(out.get("reports"), list) and out["reports"]:
+            docs = [d for d in self.ingest_report_refs(out.pop("reports"))
+                    if isinstance(d, dict) and d.get("doc")]
+            if docs:
+                atts = out.get("attachments")
+                out["attachments"] = (atts if isinstance(atts, list) else []) + docs
         return out
 
     @staticmethod
@@ -1201,6 +1625,36 @@ class App:
 
     # -- sprints ----------------------------------------------------------
 
+    def default_sprint_title(self) -> str:
+        """What a sprint is called when nobody named it: the PROJECT.
+
+        The board header used to read the literal string "sprint", which tells
+        you nothing when three of them are open in three tmux windows. The
+        project directory's basename is the name the human already uses for this
+        work ("russ"), and it is the same string the machine-wide registry
+        carries — the registry stays authoritative for the switcher's label, and
+        this is only the fallback for the title of a sprint nobody titled.
+        """
+        return os.path.basename(self.project_root.rstrip(os.sep)) or "sprint"
+
+    def name_untitled_sprint(self):
+        """Rename a sprint still carrying the old literal default.
+
+        "sprint" was never a name anybody chose — it was what the server wrote
+        when it opened one unasked, and boards that were auto-opened before this
+        change are all sitting under it. Anything else, including a title the
+        session set, is left exactly alone.
+        """
+        row = self.q1("SELECT * FROM sprints WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1")
+        if row is None or (row["title"] or "").strip() != "sprint":
+            return row
+        title = self.default_sprint_title()
+        if title == "sprint":
+            return row
+        with self.lock:
+            self.conn.execute("UPDATE sprints SET title=? WHERE id=?", (title, row["id"]))
+        return self.q1("SELECT * FROM sprints WHERE id=?", (row["id"],))
+
     def open_sprint(self, create: bool = True, title: str = None):
         row = self.q1("SELECT * FROM sprints WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1")
         if row is not None or not create:
@@ -1215,7 +1669,7 @@ class App:
             try:
                 cur = self.conn.execute(
                     "INSERT INTO sprints(opened_at, closed_at, title, hold_mode) VALUES(?,NULL,?,0)",
-                    (now(), title or "sprint"))
+                    (now(), title or self.default_sprint_title()))
                 sid = int(cur.lastrowid)
                 self._append_event(None, "server", "note",
                                    {"text": "sprint opened", "sprint_id": sid})
@@ -1246,6 +1700,12 @@ class App:
 
     def card_json(self, row, brief: bool = False) -> dict:
         num = row["num"]
+        # A board that has been up since before either column landed gets them
+        # ALTERed in on open, but read defensively anyway: a 500 on every card
+        # read is not the way to find out the migration did not run.
+        have = self.columns("cards")
+        c_model = row["model"] if "model" in have else None
+        c_executor = row["executor"] if "executor" in have else None
         out = {
             "num": num,
             "sprint_id": row["sprint_id"],
@@ -1260,6 +1720,11 @@ class App:
             "pinned": bool(row["pinned"]),
             "dup_of": row["dup_of"],
             "long_running": bool(row["long_running"]),
+            # Which model this card's agent was dispatched on, and whether that
+            # is worth saying out loud. NULL model or the sprint default means
+            # the face shows nothing: a badge on every card is decoration.
+            "model": c_model,
+            "default_model": self.default_model,
             # An assignee that emits no worker telemetry (an ordinary background
             # agent, a human, a cron). The silence timer cannot watch it, so it
             # doesn't -- the session owns checking on it.
@@ -1269,15 +1734,14 @@ class App:
             "updated_at": row["updated_at"],
             # Who ran this card and with what. NULL on both means "the board's
             # defaults" -- which is why the face only tags a card that differs.
-            "executor": row["executor"],
-            "model": row["model"],
+            "executor": c_executor,
         }
         # Resolved for the face: "grok · tmux" needs the executor's KIND, and
         # the card alone does not know it. `is_default` is the tag's whole
         # question -- a board where everything runs on the default should
         # carry no executor chrome at all.
-        dispatch = resolve_dispatch(self.settings(), row["executor"], row["model"])
-        dispatch["is_default"] = (row["executor"] is None and row["model"] is None)
+        dispatch = resolve_dispatch(self.settings(), c_executor, c_model)
+        dispatch["is_default"] = (c_executor is None and c_model is None)
         out["dispatch"] = dispatch
         last = self.q1(
             "SELECT * FROM events WHERE card_num=? ORDER BY seq DESC LIMIT 1", (num,))
@@ -1361,10 +1825,11 @@ class App:
             "answered_at": row["answered_at"], "created_at": row["created_at"],
         }
 
-    def create_card(self, text: str, images: list, hold: bool, actor: str = "user") -> dict:
+    def create_card(self, text: str, images: list, hold: bool, actor: str = "user",
+                    reports: list = None) -> dict:
         text = (text or "").strip()
         images = images or []
-        if not text and not images:
+        if not text and not images and not (reports or []):
             raise ApiError(400, "empty_submission",
                            "at least one of text or images is required")
         sprint = self.open_sprint(create=True)
@@ -1374,8 +1839,11 @@ class App:
         # Attachments are content-addressed and written to disk BEFORE the
         # event that references them.
         attachments = self.store_images(images)
+        docs = self.store_reports(reports)
+        attachments = attachments + docs
 
-        title = first_line_title(text) or "(image only)"
+        title = first_line_title(text) or \
+            (docs[0]["title"] if docs else None) or "(image only)"
         ts = now()
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -1386,9 +1854,10 @@ class App:
                     (sprint["id"] if sprint else None, state, title, text, ts, ts))
                 num = int(cur.lastrowid)
                 self._append_event(num, actor, "submitted", {
-                    "text": text or image_line(len(attachments)),
+                    "text": text or (report_line(len(docs)) if docs
+                                     else image_line(len(attachments))),
                     "attachments": attachments,
-                    "images_only": not text,
+                    "images_only": not text and not docs,
                     "hold": bool(hold or hold_mode)})
                 self._append_event(num, "server", "state", {
                     "from": None, "to": state,
@@ -1593,6 +2062,259 @@ class App:
                            field=field)
         return [self.store_attachment(img) for img in images]
 
+    # -- reports: markdown / html documents --------------------------------
+
+    def store_document(self, blob: bytes, name: str) -> dict:
+        """Content-address one REPORT to disk and return a ready-to-use ref.
+
+        Deliberately a separate door from `store_blob`: `images:` stays png/jpeg
+        only, so nothing that ever worked starts accepting text. The sniff here
+        is the honest one for a text format -- known extension, strict UTF-8, no
+        NULs (a binary wearing a .md name fails all three)."""
+        kind = report_kind_for_name(name)
+        if not kind:
+            raise ApiError(400, "bad_report",
+                           "reports must be .md or .html (got %r)" % (name or ""))
+        if not blob:
+            raise ApiError(400, "bad_report", "report is empty")
+        if len(blob) > REPORT_MAX_BYTES:
+            raise ApiError(413, "too_large",
+                           "a report may not exceed %d bytes" % REPORT_MAX_BYTES)
+        # NUL is what "a binary wearing a .md" looks like. The rest of the C0
+        # controls are rejected for the same reason AND for a second one: the
+        # renderer uses \x00 and \x01 as its own internal placeholders, so a
+        # document that could contain them could confuse it. Tab, newline and
+        # carriage return are the only control characters a document may hold.
+        if any(b < 0x09 or b in (0x0b, 0x0c) or 0x0e <= b <= 0x1f for b in blob):
+            raise ApiError(400, "bad_report",
+                           "report contains NUL or control bytes — that is not a text document")
+        try:
+            text = blob.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ApiError(400, "bad_report", "report must be valid UTF-8 text")
+        ext = REPORT_EXT_OF_KIND[kind]
+        sha = hashlib.sha256(blob).hexdigest()
+        path = os.path.join(self.attach_dir, "%s.%s" % (sha, ext))
+        if not os.path.exists(path):
+            tmp = path + ".part-%s" % secrets.token_hex(6)
+            with open(tmp, "wb") as fh:
+                fh.write(blob)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        return {"sha256": sha, "path": path, "mime": REPORT_MIME_OF_KIND[kind],
+                "bytes": len(blob), "name": os.path.basename(str(name)),
+                "kind": "report", "doc": kind,
+                "title": report_title(kind, text, name),
+                "url": self.attach_url(sha, ext),
+                "view_url": "#/report/%s.%s" % (sha, ext)}
+
+    def store_report(self, rep) -> dict:
+        """Accept {name, text} | {name, data|b64 (base64)} | a data: URL string.
+
+        A report is text, so `text` is the natural shape for an agent and
+        `data` is the natural shape for a browser that just read a File."""
+        name, text, data_s = None, None, ""
+        if isinstance(rep, dict):
+            name = rep.get("name") or rep.get("filename")
+            text = rep.get("text") if isinstance(rep.get("text"), str) else None
+            data_s = rep.get("data") or rep.get("b64") or ""
+        elif isinstance(rep, str):
+            data_s = rep
+        else:
+            raise ApiError(400, "bad_report", "each report must be an object or a data: URL")
+        if text is not None:
+            if not name:
+                raise ApiError(400, "bad_report", "a report needs a name so we know .md from .html")
+            return self.store_document(text.encode("utf-8"), name)
+        if not isinstance(data_s, str) or not data_s.strip():
+            raise ApiError(400, "bad_report", "report entry is empty")
+        if data_s.startswith("data:"):
+            head, _, data_s = data_s.partition(",")
+            if "base64" not in head:
+                raise ApiError(400, "bad_report", "data: URLs must be base64")
+            if not name:
+                m = re.match(r"^data:text/(markdown|html)", head, re.I)
+                name = "report.md" if (m and m.group(1).lower() == "markdown") else \
+                    ("report.html" if m else None)
+        if not name:
+            raise ApiError(400, "bad_report", "a report needs a name so we know .md from .html")
+        try:
+            blob = base64.b64decode(re.sub(r"\s+", "", data_s), validate=True)
+        except (binascii.Error, ValueError):
+            raise ApiError(400, "bad_report", "report is not valid base64")
+        return self.store_document(blob, name)
+
+    def store_reports(self, reports, field: str = "reports") -> list:
+        if reports is None:
+            return []
+        if not isinstance(reports, list):
+            raise ApiError(400, "bad_report", "%s must be a list of documents" % field,
+                           field=field)
+        return [self.store_report(r) for r in reports]
+
+    def ingest_report_ref(self, ref):
+        """A packet's `reports` entry -> a ref the board can open.
+
+        Workers hand us absolute paths, exactly as they do for screenshots."""
+        if isinstance(ref, dict):
+            out = dict(ref)
+            if isinstance(out.get("url"), str) and out["url"] and out.get("doc"):
+                return out
+            src = out.get("path") or out.get("file") or out.get("src")
+            if isinstance(src, str) and src:
+                merged = self.ingest_report_ref(src)
+                if isinstance(merged, dict) and merged.get("doc"):
+                    if out.get("name"):
+                        merged["name"] = out["name"]
+                    return merged
+            return out
+        if not isinstance(ref, str) or not ref.strip():
+            return ref
+        s = ref.strip()
+        m = REPORT_URL_RE.match(s) or REPORT_NAME_RE.match(s)
+        if m:
+            return {"sha256": m.group(1), "name": os.path.basename(s),
+                    "kind": "report", "doc": REPORT_KIND_BY_EXT[m.group(2)],
+                    "url": self.attach_url(m.group(1), m.group(2)),
+                    "view_url": "#/report/%s.%s" % (m.group(1), m.group(2))}
+        try:
+            if os.path.isfile(s) and os.path.getsize(s) <= REPORT_MAX_BYTES:
+                with open(s, "rb") as fh:
+                    blob = fh.read()
+                stored = self.store_document(blob, os.path.basename(s))
+                stored["source_path"] = os.path.realpath(s)
+                return stored
+        except (OSError, ApiError):
+            pass
+        return {"name": os.path.basename(s) or s}
+
+    def ingest_report_refs(self, refs):
+        if not isinstance(refs, list):
+            return refs
+        return [self.ingest_report_ref(r) for r in refs]
+
+    @staticmethod
+    def reports_in_payload(payload) -> list:
+        """Every report ref a single event payload carries, wherever it sits.
+
+        Reports ride in `attachments` (they are attachments), and a packet
+        additionally carries its own `reports` list -- an evidence packet is a
+        document envelope as much as a screenshot one."""
+        out = []
+        if not isinstance(payload, dict):
+            return out
+        buckets = [payload.get("attachments"), payload.get("reports")]
+        packet = payload.get("packet")
+        if isinstance(packet, dict):
+            buckets.append(packet.get("reports"))
+        for bucket in buckets:
+            if not isinstance(bucket, list):
+                continue
+            for ref in bucket:
+                if isinstance(ref, dict) and ref.get("doc") in ("md", "html") \
+                        and re.match(r"^[0-9a-f]{64}$", str(ref.get("sha256") or "")):
+                    out.append(ref)
+        return out
+
+    def reports_index(self, scope: str = "sprint") -> dict:
+        """Every report document in this sprint (or, with scope=all, ever).
+
+        User ruling, verbatim: "link should only appear once there's a report
+        within the sprint" -- so the DEFAULT scope, and therefore the count the
+        header link reads, is the open sprint and nothing else. History is
+        still reachable, it is just never what decides whether the link is
+        there."""
+        sprint = self.open_sprint(create=False)
+        sprint_id = sprint["id"] if sprint else None
+        titles = {r["num"]: (r["title"] or "") for r in self.q("SELECT num, title FROM cards")}
+        card_sprint = {r["num"]: r["sprint_id"] for r in self.q("SELECT num, sprint_id FROM cards")}
+        opened = sprint["opened_at"] if sprint else None
+        rows = self.q("SELECT seq, card_num, ts, actor, payload FROM events "
+                      "WHERE payload LIKE '%\"doc\":%' ORDER BY seq")
+        seen, out = set(), []
+        for row in rows:
+            payload = jload(row["payload"], {}) or {}
+            num = row["card_num"]
+            if scope != "all":
+                if num is not None:
+                    if sprint_id is None or card_sprint.get(num) != sprint_id:
+                        continue
+                else:
+                    # a sidebar report belongs to whichever sprint was open when
+                    # it was posted
+                    if opened is None or row["ts"] < opened:
+                        continue
+            for ref in self.reports_in_payload(payload):
+                sha = ref["sha256"]
+                if sha in seen:
+                    continue
+                seen.add(sha)
+                ext = REPORT_EXT_OF_KIND[ref["doc"]]
+                out.append({
+                    "sha256": sha,
+                    "doc": ref["doc"],
+                    "name": ref.get("name") or "%s.%s" % (sha[:8], ext),
+                    "title": ref.get("title") or ref.get("name") or "report",
+                    "bytes": ref.get("bytes"),
+                    "card_num": num,
+                    "card_title": titles.get(num) if num is not None else None,
+                    "actor": row["actor"],
+                    "ts": row["ts"],
+                    "seq": row["seq"],
+                    "url": self.attach_url(sha, ext),
+                    "view_url": "#/report/%s.%s" % (sha, ext),
+                })
+        out.sort(key=lambda r: r["ts"], reverse=True)
+        return {"reports": out, "count": len(out), "scope": scope,
+                "sprint": self.sprint_json(sprint) if sprint else None,
+                "generation": self.generation, "server_time": now()}
+
+    def report_count(self) -> int:
+        """How many reports this sprint has -- the header link's whole condition."""
+        try:
+            return self.reports_index("sprint")["count"]
+        except Exception:                  # a count must never break the board
+            return 0
+
+    def report_detail(self, sha: str, ext: str) -> dict:
+        """One report, rendered. Markdown comes back as HTML we generated
+        ourselves; author HTML comes back as a URL to sandbox, never inlined."""
+        kind = REPORT_KIND_BY_EXT.get(ext)
+        if not kind:
+            raise ApiError(404, "no_such_report", "unknown report type")
+        path = os.path.join(self.attach_dir, "%s.%s" % (sha, REPORT_EXT_OF_KIND[kind]))
+        if not os.path.isfile(path):
+            raise ApiError(404, "no_such_report", "unknown report")
+        with open(path, "rb") as fh:
+            blob = fh.read()
+        text = blob.decode("utf-8", "replace")
+        meta = {}
+        for entry in self.reports_index("all")["reports"]:
+            if entry["sha256"] == sha:
+                meta = entry
+                break
+        out = {
+            "sha256": sha, "doc": kind, "bytes": len(blob),
+            "name": meta.get("name") or "%s.%s" % (sha[:8], REPORT_EXT_OF_KIND[kind]),
+            "title": meta.get("title") or report_title(kind, text, meta.get("name")),
+            "card_num": meta.get("card_num"), "card_title": meta.get("card_title"),
+            "actor": meta.get("actor"), "ts": meta.get("ts"),
+            "url": self.attach_url(sha, REPORT_EXT_OF_KIND[kind]),
+            "generation": self.generation,
+        }
+        if kind == "md":
+            # Rendered HERE, by us, out of escaped text. Nothing the author
+            # wrote is ever markup: see `esc` / `render_markdown`.
+            out["html"] = render_markdown(text)
+        else:
+            # Author HTML is never inlined into the board's DOM. The browser
+            # loads this URL into a sandboxed iframe; the response itself
+            # carries `Content-Security-Policy: sandbox` too.
+            out["raw_url"] = out["url"]
+            out["sandboxed"] = True
+        return out
+
     def ingest_ref(self, ref):
         """Turn any attachment/screenshot reference into one the browser can load.
 
@@ -1662,6 +2384,11 @@ class App:
         out = dict(packet)
         if isinstance(out.get("screenshots"), list):
             out["screenshots"] = self.ingest_refs(out["screenshots"])
+        # A packet may ship DOCUMENTS as well as pictures: `reports` is a list
+        # of .md/.html paths the worker wrote, ingested exactly like screenshots
+        # are, so the library and the packet both open the same stored copy.
+        if isinstance(out.get("reports"), list):
+            out["reports"] = self.ingest_report_refs(out["reports"])
         if isinstance(out.get("per_card"), list):
             per = []
             for entry in out["per_card"]:
@@ -1968,7 +2695,13 @@ class App:
         """Has the sweep flagged this card and it still hasn't moved? The board
         reads this to amber the card's age text."""
         row = row if row is not None else self.q1("SELECT * FROM cards WHERE num=?", (num,))
-        if row is None or row["state"] not in STUCK_STATES:
+        if row is None:
+            return False
+        # Two rules write `stuck`: the parked-card sweep (five states somebody
+        # owes an action on) and the dead-worker notice (three states an agent
+        # is supposed to be working in). Both mean the same thing on the face --
+        # this has been sitting here too long -- so both amber the age.
+        if row["state"] not in STUCK_STATES and row["state"] not in WORKER_GONE_STATES:
             return False
         return bool(self._stuck_events_since(num, self._last_state_seq(num)))
 
@@ -1978,6 +2711,10 @@ class App:
                 self.sweep_stuck()
             except Exception:  # never let the timer thread die
                 self.log("staleness sweep failed: %s" % traceback.format_exc())
+            try:
+                self.sweep_worker_gone()
+            except Exception:  # ...and one rule's bug must not silence the other
+                self.log("worker-gone sweep failed: %s" % traceback.format_exc())
 
     def sweep_stuck(self) -> int:
         placeholders = ",".join("?" * len(STUCK_STATES))
@@ -2002,6 +2739,162 @@ class App:
                 except Exception:
                     self.conn.execute("ROLLBACK")
                     raise
+            fired += 1
+        if fired:
+            self.notify()
+        return fired
+
+    # -- killed-agent detection -------------------------------------------
+    #
+    # `agent_silent` ambers a card at five minutes and then has nothing further
+    # to say. That is the right volume for an agent that is merely quiet and the
+    # wrong ending for one that is dead: three cards sat in In motion for hours
+    # after their workers were killed by a provider usage limit, and the board
+    # never escalated because "quiet" is all it knew how to be.
+    #
+    # This is the ending. One notice when the worker is probably gone, and one
+    # transition to `failed` -- the state that carries a Retry -- when it has
+    # been gone long enough that waiting is no longer the cautious choice.
+
+    def worker_gone_exempt(self, row):
+        """Why this card is NOT a candidate for the dead-worker rule, or None.
+
+        Returns a short machine reason so the guards are testable one at a time
+        and readable in one place. Declaring a live agent dead is the expensive
+        mistake here, so every one of these is a bias toward waiting.
+        """
+        if row["state"] not in WORKER_GONE_STATES:
+            return "state"
+        if not row["agent_name"]:
+            # Nothing to be dead. A card with no agent is a dispatch problem,
+            # and the `queued` sweep rule already owns that.
+            return "no_agent"
+        if self.card_flag(row, "external_agent"):
+            # Somebody else's process on somebody else's clock. The board has
+            # no standing to call it dead and no way to restart it.
+            return "external_agent"
+        num = row["num"]
+        if self.phase_shields(num, row):
+            # It said in advance that this stretch would be quiet, and it is
+            # still inside the time it claimed. That is a live claim, not
+            # silence.
+            return "phase"
+        if row["state"] == "needs_you" and self.q1(
+                "SELECT id FROM questions WHERE card_num=? AND answered_at IS NULL "
+                "LIMIT 1", (num,)) is not None:
+            # A worker parked on an open question is SUPPOSED to be silent --
+            # it ended its turn and the user has the ball. That quiet says
+            # nothing about whether the process is alive, and the `needs_you`
+            # sweep rule is already nagging the right person about it.
+            return "open_question"
+        return None
+
+    def worker_gone_window(self, row):
+        """(notice, failed) seconds for this card. A `long_running` card
+        promised the quiet in advance, so its window stretches by the factor
+        rather than disappearing."""
+        scale = self.worker_longrun_factor if row["long_running"] else 1.0
+        return self.worker_gone_seconds * scale, self.worker_dead_seconds * scale
+
+    def worker_gone_notified(self, num: int) -> bool:
+        """Has this episode already had its opening notice? An episode runs from
+        the card's last transition, so escalating to `failed` ends it."""
+        for row in self._stuck_events_since(num, self._last_state_seq(num)):
+            ev = self.q1("SELECT payload FROM events WHERE seq=?", (row["seq"],))
+            if (jload(ev["payload"], {}) or {}).get("rule") == "worker_gone":
+                return True
+        return False
+
+    def worker_gone_due(self, row):
+        """What this card owes right now: a notice, an escalation, or nothing.
+
+        Pure read — `sweep_worker_gone` calls it once loose and once under the
+        lock, because a worker can come back to life between the two.
+        """
+        if self.worker_gone_exempt(row) is not None:
+            return None
+        num = row["num"]
+        # Per AGENT, not per card: while it is posting on card A it is
+        # demonstrably not dead on card B. `card_baseline` already knows this,
+        # and falls back to the card's last transition for an agent that was
+        # assigned and never said a word -- which is exactly what a worker
+        # killed at dispatch looks like.
+        ts, _seq = self.card_baseline(num, row)
+        quiet = now() - ts
+        notice_after, fail_after = self.worker_gone_window(row)
+        payload = {
+            "card_num": num,
+            "state": row["state"],
+            "rule": "worker_gone",
+            "agent_name": row["agent_name"],
+            "quiet_for_seconds": round(quiet, 1),
+            "last_activity_at": ts,
+            "notice_after_seconds": notice_after,
+            "fail_after_seconds": fail_after,
+        }
+        if quiet >= fail_after:
+            payload["stage"] = "failed"
+            payload["reason"] = "worker gone: no events for %s" % human_span(quiet)
+            return payload
+        if quiet >= notice_after and not self.worker_gone_notified(num):
+            payload["stage"] = "notice"
+            payload["threshold_seconds"] = notice_after
+            payload["stuck_for_seconds"] = round(quiet, 1)
+            payload["text"] = (
+                "%s has said nothing for %s — it may have been killed; "
+                "check it, or the board fails this card at %s"
+                % (row["agent_name"], human_span(quiet), human_span(fail_after)))
+            return payload
+        return None
+
+    def sweep_worker_gone(self) -> int:
+        placeholders = ",".join("?" * len(WORKER_GONE_STATES))
+        rows = self.q("SELECT * FROM cards WHERE state IN (%s) AND agent_name IS NOT NULL"
+                      % placeholders, WORKER_GONE_STATES)
+        fired = 0
+        for row in rows:
+            num = row["num"]
+            if self.worker_gone_due(row) is None:
+                continue
+            with self.lock:
+                fresh = self.q1("SELECT * FROM cards WHERE num=?", (num,))
+                if fresh is None:
+                    continue
+                payload = self.worker_gone_due(fresh)
+                if payload is None:
+                    continue
+                if payload["stage"] == "notice":
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        self._append_event(num, "server", "stuck", payload)
+                        self.conn.execute("COMMIT")
+                    except Exception:
+                        self.conn.execute("ROLLBACK")
+                        raise
+                else:
+                    # `failed` keeps everything: the timeline, the evidence, the
+                    # branch and the worktree all stay exactly where they are,
+                    # because Retry re-dispatches a fresh agent with all of it
+                    # as the brief. The only thing that changes is that the card
+                    # stops pretending somebody is working on it.
+                    reason = payload["reason"]
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        # The face reads `error` first for a failed card, so the
+                        # machine reason goes there too -- otherwise an older,
+                        # unrelated error would be what the user sees.
+                        self._append_event(num, "server", "error", {
+                            "text": reason, "rule": "worker_gone",
+                            "agent_name": fresh["agent_name"],
+                            "quiet_for_seconds": payload["quiet_for_seconds"]})
+                        self._write_transition(
+                            num, fresh["state"], "failed", "server", reason,
+                            extra={"rule": "worker_gone",
+                                   "agent_name": fresh["agent_name"]})
+                        self.conn.execute("COMMIT")
+                    except Exception:
+                        self.conn.execute("ROLLBACK")
+                        raise
             fired += 1
         if fired:
             self.notify()
@@ -2554,7 +3447,7 @@ class App:
                 "card": self.card_json(self.card_row(num), brief=True)}
 
     def card_chat(self, num: int, text: str, images=None, actor: str = "user",
-                  detail=None) -> dict:
+                  detail=None, reports=None) -> dict:
         """A line to one card's thread -- text, images, or both.
 
         Same deal as dropping work on the board: a screenshot with no words is a
@@ -2566,13 +3459,17 @@ class App:
         text = (text or "").strip()
         self.card_row(num)              # 404 before we write anything to disk
         attachments = self.store_images(images)
+        docs = self.store_reports(reports)
+        attachments = attachments + docs
         if not text and not attachments:
             raise ApiError(400, "empty_submission",
                            "at least one of text or images is required")
-        payload = {"text": text or image_line(len(attachments))}
+        payload = {"text": text or (docs[0]["title"] if len(docs) == 1 and not images
+                                    else report_line(len(docs)) if docs
+                                    else image_line(len(attachments)))}
         if attachments:
             payload["attachments"] = attachments
-        if not text:
+        if not text and not docs:
             # The line still needs words to be skimmable on the card face, but
             # the thread should show the picture, not a caption of the picture.
             payload["images_only"] = True
@@ -2580,19 +3477,24 @@ class App:
             payload["detail"] = detail
         return self.card_event(num, "chat", payload, actor=actor)
 
-    def sidebar_post(self, text: str, actor: str, detail=None, images=None) -> dict:
+    def sidebar_post(self, text: str, actor: str, detail=None, images=None,
+                     reports=None) -> dict:
         text = (text or "").strip()
         if actor not in ("user", "session"):
             raise ApiError(400, "bad_actor", "sidebar actor must be user or session")
         attachments = self.store_images(images)
+        docs = self.store_reports(reports)
+        attachments = attachments + docs
         if not text and not attachments:
             raise ApiError(400, "missing_field", "text is required", field="text")
         # Same two-part shape as a card event: a line to skim, an optional
         # expanded version the session can park its working in.
-        payload = {"text": text or image_line(len(attachments))}
+        payload = {"text": text or (docs[0]["title"] if len(docs) == 1 and not images
+                                    else report_line(len(docs)) if docs
+                                    else image_line(len(attachments)))}
         if attachments:
             payload["attachments"] = attachments
-        if not text:
+        if not text and not docs:
             payload["images_only"] = True
         if detail is not None:
             payload["detail"] = detail
@@ -2691,20 +3593,25 @@ class App:
         return title
 
     def dispatch_label(self, executor, model) -> str:
-        """" — grok · tmux · sonnet", or nothing at all when the card is
-        running on the board's defaults. It is a suffix on the assign note, so
-        the timeline says how a card was dispatched, not just to whom."""
+        """" — grok · tmux · sonnet" when a card names its own executor, and
+        " on opus" when the only thing that changed is the model. Nothing at
+        all when the card is running on the board's defaults: the timeline is
+        for reading the exception off, not the norm. It is a suffix on the
+        assign note, so it says how a card was dispatched, not just to whom."""
         if not executor and not model:
             return ""
         d = resolve_dispatch(self.settings(), executor, model)
-        bits = []
-        if executor:
-            bits.append(d["executor"])
-            if d["kind"] != "subagent":
-                bits.append(d["kind"])
+        if not executor:
+            # A re-dispatch onto a different model is the whole point of
+            # recording it: "this one is on opus because fable ran out" has to
+            # be readable off the timeline, not inferred.
+            return (" on %s" % model) if model != self.default_model else ""
+        bits = [d["executor"]]
+        if d["kind"] != "subagent":
+            bits.append(d["kind"])
         if model:
             bits.append(d["model"])
-        return " — " + " · ".join(bits) if bits else ""
+        return " — " + " · ".join(bits)
 
     def assign(self, num: int, agent_name, worktree, branch,
                title=None, executor=None, model=None,
@@ -2712,6 +3619,11 @@ class App:
                external_agent=None) -> dict:
         self.card_row(num)
         title = clean_title(title) if title is not None else None
+        # NOTE: the model is validated further down, strictly, alongside the
+        # executor -- a blank or an over-long model on an explicit dispatch is a
+        # named 400, not something quietly recorded as "no model". (The lenient
+        # `clean_model` still normalizes the board-wide default, where the input
+        # is an env var and there is nobody to hand a 400 to.)
         # Ops work has no worktree and no branch to give -- assigning it means
         # naming who is doing it and saying what shape of evidence to expect.
         if work_kind is not None:
@@ -2738,7 +3650,7 @@ class App:
                            "(known: %s)" % (executor, ", ".join(
                                sorted(list(known.keys()) + [BUILTIN_EXECUTOR]))))
         if model is not None:
-            model = clean_model(model, "model")
+            model = clean_model_name(model, "model")
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
@@ -2753,11 +3665,14 @@ class App:
                      None if external_agent is None else (1 if external_agent else 0),
                      executor, model, now(), num))
                 how = self.dispatch_label(executor, model)
-                self._append_event(num, actor, "note", {
+                note = {
                     "text": "assigned to %s%s" % (agent_name or "(unchanged)", how),
                     "agent_name": agent_name, "worktree": worktree, "branch": branch,
                     "work_kind": work_kind, "external_agent": external_agent,
-                    "executor": executor, "model": model})
+                    "executor": executor}
+                if model:
+                    note["model"] = model
+                self._append_event(num, actor, "note", note)
                 if title is not None:
                     self._write_title(num, title, actor)
                 # Handing a card to an agent IS the start of work, so a queued
@@ -3005,6 +3920,10 @@ class App:
             # reconstruct it by scanning the whole event log.
             "sidebar": self.sidebar_thread(limit=200),
             "batches": [self.batch_json(b) for b in batch_ids],
+            # How many report documents THIS sprint has. The header's Reports
+            # link exists only when this is > 0 -- user, verbatim: "link should
+            # only appear once there's a report within the sprint".
+            "reports": self.report_count(),
             "session": self.session_liveness(),
             # The board's own dispatch policy, so a card face can tell a
             # deliberate "grok · tmux" from whatever the defaults happen to be
@@ -3013,6 +3932,8 @@ class App:
             # Flat mirror of session.cursor: how far the session has drained.
             "cursor": self.cursor_seq(),
             "states": list(STATES),
+            # What "no badge" means on a card face.
+            "default_model": self.default_model,
             # `integrating` stays in the Ready column with a "merging…" note --
             # a card only reaches Done once its branch actually landed.
             "column_of": dict(COLUMN_OF),
@@ -3020,6 +3941,9 @@ class App:
             # Which server process answered. A tab compares it against the one
             # it booted on and re-syncs itself if it changed.
             "generation": self.generation,
+            # What that process knows how to serve. A page built against a newer
+            # server compares this to its own and says so out loud.
+            "api_version": API_VERSION,
             "server_time": now(),
         }
 
@@ -3327,6 +4251,10 @@ def make_handler(app: App):
                         # The one field an open tab polls to tell "the server is
                         # slow" apart from "the server I knew is gone".
                         "generation": app.generation,
+                        # ...and the one that tells a NEW page it is talking to
+                        # an OLD server, so it can say "restart me" instead of
+                        # quietly losing the features that server never had.
+                        "api_version": API_VERSION,
                         "seq": app.max_seq()})
 
                 if not self.authed(query):
@@ -3434,6 +4362,38 @@ def make_handler(app: App):
                     blob = fh.read()
                 mime = "image/png" if m.group(2) == "png" else "image/jpeg"
                 return self._send(200, blob, mime)
+
+            # The raw bytes of a report. Markdown is inert to a browser, so it
+            # goes back as text/markdown. Author HTML goes back under
+            # `Content-Security-Policy: sandbox` -- a unique opaque origin with
+            # scripts off -- so even a direct navigation to this URL cannot read
+            # a cookie, reach the board's DOM, or call the API. The iframe that
+            # normally displays it carries a restrictive sandbox attribute too.
+            m = re.match(r"^/api/attachments/([0-9a-f]{64})\.(md|html)$", path)
+            if m:
+                sha, ext = m.group(1), m.group(2)
+                fpath = os.path.join(app.attach_dir, "%s.%s" % (sha, ext))
+                if not os.path.isfile(fpath):
+                    raise ApiError(404, "no_such_attachment", "unknown attachment")
+                with open(fpath, "rb") as fh:
+                    blob = fh.read()
+                extra = [("Content-Disposition", 'inline; filename="%s.%s"' % (sha[:12], ext))]
+                if ext == "html":
+                    extra.append(("Content-Security-Policy",
+                                  "sandbox; default-src 'none'; style-src 'unsafe-inline'; "
+                                  "img-src data:; base-uri 'none'; form-action 'none'"))
+                    extra.append(("Referrer-Policy", "no-referrer"))
+                return self._send(200, blob, REPORT_MIME_OF_KIND[
+                    REPORT_KIND_BY_EXT[ext]], extra)
+
+            if path == "/api/reports":
+                scope = (query.get("scope") or ["sprint"])[0]
+                return self.json_out(200, app.reports_index(
+                    "all" if scope == "all" else "sprint"))
+
+            m = re.match(r"^/api/reports/([0-9a-f]{64})\.(md|html)$", path)
+            if m:
+                return self.json_out(200, app.report_detail(m.group(1), m.group(2)))
 
             if path.startswith("/api/"):
                 raise ApiError(404, "no_such_route", "no route for %s" % path)
@@ -3610,7 +4570,8 @@ def make_handler(app: App):
             if path == "/api/cards":
                 card = app.create_card(body.get("text"), body.get("images") or [],
                                        bool(body.get("hold")),
-                                       actor=self.actor_or(body, "user"))
+                                       actor=self.actor_or(body, "user"),
+                                       reports=body.get("reports"))
                 return 201, card
 
             if path == "/api/cards/bulk":
@@ -3634,7 +4595,8 @@ def make_handler(app: App):
                 return 201, app.sidebar_post(body.get("text"),
                                              side if side == "session" else "user",
                                              detail=body.get("detail"),
-                                             images=body.get("images"))
+                                             images=body.get("images"),
+                                             reports=body.get("reports"))
 
             if path == "/api/batches":
                 return 201, app.make_batch(body.get("card_nums"), body.get("agent_name"),
@@ -3663,6 +4625,7 @@ def make_handler(app: App):
                 return 201, app.card_chat(num, body.get("text"),
                                           images=body.get("images"),
                                           detail=body.get("detail"),
+                                          reports=body.get("reports"),
                                           actor=self.actor_or(body, "user"))
             if verb == "answer":
                 qid = body.get("question_id")
@@ -3778,6 +4741,7 @@ def paths_for(project_root: str, data_dir: str = None) -> dict:
         "data_dir": data,
         "server_json": os.path.join(data, SERVER_JSON),
         "token": os.path.join(data, TOKEN_FILENAME),
+        "port": os.path.join(data, PORT_FILENAME),
         "log": os.path.join(data, SERVER_LOG),
         "db": os.path.join(data, DB_FILENAME),
     }
@@ -3809,6 +4773,99 @@ def write_token_file(path: str, token: str):
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def read_port_file(path: str):
+    """Which port this board answers on, kept OUTSIDE server.json — same reason
+    the token is.
+
+    `stop` deletes server.json, so before this file existed a restart had no
+    memory of the port it had been serving on for weeks and silently fell back
+    to the compiled default. Live failure: the russ board had been running on
+    8378 for a month; `sprintd start` after a restart tried 8377, found another
+    project's board sitting on it, and died with "cannot bind 127.0.0.1:8377".
+    The port is in every URL anybody bookmarked — it is identity, not liveness.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+    except OSError:
+        return None
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def write_port_file(path: str, port: int):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("%d\n" % int(port))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def port_is_free(port: int, host: str = "127.0.0.1") -> bool:
+    """Can we actually bind it right now? The only question that matters."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def port_owner(port: int, timeout: float = 1.5):
+    """Whose board is on this port, if it is a board at all.
+
+    Returns the `project_root` of the sprintd answering there, "" if something
+    is listening but it is not a sprintd, or None if the port is free.
+    """
+    if port_is_free(port):
+        return None
+    try:
+        status, raw = http_get("127.0.0.1", int(port), "/healthz", timeout=timeout)
+    except OSError:
+        return ""
+    if status != 200:
+        return ""
+    try:
+        info = json.loads(raw)
+    except (TypeError, ValueError):
+        return ""
+    return info.get("project_root") or ""
+
+
+def choose_port(preferred: int, project_root: str, explicit: bool = False,
+                limit: int = PORT_SCAN_LIMIT, say=None):
+    """The port to bind, and the reason, when the preferred one is taken.
+
+    `explicit` (the user typed `--port`) is obeyed literally and fails loudly if
+    it cannot be had — that is what asking for a specific port means. Otherwise a
+    port held by a DIFFERENT project is not this board's problem to die over: we
+    walk up to the next free one and say which, so `sprintd start` in a new
+    project never needs `--port` and a restart never needs it either.
+    """
+    preferred = int(preferred)
+    if explicit or port_is_free(preferred):
+        return preferred
+    owner = port_owner(preferred)
+    if owner and os.path.realpath(owner) == os.path.realpath(project_root):
+        # Our own board, already up — the caller's health check deals with it.
+        return preferred
+    for port in range(preferred + 1, preferred + 1 + int(limit)):
+        if port_is_free(port):
+            if say:
+                who = ("another project's board (%s)" % owner) if owner \
+                    else "another process"
+                say("port %d is held by %s -- using %d instead" % (preferred, who, port))
+            return port
+    return preferred
 
 
 def read_server_json(path: str):
@@ -4158,8 +5215,18 @@ def cmd_start(args) -> int:
         except OSError:
             pass
 
-    port = args.port if args.port is not None else (
-        (info or {}).get("port") or DEFAULT_PORT)
+    # Which port do we WANT? In order: what was asked for, what this data dir
+    # was last serving on (server.json while it lives, the port file after it is
+    # gone), then the compiled default. A restart must never need `--port`.
+    preferred = (args.port if args.port is not None
+                 else ((info or {}).get("port")
+                       or read_port_file(p["port"])
+                       or DEFAULT_PORT))
+    # ...and if we cannot have it because a DIFFERENT project is sitting there,
+    # take the next free one rather than refusing to start. Only an explicit
+    # --port is worth dying for.
+    port = choose_port(preferred, project_root, explicit=args.port is not None,
+                       say=lambda msg: print("notice: " + msg, file=sys.stderr))
     # Token identity survives stop/start: the printed URL keeps working and every
     # logged-in browser stays logged in. --new-token is the explicit rotate.
     if args.token:
@@ -4223,6 +5290,9 @@ def cmd_start(args) -> int:
     app.hosts = list(hosts)
 
     app.open_sprint(create=True)
+    # Boards opened before sprints were named after their project are all
+    # sitting under the literal "sprint"; give them the project's name once.
+    app.name_untitled_sprint()
     app.start_background()
     write_server_json(p["server_json"], {
         "pid": os.getpid(), "port": actual_port, "host": hosts[0],
@@ -4234,6 +5304,14 @@ def cmd_start(args) -> int:
     except OSError as exc:
         app.log("could not persist token file %s (%s) -- the token will not "
                 "survive a stop/start" % (p["token"], exc))
+    # The port outlives server.json for the same reason the token does: it is
+    # in every URL anyone saved, and a restart that forgets it is a restart that
+    # moves the board.
+    try:
+        write_port_file(p["port"], actual_port)
+    except OSError as exc:
+        app.log("could not persist port file %s (%s) -- a restart may not reuse "
+                "port %d" % (p["port"], exc, actual_port))
     # Announce this board machine-wide so `sprintd hub` can list it. Advisory
     # only: the hub health-checks every row and never trusts this file.
     try:

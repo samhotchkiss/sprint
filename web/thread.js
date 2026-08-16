@@ -19,9 +19,12 @@
 // what keeps the rail still while the session's cursor ticks past underneath.
 import { h, ageSuffix, richText, firstLine, reconcile, timeEl } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
-import { SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, draft } from './state.js';
+import {
+  SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, draft, bounceComposing,
+} from './state.js';
 import { detailBlock } from './detail.js';
 import { flowActive } from './review.js';
+import { splitAttachments, docsVer, reportRow } from './reports.js';
 
 const ACTOR = {
   user: { label: 'You', cls: 'from-you' },
@@ -92,11 +95,7 @@ export function threadItems(detail, app) {
     const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
     if (Array.isArray(atts) && atts.length) {
       for (const a of atts) shown.add(attachmentUrl(a));
-      // the version tracks the refs themselves (by length, not by value: a
-      // pasted data: URL is enormous) so an optimistic local thumbnail is
-      // swapped for the stored attachment exactly once
-      out.push({ key: key + ':shots', ver: refsVer(atts),
-        make: () => shotRow(atts, app, ev.actor === 'user') });
+      pushAttachments(out, key, atts, app, ev.actor === 'user');
     }
   });
 
@@ -105,8 +104,7 @@ export function threadItems(detail, app) {
   const loose = (Array.isArray(card && card.attachments) ? card.attachments : [])
     .filter((a) => !shown.has(attachmentUrl(a)));
   if (loose.length) {
-    out.push({ key: 'card-atts', ver: loose.map((a) => attachmentUrl(a)).join(','),
-      make: () => shotRow(loose, app, true, 'you attached this') });
+    pushAttachments(out, 'card-atts', loose, app, true, 'you attached this');
   }
 
   if (state === 'needs_you' && card && card.question) {
@@ -128,8 +126,12 @@ export function threadItems(detail, app) {
     const walking = !!card && flowActive(card.num);
     out.push({
       key: 'packet',
+      // ...and whether you are mid-bounce, which is what swaps the three
+      // verdict buttons for "Submit bounce / Cancel". A version that ignored it
+      // would leave Approve on screen after you pressed Bounce.
       ver: `${state}:${card ? card.bounce_count : 0}:${(packet && packet.claim) || ''}`.length
-        + ':' + state + ':' + (card ? card.bounce_count : 0) + ':' + (walking ? 'w' : ''),
+        + ':' + state + ':' + (card ? card.bounce_count : 0) + ':' + (walking ? 'w' : '')
+        + ':' + (card && bounceComposing(card.num) ? 'b' : ''),
       make: () => evidencePacket(packet, card, state, app, walking),
     });
   }
@@ -174,14 +176,31 @@ export function chatItems(lines, app) {
     out.push({ key, ver: 1, data: ev, make: () => message(ev, app) });
     const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
     if (Array.isArray(atts) && atts.length) {
-      // the version tracks the refs themselves (by length, not by value: a
-      // pasted data: URL is enormous) so an optimistic local thumbnail is
-      // swapped for the stored attachment exactly once
-      out.push({ key: key + ':shots', ver: refsVer(atts),
-        make: () => shotRow(atts, app, ev.actor === 'user') });
+      pushAttachments(out, key, atts, app, ev.actor === 'user');
     }
   });
   return out;
+}
+
+/**
+ * One event's attachments, as thread items. Pictures and documents arrive in
+ * the SAME list (a report is an attachment, deliberately) and are told apart by
+ * the server-set `doc` field, then rendered as the two different things they
+ * are: a strip of thumbnails, and a skim line that expands into a document.
+ */
+function pushAttachments(out, key, atts, app, mine, fallbackCaption) {
+  const [shots, docs] = splitAttachments(atts);
+  if (shots.length) {
+    // the version tracks the refs themselves (by length, not by value: a
+    // pasted data: URL is enormous) so an optimistic local thumbnail is
+    // swapped for the stored attachment exactly once
+    out.push({ key: key + ':shots', ver: refsVer(shots),
+      make: () => shotRow(shots, app, mine, fallbackCaption) });
+  }
+  if (docs.length) {
+    out.push({ key: key + ':docs', ver: docsVer(docs),
+      make: () => reportRow(docs, app, mine) });
+  }
 }
 
 // ---- item types ----------------------------------------------------------
@@ -363,6 +382,18 @@ function evidencePacket(packet, card, state, app, walking) {
   const shots = Array.isArray(p.screenshots) ? p.screenshots : [];
   if (shots.length) box.appendChild(packetShots(shots, app));
 
+  // A packet may ship DOCUMENTS as well as pictures. They read exactly as they
+  // do in the thread — a title you skim, the whole document behind the expand —
+  // so a findings write-up is evidence without becoming a wall of text you have
+  // to scroll past to reach Approve.
+  const [, docs] = splitAttachments(Array.isArray(p.reports) ? p.reports : []);
+  if (docs.length) {
+    const wrap = h('div');
+    wrap.appendChild(h('p.packet-label.accent', docs.length === 1 ? 'Report' : `Reports · ${docs.length}`));
+    wrap.appendChild(reportRow(docs, app, false));
+    box.appendChild(wrap);
+  }
+
   if (p.live_url) {
     box.appendChild(h('a.btn.packet-live', {
       href: p.live_url, target: '_blank', rel: 'noreferrer noopener', title: p.live_url,
@@ -430,41 +461,59 @@ function verdictBar(card, app) {
       'Bounced twice. The session stops retrying blind here and brings it to you to co-design.'));
   }
 
+  // Card #44. Hitting Bounce is already the decision; from that moment the row
+  // offers exactly two things — send it, or back out. Approve and Reject are
+  // not dimmed, they are GONE, because the failure being prevented is hitting
+  // Approve with a half-written bounce in the box under it.
+  const composing = bounceComposing(card.num) || !!draft(key);
+
   const notes = h('textarea.bounce-notes', {
+    id: 'bounce-' + card.num,
     rows: '2',
     placeholder: 'What has to change? (goes straight to the agent)',
     oninput: (e) => draft(key, e.target.value),
     onkeydown: (e) => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendBounce(); }
+      if (e.key === 'Escape') { e.preventDefault(); cancelBounce(); }
     },
   });
   notes.value = draft(key);
-  const notesWrap = h('div', { hidden: !draft(key) }, notes);
 
   function sendBounce() {
     const text = notes.value.trim();
     if (!text) { notes.focus(); return; }
     draft(key, null);
+    bounceComposing(card.num, false);
     app.verdict(card, 'bounce', text);
   }
 
-  const bounceBtn = h('button.btn.bounce', {
-    type: 'button',
-    onclick: () => {
-      if (notesWrap.hidden) {
-        notesWrap.hidden = false;
-        bounceBtn.textContent = 'Send bounce';
-        notes.focus();
-        return;
-      }
-      sendBounce();
-    },
-  }, notesWrap.hidden ? 'Bounce' : 'Send bounce');
+  function cancelBounce() {
+    // Cancel puts the three buttons back. It drops only what you typed HERE —
+    // every other composer on the page keeps its draft.
+    draft(key, null);
+    bounceComposing(card.num, false);
+    app.render();
+  }
 
-  wrap.appendChild(notesWrap);
+  if (composing) {
+    wrap.appendChild(h('div', notes));
+    wrap.appendChild(h('div.verdicts.is-bouncing',
+      h('button.btn.bounce', { type: 'button', onclick: () => sendBounce() }, 'Submit bounce'),
+      h('button.btn.ghost', { type: 'button', onclick: () => cancelBounce() }, 'Cancel')));
+    // No focus grab here. Card #46: focus is asked for ONCE, when you press
+    // Bounce (app.composeBounce), and restored by id on every re-render after
+    // that. Re-focusing on every rebuild would yank the caret out of whatever
+    // else you had clicked into — which is the bug this card is about.
+    return wrap;
+  }
+
   wrap.appendChild(h('div.verdicts',
     h('button.btn.approve', { type: 'button', onclick: () => app.verdict(card, 'approve') }, 'Approve'),
-    bounceBtn,
+    h('button.btn.bounce', {
+      type: 'button',
+      title: 'send it back with notes',
+      onclick: () => app.composeBounce(card.num),
+    }, 'Bounce'),
     h('button.btn.reject', {
       type: 'button',
       title: 'this should not have been built — the branch is dropped',
