@@ -148,7 +148,7 @@ export function renderTitle(wrap, title) {
 
   const menu = h('div.menu.sprint-menu', { role: 'menu', hidden: !state.open },
     h('p.menu-head', 'Sprints on this machine'),
-    sprints.map((s) => h('button.menu-item.sprint-item', {
+    sprints.map((s, i) => h('button.menu-item.sprint-item', {
       type: 'button',
       role: 'menuitem',
       class: s.self ? 'is-current' : null,
@@ -160,6 +160,10 @@ export function renderTitle(wrap, title) {
         if (href) location.href = href;       // same tab: it is the same work
       },
     },
+    // Card #57: "each session has a number next to it, i can hit the number to
+    // go to the session". The number is drawn even for a mouse user, because a
+    // shortcut nobody can see is a shortcut nobody uses.
+    i < 9 ? h('span.si-key', { 'aria-hidden': 'true' }, String(i + 1)) : null,
     h('span.si-dot', { class: s.needs_you ? 'is-on' : null, 'aria-hidden': 'true' }),
     h('span.si-body',
       h('span.si-name', s.name || s.project_root || 'sprint'),
@@ -174,5 +178,33 @@ export function renderTitle(wrap, title) {
 export function closeSiblingMenu() {
   if (!state.open) return false;
   state.open = false;
+  return true;
+}
+
+// ---- the keyboard's half (card #57) --------------------------------------
+
+export function siblingMenuOpen() { return !!state.open; }
+
+/** How many rows the menu has, i.e. how high its numbers go. */
+export function siblingCount() { return state.sprints.length; }
+
+/**
+ * "." opens the switcher. Returns false when there is nothing to switch BETWEEN
+ * — one board on the machine and the title is a title, not a menu, so the caller
+ * says that out loud instead of opening an empty dropdown.
+ */
+export function openSiblingMenu() {
+  if (state.sprints.length < 2) return false;
+  state.open = true;
+  return true;
+}
+
+/** Go to the nth sprint (0-based, the order the menu draws). Own board = stay. */
+export function gotoSibling(i) {
+  const s = state.sprints[i];
+  if (!s || s.self) return false;
+  const href = siblingHref(s);
+  if (!href) return false;
+  location.href = href;
   return true;
 }

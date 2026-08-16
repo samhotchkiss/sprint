@@ -221,6 +221,7 @@ export function waitingPill(card, app) {
   return h('button.pill', {
     type: 'button',
     class: `pill${mark === 'held' ? ' is-held' : ''}`,
+    'data-num': card.num,        // the keyboard's Waiting column walks these
     onclick: () => app.openCard(card.num),
   },
     h('span.pill-num', '#' + card.num),

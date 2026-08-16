@@ -2828,3 +2828,128 @@ html.skin-chaos .bounce-notes:focus {
   box-shadow: 0 0 0 3px var(--accent);
   border-radius: 0;
 }
+
+/* ==========================================================================
+   CARD #57 — keyboard navigation, and CARD #59 — independently scrolling
+   Board columns. Appended section: several agents are in this file at once.
+   ========================================================================== */
+
+/* ---- card #59: each Board column scrolls on its own ----------------------
+   The functional spec asked for this from the start ("independently scrolling
+   columns … nothing important lives at the bottom of a tall fixed layout") and
+   the Fold has had it all along; the desktop Board was scrolling as one page,
+   so a long Waiting pile pushed Review off the bottom of the screen for
+   everybody. `body.layout-board` is set by app.js exactly when the Board grid
+   is the thing on screen — the List is a reading order and must keep scrolling
+   as one page. */
+body.layout-board .main {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 0;
+}
+body.layout-board .board {
+  flex: 1 1 auto;
+  min-height: 0;
+  align-items: stretch;      /* full-height columns, so their bodies can scroll */
+  padding-bottom: 0;
+}
+body.layout-board .col { min-height: 0; }
+body.layout-board .col-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;   /* a column that hits its end does not scroll the page */
+  padding: 0 6px 24px 0;
+  scrollbar-width: thin;
+}
+/* the header, the meter and the legend stay put above all of it */
+body.layout-board .meter { padding-top: 18px; }
+body.layout-board .legend { padding-bottom: 18px; }
+
+/* ---- the keyboard cursor ------------------------------------------------
+   The highlight IS focus (every card face is a button, every List row is
+   role=button), so this styles the one card the arrows are standing on. It has
+   to be obvious in BOTH skins and at a glance, because it is the thing that
+   tells you what Return is about to open. */
+.is-cursor {
+  position: relative;
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.card.is-cursor, .row.is-cursor, .review-lead.is-cursor,
+.pill.is-cursor, .done-row.is-cursor { z-index: 1; }
+/* focus rings are the same colour, so a mouse user who tabs in sees the same
+   thing the keyboard user does rather than two competing marks */
+.is-cursor:focus-visible { outline-offset: 2px; }
+
+/* Which column the numbers landed on — quiet, and only ever one at a time. */
+.col.is-col-cursor .col-head {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+html.skin-chaos .is-cursor {
+  outline: 3px solid var(--accent);
+  outline-offset: 0;
+  border-radius: 0;
+  box-shadow: 0 0 0 3px #0a0618;
+}
+html.skin-chaos .col.is-col-cursor .col-head { box-shadow: inset 0 0 0 2px var(--accent); }
+
+/* ---- the numbered sprint switcher --------------------------------------- */
+.si-key {
+  flex: 0 0 auto;
+  min-width: 18px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 4px;
+  line-height: 1.5;
+}
+.sprint-item:hover .si-key { color: var(--dim); border-color: var(--border-chip, var(--border)); }
+html.skin-chaos .si-key { border: 2px solid var(--border-chip); border-radius: 0; font-size: 10px; }
+
+/* ---- the "?" button and the shortcut map -------------------------------- */
+.keys-btn {
+  min-width: 32px;
+  padding: 0 10px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+.keys-sheet { width: 520px; gap: 14px; }
+.keys-head { display: flex; align-items: center; gap: 12px; }
+.keys-head h2 {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.keys-list {
+  display: grid;
+  grid-template-columns: minmax(96px, auto) 1fr;
+  gap: 10px 16px;
+  align-items: baseline;
+  margin: 0;
+}
+.keys-list dt { display: flex; gap: 4px; flex-wrap: wrap; }
+.keys-list dd { margin: 0; font-size: 13.5px; line-height: 1.5; color: var(--dim); }
+.keys-list kbd {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink);
+  background: var(--chip);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 2px 6px;
+  min-width: 22px;
+  text-align: center;
+}
+.keys-note { font-size: 12.5px; color: var(--faint); }
+html.skin-chaos .keys-list kbd { border: 2px solid var(--border-chip); border-radius: 0; }
