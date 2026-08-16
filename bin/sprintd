@@ -27,6 +27,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -41,7 +42,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # --------------------------------------------------------------------------
 
 DEFAULT_PORT = 8377
+PORT_SCAN_LIMIT = 40            # how far past a taken port to look for a free one
 DEFAULT_HUB_PORT = 8300         # one hub per machine, fixed so the URL is memorable
+
+# What this server can DO, as one number the page can compare itself against.
+# The generation says WHICH process answered; this says what that process knows
+# how to serve. Bump it whenever web/ starts depending on an endpoint or a field
+# a running server might not have, and bump UI_API_VERSION in web/api.js in the
+# same commit: an old server + a new page is exactly the silent degrade this
+# number exists to turn into a sentence ("this board needs a restart").
+#   1 — the board through the hub/siblings work
+#   2 — phases (/api/board carries phase, phase_since, phase_expected_seconds)
+API_VERSION = 2
 DATA_DIRNAME = ".sprint"
 HUB_DIRNAME = ".sprint"         # under $HOME: the machine-wide (cross-project) state
 REGISTRY_FILENAME = "registry.json"
@@ -55,6 +67,9 @@ DEFAULT_HUB_PRUNE_SECONDS = 900.0      # unreachable + pid gone this long -> for
 DB_FILENAME = "sprint.db"
 SERVER_JSON = "server.json"
 TOKEN_FILENAME = "token"       # survives `stop`; server.json does not
+PORT_FILENAME = "port"         # ditto: which port this board answers on is an
+                               # IDENTITY (it is in every URL anyone saved), and
+                               # server.json is only a liveness record
 SERVER_LOG = "server.log"
 ATTACH_DIRNAME = "attachments"
 COOKIE_NAME = "sprint_token"
@@ -822,6 +837,36 @@ class App:
 
     # -- sprints ----------------------------------------------------------
 
+    def default_sprint_title(self) -> str:
+        """What a sprint is called when nobody named it: the PROJECT.
+
+        The board header used to read the literal string "sprint", which tells
+        you nothing when three of them are open in three tmux windows. The
+        project directory's basename is the name the human already uses for this
+        work ("russ"), and it is the same string the machine-wide registry
+        carries — the registry stays authoritative for the switcher's label, and
+        this is only the fallback for the title of a sprint nobody titled.
+        """
+        return os.path.basename(self.project_root.rstrip(os.sep)) or "sprint"
+
+    def name_untitled_sprint(self):
+        """Rename a sprint still carrying the old literal default.
+
+        "sprint" was never a name anybody chose — it was what the server wrote
+        when it opened one unasked, and boards that were auto-opened before this
+        change are all sitting under it. Anything else, including a title the
+        session set, is left exactly alone.
+        """
+        row = self.q1("SELECT * FROM sprints WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1")
+        if row is None or (row["title"] or "").strip() != "sprint":
+            return row
+        title = self.default_sprint_title()
+        if title == "sprint":
+            return row
+        with self.lock:
+            self.conn.execute("UPDATE sprints SET title=? WHERE id=?", (title, row["id"]))
+        return self.q1("SELECT * FROM sprints WHERE id=?", (row["id"],))
+
     def open_sprint(self, create: bool = True, title: str = None):
         row = self.q1("SELECT * FROM sprints WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1")
         if row is not None or not create:
@@ -836,7 +881,7 @@ class App:
             try:
                 cur = self.conn.execute(
                     "INSERT INTO sprints(opened_at, closed_at, title, hold_mode) VALUES(?,NULL,?,0)",
-                    (now(), title or "sprint"))
+                    (now(), title or self.default_sprint_title()))
                 sid = int(cur.lastrowid)
                 self._append_event(None, "server", "note",
                                    {"text": "sprint opened", "sprint_id": sid})
@@ -2328,6 +2373,9 @@ class App:
             # Which server process answered. A tab compares it against the one
             # it booted on and re-syncs itself if it changed.
             "generation": self.generation,
+            # What that process knows how to serve. A page built against a newer
+            # server compares this to its own and says so out loud.
+            "api_version": API_VERSION,
             "server_time": now(),
         }
 
@@ -2593,6 +2641,10 @@ def make_handler(app: App):
                         # The one field an open tab polls to tell "the server is
                         # slow" apart from "the server I knew is gone".
                         "generation": app.generation,
+                        # ...and the one that tells a NEW page it is talking to
+                        # an OLD server, so it can say "restart me" instead of
+                        # quietly losing the features that server never had.
+                        "api_version": API_VERSION,
                         "seq": app.max_seq()})
 
                 if not self.authed(query):
@@ -2980,6 +3032,7 @@ def paths_for(project_root: str, data_dir: str = None) -> dict:
         "data_dir": data,
         "server_json": os.path.join(data, SERVER_JSON),
         "token": os.path.join(data, TOKEN_FILENAME),
+        "port": os.path.join(data, PORT_FILENAME),
         "log": os.path.join(data, SERVER_LOG),
         "db": os.path.join(data, DB_FILENAME),
     }
@@ -3011,6 +3064,99 @@ def write_token_file(path: str, token: str):
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def read_port_file(path: str):
+    """Which port this board answers on, kept OUTSIDE server.json — same reason
+    the token is.
+
+    `stop` deletes server.json, so before this file existed a restart had no
+    memory of the port it had been serving on for weeks and silently fell back
+    to the compiled default. Live failure: the russ board had been running on
+    8378 for a month; `sprintd start` after a restart tried 8377, found another
+    project's board sitting on it, and died with "cannot bind 127.0.0.1:8377".
+    The port is in every URL anybody bookmarked — it is identity, not liveness.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+    except OSError:
+        return None
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def write_port_file(path: str, port: int):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("%d\n" % int(port))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def port_is_free(port: int, host: str = "127.0.0.1") -> bool:
+    """Can we actually bind it right now? The only question that matters."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def port_owner(port: int, timeout: float = 1.5):
+    """Whose board is on this port, if it is a board at all.
+
+    Returns the `project_root` of the sprintd answering there, "" if something
+    is listening but it is not a sprintd, or None if the port is free.
+    """
+    if port_is_free(port):
+        return None
+    try:
+        status, raw = http_get("127.0.0.1", int(port), "/healthz", timeout=timeout)
+    except OSError:
+        return ""
+    if status != 200:
+        return ""
+    try:
+        info = json.loads(raw)
+    except (TypeError, ValueError):
+        return ""
+    return info.get("project_root") or ""
+
+
+def choose_port(preferred: int, project_root: str, explicit: bool = False,
+                limit: int = PORT_SCAN_LIMIT, say=None):
+    """The port to bind, and the reason, when the preferred one is taken.
+
+    `explicit` (the user typed `--port`) is obeyed literally and fails loudly if
+    it cannot be had — that is what asking for a specific port means. Otherwise a
+    port held by a DIFFERENT project is not this board's problem to die over: we
+    walk up to the next free one and say which, so `sprintd start` in a new
+    project never needs `--port` and a restart never needs it either.
+    """
+    preferred = int(preferred)
+    if explicit or port_is_free(preferred):
+        return preferred
+    owner = port_owner(preferred)
+    if owner and os.path.realpath(owner) == os.path.realpath(project_root):
+        # Our own board, already up — the caller's health check deals with it.
+        return preferred
+    for port in range(preferred + 1, preferred + 1 + int(limit)):
+        if port_is_free(port):
+            if say:
+                who = ("another project's board (%s)" % owner) if owner \
+                    else "another process"
+                say("port %d is held by %s -- using %d instead" % (preferred, who, port))
+            return port
+    return preferred
 
 
 def read_server_json(path: str):
@@ -3360,8 +3506,18 @@ def cmd_start(args) -> int:
         except OSError:
             pass
 
-    port = args.port if args.port is not None else (
-        (info or {}).get("port") or DEFAULT_PORT)
+    # Which port do we WANT? In order: what was asked for, what this data dir
+    # was last serving on (server.json while it lives, the port file after it is
+    # gone), then the compiled default. A restart must never need `--port`.
+    preferred = (args.port if args.port is not None
+                 else ((info or {}).get("port")
+                       or read_port_file(p["port"])
+                       or DEFAULT_PORT))
+    # ...and if we cannot have it because a DIFFERENT project is sitting there,
+    # take the next free one rather than refusing to start. Only an explicit
+    # --port is worth dying for.
+    port = choose_port(preferred, project_root, explicit=args.port is not None,
+                       say=lambda msg: print("notice: " + msg, file=sys.stderr))
     # Token identity survives stop/start: the printed URL keeps working and every
     # logged-in browser stays logged in. --new-token is the explicit rotate.
     if args.token:
@@ -3425,6 +3581,9 @@ def cmd_start(args) -> int:
     app.hosts = list(hosts)
 
     app.open_sprint(create=True)
+    # Boards opened before sprints were named after their project are all
+    # sitting under the literal "sprint"; give them the project's name once.
+    app.name_untitled_sprint()
     app.start_background()
     write_server_json(p["server_json"], {
         "pid": os.getpid(), "port": actual_port, "host": hosts[0],
@@ -3436,6 +3595,14 @@ def cmd_start(args) -> int:
     except OSError as exc:
         app.log("could not persist token file %s (%s) -- the token will not "
                 "survive a stop/start" % (p["token"], exc))
+    # The port outlives server.json for the same reason the token does: it is
+    # in every URL anyone saved, and a restart that forgets it is a restart that
+    # moves the board.
+    try:
+        write_port_file(p["port"], actual_port)
+    except OSError as exc:
+        app.log("could not persist port file %s (%s) -- a restart may not reuse "
+                "port %d" % (p["port"], exc, actual_port))
     # Announce this board machine-wide so `sprintd hub` can list it. Advisory
     # only: the hub health-checks every row and never trusts this file.
     try:
