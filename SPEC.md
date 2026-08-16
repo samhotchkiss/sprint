@@ -187,6 +187,23 @@ root; several run at once in different tmux windows.
   link carrying that board's token. `needs_you > 0` sorts to the top with an amber left rail and the
   oldest open question's age ("stuck 22m"); longest wait first. 10s polling of `GET /api/hub`; no SSE.
 - Started once per machine by hand; boards register themselves. No launchd parity yet.
+- **From inside a board — the title switcher.** User verbatim: "When there are multiple sprints going
+  on my box, the title should turn into a dropdown. Also, it should show a dot when another sprint has
+  something waiting on me, and when I invoke the dropdown, it should show the dot next to the sprint
+  that needs me." `GET /api/siblings` (board token; 401 without it) answers the hub's question from
+  inside one board: every **live** sprint on this machine, each row `{name, url (signed with that
+  board's own token), needs_you, ready, in_motion, blocked, queued, self, alive}`, plus
+  `needs_you_elsewhere`. Same registry, same health checks (`/healthz` + `project_root` match, so a
+  recycled port is never offered wearing the wrong project's name), and the same counter the hub
+  renders — `board_rollup` is shared, so the two can never drift on what "2 need you" means. This
+  board is always in the list flagged `self: true` and rolled up straight from its own DB, never over
+  HTTP. Unreachable rows are **dropped**, not greyed: a hub row exists to tell you a board died, a
+  menu row exists to be clicked. Cached 10s server-side (`SPRINT_SIBLINGS_TTL`).
+  UI: >1 live board and the header title becomes a dropdown — one ≥44px row per sprint (name, its
+  counts, a dot when that sprint has `needs_you > 0`, "here" on the current one), clicking navigates
+  to that board's signed URL in the same tab, on the host you are already using. The title carries a
+  dot when any OTHER sprint needs you; this board's own needs-you pile is already on the page behind
+  it. One live board and the title stays the plain `<h1>` it is today. Polled every 30s; no SSE.
 
 ## Liveness (auto — there is NO manual nudge button)
 
