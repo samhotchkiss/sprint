@@ -6,7 +6,7 @@
 // compressed table, blocked work is dimmer still, and the queue is pills.
 import { h, timeEl, firstLine } from './util.js';
 import {
-  sections, meterSegments, cardState, needsKind, motionState, blockedReason,
+  sections, meterSegments, cardState, needsKind, needsYouCount, motionState, blockedReason,
   waitingMark, isStuck, BLOCKED_NOTE,
   conversations, conversationState, CONVERSATION_HINT,
 } from './state.js';
@@ -15,6 +15,7 @@ import { executorTag } from './settings.js';
 import { renderMeter } from './meter.js';
 import { renderDone } from './done.js';
 import { reviewBlock } from './review.js';
+import { reviewUnits } from './units.js';
 
 export function renderList(root, app) {
   const secs = sections();
@@ -43,11 +44,14 @@ function head(title, count, { accent = false, quiet = false, tight = false } = {
 /** Plain English, and only about what is actually on the board right now. */
 function needsIntro(cards) {
   const asks = cards.filter((c) => needsKind(c) === 'question').length;
-  const signoffs = cards.length - asks;
+  // Signoffs are counted in WORK UNITS, not cards (card #55): six cards that
+  // shipped on one branch are one thing to look at, and saying "six finished
+  // and want a verdict" over a list showing one card is the old list talking.
+  const signoffs = reviewUnits(cards.filter((c) => needsKind(c) !== 'question')).length;
   if (!cards.length) return 'Nothing is waiting on you. Every card on the board is either running, stuck on something outside this sprint, or in the queue.';
   const bits = [];
   if (asks) bits.push(asks === 1 ? 'One agent is waiting on an answer' : `${word(asks)} agents are waiting on an answer`);
-  if (signoffs) bits.push(signoffs === 1 ? 'one finished and wants a verdict' : `${word(signoffs)} finished and want a verdict`);
+  if (signoffs) bits.push(signoffs === 1 ? 'one finished piece of work wants a verdict' : `${word(signoffs)} finished pieces of work want a verdict`);
   return `${cap(bits.join('; '))}. Everything else is running without you.`;
 }
 
@@ -57,14 +61,16 @@ const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 function needsSection(col, app) {
   const sec = h('section.section');
-  sec.appendChild(head('Needs you', col.cards.length, { accent: true, tight: true }));
+  // The count is DECISIONS, not cards: a six-card branch is one thing waiting
+  // on you (card #55), and it renders as one card in the list below.
+  sec.appendChild(head('Needs you', needsYouCount(col.cards), { accent: true, tight: true }));
   sec.appendChild(h('p.section-intro', needsIntro(col.cards)));
 
   // The section still holds both shapes of asking, and they are still told apart
   // by rail colour and tag — but they no longer interleave. An open question is
-  // answered in one line; a finished branch is a review, and reviews come in
-  // work units with the verdict on the row (see review.js). Mixing the two by
-  // age made every pass through this section start over from scratch.
+  // answered in one line; a finished branch is a review, and a review is ONE
+  // card per work unit (see review.js). Mixing the two by age made every pass
+  // through this section start over from scratch.
   const asks = col.cards.filter((c) => needsKind(c) === 'question');
   const signoffs = col.cards.filter((c) => needsKind(c) !== 'question');
 
