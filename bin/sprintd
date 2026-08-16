@@ -53,7 +53,9 @@ DEFAULT_HUB_PORT = 8300         # one hub per machine, fixed so the URL is memor
 # number exists to turn into a sentence ("this board needs a restart").
 #   1 — the board through the hub/siblings work
 #   2 — phases (/api/board carries phase, phase_since, phase_expected_seconds)
-API_VERSION = 2
+#   3 — conversation cards (cards carry `kind` + `conversation`; POST
+#       /api/cards/<n>/seen records the read receipt the highlight is derived from)
+API_VERSION = 3
 DATA_DIRNAME = ".sprint"
 HUB_DIRNAME = ".sprint"         # under $HOME: the machine-wide (cross-project) state
 REGISTRY_FILENAME = "registry.json"
@@ -125,6 +127,35 @@ BULK_MAX = 50
 # branch and no preview -- what it has is a readback: the log line or command
 # output that shows the thing actually happened.
 WORK_KINDS = ("code", "ops")
+
+# --------------------------------------------------------------------------
+# Card kinds -- what SHAPE of thing a card is, which is a different question
+# from `work_kind` (how a finished card proves itself).
+#
+# User, verbatim: "we're discovering we need another card type for an ongoing
+# conversation thread. I think it's a lower section in the 'needs you' column
+# where the card gets highlighted if there's an unread and unseen message. once
+# I see the message, the highlighting dims, and once I respond the highlight
+# goes away completely. with russ, this lets me have distinct conversations on
+# specific needs"
+#
+# A conversation is NOT work: it has no queue, no agent lifecycle, no evidence
+# packet, no verdict and no merge. It sits in its own state -- `conversation` --
+# for exactly that reason: every timer, sweep and gate in this file is written
+# against the work states, so a state that is in none of them is excluded from
+# all of them by construction rather than by a list of exceptions somebody has
+# to remember to update.
+CARD_KINDS = ("work", "conversation")
+CONVERSATION_STATE = "conversation"
+
+# Which events are a MESSAGE in a conversation, as opposed to telemetry. A
+# progress line is an agent narrating itself; a chat/question/note/error is
+# somebody talking to you, and an answer is you talking back.
+CONV_MESSAGE_KINDS = ("chat", "question", "note", "error", "answer", "submitted")
+# Who counts as "them" and who counts as "you" in that thread. `server` is the
+# board's own voice and is neither.
+CONV_THEM = ("session", "worker")
+CONV_YOU = ("user",)
 
 # --------------------------------------------------------------------------
 # Staleness sweep
@@ -208,6 +239,10 @@ STATES = (
     "held", "queued", "triaging", "in_progress", "needs_you", "blocked",
     "ready", "integrating", "completed", "rejected", "failed", "stale",
     "duplicate", "canceled",
+    # A conversation card, for as long as the conversation is open. It is not a
+    # step in the work lifecycle and nothing moves it along -- only the user
+    # ends it, with `cancel`, meaning "this discussion is done".
+    "conversation",
 )
 
 # Legal transitions. `ready` is never reachable here from a plain state POST --
@@ -237,7 +272,14 @@ TRANSITIONS = {
     "stale": {"queued", "in_progress", "triaging", "canceled", "rejected",
               "duplicate", "failed"},
     "duplicate": {"queued"},
-    "canceled": {"queued"},
+    # A canceled card reopens into the queue -- unless it is a conversation,
+    # which reopens back into the conversation it always was. `transition`
+    # refuses the wrong one of these per card kind, so the pair here is not a
+    # hole: it is both halves of one door.
+    "canceled": {"queued", "conversation"},
+    # A conversation never becomes work and never merges. The ONLY way out is
+    # the user closing it.
+    "conversation": {"canceled"},
 }
 
 TERMINAL_STATES = {"completed", "rejected", "duplicate", "canceled"}
@@ -254,6 +296,9 @@ COLUMN_OF = {
     "ready": "ready", "integrating": "ready", "completed": "done",
     "rejected": "done", "failed": "in_progress", "stale": "queued",
     "duplicate": "done", "canceled": "done",
+    # Conversations live at the bottom of Needs you, in their own section --
+    # they are the other shape of "this one is on me".
+    "conversation": "needs_you",
 }
 
 SCHEMA = """
@@ -293,6 +338,7 @@ CREATE TABLE IF NOT EXISTS cards (
   long_running INTEGER NOT NULL DEFAULT 0,
   external_agent INTEGER NOT NULL DEFAULT 0,
   work_kind TEXT NOT NULL DEFAULT 'code',
+  kind TEXT NOT NULL DEFAULT 'work',
   model TEXT,
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL
@@ -1082,6 +1128,11 @@ class App:
         # Which model the agent on this card was dispatched on. NULL means
         # "the sprint default" -- the face only ever shows the exception.
         ("cards", "model", "TEXT"),
+        # What SHAPE of card this is: `work` (everything the board has ever
+        # had) or `conversation` (an ongoing thread that never becomes work).
+        # Defaulting to 'work' is what makes this migration free: every row
+        # that already exists is, by definition, the kind that already existed.
+        ("cards", "kind", "TEXT NOT NULL DEFAULT 'work'"),
     )
 
     def _add_missing_columns(self):
@@ -1121,6 +1172,24 @@ class App:
             return bool(row[name])
         except (IndexError, KeyError):
             return False
+
+    def card_kind(self, row) -> str:
+        """`work` or `conversation`, tolerant of a database from before kinds.
+
+        An old DB has no `kind` column at all, and every card in it predates
+        conversations -- so "I don't know" and "work" are the same answer, and
+        this degrades to it rather than raising.
+        """
+        if row is None or "kind" not in self.columns("cards"):
+            return "work"
+        try:
+            val = row["kind"]
+        except (IndexError, KeyError):
+            return "work"
+        return val if val in CARD_KINDS else "work"
+
+    def is_conversation(self, row) -> bool:
+        return self.card_kind(row) == "conversation"
 
     def log(self, msg: str):
         line = "%s sprintd %s" % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg)
@@ -1390,9 +1459,15 @@ class App:
             # doesn't -- the session owns checking on it.
             "external_agent": bool(row["external_agent"]),
             "work_kind": row["work_kind"] or "code",
+            # What SHAPE of card this is. `work` on every card the board has
+            # ever had; `conversation` on an ongoing thread that never enters
+            # the work lifecycle.
+            "kind": self.card_kind(row),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+        if out["kind"] == "conversation":
+            out["conversation"] = self.conversation_json(num)
         last = self.q1(
             "SELECT * FROM events WHERE card_num=? ORDER BY seq DESC LIMIT 1", (num,))
         out["last_event"] = self.event_json(last) if last else None
@@ -1467,6 +1542,92 @@ class App:
                 "created_at": row["created_at"],
                 "shared": row["card_num"] != num}
 
+    # -- conversations ----------------------------------------------------
+    #
+    # Three highlight states, and every one of them is DERIVED at read time:
+    #
+    #   unseen  something arrived from the session or a worker AFTER the last
+    #           time you opened this card -> strong highlight
+    #   seen    you have opened it since that message but have not replied
+    #           -> dimmed highlight
+    #   clear   your own message is the latest thing in the thread -> nothing
+    #
+    # The only thing stored is a read receipt -- `last_seen_seq`, one cursor per
+    # conversation card, written when you open it. Everything else is read off
+    # the append-only log. Deriving beats storing a flag because it SELF-HEALS:
+    # an event that lands late, a receipt written twice, a reply sent from a
+    # second tab -- none of them can leave a stale boolean behind, because there
+    # is no boolean.
+
+    @staticmethod
+    def seen_cursor_name(num) -> str:
+        return "seen:card:%d" % int(num)
+
+    def last_seen_seq(self, num: int) -> int:
+        return self.cursor_seq(self.seen_cursor_name(num))
+
+    def mark_seen(self, num: int, seq=None) -> dict:
+        """Record that the user has looked at this conversation.
+
+        Monotonic on purpose: a receipt never walks backwards, so a stale tab
+        posting an old seq cannot un-read a message you have already seen.
+        """
+        row = self.card_row(num)
+        if not self.is_conversation(row):
+            raise ApiError(409, "not_a_conversation",
+                           "#%s is a work card -- read receipts are a "
+                           "conversation thing" % num,
+                           card_kind=self.card_kind(row))
+        if seq is None:
+            seq = self.max_seq()
+        try:
+            seq = int(seq)
+        except (TypeError, ValueError):
+            raise ApiError(400, "missing_field", "seq must be an integer",
+                           field="seq")
+        if seq < 0:
+            raise ApiError(400, "missing_field", "seq must be an integer",
+                           field="seq")
+        name = self.seen_cursor_name(num)
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO cursors(name, seq, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET seq=MAX(cursors.seq, excluded.seq), "
+                "updated_at=excluded.updated_at",
+                (name, seq, now()))
+        return {"ok": True, "num": num, "last_seen_seq": self.last_seen_seq(num),
+                "card": self.card_json(self.card_row(num), brief=True)}
+
+    def conversation_json(self, num: int) -> dict:
+        """The three-state highlight, derived from the log and one receipt."""
+        seen = self.last_seen_seq(num)
+        placeholders = ",".join("?" * len(CONV_MESSAGE_KINDS))
+
+        def newest(actors):
+            row = self.q1(
+                "SELECT seq FROM events WHERE card_num=? AND kind IN (%s) "
+                "AND actor IN (%s) ORDER BY seq DESC LIMIT 1"
+                % (placeholders, ",".join("?" * len(actors))),
+                (num,) + tuple(CONV_MESSAGE_KINDS) + tuple(actors))
+            return int(row["seq"]) if row is not None else 0
+
+        theirs = newest(CONV_THEM)
+        yours = newest(CONV_YOU)
+        if theirs > yours:
+            state = "unseen" if theirs > seen else "seen"
+        else:
+            # You spoke last (or nobody has spoken at all): nothing is owed.
+            state = "clear"
+        return {
+            "state": state,
+            "last_seen_seq": seen,
+            "latest_incoming_seq": theirs,
+            "latest_user_seq": yours,
+            # One word for "does this want your eyes", so a face never has to
+            # re-derive the rule from three numbers.
+            "unread": state != "clear",
+        }
+
     @staticmethod
     def question_json(row) -> dict:
         return {
@@ -1476,15 +1637,25 @@ class App:
         }
 
     def create_card(self, text: str, images: list, hold: bool, actor: str = "user",
-                    reports: list = None) -> dict:
+                    reports: list = None, kind: str = "work") -> dict:
         text = (text or "").strip()
         images = images or []
         if not text and not images and not (reports or []):
             raise ApiError(400, "empty_submission",
                            "at least one of text or images is required")
+        kind = (kind or "work").strip().lower()
+        if kind not in CARD_KINDS:
+            raise ApiError(400, "bad_kind",
+                           "kind must be one of %s" % ", ".join(CARD_KINDS),
+                           field="kind")
         sprint = self.open_sprint(create=True)
         hold_mode = bool(sprint["hold_mode"]) if sprint else False
         state = "held" if (hold or hold_mode) else "queued"
+        if kind == "conversation":
+            # Hold mode is a brake on DISPATCH, and a conversation is never
+            # dispatched. Holding one would park a thread nobody is going to
+            # release, so it opens as what it is.
+            state = CONVERSATION_STATE
 
         # Attachments are content-addressed and written to disk BEFORE the
         # event that references them.
@@ -1499,19 +1670,22 @@ class App:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self.conn.execute(
-                    "INSERT INTO cards(sprint_id, state, title, body, created_at, updated_at) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (sprint["id"] if sprint else None, state, title, text, ts, ts))
+                    "INSERT INTO cards(sprint_id, state, title, body, kind, "
+                    "created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (sprint["id"] if sprint else None, state, title, text, kind,
+                     ts, ts))
                 num = int(cur.lastrowid)
                 self._append_event(num, actor, "submitted", {
                     "text": text or (report_line(len(docs)) if docs
                                      else image_line(len(attachments))),
                     "attachments": attachments,
                     "images_only": not text and not docs,
-                    "hold": bool(hold or hold_mode)})
+                    "kind": kind,
+                    "hold": bool(hold or hold_mode) and kind == "work"})
                 self._append_event(num, "server", "state", {
                     "from": None, "to": state,
-                    "reason": "hold mode is on" if (hold or hold_mode) else None,
+                    "reason": ("a conversation, not a work item" if kind == "conversation"
+                               else ("hold mode is on" if (hold or hold_mode) else None)),
                     "text": "new → %s" % state})
                 self.conn.execute("COMMIT")
             except Exception:
@@ -2064,6 +2238,27 @@ class App:
             if frm == to_state:
                 # Idempotent no-op; still surfaces as success.
                 return self.card_json(row, brief=True)
+            # The kind gate, ahead of the state gate: a conversation has no
+            # work lifecycle to move through, and a work card cannot slip into
+            # the conversation state by asking nicely. `canceled` is shared
+            # ground -- both kinds close the same way -- so this is the one
+            # place that says which of the two doors out of `canceled` is
+            # yours.
+            kind = self.card_kind(row)
+            if kind == "conversation" and to_state not in (CONVERSATION_STATE, "canceled"):
+                raise ApiError(
+                    409, "not_a_work_card",
+                    "#%s is a conversation, not a work card -- it has no "
+                    "%s step. Cancel it when the discussion is done."
+                    % (num, to_state),
+                    from_state=frm, to_state=to_state, card_kind=kind,
+                    allowed=[CONVERSATION_STATE, "canceled"])
+            if kind != "conversation" and to_state == CONVERSATION_STATE:
+                raise ApiError(
+                    409, "not_a_conversation",
+                    "#%s is a work card; use the make_conversation action to "
+                    "turn it into one" % num,
+                    from_state=frm, to_state=to_state, card_kind=kind)
             if to_state not in TRANSITIONS.get(frm, set()):
                 raise ApiError(
                     409, "illegal_transition",
@@ -2777,6 +2972,16 @@ class App:
 
     def card_ready(self, num: int, packet, actor: str = "worker") -> dict:
         row = self.card_row(num)
+        # A conversation has nothing to prove and nobody to sign it off. This
+        # fires BEFORE the packet is even looked at, so the answer is about the
+        # card rather than about which field the packet forgot.
+        if self.is_conversation(row):
+            raise ApiError(409, "not_a_work_card",
+                           "#%s is a conversation, not a work card -- there is "
+                           "no evidence packet, no verdict and no merge on one"
+                           % num,
+                           card_kind="conversation", from_state=row["state"],
+                           to_state="ready")
         missing = self.validate_packet(row, packet)
         if missing:
             with self.lock:
@@ -2858,6 +3063,11 @@ class App:
             raise ApiError(400, "bad_verdict",
                            "verdict must be approve, bounce or reject")
         row = self.card_row(num)
+        if self.is_conversation(row):
+            raise ApiError(409, "not_a_work_card",
+                           "#%s is a conversation -- there is nothing to "
+                           "approve, bounce or reject on one" % num,
+                           card_kind="conversation")
         targets = [num]
         if scope == "batch":
             members = self.batch_members(row["batch_id"])
@@ -2998,6 +3208,13 @@ class App:
         if row["state"] in TERMINAL_STATES:
             raise ApiError(409, "terminal_card",
                            "#%s is %s; cannot ask" % (num, row["state"]))
+        # On a conversation you just talk. A question panel exists to unblock a
+        # working agent, and there is no agent here to unblock.
+        if self.is_conversation(row):
+            raise ApiError(409, "not_a_work_card",
+                           "#%s is a conversation -- say it as a message, not "
+                           "as a question that blocks the card" % num,
+                           card_kind="conversation")
         if row["state"] != "needs_you" and \
                 "needs_you" not in TRANSITIONS.get(row["state"], set()):
             raise ApiError(409, "illegal_transition",
@@ -3305,10 +3522,49 @@ class App:
         self.notify()
         return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
 
+    # A conversation has no queue and no agent, so the verbs that push work
+    # around are meaningless on one. What is left is the two things you can
+    # honestly do to a thread: keep it at the top, and end it.
+    CONVERSATION_ACTIONS = ("pin", "unpin", "cancel", "reopen")
+
     def action(self, num: int, action: str, body: dict, actor: str = "user",
                from_browser: bool = False) -> dict:
         row = self.card_row(num)
-        if action in ("long_running", "external_agent"):
+        if self.is_conversation(row) and action not in self.CONVERSATION_ACTIONS:
+            raise ApiError(409, "not_a_work_card",
+                           "#%s is a conversation -- %s is a work verb. You can "
+                           "%s one." % (num, action,
+                                        ", ".join(self.CONVERSATION_ACTIONS)),
+                           card_kind="conversation",
+                           allowed=list(self.CONVERSATION_ACTIONS))
+        if action == "make_conversation":
+            # Promote a work card into a thread. The card, its number, its body
+            # and its whole timeline stay exactly where they are -- the only
+            # thing that changes is what the board expects of it.
+            if row["state"] in TERMINAL_STATES:
+                raise ApiError(409, "illegal_transition",
+                               "#%s is %s; reopen it before making it a "
+                               "conversation" % (num, row["state"]),
+                               from_state=row["state"],
+                               to_state=CONVERSATION_STATE)
+            # Kind and state change together or not at all: a card that was one
+            # and not the other is a card no rule in this file describes.
+            with self.lock:
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._write_transition(
+                        num, row["state"], CONVERSATION_STATE, actor,
+                        "made a conversation -- a thread now, not a work item",
+                        extra={"card_kind": "conversation"})
+                    self.conn.execute(
+                        "UPDATE cards SET kind='conversation', updated_at=? "
+                        "WHERE num=?", (now(), num))
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+            self.notify()
+        elif action in ("long_running", "external_agent"):
             # Both of these turn the silence timer OFF for a card, so they are
             # the session's to set, not a click in a browser: the user has no
             # way to know whether an agent is legitimately quiet. `long_running`
@@ -3426,14 +3682,21 @@ class App:
                                "#%s is %s; only a closed card (%s) can be reopened"
                                % (num, row["state"], ", ".join(sorted(TERMINAL_STATES))),
                                from_state=row["state"], to_state="queued")
-            self.transition(num, "queued", actor,
-                            reason="reopened — back in the queue",
-                            extra={"reopened_from": row["state"]})
+            # A reopened conversation goes back to being the conversation it
+            # always was, never into the work queue.
+            if self.is_conversation(row):
+                self.transition(num, CONVERSATION_STATE, actor,
+                                reason="reopened — the discussion is back on",
+                                extra={"reopened_from": row["state"]})
+            else:
+                self.transition(num, "queued", actor,
+                                reason="reopened — back in the queue",
+                                extra={"reopened_from": row["state"]})
         else:
             raise ApiError(400, "bad_action",
                            "action must be pin, unpin, cancel, hold, release, "
-                           "duplicate_of, retry, reopen, long_running or "
-                           "external_agent")
+                           "duplicate_of, retry, reopen, make_conversation, "
+                           "long_running or external_agent")
         return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
 
     def set_cursor(self, name: str, seq: int) -> dict:
@@ -3541,6 +3804,10 @@ class App:
             # Flat mirror of session.cursor: how far the session has drained.
             "cursor": self.cursor_seq(),
             "states": list(STATES),
+            # What shapes of card this server knows about. `work` is everything
+            # the board has ever had; `conversation` is a thread that never
+            # enters the work lifecycle.
+            "card_kinds": list(CARD_KINDS),
             # What "no badge" means on a card face.
             "default_model": self.default_model,
             # `integrating` stays in the Ready column with a "merging…" note --
@@ -4131,7 +4398,8 @@ def make_handler(app: App):
                 card = app.create_card(body.get("text"), body.get("images") or [],
                                        bool(body.get("hold")),
                                        actor=self.actor_or(body, "user"),
-                                       reports=body.get("reports"))
+                                       reports=body.get("reports"),
+                                       kind=body.get("kind") or "work")
                 return 201, card
 
             if path == "/api/cards/bulk":
@@ -4203,6 +4471,11 @@ def make_handler(app: App):
                                    "question_id must be an integer", field="question_id")
                 return 200, app.answer(num, qid, body.get("text"),
                                        actor=self.actor_or(body, "user"))
+            if verb == "seen":
+                # The read receipt the conversation highlight is derived from.
+                # `seq` is what the tab had actually rendered when it looked;
+                # omitting it means "everything on the board right now".
+                return 200, app.mark_seen(num, body.get("seq"))
             if verb == "action":
                 return 200, app.action(num, body.get("action"), body,
                                        actor=self.actor_or(body, "user"),
