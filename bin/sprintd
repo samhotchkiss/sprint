@@ -227,6 +227,71 @@ PLACEHOLDER_HTML = (
     "<p>web/ is not installed next to this sprintd. The API is live at /api/board.</p>"
 )
 
+# A person who clicks a link and lands on `{"error":"unauthorized"}` has been
+# handed a stack trace, not an answer. Browsers navigating to a page get this
+# instead; the API keeps its JSON. It never echoes a token.
+SIGNIN_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;
+       justify-content:center;background:#0e1116;color:#e6edf3;
+       font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,
+            "Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}
+  .card{max-width:460px;padding:30px 32px;background:#161b22;
+        border:1px solid #262d38;border-radius:12px;margin:20px}
+  h1{margin:0 0 10px;font-size:18px;font-weight:600}
+  p{margin:0 0 12px;color:#8b98a8}
+  p.last{margin-bottom:0}
+  code{color:#e6edf3;background:#11161d;border:1px solid #262d38;
+       border-radius:5px;padding:2px 7px;font-size:13px;
+       font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  a{color:#8ab4f8}
+</style></head><body>
+<div class="card">
+  <h1>__HEADING__</h1>
+  __BODY__
+</div></body></html>
+"""
+
+
+def signin_page(heading: str, paragraphs, title: str = "sprint") -> bytes:
+    body = "".join(
+        '<p%s>%s</p>' % (' class="last"' if i == len(paragraphs) - 1 else "", p)
+        for i, p in enumerate(paragraphs))
+    return (SIGNIN_HTML.replace("__TITLE__", title)
+            .replace("__HEADING__", heading)
+            .replace("__BODY__", body)).encode("utf-8")
+
+
+def wants_html(headers, path: str, method: str) -> bool:
+    """Is this a person navigating, rather than the API being called?"""
+    if method not in ("GET", "HEAD"):
+        return False
+    if path.startswith("/api/") or path == "/healthz":
+        return False
+    accept = (headers.get("Accept") or "").lower()
+    if "text/html" in accept:
+        return True
+    # curl sends */* ; fetch() from our own page sends application/json
+    return "application/json" not in accept and "text/html" not in accept \
+        and accept in ("", "*/*")
+
+
+def board_cookie_name(port) -> str:
+    """Per-port cookie name.
+
+    Cookies are scoped by HOST, not by port -- so two boards on the same
+    machine sharing one cookie name sign each other out, and the hub's whole
+    premise is several boards on one machine. The name carries the port so
+    each board gets its own slot in the browser's jar.
+    """
+    try:
+        return "%s_%d" % (COOKIE_NAME, int(port))
+    except (TypeError, ValueError):
+        return COOKIE_NAME
+
 
 # --------------------------------------------------------------------------
 # Small helpers
@@ -2035,27 +2100,68 @@ def make_handler(app: App):
                 raise ApiError(400, "bad_json", "body must be a JSON object")
             return obj
 
-        def cookie_token(self):
+        @property
+        def cookie_name(self) -> str:
+            return board_cookie_name(self.server.server_address[1])
+
+        def cookies(self, name: str):
             raw = self.headers.get("Cookie") or ""
+            out = []
             for part in raw.split(";"):
-                name, _, val = part.strip().partition("=")
-                if name == COOKIE_NAME:
-                    return urllib.parse.unquote(val)
+                key, _, val = part.strip().partition("=")
+                if key == name:
+                    out.append(urllib.parse.unquote(val))
+            return out
+
+        def cookie_token(self):
+            for name in (self.cookie_name, COOKIE_NAME):
+                for val in self.cookies(name):
+                    if val:
+                        return val
             return None
 
         def authed(self, query) -> bool:
-            given = None
+            """Every credential the request carries, in order of how deliberate
+            it is -- and ANY match authenticates.
+
+            `?t=` outranks the cookie on purpose. Clicking a link that carries a
+            token is someone deliberately signing in to THIS board; the cookie
+            is ambient, and on a machine running several boards it is very often
+            a different board's. Preferring the cookie meant a valid hub link
+            landed on `{"error":"unauthorized"}` -- reported from the hub, and
+            reproduced against the live board on 8377.
+            """
+            candidates = []
             auth = self.headers.get("Authorization") or ""
             if auth.lower().startswith("bearer "):
-                given = auth[7:].strip()
-            if given is None:
-                given = self.cookie_token()
-            if given is None:
-                qt = query.get("t")
-                given = qt[0] if qt else None
-            if not given:
-                return False
-            return secrets.compare_digest(str(given), app.token)
+                candidates.append(auth[7:].strip())
+            qt = query.get("t")
+            if qt:
+                candidates.append(qt[0])
+            # legacy `sprint_token` included, so browsers signed in before the
+            # per-port cookie landed are not logged out by the upgrade
+            for name in (self.cookie_name, COOKIE_NAME):
+                candidates.extend(self.cookies(name))
+            for given in candidates:
+                if given and secrets.compare_digest(str(given), app.token):
+                    return True
+            return False
+
+        def unauthorized(self, path, method):
+            """JSON for the API; a readable page for a person who clicked."""
+            if not wants_html(self.headers, path, method):
+                return self.json_out(401, {"error": "unauthorized",
+                                           "message": "bearer token required"})
+            return self._send(401, signin_page(
+                "This board needs its link",
+                ["Open the board from the URL your Claude Code session printed "
+                 "when it started the sprint &mdash; the one ending in "
+                 "<code>/?t=&hellip;</code>.",
+                 "Running several sprints on this machine? <code>sprintd hub</code> "
+                 "lists them all on one page and every link there signs you in.",
+                 "If the token was rotated (<code>sprintd start --new-token</code>), "
+                 "the old link stops working on purpose &mdash; use the new one."],
+                title="sprint — sign in"), "text/html; charset=utf-8")
 
         def is_waiter(self, query) -> bool:
             """Is this authenticated request the session's own waiter/drain?
@@ -2096,13 +2202,12 @@ def make_handler(app: App):
 
                 if not self.authed(query):
                     self.drain_body()
-                    return self.json_out(401, {"error": "unauthorized",
-                                               "message": "bearer token required"})
+                    return self.unauthorized(path, method)
 
                 # Cookie handshake: /?t=TOKEN
                 if method == "GET" and path == "/" and query.get("t"):
                     cookie = "%s=%s; Path=/; SameSite=Lax; Max-Age=31536000; HttpOnly" % (
-                        COOKIE_NAME, urllib.parse.quote(app.token))
+                        self.cookie_name, urllib.parse.quote(app.token))
                     # Keep every OTHER query param (?theme=, ?mock=) -- only the
                     # token is consumed here.
                     rest = [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query)
@@ -3679,27 +3784,47 @@ def make_hub_handler(hub: HubApp):
             self._send(status, jdump(obj).encode("utf-8"),
                        "application/json; charset=utf-8", extra_headers)
 
-        def cookie_token(self):
+        def cookies(self, name: str):
             raw = self.headers.get("Cookie") or ""
+            out = []
             for part in raw.split(";"):
-                name, _, val = part.strip().partition("=")
-                if name == HUB_COOKIE_NAME:
-                    return urllib.parse.unquote(val)
-            return None
+                key, _, val = part.strip().partition("=")
+                if key == name:
+                    out.append(urllib.parse.unquote(val))
+            return out
 
         def authed(self, query) -> bool:
-            given = None
+            """Same rule as a board: an explicit `?t=` outranks the cookie, so a
+            stale hub cookie (after `--new-token`, say) can never lock you out
+            of a link that carries the right token."""
+            candidates = []
             auth = self.headers.get("Authorization") or ""
             if auth.lower().startswith("bearer "):
-                given = auth[7:].strip()
-            if given is None:
-                given = self.cookie_token()
-            if given is None:
-                qt = query.get("t")
-                given = qt[0] if qt else None
-            if not given:
-                return False
-            return secrets.compare_digest(str(given), hub.token)
+                candidates.append(auth[7:].strip())
+            qt = query.get("t")
+            if qt:
+                candidates.append(qt[0])
+            candidates.extend(self.cookies(HUB_COOKIE_NAME))
+            for given in candidates:
+                if given and secrets.compare_digest(str(given), hub.token):
+                    return True
+            return False
+
+        def unauthorized(self, path, method):
+            if not wants_html(self.headers, path, method):
+                return self.json_out(401, {
+                    "error": "unauthorized",
+                    "message": "the hub has its own token: see "
+                               "~/.sprint/hub-token, or run `sprintd hub` "
+                               "again to print the URL"})
+            return self._send(401, signin_page(
+                "This page needs its link",
+                ["The hub lists every sprint on this machine, so it is guarded "
+                 "by its own token &mdash; open it with the "
+                 "<code>/?t=&hellip;</code> URL that <code>sprintd hub</code> printed.",
+                 "Lost it? Run <code>sprintd hub</code> again in any terminal: it "
+                 "reuses the running hub and prints the same URL."],
+                title="sprint hub — sign in"), "text/html; charset=utf-8")
 
         def do_GET(self):  # noqa: N802
             self._route()
@@ -3720,11 +3845,7 @@ def make_hub_handler(hub: HubApp):
                         "started_at": hub.started_at})
 
                 if not self.authed(query):
-                    return self.json_out(401, {
-                        "error": "unauthorized",
-                        "message": "the hub has its own token: see "
-                                   "~/.sprint/hub-token, or run `sprintd hub` "
-                                   "again to print the URL"})
+                    return self.unauthorized(path, self.command or "GET")
 
                 if path == "/" and query.get("t"):
                     cookie = "%s=%s; Path=/; SameSite=Lax; Max-Age=31536000; HttpOnly" % (
