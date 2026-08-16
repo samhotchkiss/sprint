@@ -1930,3 +1930,26 @@ html.skin-chaos .review-bar { border-top: 2px solid var(--border); box-shadow: v
 html.skin-chaos .btn.review-next { border: 2px solid var(--border-chip); }
 html.skin-chaos .review-group-title { line-height: 1.5; }
 html.skin-chaos .review-claim { line-height: 1.6; }
+
+/* ---- card #29: the staleness sweep ---------------------------------------
+   Appended as its own section on purpose — another card is editing the review
+   and list label rules right now, and this is meant to merge without touching
+   them.
+
+   A `stuck` event is the board saying "somebody owes this card an action and
+   nobody has done it". It gets no chrome of its own: a quiet amber system line
+   in the timeline, and the card's age text — the one thing on a face that is
+   already about time passing — goes amber to match. Both colours come from
+   --warn, so the Chaos skin picks up its own amber for free. */
+
+.status-line.is-warn .status-dot { background: var(--warn); }
+.status-line.is-warn .status-label { color: var(--warn); }
+
+/* Board card face: the age in the footer. */
+.card-foot .is-stuck-age,
+.card-foot .is-stuck-age .t { color: var(--warn); }
+
+/* List rows: whatever age text the row carries (needs/blocked/motion). */
+.row.is-stuck .row-meta .t,
+.row.is-stuck .row-age .t,
+.row.is-stuck .row-age { color: var(--warn); }

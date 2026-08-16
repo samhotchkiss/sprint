@@ -16,7 +16,7 @@
 import { h, timeEl, firstLine } from './util.js';
 import {
   boardColumns, cardState, needsKind, motionState, blockedReason, waitingMark,
-  meterSegments, sections, isSilent, STATE_LABEL,
+  meterSegments, sections, isSilent, isStuck, STUCK_HINT, STATE_LABEL,
 } from './state.js';
 import { renderMeter } from './meter.js';
 import { shortAgent } from './list.js';
@@ -124,10 +124,14 @@ export function renderCardFace(card, app) {
       h('span.prog-fill', { style: { width: st.pct + '%', background: st.color } })));
   }
 
+  // The age is the only thing on the face that can say "this has been sitting
+  // here too long", so that is where the sweep's amber goes. No new chrome.
   face.appendChild(h('div.card-foot',
     h('span', shortAgent(card.agent_name)),
     h('span.grow'),
-    h('span', timeEl(card.last_activity_at || card.state_since, { suffix: false }))));
+    h('span', { class: isStuck(card) ? 'is-stuck-age' : null,
+      title: isStuck(card) ? STUCK_HINT : null },
+      timeEl(card.last_activity_at || card.state_since, { suffix: false }))));
   return face;
 }
 

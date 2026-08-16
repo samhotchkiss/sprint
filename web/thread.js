@@ -244,9 +244,12 @@ function message(first, app) {
 }
 
 function statusChange(ev, app) {
-  const tone = ev.kind === 'error' || ev.kind === 'agent_silent' ? 'bad'
-    : (ev.kind === 'state' && (ev.payload.to === 'ready' || ev.payload.to === 'completed')) ? 'good'
-      : ev.kind === 'verdict' && ev.payload.verdict === 'approve' ? 'good' : '';
+  // `stuck` is a nudge, not a fault: nothing broke, something is just owed.
+  // Amber, not red — the same colour the card's age text goes.
+  const tone = ev.kind === 'stuck' ? 'warn'
+    : ev.kind === 'error' || ev.kind === 'agent_silent' ? 'bad'
+      : (ev.kind === 'state' && (ev.payload.to === 'ready' || ev.payload.to === 'completed')) ? 'good'
+        : ev.kind === 'verdict' && ev.payload.verdict === 'approve' ? 'good' : '';
   const label = statusLabel(ev);
   // a live time element, so the ticker keeps it honest without a rebuild
   const item = statusLine(label, timeEl(ev.ts), tone);
