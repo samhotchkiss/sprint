@@ -179,8 +179,12 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
   attachment path as submission (magic-byte sniff, content-addressed dedupe, 25 MB cap); at least one
   of text/images required; stored refs land in the chat event's `payload.attachments` with a
   ready-to-use `url` (and the on-disk `path`, so a relayed message gives the agent something to Read).
+  **Every POST that takes `images` also accepts the same list under `attachments`** — that is the name
+  the pictures come back under, and posting them back under it must not be a silent drop.
   `POST /api/cards/:num/answer`
-  `{question_id, text}` — flips needs_you→in_progress optimistically.
+  `{question_id, text?, images?}` — flips needs_you→in_progress optimistically. The answer box takes
+  screenshots exactly like a chat line does, and they ride the answer event's own
+  `payload.attachments`; an answer that is ONLY a picture is a complete answer.
 - `POST /api/cards/:num/action`
   `{action: pin|unpin|cancel|hold|release|duplicate_of|retry|reopen|long_running|external_agent}`.
   The last two are **session-only** (`403 session_only` from a browser — both turn the silence timer
@@ -192,8 +196,12 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
   "reopened" state event (409 on a non-terminal card). **Closing is a user verb — the session never
   puts a card in a terminal state on its own; work with no code change goes to `ready` with an
   answer-style packet and the user closes it.**
-- `POST /api/cards/:num/verdict` `{verdict: approve|bounce|reject, notes?}` — approve: ready→integrating;
-  bounce: ready→in_progress, bounce_count++; server emits event either way, session does the git work.
+- `POST /api/cards/:num/verdict` `{verdict: approve|bounce|reject, notes?, images?}` — approve:
+  ready→integrating; bounce: ready→in_progress, bounce_count++; server emits event either way, session
+  does the git work. A bounce carries the screenshot that shows what is wrong (same ingest, same caps,
+  same refusals as submission): it lands on the verdict event's `payload.attachments`, renders under
+  the bounce in the card's timeline, and gives the agent picking the card back up an absolute `path`
+  to Read. Nothing is written to disk until every target has passed the transition check.
 - `POST /api/cards/:num/integrated` `{ok: bool, reason?}` (session surface) — integrating→completed,
   or integrating→in_progress with an `error` event on failure.
 - Worker surface (bearer token): `POST /api/cards/:num/events` `{kind: progress|chat|note|error,
