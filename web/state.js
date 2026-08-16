@@ -694,7 +694,14 @@ export const SYSTEM_KINDS = new Set(['state', 'agent_silent', 'verdict', 'eviden
 export function messageStatus(ev) {
   if (!ev) return null;
   if (ev.failed) {
-    return { key: 'failed', label: 'not sent', title: 'the board never acknowledged this — send it again' };
+    // Never a dead end. If the line knows how to re-send itself the pill says
+    // so and IS the button; if it somehow doesn't, it still says out loud that
+    // nothing landed rather than sitting on "sending…" forever.
+    return typeof ev.retry === 'function'
+      ? { key: 'failed', retry: true, label: 'failed to send — tap to retry',
+        title: 'the board never took this — tap to send it again (same key, so it cannot land twice)' }
+      : { key: 'failed', label: 'failed to send',
+        title: 'the board never acknowledged this — send it again' };
   }
   if (ev.pending || ev.local || ev.seq == null) {
     return { key: 'sending', label: 'sending…', title: 'still on its way to the board' };

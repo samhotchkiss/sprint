@@ -143,17 +143,40 @@ act on hasn't already been acted on in a previous, interrupted drain —
 your actions themselves should be idempotent where possible (e.g. don't
 re-dispatch a card that already has a live `agent_name`).
 
+### Where the reply goes: `payload.reply_to` is the routing key
+
+Every **user-originated** event carries `payload.reply_to`, stamped by
+the server at write time. It is a machine-readable address and it is the
+authoritative answer to "where does my reply belong":
+
+| `reply_to` | where your reply goes |
+|---|---|
+| `"sidebar"` | `POST /api/sidebar {"text": …, "actor": "session"}` |
+| `"card:<num>"` | that card — `SendMessage` to its agent and/or `POST /api/cards/<num>/events` |
+
+Route off this field, not off prose, not off which endpoint you imagine
+the user hit, not off your memory of this document. It is total and it
+is a biconditional: it is on **every** `actor: "user"` event (submitted,
+chat, answer, verdict, action) with no exceptions, and it is **absent
+from every worker/session/server event** — so `reply_to` present means
+"a human said this and is waiting for you," and the value says where.
+Workers cannot forge it; the server strips it from anything they send.
+
+The reaction table below is the *what to do*; `reply_to` is the *where
+to say it*. When they appear to disagree, `reply_to` wins — it is data
+and the table is prose.
+
 ### Event reaction table
 
 | actor | kind | your reaction |
 |---|---|---|
 | user | `submitted` (card_num set) | New card landed. If hold mode is off it's already `queued`; consider it for dispatch (step 3) once you've drained the page. If hold mode is on it's `held` — do nothing until the user says go. |
-| user | `chat` (card_num set) | User talked to a specific card. If it has a live (non-terminal) agent, `SendMessage` the agent by name with the user's text as context — **and, if `payload.attachments` is non-empty, the absolute `path` of every attachment on its own line, so the agent can `Read` the images.** A pasted screenshot is usually the whole message ("this is what I mean"); a relay that drops it hands the agent a sentence about a picture it cannot see. If terminal, post a `note` explaining you can't reach that agent anymore and, if the message calls for it, dispatch fresh work referencing the old timeline. |
-| user | `chat` (card_num NULL) | Sidebar message. This is the same conversation as your terminal — answer it, and if it asks you to act (unblock, re-batch, approve, "why has #123 been blocked so long") actually do that, don't just answer in prose. Sidebar lines carry `payload.attachments` too — `Read` those paths before you answer. Reply via `POST /api/sidebar {"text":..., "actor":"session"}`. |
-| user | `answer` | An answer to a worker's question. Server already flipped `needs_you`→`in_progress`; your job is to relay the answer to the agent: `SendMessage` it by name with the answer text (plus any attachment paths from the `chat` line that came with it). |
+| user | `chat` (card_num set, `reply_to: "card:<num>"`) | User talked to a specific card. If it has a live (non-terminal) agent, `SendMessage` the agent by name with the user's text as context — **and, if `payload.attachments` is non-empty, the absolute `path` of every attachment on its own line, so the agent can `Read` the images.** A pasted screenshot is usually the whole message ("this is what I mean"); a relay that drops it hands the agent a sentence about a picture it cannot see. If terminal, post a `note` explaining you can't reach that agent anymore and, if the message calls for it, dispatch fresh work referencing the old timeline. |
+| user | `chat` (card_num NULL, `reply_to: "sidebar"`) | Sidebar message. This is the same conversation as your terminal — answer it, and if it asks you to act (unblock, re-batch, approve, "why has #123 been blocked so long") actually do that, don't just answer in prose. Sidebar lines carry `payload.attachments` too — `Read` those paths before you answer. Reply via `POST /api/sidebar {"text":..., "actor":"session"}`. |
+| user | `answer` (`reply_to: "card:<num>"`) | An answer to a worker's question. Server already flipped `needs_you`→`in_progress`; your job is to relay the answer to the agent: `SendMessage` it by name with the answer text (plus any attachment paths from the `chat` line that came with it). |
 | user | `note` with `retry: true` (then `state`→`queued`) | The user hit **Retry** on a failed/stale card. The server already cleared the dead `agent_name`/`worktree` and re-queued it. Dispatch a **fresh** agent (step 3) with the card's full timeline as its brief, and have it say plainly that it is a new agent picking up where the last one died — never `SendMessage` the old name. |
 | user | `action` results (pin/cancel/hold/release/duplicate_of) | Mostly informational — no action needed beyond noticing state changed, unless `release` just moved held cards to queued (then consider dispatch) or `cancel` hit a card with a live agent (then tell that agent to stop: `SendMessage` "this card was canceled, wrap up and stop"). |
-| user | `verdict` (approve) | See step 6 — the card already flipped `ready`→`integrating` on the board (UI shows "merging…", no spinner). Do the actual git integration now, then call `POST /api/cards/:num/integrated` yourself to land it in `completed` or bounce it back with a real failure. |
+| user | `verdict` (approve, `reply_to: "card:<num>"`) | See step 6 — the card already flipped `ready`→`integrating` on the board (UI shows "merging…", no spinner). Do the actual git integration now, then call `POST /api/cards/:num/integrated` yourself to land it in `completed` or bounce it back with a real failure. |
 | user | `verdict` (bounce) | See step 6 — `SendMessage` notes to the agent. Card is already back in `in_progress` server-side. |
 | user | `verdict` (reject) | Card is terminal (`rejected`). Kill its preview server (step 6), prune its worktree, post a closing `note`, done — no git work. |
 | session | `integrated` (ok: true) | Your own echo from step 6 — card is now `completed`. No further action beyond the cleanup you already did as part of calling it (kill preview server, prune worktree). |

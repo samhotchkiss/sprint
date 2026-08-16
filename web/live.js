@@ -1,18 +1,20 @@
 // Liveness transport: SSE first (with Last-Event-ID reconnect handled by the browser),
 // degrading to polling /api/events if the stream keeps failing.
 // The cursor drain is the truth — every (re)connect catches up from our last seq.
-import { api, ApiError } from './api.js';
+import { api, ApiError, rememberGeneration } from './api.js';
 
 const SSE_FAIL_LIMIT = 3;       // consecutive stream failures before we give up on SSE
 const POLL_MS = 3000;
 const POLL_MAX_MS = 15000;
 const SSE_RETRY_MS = 120000;    // while polling, occasionally re-try the stream
+const PROBE_MS = 2500;          // don't hammer /healthz while a stream flaps
 
 export class Live {
   constructor({ onEvents, onStatus, onAuthError, onCursor }) {
     this.onEvents = onEvents;
     this.onStatus = onStatus || (() => {});
     this.onAuthError = onAuthError || (() => {});
+    this.lastProbe = 0;
     // The session's drain cursor arrives out-of-band (a named `cursor` SSE frame,
     // or the `cursor` field on a poll) — it is not an event and never advances seq.
     this.onCursor = onCursor || (() => {});
@@ -69,15 +71,51 @@ export class Live {
     es.onmessage = handle;
     for (const kind of ['event', 'events', 'sprint']) es.addEventListener(kind, handle);
     es.addEventListener('cursor', (e) => this.ingestCursor(e));
+    // The first frame of every stream says which server process this is. A
+    // reconnect that lands on a NEW one is a restart, not a hiccup.
+    es.addEventListener('hello', (e) => this.ingestHello(e));
     es.onerror = () => {
       // EventSource retries on its own; only count a failure when it truly closed,
       // or when it never opened.
       this.fails += 1;
+      // A dropped stream is the first symptom of a backend restart, and
+      // EventSource will not tell us why it dropped. /healthz needs no auth, so
+      // it answers even when the restart also invalidated our token.
+      this.probeHealth();
       if (es.readyState === EventSource.CLOSED || this.fails >= SSE_FAIL_LIMIT) {
         this.closeStream();
         this.startPolling();
       }
     };
+  }
+
+  /** Re-open the stream from our own cursor. Used after a server restart. */
+  resync() {
+    if (this.stopped) return;
+    clearTimeout(this.retryTimer);
+    clearTimeout(this.pollTimer);
+    this.fails = 0;
+    if (typeof EventSource === 'function') this.openStream();
+    else this.poll();
+  }
+
+  /** Ask an unauthenticated /healthz who it is. Throttled; never throws. */
+  probeHealth() {
+    const t = Date.now();
+    if (t - this.lastProbe < PROBE_MS) return;
+    this.lastProbe = t;
+    api.health().then((h) => {
+      if (h && h.generation) rememberGeneration(h.generation);
+    }).catch(() => {});
+  }
+
+  ingestHello(e) {
+    if (!e || !e.data) return;
+    let data;
+    try { data = JSON.parse(e.data); } catch { return; }
+    if (data && data.generation) rememberGeneration(data.generation);
+    const seq = Number(data && data.cursor);
+    if (!Number.isNaN(seq)) this.onCursor(seq);
   }
 
   closeStream() {
@@ -102,6 +140,10 @@ export class Live {
     if (!e || !e.data) return;
     let data;
     try { data = JSON.parse(e.data); } catch { return; }
+    // The cursor is the most frequent frame on the wire, so it carries the
+    // generation too: a tab that somehow missed the hello still learns within
+    // a second that it is talking to a different server.
+    if (data && data.generation) rememberGeneration(data.generation);
     const seq = Number(data && data.cursor != null ? data.cursor : data && data.seq);
     if (!Number.isNaN(seq)) this.onCursor(seq);
   }
@@ -125,7 +167,15 @@ export class Live {
       this.pollDelay = POLL_MS;
       this.setMode('polling');
     } catch (err) {
-      if (err instanceof ApiError && err.status === 401) { this.onAuthError(); return; }
+      if (err instanceof ApiError && err.status === 401) {
+        // Auth is the one failure a restart can cause that polling cannot fix
+        // by itself. Find out whether this is a NEW server first, so the wall
+        // can say "the board restarted" rather than shrug.
+        this.probeHealth();
+        this.onAuthError();
+        return;
+      }
+      this.probeHealth();
       this.pollDelay = Math.min(POLL_MAX_MS, Math.round(this.pollDelay * 1.6));
       this.setMode('error');
     }

@@ -68,6 +68,12 @@ recovery must be easy. The user always runs claude inside tmux.
   `actor ∈ {user, session, worker, server}`. `kind ∈ {submitted, state, chat, question, answer,
   progress, evidence, verdict, agent_silent, note, error}`. Card state and timelines are projections
   of this log. seq is the global cursor for ingress.
+  **Every `actor: "user"` event carries `payload.reply_to`** — `"sidebar"` (sprint-level) or
+  `"card:<num>"` — stamped by the server at write time, in the one place any event is written, so it
+  is total by construction. It is the authoritative routing key for any orchestrator ("where does my
+  answer belong"), replacing prose in SKILL.md. It is a biconditional: stamped on every user event,
+  **stripped** from every worker/session/server event, and workers cannot forge it — so `reply_to`
+  present means "a human said this and is waiting."
 - `evidence(card_num, packet JSON, created_at)`.
 - `cursors(name PRIMARY KEY, seq)` — the session persists its drain cursor here (`orchestrator`).
 - `questions(id, card_num, text, options JSON NULL, answered_at NULL)` — answer idempotency: second
@@ -96,7 +102,8 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 
 ## HTTP API (JSON; all POSTs idempotent via optional `Idempotency-Key` header)
 
-- `GET /` + static `web/` assets. `GET /healthz` (no auth).
+- `GET /` + static `web/` assets. `GET /healthz` (no auth) — carries `generation`, one id per server
+  **process**, alongside pid/started_at/seq.
 - `POST /api/cards` `{text?, images?: [base64 png/jpeg], hold?: bool}` → card. Server stores
   attachments first, then the card+`submitted` event. At least one of text/images required.
 - `GET /api/board` — open sprint, all cards w/ latest state + last event + queue positions + session
@@ -129,7 +136,11 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
   it up"); assigning a card in any other state only records the agent and never regresses state;
   `POST /api/sprint` `{action: open|close|set_hold_mode, ...}`; `POST /api/cursors/orchestrator` `{seq}`.
 - `GET /api/events?after=SEQ&limit=N` — the drain endpoint. `GET /api/stream` — SSE (browser),
-  heartbeat comment every 15s, browsers auto-reconnect with Last-Event-ID.
+  heartbeat comment every 15s, browsers auto-reconnect with Last-Event-ID. The stream opens with a
+  named `hello` frame (`generation`, `started_at`, `cursor`, `head`) and every `cursor` frame carries
+  `generation` too; neither carries an `id:` (they are not events and must never become
+  Last-Event-ID). `/api/board` and `/api/events` carry `generation` as well, so the polling fallback
+  sees a restart on the same terms as SSE.
 - `sprintd wait --after SEQ [--timeout 60]` — CLI: blocks until events exist past SEQ or timeout;
   exit 0 = events waiting, exit 2 = timeout (relaunch me), nonzero-other = server unreachable.
   This is the session's ingress primitive (background task; its exit re-invokes the session).
@@ -352,6 +363,19 @@ your assigned worktree; one branch; never push to main; never touch other cards'
   counters anywhere.
 - **Session liveness dot** (header/chat): green live / amber "catching up" / red offline; only red
   raises the "session offline — items will queue" banner.
+- **A send is never silent, and a restart is never a dead tab.** Every POST has a deadline (a
+  backend that goes away mid-request must not leave `fetch` hanging), and a send that fails or times
+  out flips that message's delivery pill to **"failed to send — tap to retry"** — the pill IS the
+  button, and the retry re-POSTs with the SAME `Idempotency-Key`, so a slow-but-landed send replays
+  instead of duplicating. This covers all four user surfaces: sidebar chat, card chat, answers, and
+  verdicts (a failed verdict writes a visible error line into the thread, never just a toast that
+  is gone in four seconds). A failed line survives every subsequent refresh until it is retried.
+  On a `generation` change — SSE hello, cursor frame, a poll, or an unauthenticated `/healthz` probe
+  fired when the transport falls over — the tab knows the backend restarted: it re-opens the stream
+  from its own cursor, refetches the board and the open card, and keeps every composer draft and
+  pasted screenshot. If the restart also invalidated the token, the sign-in wall says so in those
+  words ("the board restarted — it needs its link again") instead of the tab dying quietly; a board
+  fetch that succeeds again takes the wall back down.
 - SSE-live throughout; optimistic UI with reconciliation; Last-Event-ID reconnect; one tab-title/
   favicon badge + one soft chime on flips to needs_you/ready (no repeat, no unread counters
   anywhere else).

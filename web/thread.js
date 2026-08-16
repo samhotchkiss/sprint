@@ -188,7 +188,13 @@ function message(first, app) {
   const mine = ev.actor === 'user';
 
   const item = h('div.item');
-  const status = h('span.msg-status');
+  // A button, always: a failed send has to be one tap from going again, and a
+  // pill that is sometimes a button and sometimes a span is two nodes to keep
+  // in sync. It only takes clicks when there is something to retry.
+  const status = h('button.msg-status', {
+    type: 'button',
+    onclick: () => { if (ev && typeof ev.retry === 'function') ev.retry(); },
+  });
   const when = h('span.msg-when');
   item.appendChild(h('div.msg-head', h('span.msg-who', who.label), status, when));
 
@@ -219,8 +225,9 @@ function message(first, app) {
       + `${ev.pending || ev.local ? ' is-pending' : ''}${ev.failed ? ' is-failed' : ''}`;
     status.hidden = !st;
     if (st) {
-      status.className = `msg-status is-${st.key}`;
+      status.className = `msg-status is-${st.key}${st.retry ? ' is-retry' : ''}`;
       status.title = st.title;
+      status.disabled = !st.retry;
       if (status.textContent !== st.label) status.textContent = st.label;
     }
     const hideWhen = st && (st.key === 'sending' || st.key === 'failed');

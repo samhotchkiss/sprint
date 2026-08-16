@@ -1322,8 +1322,8 @@ class TestBatches(Base):
                              "no member may be half-completed")
 
 
-class TestStream(Base):
-    SSE_HEARTBEAT = 0.4
+class StreamReader:
+    """Read an SSE stream line by line. Shared by every test that reads frames."""
 
     def _open_stream(self, path="/api/stream?after=0", headers=None, timeout=8.0):
         conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
@@ -1351,6 +1351,24 @@ class TestStream(Base):
                 return lines
         return lines
 
+    def _frames(self, lines, name):
+        """Every `data:` payload belonging to an `event: <name>` frame."""
+        out, kind = [], None
+        for text in lines:
+            if text.startswith("event:"):
+                kind = text.split(":", 1)[1].strip()
+            elif text.startswith("data:"):
+                if kind == name:
+                    out.append(json.loads(text[5:].strip()))
+                kind = None
+            elif not text.strip():
+                continue
+        return out
+
+
+class TestStream(StreamReader, Base):
+    SSE_HEARTBEAT = 0.4
+
     def test_stream_delivers_events_and_heartbeats(self):
         card = self.new_card("stream me")
         _conn, resp = self._open_stream()
@@ -1371,14 +1389,15 @@ class TestStream(Base):
     def test_event_frames_are_id_plus_data_only(self):
         """Event frames: `id:` = seq, `data:` = one event JSON, and no `event:`
         line -- a named type would never reach the browser's default message
-        handler. The ONLY named frame on this stream is `cursor`, which is not
-        an event and therefore carries no `id:` (it must never become
-        Last-Event-ID)."""
+        handler. The only named frames on this stream are `hello` and `cursor`,
+        neither of which is an event and neither of which carries an `id:`
+        (they must never become Last-Event-ID)."""
         self.new_card("framing")
         _conn, resp = self._open_stream()
         lines = self._read_lines(resp, lambda t: t.startswith("data:") and '"seq"' in t)
         named = [t for t in lines if t.startswith("event:")]
-        self.assertTrue(all(t.strip() == "event: cursor" for t in named), lines)
+        self.assertTrue(all(t.strip() in ("event: cursor", "event: hello") for t in named),
+                        lines)
 
         # walk frames: a `cursor` frame is named + un-id'd, an event frame is
         # id'd + anonymous.
@@ -1390,8 +1409,8 @@ class TestStream(Base):
                 ident = int(text[3:].strip())
             elif text.startswith("data:"):
                 payload = json.loads(text[5:].strip())
-                if kind == "cursor":
-                    self.assertIsNone(ident, "a cursor frame must not carry an id")
+                if kind in ("cursor", "hello"):
+                    self.assertIsNone(ident, "a %s frame must not carry an id" % kind)
                     self.assertIn("cursor", payload)
                 else:
                     seen_event = True
@@ -1448,6 +1467,288 @@ class TestStream(Base):
         ids = [int(t[3:].strip()) for t in lines if t.startswith("id:")]
         self.assertTrue(ids, lines)
         self.assertGreater(ids[0], head, "must not replay events before Last-Event-ID")
+
+
+class TestServerGeneration(StreamReader, Base):
+    """A restart must be DETECTABLE by an open tab.
+
+    The user's report: chat messages silently failed to send from a tab that
+    had been open across a backend restart -- nothing landed server-side and
+    nothing on screen said so. The tab could not tell "the server is quiet"
+    from "the server I was talking to no longer exists". `generation` is that
+    one bit: one id per server PROCESS, on every surface a live tab touches.
+    """
+
+    SSE_HEARTBEAT = 0.4
+
+    def test_healthz_carries_a_generation(self):
+        status, body = self.get("/healthz", token=None)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.get("generation"), body)
+        self.assertIsInstance(body["generation"], str)
+
+    def test_generation_is_stable_within_one_process(self):
+        gens = {self.get("/healthz", token=None)[1]["generation"] for _ in range(3)}
+        self.new_card("does not change the generation")
+        gens.add(self.get("/healthz", token=None)[1]["generation"])
+        self.assertEqual(len(gens), 1, gens)
+        self.assertEqual(gens.pop(), self.app.generation)
+
+    def test_a_second_process_gets_a_different_generation(self):
+        """Same data dir, same token, new process -- and the tab can tell."""
+        other = sprintd.App(self.project_root, log=self.logfh, token="test-token")
+        self.addCleanup(other.close)
+        self.assertNotEqual(other.generation, self.app.generation)
+
+    def test_board_and_events_carry_the_generation(self):
+        """The polling fallback learns about a restart too, not just SSE."""
+        for path in ("/api/board", "/api/events?after=0"):
+            status, body = self.get(path)
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body.get("generation"), self.app.generation, path)
+
+    def test_stream_opens_with_a_hello_carrying_the_generation(self):
+        self.new_card("hello frame")
+        _conn, resp = self._open_stream()
+        lines = self._read_lines(resp, lambda t: t.startswith("data:") and '"generation"' in t)
+        hellos = self._frames(lines, "hello")
+        self.assertTrue(hellos, lines)
+        self.assertEqual(hellos[0]["generation"], self.app.generation)
+        # It is the FIRST frame: a tab must not have to wait for traffic to
+        # find out which server it is attached to.
+        named = [t for t in lines if t.startswith("event:")]
+        self.assertEqual(named[0].strip(), "event: hello", lines)
+        # and it says where the log is, so the tab can resume from its cursor
+        self.assertIn("cursor", hellos[0])
+        self.assertIn("head", hellos[0])
+
+    def test_cursor_frames_carry_the_generation_too(self):
+        """The cursor is the most frequent frame on the wire; a tab that missed
+        the hello still learns within a second."""
+        _conn, resp = self._open_stream()
+        # past the hello (which also carries a cursor) to the cursor frame itself
+        lines = self._read_lines(
+            resp, lambda t: t.startswith("data:") and '"cursor"' in t
+            and '"started_at"' not in t)
+        cursors = self._frames(lines, "cursor")
+        self.assertTrue(cursors, lines)
+        for frame in cursors:
+            self.assertEqual(frame["generation"], self.app.generation)
+
+    def test_the_log_survives_the_restart_the_generation_reports(self):
+        """Why resuming from the cursor is safe: seq is durable, so a tab that
+        reconnects after a restart picks up exactly where it stopped hearing.
+        """
+        num = self.new_card("before the restart")["num"]
+        before_seq = self.app.max_seq()
+        self.app.close()
+        again = sprintd.App(self.project_root, log=self.logfh, token="test-token")
+        self.addCleanup(again.close)
+        self.assertNotEqual(again.generation, self.app.generation)
+        self.assertEqual(again.max_seq(), before_seq)
+        again.card_chat(num, "after the restart", actor="user")
+        fresh = again.events_after(before_seq, 50)
+        self.assertEqual([e["kind"] for e in fresh], ["chat"])
+        self.assertGreater(fresh[0]["seq"], before_seq)
+
+
+class TestReplyToRouting(Base):
+    """Every user-originated event says, in machine-readable form, where the
+    answer belongs -- `"sidebar"` or `"card:<num>"`. No orchestrator should
+    have to infer routing from operating-doc prose, from which endpoint was
+    hit, or from the shape of a payload.
+
+    Deliberately a biconditional: stamped on EVERY user event, stripped from
+    every worker/session/server event. `reply_to` present means "a human said
+    this and is waiting".
+    """
+
+    def user_events(self):
+        return [e for e in self.get("/api/events?after=0&limit=500")[1]["events"]
+                if e["actor"] == "user"]
+
+    def test_the_four_user_surfaces_all_carry_reply_to(self):
+        num = self.new_card("route my replies")["num"]
+        self.to_in_progress(num)
+        self.post("/api/cards/%d/question" % num, {"text": "which one?"})
+        status, _ = self.post("/api/cards/%d/answer" % num, {"text": "the first"})
+        self.assertEqual(status, 200)
+        status, _ = self.post("/api/cards/%d/chat" % num, {"text": "a message"})
+        self.assertEqual(status, 201)
+        self.post("/api/cards/%d/state" % num, {"state": "in_progress"})
+        status, _ = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200)
+        status, _ = self.post("/api/cards/%d/verdict" % num,
+                              {"verdict": "bounce", "notes": "not quite"})
+        self.assertEqual(status, 200)
+        status, _ = self.post("/api/sidebar", {"text": "hey", "actor": "user"})
+        self.assertEqual(status, 201)
+
+        by_kind = {}
+        for ev in self.user_events():
+            by_kind.setdefault(ev["kind"], []).append(ev)
+        for kind in ("chat", "answer", "verdict", "submitted"):
+            self.assertIn(kind, by_kind, by_kind)
+
+        card_ref = "card:%d" % num
+        for ev in self.user_events():
+            want = "sidebar" if ev["card_num"] is None else "card:%d" % ev["card_num"]
+            self.assertEqual(ev["payload"].get("reply_to"), want,
+                             "%s event routes wrong: %r" % (ev["kind"], ev["payload"]))
+        # the two shapes, both present in this run
+        refs = {e["payload"]["reply_to"] for e in self.user_events()}
+        self.assertEqual(refs, {card_ref, "sidebar"})
+
+    def test_sidebar_chat_says_sidebar(self):
+        self.post("/api/sidebar", {"text": "why is #3 blocked?", "actor": "user"})
+        ev = self.user_events()[-1]
+        self.assertIsNone(ev["card_num"])
+        self.assertEqual(ev["payload"]["reply_to"], "sidebar")
+
+    def test_card_actions_are_user_events_too(self):
+        """Total means total: pin, hold, cancel, reopen -- if a human did it on
+        a card, the reply goes to that card."""
+        num = self.new_card("act on me")["num"]
+        self.post("/api/cards/%d/action" % num, {"action": "hold"})
+        self.post("/api/cards/%d/action" % num, {"action": "release"})
+        acted = [e for e in self.user_events() if e["card_num"] == num]
+        self.assertTrue(acted)
+        for ev in acted:
+            self.assertEqual(ev["payload"]["reply_to"], "card:%d" % num)
+
+    def test_worker_session_and_server_events_carry_none(self):
+        num = self.new_card("quiet please")["num"]
+        self.to_in_progress(num)
+        self.post("/api/cards/%d/events" % num,
+                  {"kind": "progress", "payload": {"text": "step one"}})
+        self.post("/api/cards/%d/question" % num, {"text": "which one?"})
+        self.post("/api/sidebar", {"text": "on it", "actor": "session"})
+        rows = self.get("/api/events?after=0&limit=500")[1]["events"]
+        others = [e for e in rows if e["actor"] != "user"]
+        self.assertTrue(any(e["actor"] == "worker" for e in others), others)
+        self.assertTrue(any(e["actor"] == "session" for e in others), others)
+        self.assertTrue(any(e["actor"] == "server" for e in others), others)
+        for ev in others:
+            self.assertNotIn("reply_to", ev["payload"],
+                             "%s/%s must not claim a reply route" % (ev["actor"], ev["kind"]))
+
+    def test_a_worker_cannot_forge_reply_to(self):
+        """The server is the only writer of this field. A worker that sends one
+        gets it stripped -- otherwise `reply_to` would only be as trustworthy
+        as the least careful agent."""
+        num = self.new_card("forgery")["num"]
+        self.to_in_progress(num)
+        self.post("/api/cards/%d/events" % num,
+                  {"kind": "note", "payload": {"text": "hi", "reply_to": "sidebar"}})
+        ev = self.get("/api/cards/%d" % num)[1]["timeline"][-1]
+        self.assertEqual(ev["actor"], "worker")
+        self.assertNotIn("reply_to", ev["payload"])
+
+    def test_reply_to_is_on_the_card_timeline_and_the_drain(self):
+        """Both readers see the same field: the drain is what an orchestrator
+        reads, the timeline is what the drawer reads."""
+        num = self.new_card("both readers")["num"]
+        self.post("/api/cards/%d/chat" % num, {"text": "hello there"})
+        drained = [e for e in self.get("/api/events?after=0&limit=500")[1]["events"]
+                   if e["kind"] == "chat"]
+        timeline = [e for e in self.get("/api/cards/%d" % num)[1]["timeline"]
+                    if e["kind"] == "chat"]
+        self.assertEqual(len(drained), 1)
+        self.assertEqual(drained[0]["payload"]["reply_to"], "card:%d" % num)
+        self.assertEqual(timeline[0]["payload"]["reply_to"], "card:%d" % num)
+
+
+class TestRetryIsIdempotent(Base):
+    """A send that failed VISIBLY has to be retryable safely.
+
+    The failure a user cannot tell apart from a lost message is the slow one
+    that actually landed: the server took it, the answer never made it back.
+    The UI retries with the SAME Idempotency-Key, so that case replays instead
+    of writing the message twice.
+    """
+
+    def send(self, path, body, key):
+        return self.req("POST", path, body, headers={"Idempotency-Key": key})
+
+    def raw(self, path, body, key):
+        """Same POST, but keep the response headers -- we want the replay flag."""
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=10.0)
+        try:
+            conn.request("POST", path, body=json.dumps(body).encode("utf-8"),
+                         headers={"Authorization": "Bearer test-token",
+                                  "Content-Type": "application/json",
+                                  "Idempotency-Key": key})
+            resp = conn.getresponse()
+            raw = resp.read()
+            return resp.status, dict(resp.getheaders()), json.loads(raw.decode("utf-8"))
+        finally:
+            conn.close()
+
+    def test_retrying_a_card_chat_does_not_duplicate_it(self):
+        num = self.new_card("retry me")["num"]
+        s1, b1 = self.send("/api/cards/%d/chat" % num, {"text": "did that land?"}, "k-chat")
+        s2, b2 = self.send("/api/cards/%d/chat" % num, {"text": "did that land?"}, "k-chat")
+        self.assertEqual((s1, s2), (201, 201))
+        self.assertEqual(b1["event"]["seq"], b2["event"]["seq"])
+        chats = [e for e in self.get("/api/cards/%d" % num)[1]["timeline"]
+                 if e["kind"] == "chat"]
+        self.assertEqual(len(chats), 1, chats)
+
+    def test_a_replay_is_labelled_as_one(self):
+        num = self.new_card("labelled")["num"]
+        self.raw("/api/cards/%d/chat" % num, {"text": "one"}, "k-label")
+        status, headers, _ = self.raw("/api/cards/%d/chat" % num, {"text": "one"}, "k-label")
+        self.assertEqual(status, 201)
+        self.assertEqual(headers.get("Idempotent-Replay"), "true")
+
+    def test_retrying_a_sidebar_line_does_not_duplicate_it(self):
+        s1, b1 = self.send("/api/sidebar", {"text": "you there?", "actor": "user"}, "k-side")
+        s2, b2 = self.send("/api/sidebar", {"text": "you there?", "actor": "user"}, "k-side")
+        self.assertEqual((s1, s2), (201, 201))
+        self.assertEqual(b1["event"]["seq"], b2["event"]["seq"])
+        lines = [e for e in self.get("/api/events?after=0&limit=500")[1]["events"]
+                 if e["kind"] == "chat" and e["card_num"] is None]
+        self.assertEqual(len(lines), 1, lines)
+
+    def test_retrying_an_answer_replays_instead_of_409ing(self):
+        """Without a stable key the retry would hit the second-answer 409 and
+        read as 'your answer was lost' when it had in fact landed."""
+        num = self.new_card("answer me")["num"]
+        self.to_in_progress(num)
+        status, q = self.post("/api/cards/%d/question" % num, {"text": "which?"})
+        self.assertEqual(status, 201, q)
+        qid = q["question"]["id"]
+        body = {"question_id": qid, "text": "the first"}
+        s1, b1 = self.send("/api/cards/%d/answer" % num, body, "k-ans")
+        s2, b2 = self.send("/api/cards/%d/answer" % num, body, "k-ans")
+        self.assertEqual((s1, s2), (200, 200), (b1, b2))
+        answers = [e for e in self.get("/api/cards/%d" % num)[1]["timeline"]
+                   if e["kind"] == "answer"]
+        self.assertEqual(len(answers), 1, answers)
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_retrying_a_verdict_replays_instead_of_409ing(self):
+        num = self.new_card("sign me off")["num"]
+        self.to_in_progress(num)
+        self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        body = {"verdict": "approve"}
+        s1, _ = self.send("/api/cards/%d/verdict" % num, body, "k-verdict")
+        s2, _ = self.send("/api/cards/%d/verdict" % num, body, "k-verdict")
+        self.assertEqual((s1, s2), (200, 200))
+        verdicts = [e for e in self.get("/api/cards/%d" % num)[1]["timeline"]
+                    if e["kind"] == "verdict"]
+        self.assertEqual(len(verdicts), 1, verdicts)
+        self.assertEqual(self.state_of(num), "integrating")
+
+    def test_a_different_key_is_a_different_message(self):
+        """The guard is the key, not the text: sending the same words twice on
+        purpose still writes twice."""
+        num = self.new_card("say it twice")["num"]
+        self.send("/api/cards/%d/chat" % num, {"text": "ping"}, "k-one")
+        self.send("/api/cards/%d/chat" % num, {"text": "ping"}, "k-two")
+        chats = [e for e in self.get("/api/cards/%d" % num)[1]["timeline"]
+                 if e["kind"] == "chat"]
+        self.assertEqual(len(chats), 2, chats)
 
 
 class TestBoardPayloadForTheUI(Base):
