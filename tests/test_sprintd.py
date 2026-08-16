@@ -6,6 +6,7 @@ temp data dir. Port 8377 (the real default) is never touched.
 """
 
 import base64
+import datetime
 import http.client
 import importlib.util
 import json
@@ -57,6 +58,15 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="sprintd-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        # EVERY board test points machine-wide state at a temp dir, not just
+        # the registry ones: an account limit is read off a shared file beside
+        # the registry on every board read, and a suite that read the real
+        # ~/.sprint would either invent a banner from the developer's own live
+        # limit or write one into it.
+        self.registry = os.path.join(self.tmp, "hubstate", "registry.json")
+        self._old_registry_env = os.environ.get("SPRINT_REGISTRY")
+        os.environ["SPRINT_REGISTRY"] = self.registry
+        self.addCleanup(self._restore_registry_env)
         self.project_root = os.path.join(self.tmp, "project")
         os.makedirs(self.project_root)
         self.logfh = open(os.path.join(self.tmp, "server.log"), "a", encoding="utf-8")
@@ -82,6 +92,12 @@ class Base(unittest.TestCase):
         if self.START_BACKGROUND:
             self.app.start_background()
         self.addCleanup(self._teardown)
+
+    def _restore_registry_env(self):
+        if self._old_registry_env is None:
+            os.environ.pop("SPRINT_REGISTRY", None)
+        else:
+            os.environ["SPRINT_REGISTRY"] = self._old_registry_env
 
     def _teardown(self):
         try:
@@ -5767,7 +5783,10 @@ class TestDispatchModel(Base):
         # The schema as it was before `model` existed — the real shape of a
         # board that has been up since before this shipped.
         old_schema = sprintd.SCHEMA.replace("  model TEXT,\n", "")
-        self.assertNotIn("model TEXT", old_schema)
+        # The guard is that the replace actually LANDED, so it names the exact
+        # line it removed. A bare "model TEXT" also matches the `limits` table's
+        # own `model` column, which has nothing to do with this migration.
+        self.assertNotIn("  model TEXT,", old_schema)
         conn.executescript(old_schema)
         conn.execute("INSERT INTO sprints(opened_at) VALUES(1.0)")
         conn.execute("INSERT INTO cards(sprint_id, state, title, body, created_at, "
@@ -6509,6 +6528,333 @@ class TestMigratedColumns(unittest.TestCase):
         card = app2.card_json(app2.card_row(1))
         self.assertFalse(card["external_agent"])
         self.assertEqual(card["work_kind"], "code")
+class TestSettings(Base):
+    """.sprint/config.json — the board's dispatch policy.
+
+    The server stores and validates it and does nothing else with it: the
+    SESSION reads it at dispatch. Which is exactly why an unknown key has to
+    be a loud 400 — a typo that is quietly accepted reads back, hours later,
+    as "the defaults are fine".
+    """
+
+    def settings(self):
+        status, body = self.get("/api/settings")
+        self.assertEqual(status, 200, body)
+        return body
+
+    def put(self, patch, **kw):
+        return self.req("PUT", "/api/settings", patch, **kw)
+
+    # -- read -----------------------------------------------------------
+
+    def test_defaults_before_anything_is_written(self):
+        body = self.settings()
+        w = body["settings"]["worker"]
+        self.assertEqual(w["model_policy"], "lowest_feasible")
+        self.assertEqual(w["default_executor"], "subagent")
+        self.assertEqual(w["concurrency"], 3)
+        self.assertIn("claude", w["executors"])
+        self.assertEqual(body["defaults"]["worker"]["model_policy"], "lowest_feasible")
+        # the panel's dropdowns come from the server, not a list in JS
+        self.assertEqual(body["choices"]["model_policy"],
+                         ["lowest_feasible", "always_opus", "always_sonnet"])
+
+    def test_settings_need_the_token(self):
+        status, _ = self.get("/api/settings", token=None)
+        self.assertEqual(status, 401)
+        status, _ = self.put({"worker": {"concurrency": 5}}, token=None)
+        self.assertEqual(status, 401)
+
+    # -- write ----------------------------------------------------------
+
+    def test_write_persists_to_config_json_and_reads_back(self):
+        status, body = self.put({"worker": {
+            "model_policy": "always_sonnet",
+            "concurrency": 5,
+            "executors": {"grok": {"kind": "tmux", "command": "grok",
+                                   "session": "sprint-workers"},
+                          "claude": {"kind": "subagent"}},
+            "default_executor": "grok",
+        }})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["settings"]["worker"]["default_executor"], "grok")
+
+        path = os.path.join(self.project_root, ".sprint", "config.json")
+        self.assertTrue(os.path.isfile(path), "config.json was written")
+        with open(path, encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        self.assertEqual(on_disk["worker"]["concurrency"], 5)
+        self.assertEqual(on_disk["worker"]["executors"]["grok"]["command"], "grok")
+
+        # ...and a fresh read comes back with what we wrote
+        again = self.settings()["settings"]["worker"]
+        self.assertEqual(again["model_policy"], "always_sonnet")
+        self.assertEqual(again["executors"]["grok"]["kind"], "tmux")
+
+    def test_a_partial_write_leaves_everything_else_alone(self):
+        self.put({"worker": {"concurrency": 7}})
+        self.put({"worker": {"model_policy": "always_opus"}})
+        w = self.settings()["settings"]["worker"]
+        self.assertEqual(w["concurrency"], 7)
+        self.assertEqual(w["model_policy"], "always_opus")
+
+    def test_post_writes_the_same_as_put(self):
+        status, body = self.post("/api/settings", {"worker": {"concurrency": 4}})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.settings()["settings"]["worker"]["concurrency"], 4)
+
+    def test_a_change_lands_on_the_event_log_for_the_session_to_see(self):
+        before = self.get("/api/events?after=0&limit=500")[1]["head"]
+        self.put({"worker": {"concurrency": 6}})
+        status, page = self.get("/api/events?after=%d&limit=50" % before)
+        self.assertEqual(status, 200)
+        notes = [e for e in page["events"] if e["kind"] == "note"
+                 and e["payload"].get("settings")]
+        self.assertEqual(len(notes), 1, page["events"])
+        note = notes[0]
+        self.assertEqual(note["actor"], "server")
+        self.assertIn("next dispatch", note["payload"]["text"])
+        # a server event is never a human waiting for a reply
+        self.assertNotIn("reply_to", note["payload"])
+        # ...and it is not sidebar chatter either
+        self.assertEqual([e for e in self.get("/api/sidebar")[1]["events"]
+                          if e["payload"].get("settings")], [])
+
+    def test_a_write_that_changes_nothing_writes_no_event(self):
+        self.put({"worker": {"concurrency": 5}})
+        head = self.get("/api/events?after=0&limit=500")[1]["head"]
+        status, _ = self.put({"worker": {"concurrency": 5}})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.get("/api/events?after=0&limit=500")[1]["head"], head)
+
+    # -- validation ------------------------------------------------------
+
+    def test_unknown_key_is_rejected_and_named(self):
+        status, body = self.put({"worker": {"model_polciy": "always_opus"}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "unknown_key")
+        self.assertEqual(body["field"], "worker.model_polciy")
+        # ...and nothing was written
+        self.assertFalse(os.path.isfile(
+            os.path.join(self.project_root, ".sprint", "config.json")))
+
+    def test_unknown_top_level_section_is_rejected(self):
+        status, body = self.put({"orchestrator": {"model": "opus"}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "unknown_key")
+        self.assertEqual(body["field"], "orchestrator")
+
+    def test_bad_enum_is_rejected(self):
+        status, body = self.put({"worker": {"model_policy": "haiku_always"}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.model_policy")
+        self.assertIn("lowest_feasible", body["message"])
+
+    def test_concurrency_must_be_a_sane_whole_number(self):
+        for bad in ("3", 0, -1, 999, 2.5, True):
+            status, body = self.put({"worker": {"concurrency": bad}})
+            self.assertEqual(status, 400, "%r should be refused: %s" % (bad, body))
+            self.assertEqual(body["field"], "worker.concurrency")
+
+    def test_a_tmux_executor_without_a_command_is_refused(self):
+        status, body = self.put({"worker": {"executors": {"grok": {"kind": "tmux"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors.grok.command")
+
+    def test_an_unknown_executor_kind_is_refused(self):
+        status, body = self.put({"worker": {
+            "executors": {"grok": {"kind": "ssh", "command": "grok"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors.grok.kind")
+
+    def test_an_unknown_field_inside_an_executor_is_refused(self):
+        status, body = self.put({"worker": {
+            "executors": {"grok": {"kind": "tmux", "command": "grok",
+                                   "windo": "sprint"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "unknown_key")
+        self.assertIn("windo", body["field"])
+
+    def test_default_executor_must_be_one_that_exists(self):
+        status, body = self.put({"worker": {"default_executor": "grok"}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.default_executor")
+        # ...but declaring it in the same request is fine
+        status, body = self.put({"worker": {
+            "executors": {"grok": {"kind": "tmux", "command": "grok"}},
+            "default_executor": "grok"}})
+        self.assertEqual(status, 200, body)
+
+    def test_a_tmux_executor_gets_a_default_session_name(self):
+        self.put({"worker": {"executors": {"grok": {"kind": "tmux", "command": "grok"}}}})
+        w = self.settings()["settings"]["worker"]
+        self.assertEqual(w["executors"]["grok"]["session"], "sprint-workers")
+
+    def test_a_hand_edited_broken_file_falls_back_to_defaults(self):
+        path = os.path.join(self.project_root, ".sprint", "config.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{ this is not json,, }")
+        w = self.settings()["settings"]["worker"]
+        self.assertEqual(w["model_policy"], "lowest_feasible")
+        self.assertEqual(w["concurrency"], 3)
+
+    def test_a_hand_edited_file_is_picked_up_without_a_restart(self):
+        self.put({"worker": {"concurrency": 4}})
+        path = os.path.join(self.project_root, ".sprint", "config.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"worker": {"concurrency": 9,
+                                  "model_policy": "always_opus"}}, fh)
+        w = self.settings()["settings"]["worker"]
+        self.assertEqual(w["concurrency"], 9)
+        self.assertEqual(w["model_policy"], "always_opus")
+
+    def test_put_to_anything_else_is_a_404(self):
+        status, body = self.req("PUT", "/api/board", {})
+        self.assertEqual(status, 404, body)
+
+
+class TestPerCardExecutor(Base):
+    """A card can name its own executor and model at assign time.
+
+    User's scope call, verbatim: "Peer per card — mix grok-via-tmux and claude
+    subagents". So the choice lives on the card, not on the board, and the
+    board's settings are only what an unset card falls back to.
+    """
+
+    def declare_grok(self):
+        status, body = self.req("PUT", "/api/settings", {"worker": {"executors": {
+            "grok": {"kind": "tmux", "command": "grok", "session": "sprint-workers"},
+            "claude": {"kind": "subagent"}}}})
+        self.assertEqual(status, 200, body)
+
+    def card_of(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return detail["card"]
+
+    def board_card(self, num):
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        return next(c for c in board["cards"] if c["num"] == num)
+
+    def test_assign_records_executor_and_model(self):
+        self.declare_grok()
+        card = self.new_card("make the header calm")
+        status, body = self.post("/api/cards/%d/assign" % card["num"], {
+            "agent_name": "sprint-card-%d" % card["num"],
+            "worktree": "/tmp/wt", "branch": "sprint/card-x",
+            "executor": "grok", "model": "grok-4"})
+        self.assertEqual(status, 200, body)
+
+        for got in (self.card_of(card["num"]), self.board_card(card["num"])):
+            self.assertEqual(got["executor"], "grok")
+            self.assertEqual(got["model"], "grok-4")
+            self.assertEqual(got["dispatch"]["kind"], "tmux")
+            self.assertEqual(got["dispatch"]["command"], "grok")
+            self.assertEqual(got["dispatch"]["session"], "sprint-workers")
+            self.assertFalse(got["dispatch"]["is_default"])
+
+    def test_the_timeline_says_how_it_was_dispatched(self):
+        self.declare_grok()
+        card = self.new_card("something for grok")
+        self.post("/api/cards/%d/assign" % card["num"], {
+            "agent_name": "sprint-card-9", "executor": "grok", "model": "grok-4"})
+        status, detail = self.get("/api/cards/%d" % card["num"])
+        self.assertEqual(status, 200)
+        notes = [e for e in detail["timeline"] if e["kind"] == "note"
+                 and "assigned to" in (e["payload"].get("text") or "")]
+        self.assertTrue(notes)
+        self.assertIn("grok · tmux · grok-4", notes[-1]["payload"]["text"])
+
+    def test_defaults_apply_when_the_card_says_nothing(self):
+        card = self.new_card("ordinary work")
+        self.post("/api/cards/%d/assign" % card["num"],
+                  {"agent_name": "sprint-card-1"})
+        got = self.card_of(card["num"])
+        self.assertIsNone(got["executor"])
+        self.assertIsNone(got["model"])
+        # resolved from the board's policy: lowest feasible == sonnet
+        self.assertEqual(got["dispatch"]["executor"], "subagent")
+        self.assertEqual(got["dispatch"]["kind"], "subagent")
+        self.assertEqual(got["dispatch"]["model"], "sonnet")
+        self.assertTrue(got["dispatch"]["is_default"],
+                        "a card on the defaults carries no executor tag")
+
+    def test_the_model_policy_moves_the_default_model(self):
+        card = self.new_card("ordinary work")
+        self.post("/api/cards/%d/assign" % card["num"], {"agent_name": "a"})
+        self.assertEqual(self.card_of(card["num"])["dispatch"]["model"], "sonnet")
+        self.req("PUT", "/api/settings", {"worker": {"model_policy": "always_opus"}})
+        self.assertEqual(self.card_of(card["num"])["dispatch"]["model"], "opus")
+
+    def test_the_default_executor_moves_an_unset_card(self):
+        self.declare_grok()
+        card = self.new_card("ordinary work")
+        self.post("/api/cards/%d/assign" % card["num"], {"agent_name": "a"})
+        self.req("PUT", "/api/settings", {"worker": {"default_executor": "grok"}})
+        got = self.card_of(card["num"])
+        self.assertEqual(got["dispatch"]["executor"], "grok")
+        self.assertEqual(got["dispatch"]["kind"], "tmux")
+        # still no per-card choice, so still nothing to tag
+        self.assertTrue(got["dispatch"]["is_default"])
+
+    def test_an_undeclared_executor_is_refused_at_assign(self):
+        card = self.new_card("who runs this")
+        status, body = self.post("/api/cards/%d/assign" % card["num"],
+                                 {"agent_name": "a", "executor": "grok"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "executor")
+        self.assertIsNone(self.card_of(card["num"])["executor"])
+
+    def test_a_bad_model_is_refused(self):
+        card = self.new_card("who runs this")
+        for bad in ("", "   ", 7, "x" * 61):
+            status, body = self.post("/api/cards/%d/assign" % card["num"],
+                                     {"agent_name": "a", "model": bad})
+            self.assertEqual(status, 400, "%r should be refused: %s" % (bad, body))
+            self.assertEqual(body["field"], "model")
+
+    def test_assigning_again_never_clears_a_recorded_choice(self):
+        self.declare_grok()
+        card = self.new_card("keep it")
+        self.post("/api/cards/%d/assign" % card["num"],
+                  {"agent_name": "a", "executor": "grok", "model": "grok-4"})
+        self.post("/api/cards/%d/assign" % card["num"], {"worktree": "/tmp/wt2"})
+        got = self.card_of(card["num"])
+        self.assertEqual(got["executor"], "grok")
+        self.assertEqual(got["model"], "grok-4")
+
+    def test_the_board_ships_the_settings_the_faces_need(self):
+        self.declare_grok()
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200)
+        self.assertEqual(board["settings"]["worker"]["executors"]["grok"]["kind"], "tmux")
+
+    def test_an_existing_board_gains_the_columns(self):
+        """A board that predates this feature must not need a fresh DB."""
+        import sqlite3 as _sqlite3
+        db = os.path.join(self.tmp, "old.db")
+        conn = _sqlite3.connect(db)
+        conn.executescript(
+            "CREATE TABLE cards (num INTEGER PRIMARY KEY AUTOINCREMENT, sprint_id "
+            "INTEGER, state TEXT NOT NULL, title TEXT, body TEXT, batch_id INTEGER, "
+            "agent_name TEXT, worktree TEXT, branch TEXT, bounce_count INTEGER NOT "
+            "NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, dup_of INTEGER, "
+            "long_running INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, "
+            "updated_at REAL NOT NULL);")
+        conn.execute("INSERT INTO cards(sprint_id, state, title, body, created_at, "
+                     "updated_at) VALUES(1,'queued','old','old',1,1)")
+        conn.commit()
+        conn.close()
+        old_root = os.path.join(self.tmp, "oldproject")
+        os.makedirs(os.path.join(old_root, ".sprint"))
+        shutil.copy(db, os.path.join(old_root, ".sprint", "sprint.db"))
+        app = sprintd.App(old_root, log=self.logfh, token="test-token")
+        self.addCleanup(app.close)
+        cols = {r["name"] for r in app.conn.execute("PRAGMA table_info(cards)")}
+        self.assertIn("executor", cols)
+        self.assertIn("model", cols)
+        self.assertIsNone(app.card_json(app.card_row(1), brief=True)["executor"])
 class TestSprintIsNamedAfterTheProject(Base):
     """A board's title defaults to the PROJECT, never the literal "sprint".
 
@@ -6711,6 +7057,1120 @@ class TestPortSurvivesStopAndStart(unittest.TestCase):
         self.assertIn("is held by", r.stderr.decode())
         self.assertEqual(sprintd.http_get("127.0.0.1", landed, "/healthz")[0], 200)
         self.assertEqual(self._run("stop").returncode, 0)
+
+
+# --------------------------------------------------------------------------
+# Decision requests (#50) -- an agent asking for a DECISION, not a verdict.
+#
+# User's rule, verbatim: "needs you is where we talk through things. review
+# means the session genuinely thinks the card is 100% complete. needs you is
+# that the card is waiting for my input before it can keep moving forward."
+#
+# So the two handoffs must land in different places and stay that way: a
+# question with artifacts is `needs_you`, never `ready`, and the gate is
+# untouched by any of it.
+# --------------------------------------------------------------------------
+
+
+class DecisionBase(Base):
+    def working_card(self, text="which header do you want"):
+        num = self.new_card(text)["num"]
+        self.to_in_progress(num)
+        return num
+
+    def write_png(self, name="mock.png"):
+        path = os.path.join(self.tmp, name)
+        with open(path, "wb") as fh:
+            fh.write(base64.b64decode(PNG_B64))
+        return path
+
+    def question_of(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return detail["card"]["question"]
+
+
+class TestDecisionRequest(DecisionBase):
+    def test_a_decision_request_lands_needs_you_not_ready(self):
+        num = self.working_card()
+        status, body = self.post("/api/cards/%d/question" % num, {
+            "text": "Which of these three headers?",
+            "options": ["A", "B", "C"],
+            "artifacts": {"url": "http://127.0.0.1:8450/preview",
+                          "attachments": [self.write_png()],
+                          "notes": "All three keep the 44px targets."},
+        })
+        self.assertEqual(status, 201, body)
+        self.assertEqual(self.state_of(num), "needs_you")
+        self.assertNotEqual(self.state_of(num), "ready")
+
+    def test_artifacts_survive_the_round_trip(self):
+        num = self.working_card()
+        png = self.write_png()
+        self.post("/api/cards/%d/question" % num, {
+            "text": "Pick one",
+            "artifacts": {"url": "http://127.0.0.1:8450/preview",
+                          "attachments": [png],
+                          "notes": "  context  "},
+        })
+        arts = self.question_of(num)["artifacts"]
+        self.assertEqual(arts["url"], "http://127.0.0.1:8450/preview")
+        self.assertEqual(arts["notes"], "context")
+        self.assertEqual(len(arts["attachments"]), 1)
+        att = arts["attachments"][0]
+        # ...ingested exactly like a packet's screenshot: content-addressed,
+        # on disk, and servable back to the browser.
+        self.assertRegex(att["sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(os.path.isfile(att["path"]))
+        status, blob = self.get(att["url"])
+        self.assertEqual(status, 200)
+        self.assertEqual(blob, base64.b64decode(PNG_B64))
+
+    def test_the_question_event_carries_them_too(self):
+        """Answering must not erase what you were asked to look at."""
+        num = self.working_card()
+        self.post("/api/cards/%d/question" % num,
+                  {"text": "Pick one", "artifacts": {"notes": "two options below"}})
+        _, detail = self.get("/api/cards/%d" % num)
+        q = [e for e in detail["timeline"] if e["kind"] == "question"][-1]
+        self.assertEqual(q["payload"]["artifacts"]["notes"], "two options below")
+
+    def test_answering_a_decision_request_unblocks_the_card(self):
+        num = self.working_card()
+        self.post("/api/cards/%d/question" % num,
+                  {"text": "Pick one", "options": ["A", "B"],
+                   "artifacts": {"url": "http://127.0.0.1:8450/x"}})
+        qid = self.question_of(num)["id"]
+        status, _ = self.post("/api/cards/%d/answer" % num,
+                              {"question_id": qid, "text": "B"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_a_plain_question_still_has_no_artifacts(self):
+        num = self.working_card()
+        self.post("/api/cards/%d/question" % num, {"text": "what colour?"})
+        self.assertIsNone(self.question_of(num)["artifacts"])
+        self.assertEqual(self.state_of(num), "needs_you")
+
+    def test_a_malformed_artifacts_payload_names_itself(self):
+        num = self.working_card()
+        for bad, field in (
+            ("not an object", "artifacts"),
+            ({}, "artifacts"),
+            ({"url": "ftp://nope"}, "artifacts.url"),
+            ({"url": ""}, "artifacts.url"),
+            ({"notes": 7}, "artifacts.notes"),
+            ({"attachments": "shot.png"}, "artifacts.attachments"),
+        ):
+            status, body = self.post("/api/cards/%d/question" % num,
+                                     {"text": "hm", "artifacts": bad})
+            self.assertEqual(status, 400, (bad, body))
+            self.assertEqual(body.get("field"), field, (bad, body))
+        # ...and none of those left the card waiting on a question
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_the_gate_is_untouched_by_any_of_this(self):
+        """A decision request is not a back door into `ready`."""
+        num = self.working_card()
+        self.post("/api/cards/%d/question" % num,
+                  {"text": "Pick one", "artifacts": {"notes": "x"}})
+        status, body = self.post("/api/cards/%d/state" % num, {"state": "ready"})
+        self.assertEqual(status, 422, body)
+
+    def test_an_older_board_gets_the_column_added(self):
+        """CREATE TABLE IF NOT EXISTS does nothing to an existing table."""
+        self.assertIn(("questions", "artifacts", "TEXT"),
+                      [(t, c, d) for t, c, d in sprintd.App.ADDED_COLUMNS])
+
+
+class TestSprintAskArtifactFlags(DecisionBase):
+    """bin/sprint-ask is how a worker actually posts one."""
+
+    SPRINT_ASK = os.path.join(os.path.dirname(HERE), "bin", "sprint-ask")
+
+    def run_ask(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_ASK] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def test_the_flags_post_a_decision_request(self):
+        num = self.working_card()
+        png = self.write_png()
+        r = self.run_ask(num, "Which header?", "--options", '["A","B"]',
+                         "--url", "http://127.0.0.1:8450/preview",
+                         "--attach", png, "--notes", "B costs a request")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        out = r.stdout.decode()
+        self.assertIn("decision request", out)
+        self.assertIn("needs_you", out)
+        self.assertEqual(self.state_of(num), "needs_you")
+        arts = self.question_of(num)["artifacts"]
+        self.assertEqual(arts["url"], "http://127.0.0.1:8450/preview")
+        self.assertEqual(arts["notes"], "B costs a request")
+        self.assertEqual(len(arts["attachments"]), 1)
+
+    def test_a_plain_ask_is_exactly_what_it_was(self):
+        num = self.working_card()
+        r = self.run_ask(num, "what colour?")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertNotIn("decision request", r.stdout.decode())
+        self.assertIsNone(self.question_of(num)["artifacts"])
+
+    def test_a_missing_attachment_fails_before_the_network(self):
+        num = self.working_card()
+        r = self.run_ask(num, "pick", "--attach", os.path.join(self.tmp, "nope.png"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("attach", r.stderr.decode())
+        self.assertIn("no such file", r.stderr.decode())
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_a_relative_attachment_path_fails_by_name(self):
+        num = self.working_card()
+        r = self.run_ask(num, "pick", "--attach", "shot.png")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("absolute", r.stderr.decode())
+
+    def test_a_non_http_url_fails_by_name(self):
+        num = self.working_card()
+        r = self.run_ask(num, "pick", "--url", "/tmp/preview")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("url", r.stderr.decode())
+
+    def test_the_worker_contract_states_the_rule(self):
+        root = os.path.dirname(HERE)
+        with open(os.path.join(root, "agents", "sprint-worker.md"), encoding="utf-8") as fh:
+            doc = fh.read()
+        self.assertIn("needs you is where we talk through things", doc)
+        self.assertIn("--attach", doc)
+        with open(os.path.join(root, "SPEC.md"), encoding="utf-8") as fh:
+            spec = fh.read()
+        self.assertIn("needs you is where we talk through things", spec)
+        with open(os.path.join(root, "skills", "sprint", "SKILL.md"), encoding="utf-8") as fh:
+            skill = fh.read()
+        self.assertIn("decision request", skill)
+
+
+class TestSprintReadyDecisionNotice(DecisionBase):
+    """The cheap guard: a packet that is really a question says so on stderr.
+
+    Advisory, deliberately. The packet has already passed every real rule; this
+    is judgment, and a gate made of judgment is a gate that blocks good work.
+    """
+
+    SPRINT_READY = os.path.join(os.path.dirname(HERE), "bin", "sprint-ready")
+
+    def run_ready(self, num, packet):
+        import subprocess
+        path = os.path.join(self.tmp, "packet-%s.json" % num)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(packet, fh)
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_READY, str(num), path],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def test_a_packet_carrying_options_is_named_and_still_posts(self):
+        num = self.working_card()
+        packet = dict(GOOD_PACKET)
+        packet["options"] = ["A", "B"]
+        r = self.run_ready(num, packet)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        err = r.stderr.decode()
+        self.assertIn("options", err)
+        self.assertIn("sprint-ask", err)
+        self.assertEqual(self.state_of(num), "ready")   # advisory, not a gate
+
+    def test_a_validate_step_that_is_a_question_is_named(self):
+        num = self.working_card()
+        packet = dict(GOOD_PACKET)
+        packet["validate"] = ["Which of these two layouts do you want?"]
+        err = self.run_ready(num, packet).stderr.decode()
+        self.assertIn("validate", err)
+        self.assertIn("sprint-ask", err)
+
+    def test_a_claim_that_is_a_question_is_named(self):
+        num = self.working_card()
+        packet = dict(GOOD_PACKET)
+        packet["claim"] = "Should the header be sticky?"
+        err = self.run_ready(num, packet).stderr.decode()
+        self.assertIn("claim", err)
+
+    def test_an_ordinary_packet_is_not_nagged(self):
+        num = self.working_card()
+        r = self.run_ready(num, dict(GOOD_PACKET))
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertNotIn("sprint-ask", r.stderr.decode())
+        self.assertEqual(self.state_of(num), "ready")
+
+
+# --------------------------------------------------------------------------
+# Clickable links (#54). User verbatim: "make links clickable and should auto
+# open in a new tab." The browser half lives in web/util.js; this is the half
+# the server renders -- markdown reports.
+# --------------------------------------------------------------------------
+
+
+class TestBareUrlsAutolink(Base):
+    def test_a_bare_url_in_a_report_becomes_a_new_tab_link(self):
+        html = sprintd.render_markdown("see http://127.0.0.1:8450/preview for it")
+        self.assertIn('href="http://127.0.0.1:8450/preview"', html)
+        self.assertIn('target="_blank"', html)
+        self.assertIn('rel="noreferrer noopener nofollow"', html)
+
+    def test_trailing_punctuation_is_the_sentence_not_the_url(self):
+        html = sprintd.render_markdown("open http://example.com/x.")
+        self.assertIn('href="http://example.com/x"', html)
+
+    def test_a_markdown_link_is_not_double_wrapped(self):
+        html = sprintd.render_markdown("[the preview](http://example.com/x)")
+        self.assertEqual(html.count("<a "), 1)
+        self.assertIn(">the preview<", html)
+
+    def test_a_url_in_inline_code_stays_text(self):
+        html = sprintd.render_markdown("run `curl http://example.com/x`")
+        self.assertNotIn("<a ", html)
+
+    def test_a_url_in_a_fenced_block_stays_text(self):
+        html = sprintd.render_markdown("```\ncurl http://example.com/x\n```")
+        self.assertNotIn("<a ", html)
+
+    def test_a_javascript_url_is_not_linked(self):
+        html = sprintd.render_markdown("javascript:alert(1) and data:text/html,x")
+        self.assertNotIn("<a ", html)
+# Provider limit windows (card #47)
+#
+# The incident: three workers killed at once by a usage limit whose message
+# said when it would end, nothing captured that sentence, and the cards sat
+# open for hours. These tests are about the three things that failure needed —
+# record the window, show it, and fire exactly ONE resume signal when it ends.
+# --------------------------------------------------------------------------
+
+
+class TestResetTimeParsing(unittest.TestCase):
+    """`parse_reset_time` — the one parser the board and `sprint-limit` share.
+
+    Everything is pinned to a fixed reference instant, because "the next
+    occurrence of 11:50pm" is a different answer at 11:49 and at 11:51 and a
+    test that reads the wall clock would be right twice a day.
+    """
+
+    # 2026-08-16 23:52:00 local — two minutes PAST 11:50pm, which is the exact
+    # moment the real kill message arrives and the exact moment naive parsing
+    # gets it wrong.
+    REF = datetime.datetime(2026, 8, 16, 23, 52, 0).timestamp()
+
+    def at(self, value, ref=None):
+        return datetime.datetime.fromtimestamp(
+            sprintd.parse_reset_time(value, ref=self.REF if ref is None else ref))
+
+    def test_a_clock_time_means_the_next_time_it_comes_round(self):
+        # 11:50pm, read at 11:52pm, is TOMORROW. Reading it as today would put
+        # the reset two minutes in the past and clear the window instantly.
+        self.assertEqual(self.at("11:50pm"),
+                         datetime.datetime(2026, 8, 17, 23, 50))
+        # ...and the same time read BEFORE it happens is today.
+        ref = datetime.datetime(2026, 8, 16, 20, 0, 0).timestamp()
+        self.assertEqual(self.at("11:50pm", ref=ref),
+                         datetime.datetime(2026, 8, 16, 23, 50))
+
+    def test_the_shapes_a_human_actually_types(self):
+        self.assertEqual(self.at("11:50 PM"), datetime.datetime(2026, 8, 17, 23, 50))
+        self.assertEqual(self.at("11:50p.m."), datetime.datetime(2026, 8, 17, 23, 50))
+        self.assertEqual(self.at("9pm"), datetime.datetime(2026, 8, 17, 21, 0))
+        self.assertEqual(self.at("23:50"), datetime.datetime(2026, 8, 17, 23, 50))
+        # midnight and noon are the two that off-by-twelve bugs live in
+        self.assertEqual(self.at("12am"), datetime.datetime(2026, 8, 17, 0, 0))
+        self.assertEqual(self.at("12pm"), datetime.datetime(2026, 8, 17, 12, 0))
+
+    def test_iso_and_epoch(self):
+        self.assertEqual(self.at("2026-08-17T06:30:00"),
+                         datetime.datetime(2026, 8, 17, 6, 30))
+        # an offset is honoured rather than ignored
+        self.assertEqual(sprintd.parse_reset_time("2026-08-17T06:30:00+00:00"),
+                         datetime.datetime(2026, 8, 17, 6, 30,
+                                           tzinfo=datetime.timezone.utc).timestamp())
+        self.assertEqual(sprintd.parse_reset_time("2026-08-17T06:30:00Z"),
+                         datetime.datetime(2026, 8, 17, 6, 30,
+                                           tzinfo=datetime.timezone.utc).timestamp())
+        self.assertEqual(sprintd.parse_reset_time(1786945800), 1786945800.0)
+        self.assertEqual(sprintd.parse_reset_time("1786945800"), 1786945800.0)
+        # milliseconds, because something will eventually send them
+        self.assertEqual(sprintd.parse_reset_time(1786945800000), 1786945800.0)
+
+    def test_the_providers_own_parenthetical_zone(self):
+        """The kill message can be pasted verbatim, zone and all."""
+        utc = sprintd.parse_reset_time("11:50pm (UTC)", ref=self.REF)
+        self.assertEqual(
+            datetime.datetime.fromtimestamp(utc, datetime.timezone.utc),
+            datetime.datetime(2026, 8, 17, 23, 50, tzinfo=datetime.timezone.utc))
+        # a zone nobody has heard of is a 400, never a silent local reading
+        with self.assertRaises(sprintd.ApiError) as ctx:
+            sprintd.parse_reset_time("11:50pm (Bogus/Zone)", ref=self.REF)
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_nonsense_is_a_named_400_not_a_guess(self):
+        for bad in ("gibberish", "", "  ", "25:00", "13:70", "13pm", None, True, []):
+            with self.assertRaises(sprintd.ApiError) as ctx:
+                sprintd.parse_reset_time(bad, ref=self.REF)
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertEqual(ctx.exception.extra.get("field"), "resets_at")
+
+    def test_clock_label_is_the_words_the_board_uses(self):
+        ts = datetime.datetime(2026, 8, 17, 23, 50).timestamp()
+        self.assertEqual(sprintd.clock_label(ts), "11:50pm")
+        self.assertEqual(
+            sprintd.clock_label(datetime.datetime(2026, 8, 17, 0, 5).timestamp()),
+            "12:05am")
+        self.assertEqual(
+            sprintd.clock_label(datetime.datetime(2026, 8, 17, 12, 0).timestamp()),
+            "12:00pm")
+
+
+class LimitBase(Base):
+    def declare(self, model="fable", resets="11:50pm", **kw):
+        body = {"model": model, "resets_at": resets}
+        body.update(kw)
+        status, out = self.post("/api/limits", body)
+        self.assertIn(status, (200, 201), out)
+        return status, out
+
+    def limit_events(self, kind=None):
+        status, body = self.get("/api/events?after=0&limit=2000")
+        self.assertEqual(status, 200, body)
+        return [e for e in body["events"]
+                if e["kind"] in ("limit_declared", "limit_cleared")
+                and (kind is None or e["kind"] == kind)]
+
+
+class TestLimitWindows(LimitBase):
+    def test_declare_read_and_clear(self):
+        status, out = self.declare(source="kill message", note="three agents died")
+        self.assertEqual(status, 201)
+        self.assertTrue(out["created"])
+        lim = out["limit"]
+        self.assertEqual(lim["model"], "fable")
+        self.assertTrue(lim["active"])
+        self.assertGreater(lim["resets_at"], sprintd.now())
+        self.assertEqual(lim["source"], "kill message")
+
+        status, body = self.get("/api/limits")
+        self.assertEqual(status, 200, body)
+        self.assertEqual([l["id"] for l in body["active"]], [lim["id"]])
+        self.assertEqual(body["recent"], [])
+
+        # declaring it is a fact on the log, in words
+        declared = self.limit_events("limit_declared")
+        self.assertEqual(len(declared), 1)
+        self.assertIsNone(declared[0]["card_num"])
+        self.assertEqual(declared[0]["actor"], "server")
+        self.assertIn("rate-limited until", declared[0]["payload"]["text"])
+
+        status, out = self.post("/api/limits/%d/clear" % lim["id"])
+        self.assertEqual(status, 200, out)
+        self.assertTrue(out["cleared"])
+        self.assertFalse(out["limit"]["active"])
+        cleared = self.limit_events("limit_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0]["payload"]["reason"], "cleared_early")
+        self.assertEqual(cleared[0]["payload"]["model"], "fable")
+
+        status, body = self.get("/api/limits")
+        self.assertEqual(body["active"], [])
+        self.assertEqual([l["id"] for l in body["recent"]], [lim["id"]])
+
+    def test_redeclaring_the_same_window_updates_it(self):
+        """The session sees the same kill message on the second and third dead
+        agent. That must not become three lines on the board."""
+        _, first = self.declare()
+        _, second = self.declare(note="and a third agent")
+        self.assertFalse(second["created"])
+        self.assertEqual(second["limit"]["id"], first["limit"]["id"])
+        self.assertEqual(second["limit"]["note"], "and a third agent")
+        status, body = self.get("/api/limits")
+        self.assertEqual(len(body["active"]), 1)
+        # ...and the unchanged re-declaration says nothing new on the log
+        self.assertEqual(len(self.limit_events("limit_declared")), 1)
+
+    def test_a_corrected_reset_time_moves_the_window_it_corrects(self):
+        _, first = self.declare(resets="11:50pm")
+        _, second = self.declare(resets=sprintd.now() + 3600)
+        self.assertEqual(second["limit"]["id"], first["limit"]["id"])
+        self.assertNotEqual(second["limit"]["resets_at"], first["limit"]["resets_at"])
+        status, body = self.get("/api/limits")
+        self.assertEqual(len(body["active"]), 1)
+        # a real change IS worth saying out loud
+        self.assertEqual(len(self.limit_events("limit_declared")), 2)
+
+    def test_two_models_are_two_windows(self):
+        self.declare(model="fable")
+        self.declare(model="opus")
+        status, body = self.get("/api/limits")
+        self.assertEqual(sorted(l["model"] for l in body["active"]), ["fable", "opus"])
+
+    def test_a_passed_window_is_inactive_with_no_job_having_run(self):
+        """Activeness is COMPUTED. Nothing here runs the sweep — the background
+        threads are off in this fixture — and the window is still over, because
+        a board that was asleep across 11:50pm has to come back up knowing."""
+        self.assertIsNone(self.app._sweep_thread)
+        _, out = self.declare(resets=sprintd.now() - 10)
+        lim = out["limit"]
+        self.assertFalse(lim["active"])
+        self.assertIsNone(lim["cleared_at"])      # nothing wrote anything down
+
+        status, body = self.get("/api/limits")
+        self.assertEqual(body["active"], [])
+        self.assertEqual([l["id"] for l in body["recent"]], [lim["id"]])
+        status, board = self.get("/api/board")
+        self.assertEqual(board["limits"], [])
+        # and the resume signal has NOT been faked by the read path
+        self.assertEqual(self.limit_events("limit_cleared"), [])
+
+    def test_the_board_payload_carries_the_open_windows(self):
+        status, board = self.get("/api/board")
+        self.assertEqual(board["limits"], [])
+        _, out = self.declare()
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200)
+        self.assertEqual([l["id"] for l in board["limits"]], [out["limit"]["id"]])
+        self.assertEqual(board["limits"][0]["model"], "fable")
+        # the line the UI writes needs both halves of the sentence
+        self.assertTrue(board["limits"][0]["resets_at_label"])
+        self.assertEqual(board["default_model"], "fable")
+
+    def test_bad_declarations_are_named_400s(self):
+        status, body = self.post("/api/limits", {"resets_at": "11:50pm"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "model")
+        status, body = self.post("/api/limits", {"model": "fable"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "resets_at")
+        status, body = self.post("/api/limits", {"model": "fable",
+                                                 "resets_at": "half past nine-ish"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "resets_at")
+
+    def test_clearing_an_unknown_window_is_a_404(self):
+        status, body = self.post("/api/limits/999/clear")
+        self.assertEqual(status, 404, body)
+
+
+class TestLimitClearedFiresExactlyOnce(LimitBase):
+    """The one property that actually matters.
+
+    `limit_cleared` is not a log line the user reads — it is the signal the
+    session re-dispatches on. Two of them is two agents on the same card, so
+    "exactly once" is tested from every direction that could produce a storm:
+    a sweep that runs on a tick, a manual clear racing that tick, and threads.
+    """
+
+    def passed_window(self):
+        _, out = self.declare(resets=sprintd.now() - 1)
+        return out["limit"]["id"]
+
+    def test_a_sweep_on_a_tick_fires_once_no_matter_how_often_it_ticks(self):
+        self.passed_window()
+        fired = [self.app.sweep_limits() for _ in range(25)]
+        self.assertEqual(sum(fired), 1)
+        self.assertEqual(fired[0], 1)             # the FIRST tick is the one
+        self.assertEqual(len(self.limit_events("limit_cleared")), 1)
+
+    def test_concurrent_sweeps_and_clears_still_fire_once(self):
+        limit_id = self.passed_window()
+        errors = []
+
+        def hammer(fn):
+            def run():
+                try:
+                    for _ in range(10):
+                        fn()
+                except Exception as exc:       # a race must not throw either
+                    errors.append(exc)
+            return run
+
+        threads = [threading.Thread(target=hammer(self.app.sweep_limits))
+                   for _ in range(4)]
+        threads += [threading.Thread(
+            target=hammer(lambda: self.app.clear_limit(limit_id)))
+            for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.limit_events("limit_cleared")), 1)
+
+    def test_an_early_clear_and_the_clock_do_not_both_fire(self):
+        """Cleared early at 11:30, reset time arrives at 11:50: one event."""
+        _, out = self.declare(resets=sprintd.now() + 0.4)
+        status, _ = self.post("/api/limits/%d/clear" % out["limit"]["id"])
+        self.assertEqual(status, 200)
+        time.sleep(0.6)                            # the window's time arrives
+        self.assertEqual(self.app.sweep_limits(), 0)
+        events = self.limit_events("limit_cleared")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["payload"]["reason"], "cleared_early")
+
+    def test_the_clock_path_says_the_window_passed(self):
+        self.passed_window()
+        self.app.sweep_limits()
+        events = self.limit_events("limit_cleared")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["payload"]["reason"], "window_passed")
+        self.assertIn("can go back on", events[0]["payload"]["text"])
+
+    def test_the_guard_is_what_prevents_the_storm(self):
+        """Falsification. The test above would pass just as happily against an
+        implementation that never fires at all, or one the sweep only ever
+        reaches once by luck — so here the conditional UPDATE is REMOVED and
+        the storm is observed. If this test stops seeing duplicates, the one
+        above has stopped proving anything.
+        """
+        limit_id = self.passed_window()
+        real = sprintd.App.end_limit
+
+        def naive(app, lid, at=None):
+            """What this looked like before the guard: write, then announce."""
+            at = sprintd.now() if at is None else at
+            with app.lock:
+                row = app.conn.execute("SELECT * FROM limits WHERE id=?",
+                                       (lid,)).fetchone()
+                app.conn.execute("UPDATE limits SET cleared_at=? WHERE id=?",
+                                 (at, lid))
+                app._append_event(None, "server", "limit_cleared", {
+                    "limit_id": lid, "model": row["model"],
+                    "resets_at": row["resets_at"], "reason": "window_passed",
+                    "text": "naive"})
+            return True
+
+        # The sweep only selects windows that are still open, so a naive writer
+        # needs the window reopened between ticks to storm — which is exactly
+        # what a crash between the UPDATE and the COMMIT would leave behind.
+        sprintd.App.end_limit = naive
+        try:
+            for _ in range(3):
+                self.app.conn.execute(
+                    "UPDATE limits SET cleared_at=NULL WHERE id=?", (limit_id,))
+                self.app.sweep_limits()
+        finally:
+            sprintd.App.end_limit = real
+        self.assertGreater(len(self.limit_events("limit_cleared")), 1,
+                           "the naive writer did not storm — this falsification "
+                           "no longer proves the guard is load-bearing")
+
+        # ...and the real one, given the identical provocation, does not.
+        before = len(self.limit_events("limit_cleared"))
+        for _ in range(3):
+            self.app.conn.execute(
+                "UPDATE limits SET cleared_at=NULL WHERE id=?", (limit_id,))
+            self.app.sweep_limits()
+        self.assertEqual(len(self.limit_events("limit_cleared")) - before, 3,
+                         "each reopened window is its own episode")
+        # one per reopening, never several per reopening
+        self.assertEqual(self.app.sweep_limits(), 0)
+
+
+class TestModelReason(Base):
+    """WHY a card is not on the default model. Without it, "restore what was
+    downgraded" is a thing the session has to remember rather than read."""
+
+    def test_assign_records_it_and_every_payload_carries_it(self):
+        num = self.new_card("something to downgrade")["num"]
+        status, out = self.post("/api/cards/%d/assign" % num, {
+            "agent_name": "sprint-card-%d" % num, "worktree": "/tmp/wt",
+            "branch": "sprint/card-%d" % num, "model": "opus",
+            "model_reason": "fable limited until 23:50"})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["card"]["model_reason"], "fable limited until 23:50")
+
+        status, board = self.get("/api/board")
+        card = [c for c in board["cards"] if c["num"] == num][0]
+        self.assertEqual(card["model"], "opus")
+        self.assertEqual(card["model_reason"], "fable limited until 23:50")
+
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["model_reason"], "fable limited until 23:50")
+        note = [e for e in detail["timeline"]
+                if e["kind"] == "note" and e["payload"].get("model_reason")][0]
+        # the timeline reads as a sentence, not as a field dump
+        self.assertIn("on opus", note["payload"]["text"])
+        self.assertIn("fable limited until 23:50", note["payload"]["text"])
+
+    def test_an_empty_string_clears_it_and_omitting_it_does_not(self):
+        num = self.new_card("restore me")["num"]
+        self.post("/api/cards/%d/assign" % num,
+                  {"agent_name": "a", "model": "opus",
+                   "model_reason": "fable limited until 23:50"})
+        # a later assign that says nothing about the reason leaves it alone
+        self.post("/api/cards/%d/assign" % num, {"agent_name": "a"})
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["model_reason"], "fable limited until 23:50")
+        # ...and "" is how the session says "this is not a downgrade any more"
+        status, out = self.post("/api/cards/%d/assign" % num,
+                                {"agent_name": "a", "model": "fable",
+                                 "model_reason": ""})
+        self.assertEqual(status, 200, out)
+        self.assertIsNone(out["card"]["model_reason"])
+
+    def test_it_is_one_capped_line(self):
+        num = self.new_card("long reason")["num"]
+        status, out = self.post("/api/cards/%d/assign" % num, {
+            "agent_name": "a", "model_reason": "x" * 400 + "\nsecond line"})
+        self.assertEqual(status, 200, out)
+        self.assertLessEqual(len(out["card"]["model_reason"]), sprintd.MODEL_REASON_MAX)
+        self.assertNotIn("\n", out["card"]["model_reason"])
+        status, body = self.post("/api/cards/%d/assign" % num,
+                                 {"agent_name": "a", "model_reason": 17})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "model_reason")
+
+
+class TestLimitColumnsMigrate(unittest.TestCase):
+    """A board that has been up since before this landed must open, gain the
+    column and the table, and read a card written by the older server."""
+
+    def test_an_old_database_gains_model_reason_and_the_limits_table(self):
+        tmp = tempfile.mkdtemp(prefix="sprintd-limit-migrate-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        root = os.path.join(tmp, "project")
+        os.makedirs(root)
+        app = sprintd.App(root, token="t")
+        app.conn.execute("ALTER TABLE cards DROP COLUMN model_reason")
+        app.conn.execute("DROP TABLE limits")
+        app.conn.execute(
+            "INSERT INTO cards(sprint_id, state, title, body, created_at, updated_at) "
+            "VALUES(NULL,'in_progress','old','from before limits',1.0,1.0)")
+        app.close()
+
+        app2 = sprintd.App(root, token="t")
+        self.addCleanup(app2.close)
+        card = app2.card_json(app2.card_row(1))
+        self.assertIsNone(card["model_reason"])          # not a 500
+        out = app2.declare_limit("fable", "11:50pm")     # the table is back
+        self.assertTrue(out["limit"]["active"])
+        self.assertEqual([l["model"] for l in app2.active_limits()], ["fable"])
+        # and the migrated column takes a write
+        app2.assign(1, "sprint-card-1", None, None, model="opus",
+                    model_reason="fable limited until 23:50")
+        self.assertEqual(app2.card_json(app2.card_row(1))["model_reason"],
+                         "fable limited until 23:50")
+
+
+# --------------------------------------------------------------------------
+# The ACCOUNT limit (card #47, bounce)
+#
+# The second incident, verbatim: "i'm about to hit my overall claude weekly
+# limit... once i do, I need a big warning on top of every board, and then I'm
+# going to go to the session, log out, log back in with a different claude
+# session, then I should be able to hit a button in the big notice to have it
+# auto-resume".
+#
+# So: a kind of window where nothing runs at all, visible on EVERY board on the
+# machine including ones in other projects, with a button that ends it — and
+# all of it has to work with NO session attached, because a dead session is the
+# precondition, not an edge case.
+# --------------------------------------------------------------------------
+
+
+class AccountLimitBase(LimitBase):
+    def declare_account(self, resets="11:50pm", **kw):
+        body = {"kind": "account", "resets_at": resets}
+        body.update(kw)
+        status, out = self.post("/api/limits", body)
+        self.assertIn(status, (200, 201), out)
+        return status, out
+
+    def sibling(self, name="other-project"):
+        """A second board, another project, same machine — the case the user
+        will actually be in: he declares on whichever board is in front of him
+        and the OTHER ones have to say so too. Same $SPRINT_REGISTRY (Base
+        points it at this test's temp dir), which is the whole channel."""
+        root = os.path.join(self.tmp, name)
+        os.makedirs(root, exist_ok=True)
+        app = sprintd.App(root, log=self.logfh, token="test-token")
+        self.addCleanup(app.close)
+        return app
+
+
+class TestAccountLimitWindows(AccountLimitBase):
+    def test_declare_read_and_resume(self):
+        status, out = self.declare_account(source="weekly limit",
+                                           note="hit at 4pm")
+        self.assertEqual(status, 201)
+        lim = out["limit"]
+        self.assertEqual(lim["kind"], "account")
+        self.assertIsNone(lim["model"])       # an account is not a model
+        self.assertTrue(lim["active"])
+
+        status, board = self.get("/api/board")
+        banner = board["account_limit"]
+        self.assertEqual(banner["id"], lim["id"])
+        # what happened, when it lifts, and what to DO — the three the user asked
+        self.assertIn("account limit", banner["headline"].lower())
+        self.assertIn(banner["resets_at_label"], banner["detail"])
+        self.assertIn("another Claude session", banner["action"])
+        self.assertIn("Resume", banner["action"])
+        self.assertEqual(banner["resume_label"], "Resume")
+        self.assertEqual(banner["resume_url"], "/api/limits/%d/clear" % lim["id"])
+
+        # ...and the Resume button's one POST ends it
+        status, out = self.post("/api/limits/%d/clear" % lim["id"])
+        self.assertEqual(status, 200)
+        self.assertTrue(out["cleared"])
+        status, board = self.get("/api/board")
+        self.assertIsNone(board["account_limit"])
+        self.assertEqual(board["limits"], [])
+        cleared = self.limit_events("limit_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0]["payload"]["kind"], "account")
+        self.assertEqual(cleared[0]["payload"]["reason"], "cleared_early")
+        self.assertIn("re-dispatch", cleared[0]["payload"]["text"])
+
+    def test_one_account_window_at_a_time(self):
+        """Every dead agent reports the same weekly limit. One window, one
+        banner — the same rule model windows already have, keyed on the kind
+        because there is only one account."""
+        _, first = self.declare_account()
+        _, second = self.declare_account(note="and a second session died")
+        self.assertEqual(second["limit"]["id"], first["limit"]["id"])
+        self.assertFalse(second["created"])
+        status, body = self.get("/api/limits")
+        self.assertEqual(len(body["active"]), 1)
+        self.assertEqual(len(self.limit_events("limit_declared")), 1)
+
+    def test_both_kinds_at_once(self):
+        """A model window and an account window are different facts and both
+        stay true: the quiet dashed line keeps its meaning under the banner."""
+        _, model = self.declare(model="fable", resets="11:50pm")
+        _, account = self.declare_account(resets="9pm")
+        status, board = self.get("/api/board")
+        kinds = sorted(l["kind"] for l in board["limits"])
+        self.assertEqual(kinds, ["account", "model"])
+        self.assertEqual(board["account_limit"]["id"], account["limit"]["id"])
+        quiet = [l for l in board["limits"] if l["kind"] == "model"]
+        self.assertEqual([l["model"] for l in quiet], ["fable"])
+        # clearing the account one leaves the model one exactly where it was
+        self.post("/api/limits/%d/clear" % account["limit"]["id"])
+        status, board = self.get("/api/board")
+        self.assertIsNone(board["account_limit"])
+        self.assertEqual([l["id"] for l in board["limits"]],
+                         [model["limit"]["id"]])
+
+    def test_exactly_once_holds_for_the_account_kind_too(self):
+        """The signal the session re-dispatches EVERYTHING on. Two of these is
+        two agents per parked card, so the same guard is proved from the same
+        three directions: repeated sweeps, a manual clear racing them, threads.
+        """
+        _, out = self.declare_account(resets=sprintd.now() - 1)
+        limit_id = out["limit"]["id"]
+        errors = []
+
+        def hammer(fn):
+            def run():
+                try:
+                    for _ in range(10):
+                        fn()
+                except Exception as exc:
+                    errors.append(exc)
+            return run
+
+        threads = [threading.Thread(target=hammer(self.app.sweep_limits))
+                   for _ in range(4)]
+        threads += [threading.Thread(
+            target=hammer(lambda: self.app.clear_limit(limit_id)))
+            for _ in range(4)]
+        # the reconciler is a third writer racing both, and it must not add one
+        threads += [threading.Thread(
+            target=hammer(self.app.reconcile_account_limit)) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        cleared = self.limit_events("limit_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0]["payload"]["kind"], "account")
+
+    def test_activeness_is_still_computed_not_stored(self):
+        """A board asleep across the reset time comes back up knowing it is
+        over — no sweep has to have run."""
+        _, out = self.declare_account(resets=sprintd.now() + 0.4)
+        status, board = self.get("/api/board")
+        self.assertIsNotNone(board["account_limit"])
+        time.sleep(0.6)
+        status, board = self.get("/api/board")
+        self.assertIsNone(board["account_limit"])
+        self.assertEqual(board["limits"], [])
+
+    def test_a_bad_kind_is_a_named_400(self):
+        status, body = self.post("/api/limits",
+                                 {"kind": "everything", "resets_at": "11:50pm"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "bad_kind")
+        self.assertEqual(body["field"], "kind")
+        # and a model window still needs its model
+        status, body = self.post("/api/limits", {"resets_at": "11:50pm"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "model")
+
+    def test_an_account_window_needs_no_model_and_keeps_none(self):
+        status, out = self.declare_account(model="fable")
+        self.assertIsNone(out["limit"]["model"])
+        status, board = self.get("/api/board")
+        # nothing here can be mistaken for "fable is limited" — no model is
+        self.assertIsNone(board["account_limit"]["model"])
+
+
+class TestAccountLimitIsMachineWide(AccountLimitBase):
+    """The banner has to reach boards that did not declare it — the user is
+    looking at whichever project's tab is in front of him when the account
+    dies, and that is rarely the one that noticed.
+
+    The channel is one file beside the registry, not a push to siblings: no
+    board holds another's bearer token, and a push cannot reach a board that
+    STARTS after the declaration — which is the case that happens every time a
+    wedged project gets restarted mid-limit.
+    """
+
+    def test_a_sibling_board_in_another_project_raises_the_same_banner(self):
+        other = self.sibling()
+        self.assertIsNone(other.board()["account_limit"])
+        _, out = self.declare_account(resets="11:50pm")
+
+        board = other.board()          # one read is all it takes
+        banner = board["account_limit"]
+        self.assertIsNotNone(banner)
+        self.assertEqual(banner["kind"], "account")
+        self.assertAlmostEqual(banner["resets_at"], out["limit"]["resets_at"],
+                               places=0)
+        self.assertIn("account limit", banner["headline"].lower())
+        # It is the sibling's OWN row in the sibling's OWN database — not a
+        # rendering of somebody else's — which is what lets it emit its own
+        # single limit_cleared for its own parked cards later.
+        self.assertEqual([l["kind"] for l in other.active_limits()], ["account"])
+        self.assertEqual(other.limit_row(banner["id"])["kind"], "account")
+        declared = [e for e in other.events_after(0)
+                    if e["kind"] == "limit_declared"]
+        self.assertEqual(len(declared), 1)
+        self.assertEqual(declared[0]["payload"]["kind"], "account")
+        # and it says where it came from, so the banner is not from nowhere
+        self.assertIn("declared on", (banner["source"] or ""))
+
+    def test_a_board_that_starts_mid_limit_still_shows_it(self):
+        """The case a push would miss entirely."""
+        self.declare_account(resets="11:50pm")
+        latecomer = self.sibling("started-late")
+        self.assertIsNotNone(latecomer.board()["account_limit"])
+
+    def test_resume_on_one_board_lifts_it_on_all_of_them(self):
+        other = self.sibling()
+        _, out = self.declare_account(resets="11:50pm")
+        mirrored = other.board()["account_limit"]["id"]
+
+        # the user presses Resume on the SIBLING, not on the declaring board
+        other.clear_limit(mirrored)
+        self.assertIsNone(other.board()["account_limit"])
+
+        status, board = self.get("/api/board")
+        self.assertIsNone(board["account_limit"])
+        cleared = self.limit_events("limit_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0]["payload"]["kind"], "account")
+        # each board emits exactly one, for its own cards
+        theirs = [e for e in other.events_after(0) if e["kind"] == "limit_cleared"]
+        self.assertEqual(len(theirs), 1)
+
+    def test_reading_a_sibling_board_twice_does_not_re_declare(self):
+        other = self.sibling()
+        self.declare_account(resets="11:50pm")
+        for _ in range(5):
+            other.board()
+        declared = [e for e in other.events_after(0)
+                    if e["kind"] == "limit_declared"]
+        self.assertEqual(len(declared), 1)
+
+    def test_a_model_window_stays_local(self):
+        """Only the account is machine-wide. One project running out of fable
+        says nothing about another project's board."""
+        other = self.sibling()
+        self.declare(model="fable", resets="11:50pm")
+        board = other.board()
+        self.assertIsNone(board["account_limit"])
+        self.assertEqual(board["limits"], [])
+        self.assertFalse(os.path.exists(sprintd.account_limit_path()))
+
+    def test_a_corrupt_shared_file_is_no_banner_not_a_500(self):
+        path = sprintd.account_limit_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json at all")
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200)
+        self.assertIsNone(board["account_limit"])
+
+    def test_the_real_home_state_is_never_touched(self):
+        """The suite points $SPRINT_REGISTRY at a temp dir; this proves the
+        account file follows it, because a test that declared into the
+        developer's own ~/.sprint would put a banner on his live boards."""
+        self.assertEqual(os.path.dirname(sprintd.account_limit_path()),
+                         os.path.dirname(os.path.abspath(self.registry)))
+        home = os.path.join(os.path.expanduser("~"), ".sprint",
+                            "account-limit.json")
+        before = os.path.exists(home)
+        self.declare_account()
+        self.assertTrue(os.path.exists(sprintd.account_limit_path()))
+        self.assertEqual(os.path.exists(home), before)
+
+
+class TestAccountLimitWithNoSession(AccountLimitBase):
+    """The point of the whole feature: while the account is out the
+    orchestrating session is DEAD. Server and browser are the only two things
+    still moving, so everything here runs with nothing polling /api/wait, no
+    cursor ever moving, and no background threads started (START_BACKGROUND is
+    False on this class, so not even the sweep tick exists).
+    """
+
+    def assert_no_session(self):
+        status, board = self.get("/api/board")
+        sess = board["session"]
+        self.assertFalse(sess["waiter_polling"])
+        self.assertFalse(sess["waiter_alive"])
+        self.assertIsNone(sess["waiter_seen_at"])
+        self.assertEqual(board["cursor"], 0)     # nothing has drained anything
+        self.assertIsNone(self.app._sweep_thread)
+        return board
+
+    def test_the_banner_renders_and_resume_clears_with_nothing_attached(self):
+        _, out = self.declare_account(resets="11:50pm")
+        board = self.assert_no_session()
+        self.assertIsNotNone(board["account_limit"])
+        self.assertEqual(board["account_limit"]["resume_url"],
+                         "/api/limits/%d/clear" % out["limit"]["id"])
+
+        # exactly what the button does: one POST, no session in the loop
+        status, cleared = self.post(board["account_limit"]["resume_url"])
+        self.assertEqual(status, 200)
+        self.assertTrue(cleared["cleared"])
+        board = self.assert_no_session()
+        self.assertIsNone(board["account_limit"])
+        self.assertEqual(len(self.limit_events("limit_cleared")), 1)
+
+    def test_a_sibling_board_gets_it_from_the_browser_poll_alone(self):
+        """FALSIFICATION of the "no session needed" claim. The sibling has no
+        session, no waiter and no sweep thread — the ONLY thing that happens to
+        it is the GET a browser tab makes. Take that GET away and it has no way
+        to know; make it, and the banner is there. If this ever passes without
+        the board read, the propagation has quietly grown a dependency on
+        something that is not running when it matters.
+        """
+        other = self.sibling()
+        self.assertIsNone(other._sweep_thread)
+        self.declare_account(resets="11:50pm")
+
+        # before any read: the sibling's own table knows nothing
+        self.assertEqual(other.active_limits(), [])
+        self.assertEqual([e for e in other.events_after(0)
+                          if e["kind"].startswith("limit_")], [])
+
+        board = other.board()          # the browser's poll, and nothing else
+        self.assertIsNotNone(board["account_limit"])
+        self.assertFalse(board["session"]["waiter_alive"])
+        self.assertEqual(board["cursor"], 0)
+
+        # and Resume from that same sessionless board really ends it
+        other.clear_limit(board["account_limit"]["id"])
+        self.assertIsNone(other.board()["account_limit"])
+        self.assertIsNone(self.get("/api/board")[1]["account_limit"])
+
+
+class TestSprintLimitCli(Base):
+    """`bin/sprint-limit` — what the session actually types when it reads a
+    kill message. Thin by design: the server owns the parsing."""
+
+    SPRINT_LIMIT = os.path.join(os.path.dirname(HERE), "bin", "sprint-limit")
+
+    def run_limit(self, *argv, token="test-token"):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN=token)
+        return subprocess.run([sys.executable, self.SPRINT_LIMIT]
+                              + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=90)
+
+    def test_declare_list_clear(self):
+        r = self.run_limit("declare", "--model", "fable", "--resets", "11:50pm",
+                           "--source", "kill message")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        out = r.stdout.decode()
+        self.assertIn("fable is limited until", out)
+        # it prints the exact assign call the session owes next
+        self.assertIn("model_reason", out)
+        status, body = self.get("/api/limits")
+        self.assertEqual(len(body["active"]), 1)
+        limit_id = body["active"][0]["id"]
+
+        r = self.run_limit("list")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("fable", r.stdout.decode())
+
+        r = self.run_limit("clear", str(limit_id))
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("available again", r.stdout.decode())
+        status, body = self.get("/api/limits")
+        self.assertEqual(body["active"], [])
+
+    def test_declare_the_whole_account(self):
+        r = self.run_limit("declare", "--account", "--resets", "11:50pm")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        out = r.stdout.decode()
+        self.assertIn("ACCOUNT is limited until", out)
+        # it says the thing the user has to do, not just the fact
+        self.assertIn("another session", out)
+        self.assertIn("Resume", out)
+        status, board = self.get("/api/board")
+        self.assertIsNotNone(board["account_limit"])
+        limit_id = board["account_limit"]["id"]
+
+        r = self.run_limit("list")
+        self.assertIn("ACCOUNT", r.stdout.decode())
+
+        r = self.run_limit("clear", str(limit_id))
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("account is available again", r.stdout.decode())
+        self.assertIsNone(self.get("/api/board")[1]["account_limit"])
+
+    def test_it_will_not_guess_between_a_model_and_the_account(self):
+        r = self.run_limit("declare", "--resets", "11:50pm")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--account", r.stderr.decode())
+        r = self.run_limit("declare", "--account", "--model", "fable",
+                           "--resets", "11:50pm")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.get("/api/limits")[1]["active"], [])
+
+    def test_a_bad_time_fails_loudly_and_records_nothing(self):
+        r = self.run_limit("declare", "--model", "fable", "--resets", "soonish")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("11:50pm", r.stderr.decode())     # it says what IS accepted
+        status, body = self.get("/api/limits")
+        self.assertEqual(body["active"], [])
+
+    def test_it_refuses_to_run_without_a_server(self):
+        import subprocess
+        r = subprocess.run([sys.executable, self.SPRINT_LIMIT, "list"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           env={k: v for k, v in os.environ.items()
+                                if k not in ("SPRINT_SERVER", "SPRINT_TOKEN")},
+                           timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("SPRINT_SERVER", r.stderr.decode())
 
 
 if __name__ == "__main__":

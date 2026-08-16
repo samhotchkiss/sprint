@@ -1,5 +1,5 @@
 // Wiring: boot, live transport, optimistic actions, render loop.
-import { h, clear, $, debounce, tickTimes, uid, firstLine } from './util.js';
+import { h, clear, $, debounce, tickTimes, uid, firstLine, reconcile } from './util.js';
 import {
   api, ApiError, NetworkError, initAuth, onServerGeneration, onServerStale, serverIsStale,
 } from './api.js';
@@ -7,6 +7,7 @@ import { Live } from './live.js';
 import {
   store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
   sections, headline, countFor, loadView, setView, setChatOpen, bounceComposing,
+  activeLimits, limitLine, accountLimit,
 } from './state.js';
 import { renderList } from './list.js';
 import { renderBoard, renderFold } from './board.js';
@@ -16,6 +17,7 @@ import { initCompose, toBase64List, imageFiles } from './compose.js';
 import { installNotifications, attention, armNotifications, clearBadge } from './notify.js';
 import { loadSkin, installSkinToggle, installBlip } from './skin.js';
 import { startSiblings, renderTitle, closeSiblingMenu } from './siblings.js';
+import { installSettings, closeSettings, settingsOpen } from './settings.js';
 import { renderReportsPage, renderReportPage } from './reports.js';
 
 const el = {};
@@ -155,8 +157,10 @@ function renderSessionBanner() {
   // was that it was not. Lowest priority of the three: a board nobody is home
   // at is more urgent news than a board that is merely behind.
   const stale = serverIsStale();
-  if (!offline && !transportDown && !stale) { el.bannerSlot.hidden = true; return; }
-  el.bannerSlot.hidden = false;
+  const limits = renderLimitBanners();
+  el.banner.hidden = !(offline || transportDown || stale);
+  el.bannerSlot.hidden = el.banner.hidden && !limits;
+  if (el.banner.hidden) return;
   const cls = offline ? 'banner warn' : 'banner dim';
   const text = offline ? 'session offline — items will queue'
     : transportDown ? 'lost the board connection — retrying'
@@ -168,6 +172,100 @@ function renderSessionBanner() {
   if (el.banner.textContent !== text) {
     clear(el.banner);
     el.banner.appendChild(h('span', text));
+  }
+}
+
+/**
+ * One quiet line per open provider limit window, in the same slot and the same
+ * register as the session-offline banner. The user asked for exactly this and
+ * ruled out the alternatives by shape: not a modal, not a toast, and no new
+ * per-card chrome (a downgraded card already wears its model tag).
+ *
+ * It disappears on its own. `activeLimits` re-checks the clock on every paint
+ * and the page repaints every 30s, so a window that ends while nobody is
+ * looking takes its line with it whether or not an event arrived.
+ *
+ * Returns how many lines are showing, so the slot knows whether to exist.
+ */
+function renderLimitBanners() {
+  const account = store.loaded ? accountLimit() : null;
+  const live = store.loaded ? activeLimits() : [];
+  const rows = [];
+  // The account banner goes FIRST and loud: while it is up nothing on this
+  // machine can run, so it is the only thing on the page that is news. It is
+  // still a banner and not a modal — the user said so: he has to be able to
+  // read cards and type while it is showing. The two kinds coexist happily;
+  // a model window under an account window is simply the smaller fact.
+  if (account) rows.push(accountBannerSpec(account));
+  // Keyed, so a repaint that changes nothing changes no DOM — the banner slot
+  // sits above the whole board and a flicker there is a flicker everywhere.
+  for (const lim of live) {
+    const text = limitLine(lim);
+    rows.push({
+      key: 'limit:' + (lim.id == null ? lim.model : lim.id),
+      ver: text,
+      make: () => h('div.banner.limit', { title: lim.note || lim.source || '' },
+        h('span', text)),
+    });
+  }
+  reconcile(el.limitBanners, rows);
+  el.limitBanners.hidden = !rows.length;
+  return rows.length;
+}
+
+/**
+ * The account-limit banner: what happened, when it lifts, what to do, and the
+ * button that does the last step.
+ *
+ * The words come from the server (`account_limit.headline/detail/action`) so
+ * the banner, the event log and `sprint-limit` cannot drift; the fallbacks
+ * exist only for a board answering an older payload. Nothing here needs a
+ * session: the banner is drawn from `/api/board` and Resume is one POST, which
+ * is the whole point — when the account is out, the session is dead.
+ */
+function accountBannerSpec(lim) {
+  const until = lim.label || '';
+  const headline = lim.headline || 'Claude account limit reached — nothing can run';
+  const detail = lim.detail
+    || (until ? `Every sprint board on this machine is stopped until ${until}.`
+      : 'Every sprint board on this machine is stopped.');
+  const action = lim.action
+    || 'Log out of Claude, sign in with another Claude session, then press Resume.';
+  return {
+    key: 'account-limit:' + (lim.id == null ? 'x' : lim.id),
+    ver: [headline, detail, action, lim.resumeLabel].join('|'),
+    make: () => h('div.banner.account', { role: 'status' },
+      h('div.account-words',
+        h('div.account-headline', headline),
+        h('div.account-detail', detail),
+        h('div.account-action', action)),
+      h('button.btn.send.account-resume', {
+        type: 'button',
+        onclick: (e) => resumeAccount(lim, e.currentTarget),
+      }, lim.resumeLabel || 'Resume')),
+  };
+}
+
+/**
+ * Resume: clear the account window, then re-read the board.
+ *
+ * The clear is the server's single-writer one, so a double-press cannot fire
+ * two `limit_cleared` events — and one event is what the session re-dispatches
+ * off, so a second would be a second agent on the same card.
+ */
+async function resumeAccount(lim, btn) {
+  if (lim.id == null) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Resuming…'; }
+  try {
+    await api.clearLimit(lim.id);
+    store.accountLimit = null;
+    store.limits = store.limits.filter((l) => l.kind !== 'account');
+    render();
+    refreshBoard();
+    toast('account limit cleared — parked work can go back out');
+  } catch (err) {
+    if (btn) { btn.disabled = false; btn.textContent = lim.resumeLabel || 'Resume'; }
+    handleError(err, null);
   }
 }
 
@@ -702,11 +800,29 @@ function goReport(sha, ext, replace) {
     else location.hash = want;
   }
   render();
-  loadPage(page, () => api.report(sha, ext));
+  loadPage(page, () => api.report(sha, ext), railToReportCard);
+}
+
+/**
+ * Card #52, user verbatim: "when I'm looking at a report, the sidebar should be
+ * the card that created it, not the session chat."
+ *
+ * A report is something an agent wrote ON a card, so the conversation that
+ * belongs beside it is that card's — thread above, composer below, exactly as
+ * if you had clicked the card. The report keeps the main area and the URL; only
+ * the rail changes hands. A report with no card behind it (one posted into the
+ * sidebar) keeps the session chat, and the page says so out loud rather than
+ * leaving you to wonder which conversation you are in.
+ */
+function railToReportCard(target) {
+  if (!target || target.kind !== 'report' || !target.data) return;
+  const num = target.data.card_num;
+  if (num == null) return;
+  openCard(Number(num), { keepPage: true });
 }
 
 /** Fetch for the page that is open NOW; a later navigation wins. */
-async function loadPage(target, fetcher) {
+async function loadPage(target, fetcher, then) {
   try {
     const data = await fetcher();
     if (page !== target) return;
@@ -716,6 +832,7 @@ async function loadPage(target, fetcher) {
     target.error = err;
     handleError(err, null);
   }
+  if (then) then(target);
   render();
 }
 
@@ -752,7 +869,13 @@ function openCard(num, opts) {
   if (num == null) return;
   const n = Number(num);
   const kind = (opts && opts.focus) || 'composer';
-  page = null;
+  // Card #52, user verbatim: "when I'm looking at a report, the sidebar should
+  // be the card that created it, not the session chat." A report page keeps the
+  // main area and hands the RAIL to its originating card, so `keepPage` opens
+  // the card without navigating away from what you are reading — and without
+  // taking the report's URL off the address bar.
+  const keepPage = !!(opts && opts.keepPage);
+  if (!keepPage) page = null;
   const card = store.cards.get(n) || null;
   // `fromUnit` is how you got here, and it is the only thing the card's head
   // needs to offer the way back to the outline you left.
@@ -768,8 +891,11 @@ function openCard(num, opts) {
   // #46): opening the card is what puts you in it, and `askFocus` is what puts
   // the caret in the box once the rail has painted it.
   if (kind === 'bounce') bounceComposing(n, true);
-  askFocus(n, kind);
-  if (location.hash !== `#/c/${n}`) history.replaceState(null, '', `#/c/${n}`);
+  // ...but never when the card arrived UNDER something you opened to read: you
+  // asked for a report, not for a caret. #46's "focus my cursor in the reply
+  // box" is about clicking a card, and this is not that.
+  if (!keepPage) askFocus(n, kind);
+  if (!keepPage && location.hash !== `#/c/${n}`) history.replaceState(null, '', `#/c/${n}`);
   render();
   refreshDetail();
 }
@@ -953,6 +1079,7 @@ async function boot() {
   el.chatBtn = $('#chat-btn');
   el.bannerSlot = $('#banner-slot');
   el.banner = $('#banner');
+  el.limitBanners = $('#limit-banners');
   el.composeWrap = $('#compose-wrap');
   el.reportsLink = $('#reports-link');
   // scoped to the layout control — the skin control is a second .seg beside it
@@ -987,6 +1114,13 @@ async function boot() {
   // The skin is pure CSS, but a re-paint costs nothing and keeps anything that
   // reads a computed colour honest.
   installSkinToggle($('#skin-seg'), render);
+  // Saved settings change what the NEXT dispatch does, and they change what a
+  // card face calls "the default" — so the board is refetched, not just
+  // repainted.
+  installSettings($('#settings-btn'), () => {
+    toast('Settings saved — in effect for the next dispatch.');
+    refreshBoard();
+  });
   el.chatBtn.addEventListener('click', () => toggleChat());
   $('#drop-btn').addEventListener('click', () => openCompose());
   $('#compose-cancel').addEventListener('click', () => closeCompose());
@@ -1013,7 +1147,8 @@ async function boot() {
     // "/" is the shortcut to drop work — from anywhere on the board, and from a
     // text box that is still empty. Once there are words in the box a slash is
     // just a slash, and inside the Drop-work sheet itself it always is.
-    if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey && el.composeWrap.hidden) {
+    if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey
+        && el.composeWrap.hidden && !settingsOpen()) {
       const a = document.activeElement;
       const inSheet = !!(a && el.composeWrap.contains(a));
       if (!inSheet && (!isTyping(a) || emptyTextTarget(a))) {
@@ -1023,6 +1158,7 @@ async function boot() {
       }
     }
     if (e.key === 'Escape') {
+      if (closeSettings()) return;
       if (closeSiblingMenu()) { render(); return; }
       if (!el.lightbox.hidden) { closeLightbox(el.lightbox); return; }
       if (!el.composeWrap.hidden) { closeCompose(); return; }

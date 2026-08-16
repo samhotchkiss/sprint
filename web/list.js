@@ -8,9 +8,9 @@ import { h, timeEl, firstLine } from './util.js';
 import {
   sections, meterSegments, cardState, needsKind, needsYouCount, motionState, blockedReason,
   waitingMark, isStuck, BLOCKED_NOTE,
-  modelTag, MODEL_HINT,
 } from './state.js';
 import { phaseChip } from './phase.js';
+import { executorTag } from './settings.js';
 import { renderMeter } from './meter.js';
 import { renderDone } from './done.js';
 import { reviewBlock } from './review.js';
@@ -94,19 +94,18 @@ export function needsRow(card, app) {
     h('span.row-title', card.title),
     h('span.row-ask', askLine(card, kind, state)));
 
-  // Options answer inline, right here, because they are one tap and the design
-  // says the top of the page is where decisions get made. Free-text answers open
-  // the card — a sentence deserves the thread it lands in.
+  // Card #53, user verbatim: "get the actions out of cards. I click the card, it
+  // loads in the sidebar, and that's where I review and act." The quick-reply
+  // chips used to answer from this row; they are the same chips, in the rail, on
+  // the question panel, with the thread and the agent's artifacts around them.
+  // What the row keeps is the news that there are options at all.
   if (q && q.options && q.options.length) {
-    const chips = h('span.chips');
-    for (const opt of q.options) {
-      chips.appendChild(h('button.chip-btn', {
-        type: 'button',
-        title: `answer #${card.num}: ${opt.label}`,
-        onclick: (e) => { e.stopPropagation(); app.answer(card, q, opt.value); },
-      }, opt.label));
-    }
-    main.appendChild(chips);
+    main.appendChild(h('span.row-optnote',
+      `${q.options.length} options — open it to choose`));
+  }
+  if (q && q.artifacts) {
+    main.appendChild(h('span.row-optnote.is-artifacts',
+      artifactNote(q.artifacts)));
   }
 
   row.appendChild(h('span.row-num', '#' + card.num));
@@ -115,6 +114,21 @@ export function needsRow(card, app) {
     h('span.row-tag', kind === 'question' ? 'Asks' : state === 'integrating' ? 'Merging' : 'Signoff'),
     h('span.row-meta', shortAgent(card.agent_name), ' · ', timeEl(card.last_activity_at, { suffix: false }))));
   return row;
+}
+
+/**
+ * What a DECISION REQUEST brought with it, in a few words. Card #50: the point
+ * of the row is to say "there is something to look at in here", not to be the
+ * place you look at it.
+ */
+function artifactNote(a) {
+  const bits = [];
+  if (a.attachments && a.attachments.length) {
+    bits.push(a.attachments.length === 1 ? 'a screenshot' : `${a.attachments.length} screenshots`);
+  }
+  if (a.url) bits.push('a live preview');
+  if (!bits.length && a.notes) bits.push('context');
+  return `Handed over ${bits.join(' + ')} to look at`;
 }
 
 function askLine(card, kind, state) {
@@ -163,13 +177,10 @@ export function motionRow(card, app) {
   row.appendChild(h('span.row-prog', { title: st.title },
     h('span.prog-track', h('span.prog-fill', { style: { width: st.pct + '%', background: st.color } })),
     chip || h('span.prog-label', { style: { color: st.color } }, st.label)));
-  // ...and, only when it isn't the sprint default, what it is running on. A
-  // card re-dispatched on a fallback model after its agent was killed should
-  // say so where the agent's name already is.
-  const model = modelTag(card);
-  row.appendChild(h('span.row-agent',
-    shortAgent(card.agent_name),
-    model ? h('span.model-tag', { title: MODEL_HINT }, model) : null));
+  // The agent's name, and — only when this card is not on the board's default
+  // executor/model — how it was dispatched: "grok · tmux", or just "opus" for
+  // a card whose only exception is the fallback model it was re-dispatched on.
+  row.appendChild(h('span.row-agent', shortAgent(card.agent_name), executorTag(card, { compact: true })));
   return row;
 }
 

@@ -17,9 +17,12 @@
 import { h, clear, reconcile } from './util.js';
 import { store, cardState, isSilent, draft, attachedImages } from './state.js';
 import { phaseOf, phaseChip } from './phase.js';
+import { executorTag } from './settings.js';
 import { renderThread, renderChat } from './thread.js';
 import { initCompose } from './compose.js';
-import { unitInReview, unitSig, unitHead, unitOutline, unitBar } from './review.js';
+import {
+  unitInReview, unitSig, unitHead, unitOutline, unitBar, verdictBarSig, packetVerdictBar,
+} from './review.js';
 
 export function renderRail(root, app) {
   // A work unit takes the rail as a whole page — the outline, then one Approve
@@ -62,6 +65,13 @@ export function renderRail(root, app) {
     } else {
       renderThread(thread, { ...detail, state: cardState(card) }, app);
     }
+    // The card's own verdict. Card #53: every verdict lives in the rail, pinned
+    // here rather than at the bottom of the packet, so a packet with six
+    // screenshots in it can never push Approve below the fold. A work unit's
+    // Approve is pinned in exactly this spot, under its outline (card #55) —
+    // whichever the rail is showing, the decision is in the same place.
+    syncOptional(root, 'verdict-bar', card ? verdictBarSig(card) : null,
+      () => packetVerdictBar(card, app));
     // The composer is the ONE thing on this page you may be mid-sentence in, so
     // it is keyed on the card alone and never rebuilt for anything else: a state
     // flip, a silence, a question arriving all *tune* it in place. Rebuilding it
@@ -101,6 +111,26 @@ function syncPart(root, cls, sig, build) {
   return node;
 }
 
+/**
+ * A part that is sometimes not there at all. Same signature contract as
+ * `syncPart`; a null signature removes it. It has to be placed before the
+ * composer, so it is inserted rather than appended.
+ */
+function syncOptional(root, cls, sig, build) {
+  const found = root.querySelector('.' + cls);
+  if (sig == null) {
+    if (found) root.removeChild(found);
+    return null;
+  }
+  const want = String(sig);
+  if (found && found.dataset.sig === want) return found;
+  const node = build();
+  node.dataset.sig = want;
+  if (found) root.replaceChild(node, found);
+  else root.insertBefore(node, root.querySelector('.composer') || null);
+  return node;
+}
+
 function headSig(detail, card) {
   if (!card) return 'loading:' + detail.num;
   // The phase (and whether it has run past what it claimed) is part of the head
@@ -108,7 +138,9 @@ function headSig(detail, card) {
   const ph = phaseOf(card);
   return [detail.num, card.title, cardState(card), card.pinned ? 'p' : '',
     detail.fromUnit != null ? 'u' + detail.fromUnit : '',
-    ph ? `${ph.name}@${ph.since}${ph.overdue ? '!' : ''}` : ''].join('|');
+    ph ? `${ph.name}@${ph.since}${ph.overdue ? '!' : ''}` : '',
+    // the executor tag lives in the head too, so a re-dispatch on grok repaints it
+    card.executor || '', card.model || ''].join('|');
 }
 
 /**
@@ -168,6 +200,10 @@ function cardHead(detail, card, app) {
   // one line that says what its agent is doing right now.
   const chip = card ? phaseChip(card) : null;
   if (chip) head.appendChild(chip);
+  // ...and, when this card is not running on the board's defaults, what it was
+  // dispatched as: "grok · tmux".
+  const exec = card ? executorTag(card) : null;
+  if (exec) head.appendChild(exec);
   if (card) head.appendChild(cardMenu(card, state, app));
   head.appendChild(h('button.rail-close', {
     type: 'button', onclick: () => app.closeCard(),

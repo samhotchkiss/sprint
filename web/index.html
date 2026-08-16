@@ -34,6 +34,9 @@ try {
          once this sprint has a report in it — app.js unhides it off the
          board's own `reports` count. -->
     <a class="reports-link" id="reports-link" href="#/reports" hidden>Reports</a>
+    <!-- quiet by design: dispatch policy is something you visit twice a month -->
+    <button class="btn ghost settings-btn" id="settings-btn" type="button"
+            title="model policy, executors, how many agents run at once">Settings</button>
     <div class="seg" id="skin-seg" role="group" aria-label="skin">
       <button class="seg-btn" type="button" data-skin="calm" aria-pressed="true">Calm</button>
       <button class="seg-btn" type="button" data-skin="chaos" aria-pressed="false">Chaos</button>
@@ -51,6 +54,10 @@ try {
 
   <div class="banner-slot" id="banner-slot" hidden>
     <div class="banner" id="banner"></div>
+    <!-- one quiet line per open provider limit window ("fable is rate-limited
+         until 11:50pm — work is running on opus"). Same slot, same register as
+         the offline banner; app.js fills it from the board's `limits`. -->
+    <div class="limit-banners" id="limit-banners" hidden></div>
   </div>
 
   <main class="main" id="main" aria-label="board"></main>

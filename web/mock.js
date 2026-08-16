@@ -4,6 +4,7 @@
 //   &offline=1         session reported offline (banner)
 //   &session=busy      session attached but its drain cursor is behind (dot only, no banner)
 //   &live=1            drip a few scripted events (chime + badge + reconciliation)
+//   &limited=1         a provider limit window is open (board line + model tags)
 // It stubs window.fetch (for /api/* only) and window.EventSource.
 
 const now = Date.now();
@@ -55,6 +56,9 @@ const state = {
   evidence: {},
   sidebar: [],
   queue: [],       // undelivered events
+  // Open provider limit windows (?limited=1). Empty by default: a board with
+  // nothing limited is the normal board.
+  limits: [],
 };
 
 function card(c) {
@@ -340,8 +344,10 @@ function boardPayload() {
     sprint: state.sprint,
     session: sessionPayload(),
     seq,
-    cards: state.cards.map((c) => ({ ...c })),
+    cards: state.cards.map((c) => ({ ...c, default_model: 'fable' })),
     sidebar: state.sidebar,
+    default_model: 'fable',
+    limits: state.limits,
   };
 }
 
@@ -527,6 +533,23 @@ export function installMock(params) {
   const sess = params.get('session');
   if (sess === 'busy' || sess === 'offline' || sess === 'online') state.sessionStatus = sess;
   if (params.get('unauth')) unauth = true;   // &unauth=1 exercises the 401 re-auth wall
+  // &limited=1 — a provider limit window is open and two cards were re-dispatched
+  // onto the fallback because of it. The board line and the model tags together.
+  if (params.get('limited')) {
+    const resets = new Date(now + 2 * HOUR + 20 * MIN);
+    state.limits = [{
+      id: 1, model: 'fable', resets_at: resets.toISOString(),
+      resets_at_label: `${resets.getHours() % 12 || 12}:${String(resets.getMinutes()).padStart(2, '0')}${resets.getHours() < 12 ? 'am' : 'pm'}`,
+      declared_at: iso(6 * MIN), cleared_at: null, source: 'kill message',
+      note: null, active: true,
+    }];
+    for (const c of state.cards) {
+      if (c.num === 131 || c.num === 132) {
+        c.model = 'opus';
+        c.model_reason = 'fable limited until ' + state.limits[0].resets_at_label;
+      }
+    }
+  }
 
   const realFetch = window.fetch.bind(window);
   window.fetch = (input, init = {}) => {

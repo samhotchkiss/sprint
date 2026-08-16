@@ -17,10 +17,10 @@
 // Nothing in here is rebuilt on a whim. Every item carries a key and a version
 // (see `reconcile`), so a frame that changed nothing changes no DOM — which is
 // what keeps the rail still while the session's cursor ticks past underneath.
-import { h, ageSuffix, richText, firstLine, reconcile, timeEl } from './util.js';
+import { h, ageSuffix, richText, firstLine, reconcile, timeEl, autolink } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
 import {
-  SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, draft, bounceComposing,
+  SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, normArtifacts,
 } from './state.js';
 import { detailBlock } from './detail.js';
 import { splitAttachments, docsVer, reportRow } from './reports.js';
@@ -96,6 +96,16 @@ export function threadItems(detail, app) {
       for (const a of atts) shown.add(attachmentUrl(a));
       pushAttachments(out, key, atts, app, ev.actor === 'user');
     }
+    // A decision request that has already been answered keeps what it handed
+    // over: the mockups you chose between are part of the history of the choice.
+    if (ev.kind === 'question') {
+      const arts = normArtifacts(ev.payload && ev.payload.artifacts);
+      if (arts) {
+        for (const a of arts.attachments) shown.add(attachmentUrl(a));
+        out.push({ key: key + ':artifacts', ver: artifactsVer(arts),
+          make: () => h('div.item', artifactsPanel(arts, app, { past: true })) });
+      }
+    }
   });
 
   // Anything attached to the card that no line in the thread already showed —
@@ -122,12 +132,11 @@ export function threadItems(detail, app) {
     }
     out.push({
       key: 'packet',
-      // ...and whether you are mid-bounce, which is what swaps the three
-      // verdict buttons for "Submit bounce / Cancel". A version that ignored it
-      // would leave Approve on screen after you pressed Bounce.
+      // Mid-bounce no longer changes anything in here: the verdict left the
+      // packet for the rail's pinned bar (card #53), so the packet is the
+      // evidence and only the evidence.
       ver: `${state}:${card ? card.bounce_count : 0}:${(packet && packet.claim) || ''}`.length
-        + ':' + state + ':' + (card ? card.bounce_count : 0)
-        + ':' + (card && bounceComposing(card.num) ? 'b' : ''),
+        + ':' + state + ':' + (card ? card.bounce_count : 0),
       make: () => evidencePacket(packet, card, state, app),
     });
   }
@@ -319,10 +328,43 @@ function shotRow(refs, app, mine, fallbackCaption) {
   return row;
 }
 
+/** A stable version number for an artifacts payload — see `reconcile`. */
+function artifactsVer(a) {
+  if (!a) return '0';
+  return [a.url ? a.url.length : 0, a.notes ? a.notes.length : 0,
+    a.attachments.length, a.attachments.map((r) => String(attachmentUrl(r) || '').length).join('.')].join(':');
+}
+
+/**
+ * What a DECISION REQUEST handed over. Card #50, user verbatim: "needs you is
+ * where we talk through things. review means the session genuinely thinks the
+ * card is 100% complete. needs you is that the card is waiting for my input
+ * before it can keep moving forward."
+ *
+ * So this is deliberately NOT a packet: no claim, no test counts, no verdict.
+ * It is the three things you might need in order to answer — a note, the
+ * pictures, and a live URL — sitting directly above the box you answer in.
+ */
+export function artifactsPanel(a, app, { past = false } = {}) {
+  const box = h('div.artifacts', { class: past ? 'artifacts is-past' : 'artifacts' });
+  box.appendChild(h('p.artifacts-label.accent',
+    past ? 'What the agent handed over' : 'Look at this before you answer'));
+  if (a.notes) box.appendChild(h('p.artifacts-notes', richText(a.notes, app && app.openCard)));
+  if (a.attachments.length) box.appendChild(packetShots(a.attachments, app));
+  if (a.url) {
+    box.appendChild(h('a.btn.artifacts-live', {
+      href: a.url, target: '_blank', rel: 'noopener noreferrer', title: a.url,
+    }, 'Open the preview ↗'));
+  }
+  return box;
+}
+
 function questionPanel(card, q, app) {
   const item = h('div.item');
   const panel = h('div.ask');
-  panel.appendChild(h('p.ask-text', q.text || 'The agent is waiting on you.'));
+  panel.appendChild(h('p.ask-text', richText(q.text || 'The agent is waiting on you.', app.openCard)));
+  // Artifacts first: you cannot pick between three mockups you have not seen.
+  if (q.artifacts) panel.appendChild(artifactsPanel(q.artifacts, app));
   if (q.options && q.options.length) {
     const opts = h('div.ask-options');
     for (const opt of q.options) {
@@ -351,7 +393,8 @@ function evidencePacket(packet, card, state, app) {
 
   box.appendChild(h('div',
     h('p.packet-label.good', 'The claim'),
-    h('p.packet-claim', p.claim || 'No claim recorded — ask the agent what it thinks it did.')));
+    h('p.packet-claim', richText(p.claim || 'No claim recorded — ask the agent what it thinks it did.',
+      app.openCard))));
 
   const steps = Array.isArray(p.validate) ? p.validate.filter(Boolean)
     : (typeof p.validate === 'string' && p.validate ? [p.validate] : []);
@@ -359,7 +402,9 @@ function evidencePacket(packet, card, state, app) {
     const list = h('div.steps');
     steps.forEach((s, i) => {
       const text = typeof s === 'string' ? s : (s.text || s.step || '');
-      list.appendChild(h('div.step', h('span.step-n', String(i + 1)), h('p', text)));
+      // Card #54: a check step that says "open http://…" should be one click.
+      list.appendChild(h('div.step', h('span.step-n', String(i + 1)),
+        h('p', richText(text, app.openCard))));
     });
     box.appendChild(h('div', h('p.packet-label.accent', 'Check it yourself'), list));
   }
@@ -370,9 +415,14 @@ function evidencePacket(packet, card, state, app) {
   const readback = Array.isArray(p.readback) ? p.readback.join('\n')
     : (typeof p.readback === 'string' ? p.readback : '');
   if (readback.trim()) {
-    box.appendChild(h('div',
-      h('p.packet-label.accent', 'What came back'),
-      h('pre.packet-readback', readback.trim())));
+    // Verbatim and preformatted — but a URL in it is still a link (card #54),
+    // built out of text nodes so the log keeps every character it had.
+    const pre = h('pre.packet-readback');
+    readback.trim().split('\n').forEach((line, i) => {
+      if (i) pre.appendChild(document.createTextNode('\n'));
+      pre.appendChild(autolink(line, app.openCard));
+    });
+    box.appendChild(h('div', h('p.packet-label.accent', 'What came back'), pre));
   }
 
   const shots = Array.isArray(p.screenshots) ? p.screenshots : [];
@@ -415,7 +465,15 @@ function evidencePacket(packet, card, state, app) {
     box.appendChild(per);
   }
 
-  if (state === 'ready') box.appendChild(verdictBar(card, app));
+  // Card #53, user verbatim: "get the actions out of cards. I click the card, it
+  // loads in the sidebar, and that's where I review and act." The verdict is not
+  // in here at all any more — it is a bar pinned at the bottom of the rail, above
+  // the composer, where it cannot be scrolled off by a packet with six
+  // screenshots in it. One place to decide, and it does not move.
+  if (state === 'ready') {
+    box.appendChild(h('p.packet-walking',
+      'Approve, Bounce and Reject are pinned at the bottom of the rail — you never have to scroll for them.'));
+  }
   item.appendChild(box);
   return item;
 }
@@ -441,75 +499,4 @@ function packetShots(shots, app) {
     }, frame, cap ? h('span.shot-cap', cap) : null));
   });
   return strip;
-}
-
-function verdictBar(card, app) {
-  const key = `bounce:${card.num}`;
-  const wrap = h('div', { style: { display: 'flex', flexDirection: 'column', gap: '9px' } });
-
-  // Two bounces and the server tags `escalate`: stop offering a blind third try.
-  if (card.bounce_count >= 2) {
-    wrap.appendChild(h('p.escalate',
-      'Bounced twice. The session stops retrying blind here and brings it to you to co-design.'));
-  }
-
-  // Card #44. Hitting Bounce is already the decision; from that moment the row
-  // offers exactly two things — send it, or back out. Approve and Reject are
-  // not dimmed, they are GONE, because the failure being prevented is hitting
-  // Approve with a half-written bounce in the box under it.
-  const composing = bounceComposing(card.num) || !!draft(key);
-
-  const notes = h('textarea.bounce-notes', {
-    id: 'bounce-' + card.num,
-    rows: '2',
-    placeholder: 'What has to change? (goes straight to the agent)',
-    oninput: (e) => draft(key, e.target.value),
-    onkeydown: (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendBounce(); }
-      if (e.key === 'Escape') { e.preventDefault(); cancelBounce(); }
-    },
-  });
-  notes.value = draft(key);
-
-  function sendBounce() {
-    const text = notes.value.trim();
-    if (!text) { notes.focus(); return; }
-    draft(key, null);
-    bounceComposing(card.num, false);
-    app.verdict(card, 'bounce', text);
-  }
-
-  function cancelBounce() {
-    // Cancel puts the three buttons back. It drops only what you typed HERE —
-    // every other composer on the page keeps its draft.
-    draft(key, null);
-    bounceComposing(card.num, false);
-    app.render();
-  }
-
-  if (composing) {
-    wrap.appendChild(h('div', notes));
-    wrap.appendChild(h('div.verdicts.is-bouncing',
-      h('button.btn.bounce', { type: 'button', onclick: () => sendBounce() }, 'Submit bounce'),
-      h('button.btn.ghost', { type: 'button', onclick: () => cancelBounce() }, 'Cancel')));
-    // No focus grab here. Card #46: focus is asked for ONCE, when you press
-    // Bounce (app.composeBounce), and restored by id on every re-render after
-    // that. Re-focusing on every rebuild would yank the caret out of whatever
-    // else you had clicked into — which is the bug this card is about.
-    return wrap;
-  }
-
-  wrap.appendChild(h('div.verdicts',
-    h('button.btn.approve', { type: 'button', onclick: () => app.verdict(card, 'approve') }, 'Approve'),
-    h('button.btn.bounce', {
-      type: 'button',
-      title: 'send it back with notes',
-      onclick: () => app.composeBounce(card.num),
-    }, 'Bounce'),
-    h('button.btn.reject', {
-      type: 'button',
-      title: 'this should not have been built — the branch is dropped',
-      onclick: () => app.verdict(card, 'reject', draft(key) || undefined),
-    }, 'Reject')));
-  return wrap;
 }

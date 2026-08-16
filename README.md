@@ -49,13 +49,15 @@ running inside the project you want a board for.
    you, and everything under it — In motion, Blocked, Queued & held —
    gets quieter on purpose. **LIST/BOARD** in the header swaps the
    reading order for the kanban columns; it remembers which you picked.
-5. Answer a multiple-choice question straight from its row in the list.
-   Everything else happens in the right rail: click a card and its whole
-   thread opens there, with the evidence packet — claim, "check it
-   yourself" steps, screenshots, Approve / Bounce / Reject — in the
-   stream where it arrived. Click **Chat** for the session itself; it's
-   the same brain as the terminal, so it can act on what you say there,
-   not just answer. The rail holds one or the other, never both.
+5. Everything you do happens in the right rail: click a card and its
+   whole thread opens there, with the evidence packet — claim, "check it
+   yourself" steps, screenshots — and Approve / Bounce / Reject pinned
+   at the bottom where they can't be scrolled off. Work that shipped
+   together is **one card** in Awaiting review: open it and you get an
+   outline of everything that changed, one section per change, with a
+   single Approve under the lot. Click **Chat** for the session itself;
+   it's the same brain as the terminal, so it can act on what you say
+   there, not just answer. The rail holds one thing at a time.
 6. When an agent's output is a **document** rather than a line — an audit, a
    findings write-up, a comparison — it attaches it as a report. It reads in
    the thread as a title you can skim and expand, and a quiet **Reports** link
@@ -179,6 +181,36 @@ Details worth knowing:
   parity for it yet (`sprintd doctor --install-launchd` covers boards
   only).
 
+## When a provider limit kills your agents
+
+Agents get killed by usage limits, several at once, and the kill message
+is usually the only thing that says when it ends:
+
+```
+You've hit your session limit · resets 11:50pm (America/Denver)
+```
+
+Tell the board, and it takes it from there:
+
+```
+bin/sprint-limit declare --model fable --resets "11:50pm" --source "kill message"
+bin/sprint-limit list          # what's limited, and how long is left
+bin/sprint-limit clear 3       # it came back early
+```
+
+While the window is open the board carries one quiet line — *"fable is
+rate-limited until 11:50pm — work is running on opus"* — in the same
+place the session-offline banner goes. When it passes, the board emits a
+single `limit_cleared` event, and the session's job (per
+`skills/sprint/SKILL.md` step 5b) is to put whatever it downgraded back
+on the model it should have been on.
+
+`--resets` takes the provider's own wording: a clock time (`11:50pm`,
+`23:50` — meaning the *next* time it comes round), that same clock time
+with the zone in parentheses, an ISO 8601 timestamp, or an epoch. It
+prints back the exact instant it landed on, so a typo is caught before
+the board acts on it.
+
 ## Power-outage recovery
 
 The Mac this runs on is online 24/7, but power outages happen. Recovery
@@ -251,11 +283,43 @@ a live Claude Code conversation, not a daemon.
                     +----------------------------------+
                                      |
                                      | Agent tool, subagent_type: sprint-worker
+                                     | ...or a tmux window + tmux-send, per card
                                      v
                     one git worktree + branch per card/batch,
                     fetched fresh from origin/main, never the
                     primary checkout or a serving dev worktree
 ```
+
+## Settings — model policy and executors
+
+The header's quiet **Settings** link edits `.sprint/config.json`, which is
+this board's dispatch policy (and is a plain file you can also edit by
+hand — the server re-reads it on change, no restart):
+
+```json
+{"worker": {
+  "model_policy": "lowest_feasible",
+  "default_executor": "subagent",
+  "executors": {"claude": {"kind": "subagent"},
+                "grok": {"kind": "tmux", "command": "grok", "session": "sprint-workers"}},
+  "concurrency": 3}}
+```
+
+- `model_policy` — `lowest_feasible` (sonnet by default; the session
+  stamps opus on a card that genuinely needs it), `always_sonnet`, or
+  `always_opus`.
+- `executors` — how a worker is run. `subagent` is a Claude worker via
+  the Agent tool; `tmux` is any CLI agent (grok, codex, …) started in
+  its own tmux window and driven with the `tmux-send` skill. The choice
+  is **per card** — a sprint can mix grok-via-tmux and Claude subagents —
+  and a card that is not on the defaults says so on its face: `grok · tmux`.
+- A change takes effect for the **next** dispatch; cards already running
+  keep the executor and model they started with.
+
+The procedure for driving a tmux worker (window naming, the verified
+send, liveness by pane, cleanup) lives in `skills/sprint/SKILL.md`,
+including a by-hand checklist — that path opens real windows and starts
+real agents, so it is verified by a human, not by the test suite.
 
 The server never spawns, supervises, or judges an agent — it just
 records events and enforces the state machine (illegal transitions

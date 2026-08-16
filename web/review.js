@@ -26,6 +26,13 @@
 // Member cards still exist — for tracking, for chat, for history. They just do
 // not each demand a verdict, and they do not each appear in this list.
 //
+// Card #53 holds all the way through, user verbatim: "get the actions out of
+// cards. I click the card, it loads in the sidebar, and that's where I review
+// and act." So nothing in this list does anything except open the rail — no
+// verdict on a face, no lightbox on a thumbnail, no live link on a row. The
+// verdict is a bar pinned at the bottom of the rail where it cannot be scrolled
+// off: the unit's bar under its outline, a single card's bar under its thread.
+//
 // Deleted with this card, deliberately and not as a follow-up: the grouped
 // (expand-to-see-the-members) row, the per-member review rows, and the
 // Review-next walkthrough. All three existed to organise a list that should not
@@ -34,7 +41,7 @@ import { h, timeEl, firstLine, plural } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
 import { store, cardState, draft, bounceComposing } from './state.js';
 import { shortAgent, openable } from './list.js';
-import { reviewUnits, unitOf, packetFor, memberPart } from './units.js';
+import { reviewUnits, unitOf, packetFor, memberPart, ownTitle } from './units.js';
 import { splitAttachments, reportRow } from './reports.js';
 
 export { reviewUnits, unitOf, packetFor } from './units.js';
@@ -153,29 +160,28 @@ function reviewHead(cards, units) {
 
 /**
  * ONE card for a work unit. It says what the unit is, what the branch claims,
- * and how many changes are inside it; clicking it opens the outline in the
- * rail. Approve is here too when the unit shipped one packet — the claim on
- * this card IS that packet's claim, so a yes here is a yes to something you can
- * read without opening anything.
+ * and how many changes are inside it. That is all it does: clicking anywhere on
+ * it opens the outline in the rail (card #53 — a card face is a single click
+ * target and nothing else), and the Approve that covers the whole unit is at
+ * the bottom of that outline, under the changes it decides.
  */
 function unitCard(unit, app, { compact }) {
   const p = unit.packet;
-  const item = h('div.unit-card', { 'data-unit': unit.key });
-
-  const lead = h('div.unit-lead', {
+  const item = h('div.unit-card', {
+    'data-unit': unit.key,
     role: 'button',
     tabindex: '0',
     title: 'open the outline — everything that changed, in one page',
     onclick: () => app.openUnit(unit.lead.num),
     onkeydown: (e) => {
-      if ((e.key === 'Enter' || e.key === ' ') && e.target === lead) {
-        e.preventDefault(); app.openUnit(unit.lead.num);
-      }
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); app.openUnit(unit.lead.num); }
     },
   });
+
+  const lead = h('div.unit-lead');
   const body = h('div.unit-body',
     h('span.unit-title', unit.title),
-    h('span.unit-count', `${plural(unit.size, 'change')} on one branch — open it to read them`));
+    h('span.unit-count', `${plural(unit.size, 'change')} on one branch`));
   if (p && p.claim) body.appendChild(h('p.review-claim', p.claim));
   if (p && p.steps.length) {
     body.appendChild(h('div.review-check',
@@ -184,45 +190,39 @@ function unitCard(unit, app, { compact }) {
       p.steps.length > 1 ? h('span.review-more', `+${p.steps.length - 1} more`) : null));
   }
   lead.appendChild(body);
-  const thumb = p ? thumbFor(p, app) : null;
+  const thumb = p ? thumbFor(p) : null;
   if (thumb) lead.appendChild(thumb);
   item.appendChild(lead);
 
+  // The status line says where this unit is up to and nothing else — the same
+  // shape a single card's line has, so the two read as one list.
   const acts = h('div.review-acts');
   const waiting = readyMembers(unit.nums);
   const prog = unitProgress(unit.key);
-  // One Approve, on the card, when the unit shipped ONE packet — the claim
-  // above it IS that packet's claim, so a yes here is a yes to something you
-  // have read. A looser unit (one branch, different packets) has no single
-  // sentence to lead with, so its only verdict is in the outline.
-  if (p && waiting.length) {
-    acts.appendChild(h('button.btn.tiny.approve', {
-      type: 'button',
-      disabled: !!(prog && !prog.error),
-      title: `one branch, one packet — approves each of the ${waiting.length} cards in it`,
-      onclick: (e) => { e.stopPropagation(); approveUnit(unit, app); },
-    }, prog && !prog.error
-      ? `approving ${Math.min(prog.done + 1, prog.total)} of ${prog.total}…`
-      : (waiting.length > 1 ? `Approve all ${waiting.length}` : `Approve #${waiting[0].num}`)));
-  }
-  acts.appendChild(h('button.btn.tiny.unit-open', {
-    type: 'button',
-    onclick: (e) => { e.stopPropagation(); app.openUnit(unit.lead.num); },
-  }, p ? 'Read the changes' : `Read all ${unit.size}`));
-  if (p && p.live_url) {
-    acts.appendChild(h('a.btn.tiny.ghost.review-live', {
-      href: p.live_url, target: '_blank', rel: 'noreferrer noopener', title: p.live_url,
-      onclick: (e) => e.stopPropagation(),
-    }, 'See it live ↗'));
-  }
+  acts.appendChild(h('span.review-open-hint', unitHint(unit, waiting, prog)));
   acts.appendChild(h('span.grow'));
   acts.appendChild(h('span.review-meta',
     [shortAgent(unit.agent), p ? unitMeta(p) : ''].filter(Boolean).join(' · '), ' · ',
     timeEl(unit.lead.last_activity_at, { suffix: false })));
-  item.appendChild(acts);
-  const err = progressLine(unitProgress(unit.key));
+  item.appendChild(h('div.review-actwrap', acts));
+
+  const err = progressLine(prog);
   if (err) item.appendChild(err);
   return item;
+}
+
+/** One line: what opening this unit gets you, in the words of what it is now. */
+function unitHint(unit, waiting, prog) {
+  if (prog && !prog.error) return `Approving ${Math.min(prog.done + 1, prog.total)} of ${prog.total}…`;
+  if (!waiting.length) {
+    return unit.cards.some((c) => cardState(c) === 'integrating')
+      ? 'Approved — the session is merging this branch now.'
+      : 'Nothing here is waiting on you any more.';
+  }
+  if (unit.cards.some((c) => bounceComposing(c.num))) return 'Bounce half-written — open it to finish';
+  return waiting.length > 1
+    ? `Open it to read all ${waiting.length} changes and approve them together`
+    : 'Open it to read the changes and approve them';
 }
 
 function unitMeta(p) {
@@ -234,22 +234,19 @@ function unitMeta(p) {
 
 /**
  * A unit of one: one card, one packet. Exactly what it has always been — its
- * own card in review, leading with its own title and claim, with the verdict on
- * it. There is nothing to outline, so clicking it opens the card itself.
+ * own card in review, leading with its own title and claim. Clicking it opens
+ * the card itself, and the verdict is the bar pinned under its thread.
  */
 export function singleCard(card, app, { compact = false } = {}) {
   const p = packetFor(card);
   const state = cardState(card);
   const merging = state === 'integrating';
-  const item = h('div.review-item', {
-    class: `review-item${merging ? ' is-merging' : ''}`,
-    'data-num': card.num,
-  });
+  const item = openable(`review-item${merging ? ' is-merging' : ''}`, card, app);
 
-  const lead = openable('review-lead', card, app);
+  const lead = h('div.review-lead');
   lead.appendChild(h('span.row-num', '#' + card.num));
   const body = h('span.review-body',
-    h('span.review-title', card.title),
+    h('span.review-title', ownTitle(card) || firstLine(card.body || '', 70) || `Card #${card.num}`),
     h('p.review-claim', p.claim || 'No claim recorded — open it and ask the agent what it thinks it did.'));
   if (p.steps.length) {
     body.appendChild(h('div.review-check',
@@ -258,15 +255,19 @@ export function singleCard(card, app, { compact = false } = {}) {
       p.steps.length > 1 ? h('span.review-more', `+${p.steps.length - 1} more`) : null));
   }
   lead.appendChild(body);
-  const thumb = thumbFor(p, app);
+  const thumb = thumbFor(p);
   if (thumb) lead.appendChild(thumb);
   item.appendChild(lead);
-  item.appendChild(singleActions(card, p, app, merging));
+  item.appendChild(statusRow(card, p, merging));
   return item;
 }
 
-function singleActions(card, p, app, merging) {
-  const key = `bounce:${card.num}`;
+/**
+ * The line under a single card. Card #53: it says what this card is and where
+ * it is up to, and it does not DO anything — the verdict is in the rail, one
+ * click away, on the card you are already about to click.
+ */
+function statusRow(card, p, merging) {
   const row = h('div.review-acts');
 
   if (merging) {
@@ -277,46 +278,13 @@ function singleActions(card, p, app, merging) {
     return row;
   }
 
-  // Cards #44 and #46 together. #44: once you have pressed Bounce, Approve is
-  // gone — a stray click must not merge the thing you were sending back. #46:
-  // the words are typed in the RAIL, so this row carries the composing STATE and
-  // none of the typing.
-  const composing = bounceComposing(card.num) || !!draft(key);
-
-  function cancel() {
-    draft(key, null);
-    bounceComposing(card.num, false);
-    app.render();
-  }
-
-  if (composing) {
-    row.appendChild(h('button.btn.bounce.tiny', {
-      type: 'button',
-      title: 'back to the notes box in the panel',
-      onclick: (e) => { e.stopPropagation(); app.openCard(card.num, { focus: 'bounce' }); },
-    }, 'Writing the bounce →'));
-    row.appendChild(h('button.btn.tiny.ghost', {
-      type: 'button',
-      onclick: (e) => { e.stopPropagation(); cancel(); },
-    }, 'Cancel'));
-  } else {
-    row.appendChild(h('button.btn.approve.tiny', {
-      type: 'button',
-      title: `approve #${card.num} — the session rebases, gates and merges the branch`,
-      onclick: (e) => { e.stopPropagation(); app.verdict(card, 'approve'); },
-    }, 'Approve'));
-    row.appendChild(h('button.btn.bounce.tiny', {
-      type: 'button',
-      title: 'open it and send it back with notes',
-      onclick: (e) => { e.stopPropagation(); app.openCard(card.num, { focus: 'bounce' }); },
-    }, 'Bounce'));
-    if (p.live_url) {
-      row.appendChild(h('a.btn.tiny.ghost.review-live', {
-        href: p.live_url, target: '_blank', rel: 'noreferrer noopener', title: p.live_url,
-        onclick: (e) => e.stopPropagation(),
-      }, 'See it live ↗'));
-    }
-  }
+  // Card #44's composing state survives, as a STATE rather than as a control:
+  // the words are typed in the rail (#46), and the line only says that is where
+  // you left them.
+  const composing = bounceComposing(card.num) || !!draft(`bounce:${card.num}`);
+  row.appendChild(composing
+    ? h('span.review-composing', 'Bounce half-written — open it to finish')
+    : h('span.review-open-hint', 'Open it to approve, bounce or reject'));
   row.appendChild(h('span.grow'));
   row.appendChild(h('span.review-meta', metaLine(card, p), ' · ',
     timeEl(card.last_activity_at, { suffix: false })));
@@ -331,7 +299,12 @@ function metaLine(card, p) {
   return bits.join(' · ');
 }
 
-function thumbFor(p, app) {
+/**
+ * The packet's first screenshot, as a picture and nothing else. It used to open
+ * a lightbox; card #53 took every click off the face except the one that opens
+ * the rail, and the lightbox is one click further in, on the packet itself.
+ */
+function thumbFor(p) {
   if (!p.shots.length) return null;
   const urls = p.shots.map(attachmentUrl).filter(Boolean);
   if (!urls.length) return null;
@@ -341,10 +314,8 @@ function thumbFor(p, app) {
       src: urls[0], alt: caps[0] || 'screenshot', loading: 'lazy',
       onerror: (e) => { e.target.remove(); },
     }));
-  return h('button.review-thumb', {
-    type: 'button',
+  return h('span.review-thumb', {
     title: p.shots.length > 1 ? `${p.shots.length} screenshots` : (caps[0] || 'screenshot'),
-    onclick: (e) => { e.stopPropagation(); app.lightbox(urls, 0, caps); },
   }, frame, p.shots.length > 1 ? h('span.review-thumb-n', String(p.shots.length)) : null);
 }
 
@@ -487,7 +458,7 @@ function changeSection(unit, card, n, app) {
   }
   if (state !== 'ready') {
     sec.appendChild(h('p.unit-change-note',
-      `Back with the agent — this part is no longer waiting on you.`));
+      'Back with the agent — this part is no longer waiting on you.'));
     return sec;
   }
   if (card.bounce_count) {
@@ -559,10 +530,12 @@ function bounceRow(card, app, { label, placeholder, submit, run, hint, num }) {
 }
 
 /**
- * The one verdict for the unit, pinned at the bottom of the rail. One Approve,
- * covering everything the outline just showed you — and, next to it, the way to
- * send the whole thing back when the problem is the branch rather than one part
- * of it.
+ * The one verdict for the unit, pinned at the bottom of the rail — the same
+ * place a single card's verdict bar sits (card #53), so the decision is always
+ * in one spot and can never be scrolled off by an outline with six sections in
+ * it. One Approve, covering everything the outline just showed you, and next to
+ * it the way to send the whole thing back when the problem is the branch rather
+ * than one part of it.
  */
 export function unitBar(unit, app) {
   const bar = h('div.unit-bar');
@@ -574,6 +547,15 @@ export function unitBar(unit, app) {
       ? 'Approved — the session is merging this branch now.'
       : 'Nothing here is waiting on you any more.'));
     return bar;
+  }
+
+  // Two bounces and the server tags `escalate`: stop offering a blind third try
+  // on the part that keeps coming back.
+  const stuck = waiting.filter((c) => (c.bounce_count || 0) >= 2);
+  if (stuck.length) {
+    bar.appendChild(h('p.escalate',
+      `${stuck.map((c) => '#' + c.num).join(', ')} bounced twice. The session stops retrying blind `
+      + 'here and brings it to you to co-design.'));
   }
 
   const n = unitBounceNum(unit);
@@ -611,6 +593,111 @@ export function unitBar(unit, app) {
     }, 'Send it all back')));
   const err = progressLine(prog);
   if (err) bar.appendChild(err);
+  return bar;
+}
+
+// ---- one card's verdict, in the rail -------------------------------------
+//
+// Card #53, user verbatim: "get the actions out of cards. I click the card, it
+// loads in the sidebar, and that's where I review and act."
+//
+// This is the bar for a card you opened on its own — a unit of one from the
+// review list, or a member you clicked through to out of an outline. It is
+// pinned at the bottom of the rail, above the composer, in exactly the place
+// the unit's bar sits: whichever of the two the rail is showing, the decision
+// is in the same spot and outside the scrolling thread.
+//
+// It decides ONE card. The whole-branch Approve is not repeated here, because
+// the thing that approves a branch is the branch's own outline — a button that
+// acted on five other cards you cannot see from here is exactly the blind bulk
+// approve card #26 refused.
+
+/** The signature the rail memoises this bar on. Null = no bar for this card. */
+export function verdictBarSig(card) {
+  if (!card || cardState(card) !== 'ready') return null;
+  const unit = unitInReview(card.num);
+  return [card.num, card.bounce_count,
+    bounceComposing(card.num) || draft(`bounce:${card.num}`) ? 'b' : '',
+    unit && unit.size > 1 ? unit.size : 0].join('|');
+}
+
+export function packetVerdictBar(card, app) {
+  const key = `bounce:${card.num}`;
+  const bar = h('div.review-bar.is-verdict');
+  const unit = unitInReview(card.num);
+  const many = !!unit && unit.size > 1;
+
+  // Two bounces and the server tags `escalate`: stop offering a blind third try.
+  if (card.bounce_count >= 2) {
+    bar.appendChild(h('p.escalate',
+      'Bounced twice. The session stops retrying blind here and brings it to you to co-design.'));
+  }
+  if (many) {
+    bar.appendChild(h('p.review-bar-unit',
+      `One of ${plural(unit.size, 'change')} on one branch. What you do here decides this card `
+      + 'alone — the whole branch is approved from its outline.'));
+  }
+
+  // Card #44. Hitting Bounce is already the decision; from that moment the bar
+  // offers exactly two things — send it, or back out. Approve and Reject are not
+  // dimmed, they are GONE, because the failure being prevented is hitting
+  // Approve with a half-written bounce in the box under it.
+  const composing = bounceComposing(card.num) || !!draft(key);
+
+  const notes = h('textarea.bounce-notes', {
+    id: 'bounce-' + card.num,
+    rows: '2',
+    placeholder: 'What has to change? (goes straight to the agent)',
+    oninput: (e) => draft(key, e.target.value),
+    onkeydown: (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+      if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+    },
+  });
+  notes.value = draft(key);
+
+  function send() {
+    const text = notes.value.trim();
+    if (!text) { notes.focus(); return; }
+    draft(key, null);
+    bounceComposing(card.num, false);
+    app.verdict(card, 'bounce', text);
+  }
+
+  function cancel() {
+    // Cancel puts the buttons back. It drops only what you typed HERE — every
+    // other composer on the page keeps its draft.
+    draft(key, null);
+    bounceComposing(card.num, false);
+    app.render();
+  }
+
+  if (composing) {
+    bar.appendChild(h('div.review-notes', notes));
+    bar.appendChild(h('div.verdicts.is-bouncing',
+      h('button.btn.bounce', { type: 'button', onclick: () => send() }, 'Submit bounce'),
+      h('button.btn.ghost', { type: 'button', onclick: () => cancel() }, 'Cancel')));
+    // No focus grab here. Card #46: focus is asked for ONCE, when you press
+    // Bounce (app.composeBounce), and restored by id on every re-render after.
+    return bar;
+  }
+
+  bar.appendChild(h('div.verdicts',
+    h('button.btn.approve', {
+      type: 'button',
+      title: `approve #${card.num} — the session rebases, gates and merges the branch`,
+      onclick: () => app.verdict(card, 'approve'),
+    }, many ? `Approve #${card.num} only` : 'Approve'),
+    h('button.btn.bounce', {
+      type: 'button',
+      title: 'send it back with notes',
+      onclick: () => app.composeBounce(card.num),
+    }, 'Bounce'),
+    h('button.btn.reject', {
+      type: 'button',
+      title: 'this should not have been built — the branch is dropped',
+      onclick: () => app.verdict(card, 'reject', draft(key) || undefined),
+    }, 'Reject')));
   return bar;
 }
 

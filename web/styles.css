@@ -1736,12 +1736,13 @@ html.skin-chaos .detail-body { border-top: 2px solid #4a3f8e; }
    A self-contained section appended at the end of the file: nothing above this
    line is edited, so this lands cleanly next to other work in flight.
 
-   Card #55 rewrote what lives here: the grouped row, the per-member rows and
-   the Review-next bar are gone, because the LIST they were arranging is gone.
-   What is left is the shared vocabulary — a REVIEW ITEM (one card, its claim,
-   its check, a thumbnail, the verdict on it) which is now only ever a unit of
-   one. The unit card and its outline are in their own section at the end of
-   this file.
+   Two shapes live here. A REVIEW ITEM is one card in Awaiting review with its
+   claim, its first check and a thumbnail — a click target and nothing more
+   (card #53). The REVIEW BAR is the verdict, pinned to the bottom of the rail
+   where it cannot be scrolled off. The grouped rows and the Review-next
+   walkthrough that used to live here were deleted by card #55: work that
+   shipped together is ONE card now, and its styles are at the end of this
+   file.
    =========================================================================== */
 
 .review-block { display: flex; flex-direction: column; gap: 10px; }
@@ -1755,6 +1756,9 @@ html.skin-chaos .detail-body { border-top: 2px solid #4a3f8e; }
   color: var(--good);
 }
 .review-head-note { font-size: 13px; color: var(--faint); }
+
+/* ---- a work unit, collapsed --------------------------------------------- */
+
 
 /* ---- one card, with the verdict on it ----------------------------------- */
 
@@ -1835,9 +1839,25 @@ html.skin-chaos .detail-body { border-top: 2px solid #4a3f8e; }
 .bounce-pop { display: flex; flex-direction: column; gap: 8px; }
 .bounce-pop-acts { display: flex; gap: 8px; }
 
+/* ---- the verdict, pinned in the rail ------------------------------------- */
+
+.review-bar {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--rule);
+  background: var(--panel);
+}
+.review-bar-note { font-size: 11.5px; color: var(--faint); }
+.packet-walking { font-family: var(--font-mono); font-size: 11px; color: var(--faint); line-height: 1.6; }
+
 /* ---- the Board's narrow column ------------------------------------------ */
 
 .review-block.is-compact { gap: 8px; }
+.review-block.is-compact .review-head { flex-wrap: wrap; gap: 8px; padding: 0 0 2px 0; }
+.review-block.is-compact .review-head { justify-content: flex-end; }
 .review-block.is-compact .review-more { display: none; }
 .review-block.is-compact .review-check p { flex: 1; min-width: 0; }
 .review-block.is-compact .review-item { padding: 12px; gap: 9px; }
@@ -1848,8 +1868,8 @@ html.skin-chaos .detail-body { border-top: 2px solid #4a3f8e; }
 .review-block.is-compact .review-thumb { grid-column: 1 / -1; }
 .review-block.is-compact .review-thumb-frame { width: 100%; height: 72px; }
 .review-block.is-compact .review-acts { gap: 6px; row-gap: 8px; }
-/* the column is 280px: a spacer that forces the meta onto its own line is
-   width nobody has */
+/* the column is 280px: the row-click and the chevron already toggle the unit,
+   and a spacer that forces the meta onto its own line is width nobody has */
 .review-block.is-compact .review-acts .grow { display: none; }
 .review-block.is-compact .review-acts .btn.tiny { padding: 0 11px; font-size: 12.5px; }
 .review-block.is-compact .review-meta { flex-basis: 100%; }
@@ -1863,6 +1883,8 @@ html.skin-chaos .detail-body { border-top: 2px solid #4a3f8e; }
   .review-block.is-compact .review-acts .btn.tiny { min-height: 44px; }
   .review-head-note { display: none; }
   .review-claim, .review-check { max-width: none; }
+  .review-bar { padding: 12px 14px; }
+  .review-bar .verdicts .btn { min-height: 48px; }
 }
 
 @media (max-width: 600px) {
@@ -1877,13 +1899,9 @@ html.skin-chaos .detail-body { border-top: 2px solid #4a3f8e; }
    outlines, and the signoff rail stays green so a review still reads as a
    review at a glance. */
 
-html.skin-chaos .review-item {
-  border: 2px solid var(--border);
-  border-left: 3px solid var(--rail-signoff);
-  box-shadow: var(--panel-shadow);
-}
 html.skin-chaos .review-item.is-merging { border-left-color: var(--good); }
 html.skin-chaos .review-thumb-frame { border: 2px solid var(--border); }
+html.skin-chaos .review-bar { border-top: 2px solid var(--border); box-shadow: var(--panel-shadow); }
 html.skin-chaos .review-claim { line-height: 1.6; }
 
 /* ---- card #29: the staleness sweep ---------------------------------------
@@ -2039,10 +2057,12 @@ html.skin-chaos .title-caret { font-size: 10px; }
    A second self-contained section appended after card #25's: nothing above this
    line is edited, so this lands cleanly next to other work in flight.
 
-   #28: a unit is named after the work in it, never after the agent.
-   #26: one Approve per work unit that shipped as one branch with one packet.
-   Card #55 removed the Review-next button and the grouped row from this
-   section; what remains is the review head and the singleton row.
+   #28: the entry is named after the work in it, so the NAME carries the weight
+   and the metadata drops back to a quiet line under it.
+   #26: one Approve per work unit that shipped as one branch with one packet,
+   with its progress and its failure said in words rather than in a spinner.
+   Card #55 later moved both of those onto the unit card and its outline at the
+   end of this file; what is left here is the heading and the singleton row.
    =========================================================================== */
 
 .review-head {
@@ -2064,10 +2084,23 @@ html.skin-chaos .title-caret { font-size: 10px; }
 .review-item .review-claim { margin-top: 5px; font-size: 13.5px; color: var(--dim); }
 .review-block.is-compact .review-item .review-title { font-size: 13.5px; }
 
+/* ---- what a card's own verdict says about the branch around it ----------- */
+
+.review-bar-unit {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--dim);
+  max-width: 70ch;
+}
+
+@media (max-width: 1199px) {
+}
+
 /* ---- Chaos: same words, hard edges --------------------------------------- */
 
 html.skin-chaos .review-head { border-bottom: 2px solid var(--border); }
 html.skin-chaos .review-item .review-title { line-height: 1.5; }
+html.skin-chaos .review-unit-error, html.skin-chaos .review-bar-unit { line-height: 1.7; }
 
 /* ===========================================================================
    Reports — documents as first-class attachments (card #33)
@@ -2437,6 +2470,164 @@ html.skin-chaos .packet-readback {
   line-height: 1.7;
 }
 
+/* --------------------------------------------------------------------------
+   card #43 — sprint settings + the per-card executor tag
+   (appended section: three agents are editing this file in parallel, so this
+   block is self-contained and touches nothing above it)
+
+   Two surfaces. The Settings panel is the board's dispatch policy — model,
+   executors, how many run at once — reached from a deliberately quiet header
+   link, because it is something you visit twice a month. The executor tag is
+   the other half: it appears on a card ONLY when that card was dispatched
+   differently from the board's default, so "grok · tmux" means "this one is
+   not like the others" rather than being chrome on every face.
+   -------------------------------------------------------------------------- */
+
+/* the header link — quieter than Drop work, same weight as Chat */
+.settings-btn { color: var(--faint); }
+.settings-btn:hover { color: var(--ink); border-color: var(--border-chip); }
+
+.settings-sheet { width: 620px; gap: 14px; }
+.settings-head h2 {
+  font-family: var(--font-display);
+  font-size: 19px;
+  font-weight: var(--display-weight);
+  color: var(--ink);
+  margin: 0 0 6px;
+  text-transform: var(--display-case);
+}
+/* the one sentence the panel exists to say out loud */
+.settings-when {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--dim);
+  max-width: 66ch;
+}
+.settings-when strong { color: var(--ink); font-weight: 600; }
+
+.settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-height: 56vh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.settings-field { display: flex; flex-direction: column; gap: 7px; }
+.settings-label {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.settings-hint {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--faint);
+  max-width: 68ch;
+}
+.settings-seg { align-self: flex-start; }
+
+.settings-select,
+.settings-num {
+  font-family: var(--font-body);
+  font-size: 14px;
+  color: var(--ink);
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  padding: 0 12px;
+  min-height: 44px;
+  outline: none;
+  align-self: flex-start;
+}
+.settings-select { min-width: 240px; }
+.settings-num { width: 110px; }
+.settings-select:focus, .settings-num:focus { border-color: var(--accent); }
+
+.settings-json {
+  width: 100%;
+  min-height: 132px;
+  max-height: 32vh;
+  resize: vertical;
+  background: var(--input);
+  color: var(--body-ink);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  padding: 11px 12px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  outline: none;
+}
+.settings-json:focus { border-color: var(--accent); }
+
+.settings-foot { display: flex; align-items: center; gap: 10px; }
+.settings-status { font-size: 12.5px; color: var(--faint); }
+.settings-err {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--bad);
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  padding: 9px 11px;
+}
+
+/* the tag — mono, quiet, and never on a card running the defaults */
+.exec-tag {
+  display: inline-flex;
+  align-items: baseline;
+  flex: none;
+  padding: 2px 7px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--exec-ink, #b6a6cd);
+  background: var(--exec-bg, #16131d);
+  border: 1px solid var(--exec-line, #2b2536);
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
+.row-agent .exec-tag { margin-left: 7px; }
+.rail-head .exec-tag { flex: none; }
+/* The card foot is one line: agent · tag · age. The agent name gives way
+   before the tag does, and neither is allowed to wrap the age onto its own
+   row (which is what an untamed tag did to a 300px column). */
+.card-foot { flex-wrap: nowrap; }
+.card-foot > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-foot .exec-tag { max-width: 62%; overflow: hidden; text-overflow: ellipsis; }
+
+@media (max-width: 1199px) {
+  /* Fold: 740px tall is the scarce dimension, so the sheet starts higher and
+     the fields scroll inside it rather than pushing Save off the screen. */
+  #settings-wrap { padding-top: 22px; }
+  .settings-sheet { width: 100%; }
+  .settings-body { max-height: 56vh; }
+  .settings-json { min-height: 96px; }
+  .settings-foot .btn { min-height: 44px; }
+  /* the header is 54px and already full — the link keeps its words, not an icon */
+  .settings-btn { padding: 0 10px; }
+}
+
+/* ---- Chaos: same words, hard edges --------------------------------------- */
+
+html.skin-chaos .settings-sheet { border: 2px solid var(--border); }
+html.skin-chaos .settings-select,
+html.skin-chaos .settings-num,
+html.skin-chaos .settings-json,
+html.skin-chaos .settings-err { border: 2px solid var(--border); border-radius: 0; }
+html.skin-chaos .settings-when,
+html.skin-chaos .settings-hint { line-height: 1.7; }
+html.skin-chaos .exec-tag {
+  border: 1px solid var(--border);
+  border-radius: 0;
+  color: #e7dcff;
+  background: #241a45;
+  box-shadow: inset 1px 1px 0 #4b3a86, inset -1px -1px 0 #0a0618;
+}
+
 /* ============================================================================
    Card #46 — you type in the rail, and what you type stays put.
    User verbatim: "when I'm typing a response into a card and the board moves,
@@ -2470,6 +2661,222 @@ html.skin-chaos .composer textarea:focus,
 html.skin-chaos .bounce-notes:focus {
   box-shadow: 0 0 0 3px var(--accent);
   border-radius: 0;
+}
+
+/* ============================================================================
+   Cards #50 / #52 / #53 / #54 — where interaction lives.
+   #50  an agent can ask for a DECISION, handing over artifacts with the
+        question. User verbatim: "needs you is where we talk through things.
+        review means the session genuinely thinks the card is 100% complete.
+        needs you is that the card is waiting for my input before it can keep
+        moving forward."
+   #52  "when I'm looking at a report, the sidebar should be the card that
+        created it, not the session chat."
+   #53  "get the actions out of cards. I click the card, it loads in the
+        sidebar, and that's where I review and act."
+   #54  "make links clickable and should auto open in a new tab."
+   ========================================================================== */
+
+/* ---- #50: what a decision request handed over --------------------------- */
+
+.artifacts {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  margin-top: 14px;
+  padding: 13px 14px 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-ctl);
+  background: var(--input);
+}
+.artifacts-label {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+}
+.artifacts-label.accent { color: var(--accent); }
+.artifacts-notes {
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--dim);
+  text-wrap: pretty;
+  max-width: 70ch;
+}
+.artifacts-live { align-self: flex-start; }
+/* The same panel, once the question has been answered: it is history now, so it
+   stops asking for the eye it wanted while the answer was owed. */
+.artifacts.is-past {
+  border-left-color: var(--border-chip);
+  background: none;
+}
+.artifacts.is-past .artifacts-label { color: var(--faint); }
+
+/* The row only says a decision is waiting; the deciding happens in the rail. */
+.row-optnote {
+  display: block;
+  margin-top: 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+}
+.row-optnote.is-artifacts { color: var(--faint); }
+
+/* ---- #53: a review row is a click target, not a control panel ----------- */
+
+.review-item {
+  cursor: pointer;
+  text-align: left;
+}
+.review-item:hover { border-color: var(--border-chip); }
+.review-item:hover .review-claim { color: var(--accent-hi); }
+.review-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* The lead is no longer its own button — the whole row is the one. */
+.review-lead { cursor: inherit; }
+/* ...and the thumbnail is a picture again: the lightbox is on the packet, in
+   the rail, one click further in. */
+.review-thumb { cursor: inherit; display: inline-block; }
+.review-thumb:hover .review-thumb-frame { border-color: var(--border); }
+
+.review-open-hint,
+.review-composing {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+.review-composing { color: var(--accent); }
+.review-item:hover .review-open-hint { color: var(--dim); }
+
+/* The verdict, pinned in the rail above the composer. Same bar as the
+   walkthrough's, so a verdict is always given in the same square inch of
+   screen — and never scrolled off by a packet with six screenshots in it. */
+.review-bar.is-verdict .verdicts .btn { min-height: 46px; }
+
+/* ---- #52: which conversation is beside the report you are reading ------- */
+
+.report-rail-note {
+  margin: -6px 0 18px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+/* ---- #54: a URL in prose is a link, and it leaves the board ------------- */
+
+.extlink {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  word-break: break-word;
+}
+.extlink:hover { color: var(--accent-hi); }
+.packet-readback .extlink,
+.detail-body .extlink { color: var(--accent); }
+
+/* ---- Chaos: same words, hard edges -------------------------------------- */
+
+html.skin-chaos .artifacts {
+  border: 2px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 0;
+}
+html.skin-chaos .review-item:focus-visible { outline-offset: 0; }
+html.skin-chaos .extlink { text-decoration-thickness: 2px; }
+/* ==========================================================================
+   APPENDED — provider limit line (card #47)
+   "fable is rate-limited until 11:50pm — work is running on opus", in the same
+   slot and the same restrained register as the session-offline banner. It is
+   deliberately the QUIETEST thing that can be said out loud: nothing is broken
+   and nothing is waiting on the user, so it borrows `.banner`'s shape and then
+   steps further back than `.banner.dim` does. Not a modal, not a toast, and
+   there is no per-card chrome to go with it — a card that was moved onto a
+   fallback model already wears its model tag.
+   ========================================================================== */
+
+.limit-banners { display: flex; flex-direction: column; }
+
+.banner.limit {
+  color: var(--dim);
+  border-color: var(--border);
+  /* A dashed edge reads as "a temporary condition" without spending any colour
+     on it — the accent belongs to things that need you. */
+  border-style: dashed;
+}
+
+/* The model and the time are the two words anyone actually reads off this
+   line, but underlining or colouring them would make a status line look like a
+   control. It stays one sentence. */
+.banner.limit span { overflow-wrap: anywhere; }
+
+/* Chaos: hard ink outline, no radius, like every other plate in the skin.
+   Dashed survives — it is what makes this one quieter than the warn banner
+   sitting directly above it. */
+html.skin-chaos .banner.limit {
+  border: 2px dashed var(--border);
+  border-radius: 0;
+}
+
+/* ==========================================================================
+   APPENDED — the account-limit banner (card #47, bounce)
+
+   The other direction from the quiet line above. A model window means work
+   moved down a tier; an ACCOUNT window means nothing on this machine can run
+   at all, and the fix is a thing only the user can do: log out, sign in with
+   another Claude session, press Resume. So this one is allowed to be loud —
+   accent border, accent headline, and the one button on the page.
+
+   Still a banner, not a modal, and it takes the user's own words for why: he
+   must be able to read cards and type underneath it. Nothing is dimmed and
+   nothing is blocked.
+   ========================================================================== */
+
+.banner.account {
+  align-items: flex-start;
+  gap: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--accent);
+  /* A wash of the accent rather than a fill: loud enough to be the first thing
+     read, quiet enough that the board underneath is still the page. */
+  background: linear-gradient(0deg, rgba(216, 164, 92, .07), rgba(216, 164, 92, .07)), var(--panel);
+  color: var(--body-ink);
+}
+.banner.account .account-words { flex: 1 1 auto; min-width: 0; }
+.banner.account .account-headline {
+  color: var(--accent-hi);
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.banner.account .account-detail { margin-top: 3px; color: var(--body-ink); }
+/* What to DO is the half of this the user came for, so it is not the faintest
+   line in the box — it sits level with the detail, one shade back. */
+.banner.account .account-action { margin-top: 3px; color: var(--dim); }
+.banner.account .account-resume {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 0 18px;
+  align-self: center;
+}
+.banner.account .account-resume[disabled] { opacity: .6; cursor: default; }
+
+/* Fold (980×740) and narrower: the button drops under the words rather than
+   squeezing three sentences into a column two words wide. */
+@media (max-width: 1199px) {
+  .banner.account { flex-direction: column; align-items: stretch; gap: 10px; }
+  .banner.account .account-resume { align-self: flex-start; }
+}
+
+/* Chaos: hard outline, no radius, like every other plate in that skin. */
+html.skin-chaos .banner.account {
+  border: 2px solid var(--accent);
+  border-radius: 0;
+  background: var(--panel);
 }
 
 /* ===========================================================================
@@ -2529,8 +2936,6 @@ html.skin-chaos .bounce-notes:focus {
   color: var(--faint);
 }
 .unit-body .review-claim { margin-top: 8px; font-size: 13.5px; color: var(--dim); }
-.review-acts .btn.unit-open { background: var(--chip); border-color: var(--border-chip); color: var(--dim); }
-.review-acts .btn.unit-open:hover { border-color: var(--accent); color: var(--ink); }
 .unit-error {
   font-size: 12.5px;
   line-height: 1.5;
@@ -2654,7 +3059,6 @@ html.skin-chaos .bounce-notes:focus {
   .unit-outline { padding: 16px 16px 22px; }
   .unit-bar { padding: 12px 14px; }
   .unit-bar .verdicts .btn { min-height: 48px; }
-  .review-acts .btn.unit-open { min-height: 44px; }
 }
 
 @media (max-width: 600px) {
