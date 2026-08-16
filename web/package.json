@@ -1,0 +1,6 @@
+{
+  "name": "sprint-board-web",
+  "private": true,
+  "type": "module",
+  "description": "Not a package: this file exists so node reads web/*.js as the ES modules the browser already reads them as, which is what lets tests/units.test.mjs import the review model directly."
+}

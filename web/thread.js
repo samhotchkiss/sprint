@@ -23,7 +23,6 @@ import {
   SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, normArtifacts,
 } from './state.js';
 import { detailBlock } from './detail.js';
-import { flowActive } from './review.js';
 import { splitAttachments, docsVer, reportRow } from './reports.js';
 
 const ACTOR = {
@@ -131,17 +130,14 @@ export function threadItems(detail, app) {
       out.push({ key: 'merging', ver: card.state_since || 1,
         make: () => statusLine('Approved — merging', ageSuffix(card.state_since), 'good') });
     }
-    // While the Review-next walkthrough is standing on this card, the verdict
-    // lives in its pinned bar instead — one Approve on screen, in one place.
-    const walking = !!card && flowActive(card.num);
     out.push({
       key: 'packet',
       // Mid-bounce no longer changes anything in here: the verdict left the
       // packet for the rail's pinned bar (card #53), so the packet is the
       // evidence and only the evidence.
       ver: `${state}:${card ? card.bounce_count : 0}:${(packet && packet.claim) || ''}`.length
-        + ':' + state + ':' + (card ? card.bounce_count : 0) + ':' + (walking ? 'w' : ''),
-      make: () => evidencePacket(packet, card, state, app, walking),
+        + ':' + state + ':' + (card ? card.bounce_count : 0),
+      make: () => evidencePacket(packet, card, state, app),
     });
   }
   return out;
@@ -390,7 +386,7 @@ function questionPanel(card, q, app) {
 
 // ---- the evidence packet -------------------------------------------------
 
-function evidencePacket(packet, card, state, app, walking) {
+function evidencePacket(packet, card, state, app) {
   const p = packet || {};
   const item = h('div.item');
   const box = h('div.packet');
@@ -475,9 +471,8 @@ function evidencePacket(packet, card, state, app, walking) {
   // the composer, where it cannot be scrolled off by a packet with six
   // screenshots in it. One place to decide, and it does not move.
   if (state === 'ready') {
-    box.appendChild(h('p.packet-walking', walking
-      ? 'Approve, Bounce or Skip are pinned at the bottom of the rail while you are walking the queue.'
-      : 'Approve, Bounce and Reject are pinned at the bottom of the rail — you never have to scroll for them.'));
+    box.appendChild(h('p.packet-walking',
+      'Approve, Bounce and Reject are pinned at the bottom of the rail — you never have to scroll for them.'));
   }
   item.appendChild(box);
   return item;
