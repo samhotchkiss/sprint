@@ -23,7 +23,6 @@ import {
   SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, draft, bounceComposing,
 } from './state.js';
 import { detailBlock } from './detail.js';
-import { flowActive } from './review.js';
 import { splitAttachments, docsVer, reportRow } from './reports.js';
 
 const ACTOR = {
@@ -121,18 +120,15 @@ export function threadItems(detail, app) {
       out.push({ key: 'merging', ver: card.state_since || 1,
         make: () => statusLine('Approved — merging', ageSuffix(card.state_since), 'good') });
     }
-    // While the Review-next walkthrough is standing on this card, the verdict
-    // lives in its pinned bar instead — one Approve on screen, in one place.
-    const walking = !!card && flowActive(card.num);
     out.push({
       key: 'packet',
       // ...and whether you are mid-bounce, which is what swaps the three
       // verdict buttons for "Submit bounce / Cancel". A version that ignored it
       // would leave Approve on screen after you pressed Bounce.
       ver: `${state}:${card ? card.bounce_count : 0}:${(packet && packet.claim) || ''}`.length
-        + ':' + state + ':' + (card ? card.bounce_count : 0) + ':' + (walking ? 'w' : '')
+        + ':' + state + ':' + (card ? card.bounce_count : 0)
         + ':' + (card && bounceComposing(card.num) ? 'b' : ''),
-      make: () => evidencePacket(packet, card, state, app, walking),
+      make: () => evidencePacket(packet, card, state, app),
     });
   }
   return out;
@@ -348,7 +344,7 @@ function questionPanel(card, q, app) {
 
 // ---- the evidence packet -------------------------------------------------
 
-function evidencePacket(packet, card, state, app, walking) {
+function evidencePacket(packet, card, state, app) {
   const p = packet || {};
   const item = h('div.item');
   const box = h('div.packet');
@@ -419,11 +415,7 @@ function evidencePacket(packet, card, state, app, walking) {
     box.appendChild(per);
   }
 
-  if (state === 'ready' && !walking) box.appendChild(verdictBar(card, app));
-  else if (state === 'ready') {
-    box.appendChild(h('p.packet-walking',
-      'Approve, Bounce or Skip are pinned at the bottom of this panel while you are walking the queue.'));
-  }
+  if (state === 'ready') box.appendChild(verdictBar(card, app));
   item.appendChild(box);
   return item;
 }

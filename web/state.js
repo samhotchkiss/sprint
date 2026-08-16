@@ -106,6 +106,11 @@ export const store = {
   sidebar: [],            // sprint-level chat events
   seq: 0,
   detail: null,           // {num, card, timeline, evidence, attachments, pendingLines}
+  // Which work unit's outline the rail is showing, as {lead: <card num>} — the
+  // unit itself is never stored, only the card you opened it from (card #55).
+  // A unit is a projection over the cards under review, so it is recomputed
+  // every paint and dissolves by itself when its members stop needing you.
+  unit: null,
   drafts: new Map(),      // freeform text kept across re-renders
   bouncing: new Set(),    // card nums whose verdict row is mid-BOUNCE (see below)
   attached: new Map(),    // composer key -> images pasted but not sent yet

@@ -1,9 +1,9 @@
 // The right rail — 480px on the desktop, a 452px slide-over on the Fold.
 //
-// One thing occupies it at a time: the session chat, or one card's thread. That
-// is the whole rule, and it is why the Chat button un-highlights the moment a
-// card takes the rail — the rail belongs to the card now, and nothing on screen
-// should suggest otherwise.
+// One thing occupies it at a time: the session chat, one card's thread, or one
+// work unit's outline (card #55). That is the whole rule, and it is why the Chat
+// button un-highlights the moment a card takes the rail — the rail belongs to
+// the card now, and nothing on screen should suggest otherwise.
 //
 // The composer is pinned to the bottom with the line that explains what this
 // place is: everything here appends, nothing is rewritten.
@@ -19,10 +19,17 @@ import { store, cardState, isSilent, draft, attachedImages } from './state.js';
 import { phaseOf, phaseChip } from './phase.js';
 import { renderThread, renderChat } from './thread.js';
 import { initCompose } from './compose.js';
-import { flowBarSig, reviewBar } from './review.js';
+import { unitInReview, unitSig, unitHead, unitOutline, unitBar } from './review.js';
 
 export function renderRail(root, app) {
-  const owner = railOwner();
+  // A work unit takes the rail as a whole page — the outline, then one Approve
+  // for the lot. It is resolved fresh every paint: the unit is a projection over
+  // whatever is still under review, so a unit that has dissolved (everything
+  // merged, everything bounced) closes itself rather than hanging around.
+  const unit = store.unit ? unitInReview(store.unit.lead) : null;
+  if (store.unit && !unit) store.unit = null;
+
+  const owner = railOwner(unit);
   if (!owner) {
     if (root.firstChild) clear(root);
     root.dataset.owner = '';
@@ -31,6 +38,13 @@ export function renderRail(root, app) {
   const same = root.dataset.owner === owner;
   if (!same) clear(root);            // a different card owns the rail: start clean
   root.dataset.owner = owner;
+
+  if (unit && !store.detail) {
+    syncPart(root, 'rail-head', unit.key + '|' + unit.size, () => unitHead(unit, app));
+    syncPart(root, 'unit-outline', unitSig(unit), () => unitOutline(unit, app));
+    syncPart(root, 'unit-bar', unitSig(unit), () => unitBar(unit, app));
+    return;
+  }
 
   const keep = same ? root.querySelector('.thread') : null;
   const prevTop = keep ? keep.scrollTop : null;
@@ -48,11 +62,6 @@ export function renderRail(root, app) {
     } else {
       renderThread(thread, { ...detail, state: cardState(card) }, app);
     }
-    // The walkthrough's action bar, when this card is the one it is on. It sits
-    // between the thread and the composer and it is the ONLY verdict on screen
-    // while it is up — the packet drops its own buttons rather than showing you
-    // two Approves that do the same thing.
-    syncOptional(root, 'review-bar', barSig(card), () => reviewBar(card, app));
     // The composer is the ONE thing on this page you may be mid-sentence in, so
     // it is keyed on the card alone and never rebuilt for anything else: a state
     // flip, a silence, a question arriving all *tune* it in place. Rebuilding it
@@ -92,41 +101,13 @@ function syncPart(root, cls, sig, build) {
   return node;
 }
 
-/**
- * A part that is sometimes not there at all. Same signature contract as
- * `syncPart`; a null signature removes it. It has to be placed before the
- * composer, so it is inserted rather than appended.
- */
-function syncOptional(root, cls, sig, build) {
-  const found = root.querySelector('.' + cls);
-  if (sig == null) {
-    if (found) root.removeChild(found);
-    return null;
-  }
-  const want = String(sig);
-  if (found && found.dataset.sig === want) return found;
-  const node = build();
-  node.dataset.sig = want;
-  if (found) root.replaceChild(node, found);
-  else root.insertBefore(node, root.querySelector('.composer') || null);
-  return node;
-}
-
-/**
- * Null unless the walkthrough is standing on this exact card, ready for a
- * verdict. review.js owns the signature: a unit step's bar also changes while
- * its members are being approved one after another.
- */
-function barSig(card) {
-  return flowBarSig(card);
-}
-
 function headSig(detail, card) {
   if (!card) return 'loading:' + detail.num;
   // The phase (and whether it has run past what it claimed) is part of the head
   // now, so it has to be part of what makes the head repaint.
   const ph = phaseOf(card);
   return [detail.num, card.title, cardState(card), card.pinned ? 'p' : '',
+    detail.fromUnit != null ? 'u' + detail.fromUnit : '',
     ph ? `${ph.name}@${ph.since}${ph.overdue ? '!' : ''}` : ''].join('|');
 }
 
@@ -149,8 +130,9 @@ function draftKey(card) {
   return 'card:' + card.num;
 }
 
-function railOwner() {
+function railOwner(unit) {
   if (store.detail) return 'card:' + store.detail.num;
+  if (unit) return 'unit:' + unit.key;
   if (store.chatOpen) return 'chat';
   return '';
 }
@@ -173,6 +155,13 @@ function chatHead() {
 function cardHead(detail, card, app) {
   const state = card ? cardState(card) : null;
   const head = h('div.rail-head');
+  // You came here from a unit's outline to read one member's own history; the
+  // way back is where you left from, not the whole board.
+  if (detail.fromUnit != null) {
+    head.appendChild(h('button.rail-back', {
+      type: 'button', title: 'back to the outline', onclick: () => app.openUnit(detail.fromUnit),
+    }, '‹ Unit'));
+  }
   head.appendChild(h('span.rail-num', '#' + detail.num));
   head.appendChild(h('span.rail-title', { title: card ? card.title : '' }, card ? card.title : 'Loading…'));
   // The same chip the card face carries: opening a card should not cost you the
