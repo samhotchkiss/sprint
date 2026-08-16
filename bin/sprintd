@@ -9,7 +9,7 @@ dispatches, resumes, nudges, batches, merges and escalates. sprintd never runs
 agents and never makes decisions -- it validates transitions, appends to an
 append-only event log, and hands the session a cursor to drain.
 
-Subcommands: start | stop | status | wait | doctor | hub
+Subcommands: start | stop | status | tail | wait | doctor | hub
 """
 
 from __future__ import annotations
@@ -72,6 +72,14 @@ DEFAULT_WAITER_ONLINE_SECONDS = 10.0            # waiter seen this recently == a
 DEFAULT_WAITER_GONE_SECONDS = 30.0             # waiter unseen this long == really gone
 DEFAULT_WAITER_PERSIST_SECONDS = 5.0           # how often the waiter mark hits disk
 DEFAULT_SSE_HEARTBEAT = 15.0                    # per spec
+
+# `sprintd tail` -- the quiet ingress. It never exits on its own, so every
+# knob here is about how loudly it fails, not whether it gives up.
+TAIL_TEXT_MAX = 120            # chars of `payload.text` on a tail line
+TAIL_BACKOFF_MIN = 0.25        # first reconnect delay after a drop
+TAIL_BACKOFF_MAX = 5.0         # ...doubling up to here, forever
+TAIL_READ_TIMEOUT = 45.0       # 3 missed 15s heartbeats == this stream is dead
+TAIL_UNREACHABLE_SECONDS = 60.0  # down this long: say so ONCE, then keep trying
 
 ACTORS = ("user", "session", "worker", "server")
 EVENT_KINDS = (
@@ -2354,6 +2362,11 @@ def make_handler(app: App):
                 return self._send(200, fh.read(), ctype)
 
         def _stream(self, query):
+            # `sprintd tail` holds this stream open as the session's ingress.
+            # A held-open stream is proof of attachment exactly like the
+            # waiter's polling is -- but only if it says so (a browser's
+            # EventSource cannot send the header, and must never count).
+            waiter = self.is_waiter(query)
             after = 0
             lei = self.headers.get("Last-Event-ID")
             if lei and str(lei).strip().isdigit():
@@ -2397,6 +2410,8 @@ def make_handler(app: App):
                                  "after": after})).encode("utf-8")
 
             try:
+                if waiter:
+                    app.note_waiter_seen()
                 self.wfile.write(b": connected\n\nretry: 2000\n\n")
                 self.wfile.write(hello_frame())
                 cursor = app.cursor_seq()
@@ -2404,6 +2419,11 @@ def make_handler(app: App):
                 self.wfile.flush()
                 last_beat = now()
                 while not app.stopping.is_set():
+                    # Sitting here IS the heartbeat: refresh the sighting every
+                    # tick (~1s) so a session that is quietly listening never
+                    # reads as offline. In-memory; the disk write is throttled.
+                    if waiter:
+                        app.note_waiter_seen()
                     # Hold cond across the read so a concurrent write cannot
                     # slip its notify() between the query and the wait.
                     with app.cond:
@@ -3254,6 +3274,154 @@ def cmd_wait(args) -> int:
             print(jdump({"after": after, "head": data.get("head"), "timeout": True}))
             return 2
         time.sleep(min(poll, remaining))
+
+
+def tail_line(ev: dict, limit: int = TAIL_TEXT_MAX) -> dict:
+    """One event -> the one compact line a monitor reads.
+
+    Fixed key set, fixed order, every key always present: whatever is
+    watching this stream should be able to read a field without first
+    checking whether it exists. `reply_to` is the whole point of the line
+    for the session -- present means a human said this and is waiting.
+    """
+    payload = ev.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    reply_to = payload.get("reply_to")
+    return {
+        "seq": ev.get("seq"),
+        "card": ev.get("card_num"),
+        "actor": ev.get("actor"),
+        "kind": ev.get("kind"),
+        "reply_to": reply_to if isinstance(reply_to, str) else None,
+        "text": one_line(payload.get("text") or "", limit),
+    }
+
+
+def sse_frames(resp):
+    """Yield (event_name_or_None, data_text) per SSE frame off a live response.
+
+    Comments (`: heartbeat`), `retry:` and `id:` lines are structure, not
+    content -- they are consumed and never yielded, because waking a monitor
+    on a heartbeat is exactly what this command exists to avoid.
+    """
+    name, data = None, []
+    while True:
+        try:
+            raw = resp.fp.readline()
+        except (AttributeError, ValueError):
+            return
+        if not raw:
+            return
+        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if line == "":
+            if data:
+                yield name, "\n".join(data)
+            name, data = None, []
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        value = value[1:] if value.startswith(" ") else value
+        if field == "event":
+            name = value.strip()
+        elif field == "data":
+            data.append(value)
+
+
+def cmd_tail(args) -> int:
+    """Follow the board's event log, one compact JSON line per event.
+
+    This is the session's quiet ingress: it lives under a streaming monitor,
+    so it must wake that monitor exactly once per real event and never for
+    anything else -- no heartbeats, no cursor moves, no reconnect chatter.
+    It never exits on its own; a server that is gone is a thing to report
+    once and keep retrying, not a reason to die.
+    """
+    project_root = os.path.realpath(args.project_root or find_project_root())
+    p = paths_for(project_root, args.data_dir)
+    after = max(0, int(args.after or 0))
+    user_only = bool(args.user_only)
+    unreachable_after = float(args.unreachable_after)
+    read_timeout = float(args.read_timeout)
+
+    generation = None
+    port = args.port
+    token = args.token
+    down_since = None
+    said_unreachable = False
+    backoff = TAIL_BACKOFF_MIN
+
+    def emit(obj):
+        sys.stdout.write(jdump(obj) + "\n")
+        sys.stdout.flush()
+
+    while True:
+        info = read_server_json(p["server_json"]) or {}
+        # Last known port/token wins over the built-in default: mid-restart
+        # there is no server.json, and guessing DEFAULT_PORT there would
+        # attach us to whatever else happens to own 8377.
+        port = args.port or info.get("port") or port or DEFAULT_PORT
+        token = args.token or info.get("token") or token
+        conn = None
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port,
+                                              timeout=read_timeout)
+            headers = {"Accept": "text/event-stream",
+                       # the session is listening here; this stream is its
+                       # proof of life exactly as the waiter's polling is
+                       WAITER_HEADER: "sprintd-tail"}
+            if token:
+                headers["Authorization"] = "Bearer " + token
+            conn.request("GET", "/api/stream?after=%d" % after, headers=headers)
+            resp = conn.getresponse()
+            if resp.status != 200:
+                raise ConnectionError("HTTP %s" % resp.status)
+            down_since = None
+            said_unreachable = False
+            backoff = TAIL_BACKOFF_MIN
+            for name, data in sse_frames(resp):
+                obj = jload(data, None)
+                if not isinstance(obj, dict):
+                    continue
+                if name in ("hello", "cursor"):
+                    gen = obj.get("generation")
+                    if gen:
+                        if generation is not None and gen != generation:
+                            # A different process is answering on this port:
+                            # whatever is watching needs to know its backend
+                            # restarted, and this is the only frame that says so.
+                            emit({"restart": True, "generation": gen,
+                                  "after": after, "head": obj.get("head")})
+                        generation = gen
+                    continue
+                if name:
+                    continue          # some future named frame; not an event
+                seq = obj.get("seq")
+                if not isinstance(seq, int):
+                    continue
+                if seq <= after:
+                    continue          # resume overlap: at-least-once on the
+                                      # wire, exactly once on stdout
+                after = seq
+                if user_only and obj.get("actor") != "user":
+                    continue
+                emit(tail_line(obj))
+        except (OSError, http.client.HTTPException, ValueError):
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        if down_since is None:
+            down_since = now()
+        if not said_unreachable and now() - down_since >= unreachable_after:
+            emit({"error": "unreachable"})
+            said_unreachable = True
+        time.sleep(backoff)
+        backoff = min(TAIL_BACKOFF_MAX, backoff * 2)
 
 
 def cmd_doctor(args) -> int:
@@ -4183,6 +4351,24 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--port", type=int, default=None)
     s.add_argument("--token", default=None)
     s.set_defaults(func=cmd_wait)
+
+    s = sub.add_parser("tail", help="follow the event log, one JSON line per event "
+                                    "(never exits; runs under a streaming monitor)")
+    s.add_argument("--after", type=int, default=0,
+                   help="catch up from this seq before streaming (your cursor)")
+    s.add_argument("--user-only", action="store_true",
+                   help="print only actor=user events -- the ones a session must "
+                        "answer promptly")
+    s.add_argument("--port", type=int, default=None)
+    s.add_argument("--token", default=None)
+    s.add_argument("--read-timeout", type=float, default=TAIL_READ_TIMEOUT,
+                   help="seconds of silence that count as a dead stream "
+                        "(default %g)" % TAIL_READ_TIMEOUT)
+    s.add_argument("--unreachable-after", type=float,
+                   default=TAIL_UNREACHABLE_SECONDS,
+                   help="seconds down before printing one {\"error\":\"unreachable\"} "
+                        "line (default %g)" % TAIL_UNREACHABLE_SECONDS)
+    s.set_defaults(func=cmd_tail)
 
     s = sub.add_parser("doctor", help="check the environment; fix what is safe to fix")
     s.add_argument("--install-launchd", action="store_true",
