@@ -526,6 +526,272 @@ def image_line(n: int) -> str:
     return "sent a screenshot" if n == 1 else "sent %d screenshots" % n
 
 
+def report_line(n: int) -> str:
+    return "attached a report" if n == 1 else "attached %d reports" % n
+
+
+# --------------------------------------------------------------------------
+# Reports: markdown/HTML documents as first-class attachments
+#
+# An agent's real output is often a DOCUMENT -- a findings write-up, a
+# comparison table, a migration plan -- and pasting 400 lines of it into a chat
+# one-liner destroys both the document and the timeline. So a report rides the
+# exact same content-addressed attachment store an image does, and renders in
+# the thread as a skim line (its title) that expands into the whole rendered
+# page.
+#
+# Two document kinds, two safety stories:
+#
+#   .md    We render it OURSELVES, server-side, with the small renderer below.
+#          Raw HTML inside a .md is ESCAPED, never passed through -- a report
+#          that contains `<script>` renders the characters `<script>`, inert.
+#          There is no sanitizer to get wrong because no author markup is ever
+#          treated as markup.
+#   .html  We do NOT render or rewrite it. It is served back under a
+#          `Content-Security-Policy: sandbox` header (unique opaque origin, no
+#          scripts, no same-origin access) AND displayed only inside an iframe
+#          carrying a restrictive `sandbox` attribute. Belt and braces: even a
+#          direct navigation to the raw URL cannot touch the board's session.
+#
+# Reports are TEXT. There are no magic bytes to sniff, so the check is: the
+# name carries a known document extension, the bytes decode as strict UTF-8,
+# and there are no NULs (that is what "a binary wearing a .md" looks like).
+REPORT_KIND_BY_EXT = {
+    "md": "md", "markdown": "md", "mdown": "md",
+    "html": "html", "htm": "html",
+}
+REPORT_EXT_OF_KIND = {"md": "md", "html": "html"}
+REPORT_MIME_OF_KIND = {"md": "text/markdown; charset=utf-8",
+                       "html": "text/html; charset=utf-8"}
+# A report is prose, not a payload. 2 MB is a very long document and still an
+# order of magnitude under the request cap; past that it is not a report.
+REPORT_MAX_BYTES = 2 * 1024 * 1024
+REPORT_NAME_RE = re.compile(r"^([0-9a-f]{64})\.(md|html)$")
+REPORT_URL_RE = re.compile(r"^/api/attachments/([0-9a-f]{64})\.(md|html)$")
+# Which link targets survive rendering. Anything else (javascript:, data:,
+# vbscript:) is dropped to plain text -- a link you cannot see is better than
+# one that runs.
+SAFE_URL_RE = re.compile(r"^(https?://|mailto:|/|#|\./|\.\./)", re.I)
+
+
+def report_kind_for_name(name) -> str:
+    """'md' | 'html' | None -- decided by extension alone, deliberately."""
+    base = os.path.basename(str(name or "")).strip().lower()
+    if "." not in base:
+        return None
+    return REPORT_KIND_BY_EXT.get(base.rsplit(".", 1)[1])
+
+
+def esc(text) -> str:
+    """The whole safety story of the markdown renderer, in one function.
+
+    Everything an author wrote becomes text BEFORE any tag is generated, so no
+    author-supplied markup ever reaches the browser as markup."""
+    return (str("" if text is None else text)
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def safe_url(url) -> str:
+    u = str(url or "").strip()
+    if not u or not SAFE_URL_RE.match(u):
+        return ""
+    return esc(u)
+
+
+def render_inline(text: str) -> str:
+    """Inline markdown over ALREADY-ESCAPED text.
+
+    Order matters: code spans are lifted out first (their contents are never
+    re-scanned for emphasis), then links/images, then emphasis. Placeholders
+    are NUL-delimited, and NUL can never appear in a stored report -- that is
+    exactly what `store_document` rejects."""
+    out = esc(text)
+    stash = []
+
+    def keep(html: str) -> str:
+        stash.append(html)
+        return "\x00%d\x00" % (len(stash) - 1)
+
+    out = re.sub(r"`([^`]+)`", lambda m: keep("<code>%s</code>" % m.group(1)), out)
+    out = re.sub(
+        r"!\[([^\]]*)\]\(([^)\s]+)\)",
+        lambda m: keep('<img src="%s" alt="%s">' % (safe_url(m.group(2)), m.group(1)))
+        if safe_url(m.group(2)) else m.group(1),
+        out)
+    out = re.sub(
+        r"\[([^\]]+)\]\(([^)\s]+)\)",
+        lambda m: keep('<a href="%s" rel="noreferrer noopener nofollow" target="_blank">%s</a>'
+                       % (safe_url(m.group(2)), m.group(1)))
+        if safe_url(m.group(2)) else m.group(1),
+        out)
+    out = re.sub(r"~~(.+?)~~", r"<del>\1</del>", out)
+    out = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", out)
+    out = re.sub(r"__(.+?)__", r"<strong>\1</strong>", out)
+    out = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<em>\1</em>", out)
+    out = re.sub(r"(?<![\w_])_([^_\n]+)_(?![\w_])", r"<em>\1</em>", out)
+    return re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], out)
+
+
+def _table_rows(line: str) -> list:
+    cells = line.strip()
+    if cells.startswith("|"):
+        cells = cells[1:]
+    if cells.endswith("|"):
+        cells = cells[:-1]
+    return [c.strip() for c in cells.split("|")]
+
+
+def render_markdown(text: str) -> str:
+    """A small, deliberate markdown subset -- no dependencies, ever.
+
+    Headings, fenced code, blockquotes, nested lists, tables, rules, links,
+    images, emphasis, inline code. Everything else is a paragraph. Raw HTML is
+    escaped, never emitted: see `esc`."""
+    lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out, i = [], 0
+    # open list stack: (tag, indent, nested_in_li) -- a deeper list is opened
+    # INSIDE the <li> above it, which is what makes it indent correctly.
+    stack = []
+
+    def close_lists(to_indent=-1):
+        while stack and stack[-1][1] > to_indent:
+            tag, _, nested = stack.pop()
+            out.append("</%s>%s" % (tag, "</li>" if nested else ""))
+
+    while i < len(lines):
+        raw = lines[i]
+        line = raw.rstrip()
+        stripped = line.strip()
+
+        if not stripped:
+            close_lists()
+            i += 1
+            continue
+
+        m = re.match(r"^(\s*)```+\s*([\w.+-]*)\s*$", line)
+        if m:
+            close_lists()
+            lang, body, i = m.group(2), [], i + 1
+            while i < len(lines) and not re.match(r"^\s*```+\s*$", lines[i]):
+                body.append(lines[i])
+                i += 1
+            i += 1                       # the closing fence (or EOF)
+            cls = ' class="lang-%s"' % esc(lang) if lang else ""
+            out.append("<pre><code%s>%s</code></pre>" % (cls, esc("\n".join(body))))
+            continue
+
+        if re.match(r"^\s*([-*_])\s*(\1\s*){2,}$", line):
+            close_lists()
+            out.append("<hr>")
+            i += 1
+            continue
+
+        m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if m:
+            close_lists()
+            level = len(m.group(1))
+            out.append("<h%d>%s</h%d>" % (level, render_inline(m.group(2).rstrip("#").strip()), level))
+            i += 1
+            continue
+
+        if stripped.startswith(">"):
+            close_lists()
+            quote = []
+            while i < len(lines) and lines[i].strip().startswith(">"):
+                quote.append(lines[i].strip()[1:].lstrip())
+                i += 1
+            out.append("<blockquote>%s</blockquote>" % render_markdown("\n".join(quote)))
+            continue
+
+        # table: a header row followed by a |---|---| separator
+        if "|" in stripped and i + 1 < len(lines) and \
+                re.match(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$", lines[i + 1]) and \
+                "|" in lines[i + 1]:
+            close_lists()
+            head = _table_rows(stripped)
+            i += 2
+            body = []
+            while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                body.append(_table_rows(lines[i]))
+                i += 1
+            cells = "".join("<th>%s</th>" % render_inline(c) for c in head)
+            rows = "".join(
+                "<tr>%s</tr>" % "".join("<td>%s</td>" % render_inline(c) for c in r)
+                for r in body)
+            out.append("<table><thead><tr>%s</tr></thead><tbody>%s</tbody></table>"
+                       % (cells, rows))
+            continue
+
+        m = re.match(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$", line)
+        if m:
+            indent = len(m.group(1).expandtabs(4))
+            tag = "ul" if m.group(2) in ("-", "*", "+") else "ol"
+            close_lists(indent)
+            if not stack or stack[-1][1] < indent:
+                # reopen the <li> above so the sub-list lives inside it
+                nested = bool(stack) and out and out[-1].endswith("</li>")
+                if nested:
+                    out[-1] = out[-1][: -len("</li>")]
+                stack.append((tag, indent, nested))
+                out.append("<%s>" % tag)
+            elif stack[-1][0] != tag:
+                otag, oind, onest = stack.pop()
+                out.append("</%s>" % otag)
+                stack.append((tag, oind, onest))
+                out.append("<%s>" % tag)
+            out.append("<li>%s</li>" % render_inline(m.group(3)))
+            i += 1
+            continue
+
+        close_lists()
+        para = []
+        while i < len(lines) and lines[i].strip() and \
+                not re.match(r"^(\s*)(#{1,6}\s|>|```|([-*+]|\d+[.)])\s)", lines[i]):
+            para.append(lines[i].strip())
+            i += 1
+        if para:
+            out.append("<p>%s</p>" % render_inline("\n".join(para)).replace("\n", "<br>"))
+        else:                              # a construct we just refused to eat
+            out.append("<p>%s</p>" % render_inline(stripped))
+            i += 1
+    close_lists()
+    return "\n".join(out)
+
+
+def report_title(kind: str, text: str, name: str = None) -> str:
+    """The skim line: what this document calls itself."""
+    fallback = os.path.basename(str(name or "")) or "report"
+    body = str(text or "")
+    if kind == "html":
+        m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S) or \
+            re.search(r"<h1[^>]*>(.*?)</h1>", body, re.I | re.S)
+        if m:
+            title = re.sub(r"<[^>]+>", " ", m.group(1))
+            title = html_unescape_lite(" ".join(title.split()))
+            if title:
+                return one_line(title, 120)
+        return fallback
+    for raw in body.split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("```"):
+            continue
+        m = re.match(r"^#{1,6}\s+(.*)$", line)
+        if m:
+            line = m.group(1)
+        line = re.sub(r"[*_`>#]+", "", line).strip()
+        if line:
+            return one_line(line, 120)
+    return fallback
+
+
+def html_unescape_lite(text: str) -> str:
+    for a, b in (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'),
+                 ("&#39;", "'"), ("&amp;", "&")):
+        text = text.replace(a, b)
+    return text
+
+
 class ApiError(Exception):
     def __init__(self, status: int, code: str, message: str = "", **extra):
         super().__init__(message or code)
@@ -750,6 +1016,14 @@ class App:
         for key in ("attachments", "images", "screenshots"):
             if isinstance(out.get(key), list) and out[key]:
                 out[key] = self.ingest_refs(out[key])
+        # `reports` on a worker event is a list of .md/.html paths, and it lands
+        # in `attachments` beside any images so the thread has ONE list to read.
+        if isinstance(out.get("reports"), list) and out["reports"]:
+            docs = [d for d in self.ingest_report_refs(out.pop("reports"))
+                    if isinstance(d, dict) and d.get("doc")]
+            if docs:
+                atts = out.get("attachments")
+                out["attachments"] = (atts if isinstance(atts, list) else []) + docs
         return out
 
     @staticmethod
@@ -966,10 +1240,11 @@ class App:
             "answered_at": row["answered_at"], "created_at": row["created_at"],
         }
 
-    def create_card(self, text: str, images: list, hold: bool, actor: str = "user") -> dict:
+    def create_card(self, text: str, images: list, hold: bool, actor: str = "user",
+                    reports: list = None) -> dict:
         text = (text or "").strip()
         images = images or []
-        if not text and not images:
+        if not text and not images and not (reports or []):
             raise ApiError(400, "empty_submission",
                            "at least one of text or images is required")
         sprint = self.open_sprint(create=True)
@@ -979,8 +1254,11 @@ class App:
         # Attachments are content-addressed and written to disk BEFORE the
         # event that references them.
         attachments = self.store_images(images)
+        docs = self.store_reports(reports)
+        attachments = attachments + docs
 
-        title = first_line_title(text) or "(image only)"
+        title = first_line_title(text) or \
+            (docs[0]["title"] if docs else None) or "(image only)"
         ts = now()
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -991,9 +1269,10 @@ class App:
                     (sprint["id"] if sprint else None, state, title, text, ts, ts))
                 num = int(cur.lastrowid)
                 self._append_event(num, actor, "submitted", {
-                    "text": text or image_line(len(attachments)),
+                    "text": text or (report_line(len(docs)) if docs
+                                     else image_line(len(attachments))),
                     "attachments": attachments,
-                    "images_only": not text,
+                    "images_only": not text and not docs,
                     "hold": bool(hold or hold_mode)})
                 self._append_event(num, "server", "state", {
                     "from": None, "to": state,
@@ -1072,6 +1351,254 @@ class App:
                            field=field)
         return [self.store_attachment(img) for img in images]
 
+    # -- reports: markdown / html documents --------------------------------
+
+    def store_document(self, blob: bytes, name: str) -> dict:
+        """Content-address one REPORT to disk and return a ready-to-use ref.
+
+        Deliberately a separate door from `store_blob`: `images:` stays png/jpeg
+        only, so nothing that ever worked starts accepting text. The sniff here
+        is the honest one for a text format -- known extension, strict UTF-8, no
+        NULs (a binary wearing a .md name fails all three)."""
+        kind = report_kind_for_name(name)
+        if not kind:
+            raise ApiError(400, "bad_report",
+                           "reports must be .md or .html (got %r)" % (name or ""))
+        if not blob:
+            raise ApiError(400, "bad_report", "report is empty")
+        if len(blob) > REPORT_MAX_BYTES:
+            raise ApiError(413, "too_large",
+                           "a report may not exceed %d bytes" % REPORT_MAX_BYTES)
+        if b"\x00" in blob:
+            raise ApiError(400, "bad_report",
+                           "report contains NUL bytes — that is not a text document")
+        try:
+            text = blob.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ApiError(400, "bad_report", "report must be valid UTF-8 text")
+        ext = REPORT_EXT_OF_KIND[kind]
+        sha = hashlib.sha256(blob).hexdigest()
+        path = os.path.join(self.attach_dir, "%s.%s" % (sha, ext))
+        if not os.path.exists(path):
+            tmp = path + ".part-%s" % secrets.token_hex(6)
+            with open(tmp, "wb") as fh:
+                fh.write(blob)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        return {"sha256": sha, "path": path, "mime": REPORT_MIME_OF_KIND[kind],
+                "bytes": len(blob), "name": os.path.basename(str(name)),
+                "kind": "report", "doc": kind,
+                "title": report_title(kind, text, name),
+                "url": self.attach_url(sha, ext),
+                "view_url": "#/report/%s.%s" % (sha, ext)}
+
+    def store_report(self, rep) -> dict:
+        """Accept {name, text} | {name, data|b64 (base64)} | a data: URL string.
+
+        A report is text, so `text` is the natural shape for an agent and
+        `data` is the natural shape for a browser that just read a File."""
+        name, text, data_s = None, None, ""
+        if isinstance(rep, dict):
+            name = rep.get("name") or rep.get("filename")
+            text = rep.get("text") if isinstance(rep.get("text"), str) else None
+            data_s = rep.get("data") or rep.get("b64") or ""
+        elif isinstance(rep, str):
+            data_s = rep
+        else:
+            raise ApiError(400, "bad_report", "each report must be an object or a data: URL")
+        if text is not None:
+            if not name:
+                raise ApiError(400, "bad_report", "a report needs a name so we know .md from .html")
+            return self.store_document(text.encode("utf-8"), name)
+        if not isinstance(data_s, str) or not data_s.strip():
+            raise ApiError(400, "bad_report", "report entry is empty")
+        if data_s.startswith("data:"):
+            head, _, data_s = data_s.partition(",")
+            if "base64" not in head:
+                raise ApiError(400, "bad_report", "data: URLs must be base64")
+            if not name:
+                m = re.match(r"^data:text/(markdown|html)", head, re.I)
+                name = "report.md" if (m and m.group(1).lower() == "markdown") else \
+                    ("report.html" if m else None)
+        if not name:
+            raise ApiError(400, "bad_report", "a report needs a name so we know .md from .html")
+        try:
+            blob = base64.b64decode(re.sub(r"\s+", "", data_s), validate=True)
+        except (binascii.Error, ValueError):
+            raise ApiError(400, "bad_report", "report is not valid base64")
+        return self.store_document(blob, name)
+
+    def store_reports(self, reports, field: str = "reports") -> list:
+        if reports is None:
+            return []
+        if not isinstance(reports, list):
+            raise ApiError(400, "bad_report", "%s must be a list of documents" % field,
+                           field=field)
+        return [self.store_report(r) for r in reports]
+
+    def ingest_report_ref(self, ref):
+        """A packet's `reports` entry -> a ref the board can open.
+
+        Workers hand us absolute paths, exactly as they do for screenshots."""
+        if isinstance(ref, dict):
+            out = dict(ref)
+            if isinstance(out.get("url"), str) and out["url"] and out.get("doc"):
+                return out
+            src = out.get("path") or out.get("file") or out.get("src")
+            if isinstance(src, str) and src:
+                merged = self.ingest_report_ref(src)
+                if isinstance(merged, dict) and merged.get("doc"):
+                    if out.get("name"):
+                        merged["name"] = out["name"]
+                    return merged
+            return out
+        if not isinstance(ref, str) or not ref.strip():
+            return ref
+        s = ref.strip()
+        m = REPORT_URL_RE.match(s) or REPORT_NAME_RE.match(s)
+        if m:
+            return {"sha256": m.group(1), "name": os.path.basename(s),
+                    "kind": "report", "doc": REPORT_KIND_BY_EXT[m.group(2)],
+                    "url": self.attach_url(m.group(1), m.group(2)),
+                    "view_url": "#/report/%s.%s" % (m.group(1), m.group(2))}
+        try:
+            if os.path.isfile(s) and os.path.getsize(s) <= REPORT_MAX_BYTES:
+                with open(s, "rb") as fh:
+                    blob = fh.read()
+                stored = self.store_document(blob, os.path.basename(s))
+                stored["source_path"] = os.path.realpath(s)
+                return stored
+        except (OSError, ApiError):
+            pass
+        return {"name": os.path.basename(s) or s}
+
+    def ingest_report_refs(self, refs):
+        if not isinstance(refs, list):
+            return refs
+        return [self.ingest_report_ref(r) for r in refs]
+
+    @staticmethod
+    def reports_in_payload(payload) -> list:
+        """Every report ref a single event payload carries, wherever it sits.
+
+        Reports ride in `attachments` (they are attachments), and a packet
+        additionally carries its own `reports` list -- an evidence packet is a
+        document envelope as much as a screenshot one."""
+        out = []
+        if not isinstance(payload, dict):
+            return out
+        buckets = [payload.get("attachments"), payload.get("reports")]
+        packet = payload.get("packet")
+        if isinstance(packet, dict):
+            buckets.append(packet.get("reports"))
+        for bucket in buckets:
+            if not isinstance(bucket, list):
+                continue
+            for ref in bucket:
+                if isinstance(ref, dict) and ref.get("doc") in ("md", "html") \
+                        and re.match(r"^[0-9a-f]{64}$", str(ref.get("sha256") or "")):
+                    out.append(ref)
+        return out
+
+    def reports_index(self, scope: str = "sprint") -> dict:
+        """Every report document in this sprint (or, with scope=all, ever).
+
+        User ruling, verbatim: "link should only appear once there's a report
+        within the sprint" -- so the DEFAULT scope, and therefore the count the
+        header link reads, is the open sprint and nothing else. History is
+        still reachable, it is just never what decides whether the link is
+        there."""
+        sprint = self.open_sprint(create=False)
+        sprint_id = sprint["id"] if sprint else None
+        titles = {r["num"]: (r["title"] or "") for r in self.q("SELECT num, title FROM cards")}
+        card_sprint = {r["num"]: r["sprint_id"] for r in self.q("SELECT num, sprint_id FROM cards")}
+        opened = sprint["opened_at"] if sprint else None
+        rows = self.q("SELECT seq, card_num, ts, actor, payload FROM events "
+                      "WHERE payload LIKE '%\"doc\":%' ORDER BY seq")
+        seen, out = set(), []
+        for row in rows:
+            payload = jload(row["payload"], {}) or {}
+            num = row["card_num"]
+            if scope != "all":
+                if num is not None:
+                    if sprint_id is None or card_sprint.get(num) != sprint_id:
+                        continue
+                else:
+                    # a sidebar report belongs to whichever sprint was open when
+                    # it was posted
+                    if opened is None or row["ts"] < opened:
+                        continue
+            for ref in self.reports_in_payload(payload):
+                sha = ref["sha256"]
+                if sha in seen:
+                    continue
+                seen.add(sha)
+                ext = REPORT_EXT_OF_KIND[ref["doc"]]
+                out.append({
+                    "sha256": sha,
+                    "doc": ref["doc"],
+                    "name": ref.get("name") or "%s.%s" % (sha[:8], ext),
+                    "title": ref.get("title") or ref.get("name") or "report",
+                    "bytes": ref.get("bytes"),
+                    "card_num": num,
+                    "card_title": titles.get(num) if num is not None else None,
+                    "actor": row["actor"],
+                    "ts": row["ts"],
+                    "seq": row["seq"],
+                    "url": self.attach_url(sha, ext),
+                    "view_url": "#/report/%s.%s" % (sha, ext),
+                })
+        out.sort(key=lambda r: r["ts"], reverse=True)
+        return {"reports": out, "count": len(out), "scope": scope,
+                "sprint": self.sprint_json(sprint) if sprint else None,
+                "generation": self.generation, "server_time": now()}
+
+    def report_count(self) -> int:
+        """How many reports this sprint has -- the header link's whole condition."""
+        try:
+            return self.reports_index("sprint")["count"]
+        except Exception:                  # a count must never break the board
+            return 0
+
+    def report_detail(self, sha: str, ext: str) -> dict:
+        """One report, rendered. Markdown comes back as HTML we generated
+        ourselves; author HTML comes back as a URL to sandbox, never inlined."""
+        kind = REPORT_KIND_BY_EXT.get(ext)
+        if not kind:
+            raise ApiError(404, "no_such_report", "unknown report type")
+        path = os.path.join(self.attach_dir, "%s.%s" % (sha, REPORT_EXT_OF_KIND[kind]))
+        if not os.path.isfile(path):
+            raise ApiError(404, "no_such_report", "unknown report")
+        with open(path, "rb") as fh:
+            blob = fh.read()
+        text = blob.decode("utf-8", "replace")
+        meta = {}
+        for entry in self.reports_index("all")["reports"]:
+            if entry["sha256"] == sha:
+                meta = entry
+                break
+        out = {
+            "sha256": sha, "doc": kind, "bytes": len(blob),
+            "name": meta.get("name") or "%s.%s" % (sha[:8], REPORT_EXT_OF_KIND[kind]),
+            "title": meta.get("title") or report_title(kind, text, meta.get("name")),
+            "card_num": meta.get("card_num"), "card_title": meta.get("card_title"),
+            "actor": meta.get("actor"), "ts": meta.get("ts"),
+            "url": self.attach_url(sha, REPORT_EXT_OF_KIND[kind]),
+            "generation": self.generation,
+        }
+        if kind == "md":
+            # Rendered HERE, by us, out of escaped text. Nothing the author
+            # wrote is ever markup: see `esc` / `render_markdown`.
+            out["html"] = render_markdown(text)
+        else:
+            # Author HTML is never inlined into the board's DOM. The browser
+            # loads this URL into a sandboxed iframe; the response itself
+            # carries `Content-Security-Policy: sandbox` too.
+            out["raw_url"] = out["url"]
+            out["sandboxed"] = True
+        return out
+
     def ingest_ref(self, ref):
         """Turn any attachment/screenshot reference into one the browser can load.
 
@@ -1141,6 +1668,11 @@ class App:
         out = dict(packet)
         if isinstance(out.get("screenshots"), list):
             out["screenshots"] = self.ingest_refs(out["screenshots"])
+        # A packet may ship DOCUMENTS as well as pictures: `reports` is a list
+        # of .md/.html paths the worker wrote, ingested exactly like screenshots
+        # are, so the library and the packet both open the same stored copy.
+        if isinstance(out.get("reports"), list):
+            out["reports"] = self.ingest_report_refs(out["reports"])
         if isinstance(out.get("per_card"), list):
             per = []
             for entry in out["per_card"]:
@@ -1965,7 +2497,7 @@ class App:
                 "card": self.card_json(self.card_row(num), brief=True)}
 
     def card_chat(self, num: int, text: str, images=None, actor: str = "user",
-                  detail=None) -> dict:
+                  detail=None, reports=None) -> dict:
         """A line to one card's thread -- text, images, or both.
 
         Same deal as dropping work on the board: a screenshot with no words is a
@@ -1977,13 +2509,17 @@ class App:
         text = (text or "").strip()
         self.card_row(num)              # 404 before we write anything to disk
         attachments = self.store_images(images)
+        docs = self.store_reports(reports)
+        attachments = attachments + docs
         if not text and not attachments:
             raise ApiError(400, "empty_submission",
                            "at least one of text or images is required")
-        payload = {"text": text or image_line(len(attachments))}
+        payload = {"text": text or (docs[0]["title"] if len(docs) == 1 and not images
+                                    else report_line(len(docs)) if docs
+                                    else image_line(len(attachments)))}
         if attachments:
             payload["attachments"] = attachments
-        if not text:
+        if not text and not docs:
             # The line still needs words to be skimmable on the card face, but
             # the thread should show the picture, not a caption of the picture.
             payload["images_only"] = True
@@ -1991,19 +2527,24 @@ class App:
             payload["detail"] = detail
         return self.card_event(num, "chat", payload, actor=actor)
 
-    def sidebar_post(self, text: str, actor: str, detail=None, images=None) -> dict:
+    def sidebar_post(self, text: str, actor: str, detail=None, images=None,
+                     reports=None) -> dict:
         text = (text or "").strip()
         if actor not in ("user", "session"):
             raise ApiError(400, "bad_actor", "sidebar actor must be user or session")
         attachments = self.store_images(images)
+        docs = self.store_reports(reports)
+        attachments = attachments + docs
         if not text and not attachments:
             raise ApiError(400, "missing_field", "text is required", field="text")
         # Same two-part shape as a card event: a line to skim, an optional
         # expanded version the session can park its working in.
-        payload = {"text": text or image_line(len(attachments))}
+        payload = {"text": text or (docs[0]["title"] if len(docs) == 1 and not images
+                                    else report_line(len(docs)) if docs
+                                    else image_line(len(attachments)))}
         if attachments:
             payload["attachments"] = attachments
-        if not text:
+        if not text and not docs:
             payload["images_only"] = True
         if detail is not None:
             payload["detail"] = detail
@@ -2317,6 +2858,10 @@ class App:
             # reconstruct it by scanning the whole event log.
             "sidebar": self.sidebar_thread(limit=200),
             "batches": [self.batch_json(b) for b in batch_ids],
+            # How many report documents THIS sprint has. The header's Reports
+            # link exists only when this is > 0 -- user, verbatim: "link should
+            # only appear once there's a report within the sprint".
+            "reports": self.report_count(),
             "session": self.session_liveness(),
             # Flat mirror of session.cursor: how far the session has drained.
             "cursor": self.cursor_seq(),
@@ -2683,6 +3228,38 @@ def make_handler(app: App):
                 mime = "image/png" if m.group(2) == "png" else "image/jpeg"
                 return self._send(200, blob, mime)
 
+            # The raw bytes of a report. Markdown is inert to a browser, so it
+            # goes back as text/markdown. Author HTML goes back under
+            # `Content-Security-Policy: sandbox` -- a unique opaque origin with
+            # scripts off -- so even a direct navigation to this URL cannot read
+            # a cookie, reach the board's DOM, or call the API. The iframe that
+            # normally displays it carries a restrictive sandbox attribute too.
+            m = re.match(r"^/api/attachments/([0-9a-f]{64})\.(md|html)$", path)
+            if m:
+                sha, ext = m.group(1), m.group(2)
+                fpath = os.path.join(app.attach_dir, "%s.%s" % (sha, ext))
+                if not os.path.isfile(fpath):
+                    raise ApiError(404, "no_such_attachment", "unknown attachment")
+                with open(fpath, "rb") as fh:
+                    blob = fh.read()
+                extra = [("Content-Disposition", 'inline; filename="%s.%s"' % (sha[:12], ext))]
+                if ext == "html":
+                    extra.append(("Content-Security-Policy",
+                                  "sandbox; default-src 'none'; style-src 'unsafe-inline'; "
+                                  "img-src data:; base-uri 'none'; form-action 'none'"))
+                    extra.append(("Referrer-Policy", "no-referrer"))
+                return self._send(200, blob, REPORT_MIME_OF_KIND[
+                    REPORT_KIND_BY_EXT[ext]], extra)
+
+            if path == "/api/reports":
+                scope = (query.get("scope") or ["sprint"])[0]
+                return self.json_out(200, app.reports_index(
+                    "all" if scope == "all" else "sprint"))
+
+            m = re.match(r"^/api/reports/([0-9a-f]{64})\.(md|html)$", path)
+            if m:
+                return self.json_out(200, app.report_detail(m.group(1), m.group(2)))
+
             if path.startswith("/api/"):
                 raise ApiError(404, "no_such_route", "no route for %s" % path)
             return self._static(path)
@@ -2834,7 +3411,8 @@ def make_handler(app: App):
             if path == "/api/cards":
                 card = app.create_card(body.get("text"), body.get("images") or [],
                                        bool(body.get("hold")),
-                                       actor=actor_hint if actor_hint in ACTORS else "user")
+                                       actor=actor_hint if actor_hint in ACTORS else "user",
+                                       reports=body.get("reports"))
                 return 201, card
 
             if path == "/api/sidebar":
@@ -2842,7 +3420,8 @@ def make_handler(app: App):
                                              actor_hint if actor_hint in ("user", "session")
                                              else "user",
                                              detail=body.get("detail"),
-                                             images=body.get("images"))
+                                             images=body.get("images"),
+                                             reports=body.get("reports"))
 
             if path == "/api/batches":
                 return 201, app.make_batch(body.get("card_nums"), body.get("agent_name"),
@@ -2871,6 +3450,7 @@ def make_handler(app: App):
                 return 201, app.card_chat(num, body.get("text"),
                                           images=body.get("images"),
                                           detail=body.get("detail"),
+                                          reports=body.get("reports"),
                                           actor=actor_hint if actor_hint in ACTORS else "user")
             if verb == "answer":
                 qid = body.get("question_id")
