@@ -23,7 +23,7 @@
 // the group row expands to individual cards rather than acting on them together.
 import { h, timeEl, firstLine, plural } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
-import { cardState, draft } from './state.js';
+import { store, cardState, draft } from './state.js';
 import { shortAgent, openable } from './list.js';
 
 // ---- the model -----------------------------------------------------------
@@ -90,7 +90,7 @@ function groupTitle(members) {
   const leaf = branch ? String(branch).split('/').pop() : '';
   if (leaf && !/^(card|batch)[-_]?\d+$/i.test(leaf)) return humanize(leaf);
   const agent = members[0].agent_name;
-  return agent ? shortAgent(agent) : `${members.length} cards`;
+  return agent ? `Agent ${shortAgent(agent)}` : `${members.length} cards`;
 }
 
 function humanize(s) {
@@ -156,7 +156,23 @@ export function startFlow(app, nums) {
   const queue = (nums || []).filter((n) => n != null);
   if (!queue.length) return;
   flow = { queue, i: 0, approved: 0, bounced: 0, skipped: 0 };
-  app.openCard(queue[0]);
+  flow.i = nextIndex(0);
+  if (flow.i >= queue.length) { flow = null; return; }
+  app.openCard(queue[flow.i]);
+}
+
+/**
+ * The queue is a snapshot, and the board moves underneath it: a card can be
+ * approved from the row, bounced from the rail, or merged by the session while
+ * you are three cards back. Walk past anything that is no longer asking for a
+ * verdict rather than parking the walkthrough on a card with nothing to decide.
+ */
+function nextIndex(from) {
+  for (let i = from; i < flow.queue.length; i += 1) {
+    const card = store.cards.get(flow.queue[i]);
+    if (card && cardState(card) === 'ready') return i;
+  }
+  return flow.queue.length;
 }
 
 export function stopFlow(app) {
@@ -166,7 +182,7 @@ export function stopFlow(app) {
 
 function advance(app) {
   if (!flow) return;
-  flow.i += 1;
+  flow.i = nextIndex(flow.i + 1);
   if (flow.i >= flow.queue.length) {
     const done = flow;
     flow = null;
@@ -287,22 +303,42 @@ function reviewHead(cards, app, compact) {
     },
   }, running ? `Reviewing ${flow.i + 1} of ${flow.queue.length}` : 'Review next');
 
+  // On the Board the column already has an "Awaiting review" heading over it;
+  // saying it twice, two lines apart, is how the first cut of this read.
   const head = h('div.review-head',
-    h('span.review-head-name', 'Awaiting review'),
+    compact ? null : h('span.review-head-name', 'Awaiting review'),
     compact ? null : h('span.review-head-note', line),
     h('span.grow'),
     btn);
   return head;
 }
 
-/** One work unit, collapsed: a row that says what it is and how many. */
+/**
+ * A batch ships ONE packet for the whole branch, with a per-card claim inside
+ * it. Repeating that packet's check step and screenshots on all six member rows
+ * is six copies of one sentence — so when the members really do share a packet,
+ * it is shown once on the unit and the member rows keep only what differs.
+ */
+function sharedPacket(members) {
+  if (members.length < 2) return null;
+  const first = members[0].evidence;
+  if (!first || !Array.isArray(first.per_card) || !first.per_card.length) return null;
+  const claim = first.claim || '';
+  const same = members.every((m) => m.evidence && (m.evidence.claim || '') === claim);
+  if (!same) return null;
+  return packetFor({ ...members[0], evidence: { ...first, per_card: null } });
+}
+
+/** One work unit: what it is, what the branch claims, and a way into it. */
 function groupRow(g, app, { compact }) {
   const isOpen = groupOpen(g.key);
   const wrap = h('div.review-unit', { class: isOpen ? 'review-unit is-open' : 'review-unit' });
+  const shared = sharedPacket(g.cards);
 
   const toggle = h('button.review-group', {
     type: 'button',
     'aria-expanded': isOpen ? 'true' : 'false',
+    title: isOpen ? 'collapse this work unit' : `show all ${g.cards.length} cards`,
     onclick: () => { groupOpen(g.key, !groupOpen(g.key)); app.render(); },
   },
     h('span.review-chev', isOpen ? '▾' : '▸'),
@@ -314,12 +350,63 @@ function groupRow(g, app, { compact }) {
       h('span.row-meta', shortAgent(g.agent), ' · ', timeEl(g.card.last_activity_at, { suffix: false }))));
 
   wrap.appendChild(toggle);
+
+  // The unit leads with the branch's claim and first check, exactly like a
+  // single card does — when there is one branch-wide packet to lead with.
+  const body = h('div.review-unit-body');
+  if (shared) {
+    const lead = h('div.review-unit-claim');
+    lead.appendChild(h('p.review-claim', shared.claim));
+    if (shared.steps.length) {
+      lead.appendChild(h('div.review-check',
+        h('span.step-n', '1'),
+        h('p', firstLine(shared.steps[0], compact ? 150 : 260)),
+        shared.steps.length > 1 ? h('span.review-more', `+${shared.steps.length - 1} more`) : null));
+    }
+    const thumb = thumbFor(shared, app);
+    const holder = h('div.review-unit-lead', lead);
+    if (thumb) holder.appendChild(thumb);
+    body.appendChild(holder);
+  }
+
+  // No group-level Approve, ever: approving six cards with one click is the
+  // blind bulk approve the spec rules out. The unit's action is to WALK it —
+  // same per-card verdicts, one after another.
+  const acts = h('div.review-acts');
+  acts.appendChild(h('button.btn.tiny.review-walk', {
+    type: 'button',
+    title: 'step through these one at a time, oldest first',
+    onclick: () => startFlow(app, g.cards.map((c) => c.num)),
+  }, `Review these ${g.cards.length}`));
+  acts.appendChild(h('button.btn.tiny.ghost.review-toggle-cards', {
+    type: 'button',
+    onclick: () => { groupOpen(g.key, !isOpen); app.render(); },
+  }, isOpen ? 'Hide the cards' : 'Show the cards'));
+  if (shared && shared.live_url) {
+    acts.appendChild(h('a.btn.tiny.ghost.review-live', {
+      href: shared.live_url, target: '_blank', rel: 'noreferrer noopener', title: shared.live_url,
+    }, 'See it live ↗'));
+  }
+  acts.appendChild(h('span.grow'));
+  if (shared) acts.appendChild(h('span.review-meta', unitMeta(shared)));
+  body.appendChild(acts);
+  wrap.appendChild(body);
+
   if (isOpen) {
     const members = h('div.review-members');
-    for (const card of g.cards) members.appendChild(reviewRow(card, app, { compact, inGroup: true }));
+    for (const card of g.cards) {
+      members.appendChild(reviewRow(card, app, { compact, inGroup: true, shared: !!shared }));
+    }
     wrap.appendChild(members);
   }
   return wrap;
+}
+
+function unitMeta(p) {
+  const bits = [];
+  if (p.steps.length) bits.push(`${p.steps.length} ${p.steps.length === 1 ? 'check' : 'checks'}`);
+  if (p.test_result) bits.push(firstLine(p.test_result, 26));
+  return bits.join(' · ');
 }
 
 function groupSub(g) {
@@ -334,7 +421,7 @@ function groupSub(g) {
  * One card, with the verdict on it. The claim and the first check are the whole
  * point: they are what the drawer used to make you go and find.
  */
-export function reviewRow(card, app, { compact = false, inGroup = false } = {}) {
+export function reviewRow(card, app, { compact = false, inGroup = false, shared = false } = {}) {
   const p = packetFor(card);
   const state = cardState(card);
   const merging = state === 'integrating';
@@ -348,7 +435,9 @@ export function reviewRow(card, app, { compact = false, inGroup = false } = {}) 
   const body = h('span.review-body',
     h('span.review-title', card.title),
     h('p.review-claim', p.claim || 'No claim recorded — open it and ask the agent what it thinks it did.'));
-  if (p.steps.length) {
+  // In a batch the check step and the screenshots belong to the branch, not to
+  // this card, and the unit above already showed them once.
+  if (p.steps.length && !shared) {
     body.appendChild(h('div.review-check',
       h('span.step-n', '1'),
       h('p', firstLine(p.steps[0], compact ? 150 : 260)),
@@ -357,11 +446,11 @@ export function reviewRow(card, app, { compact = false, inGroup = false } = {}) 
         : null));
   }
   lead.appendChild(body);
-  const thumb = thumbFor(p, app);
+  const thumb = shared ? null : thumbFor(p, app);
   if (thumb) lead.appendChild(thumb);
   item.appendChild(lead);
 
-  item.appendChild(actionsRow(card, p, app, merging));
+  item.appendChild(actionsRow(card, p, app, merging, shared));
   return item;
 }
 
@@ -382,7 +471,7 @@ function thumbFor(p, app) {
   }, frame, p.shots.length > 1 ? h('span.review-thumb-n', String(p.shots.length)) : null);
 }
 
-function actionsRow(card, p, app, merging) {
+function actionsRow(card, p, app, merging, shared) {
   const key = `bounce:${card.num}`;
   const row = h('div.review-acts');
 
@@ -428,24 +517,24 @@ function actionsRow(card, p, app, merging) {
     title: 'send it back with notes',
     onclick: (e) => { e.stopPropagation(); pop.hidden = !pop.hidden; if (!pop.hidden) notes.focus(); },
   }, 'Bounce'));
-  if (p.live_url) {
+  if (p.live_url && !shared) {
     row.appendChild(h('a.btn.tiny.ghost.review-live', {
       href: p.live_url, target: '_blank', rel: 'noreferrer noopener', title: p.live_url,
       onclick: (e) => e.stopPropagation(),
     }, 'See it live ↗'));
   }
   row.appendChild(h('span.grow'));
-  row.appendChild(h('span.review-meta', metaLine(card, p), ' · ',
+  row.appendChild(h('span.review-meta', metaLine(card, p, shared), ' · ',
     timeEl(card.last_activity_at, { suffix: false })));
 
   const wrap = h('div.review-actwrap', row, pop);
   return wrap;
 }
 
-function metaLine(card, p) {
+function metaLine(card, p, shared) {
   const bits = [shortAgent(card.agent_name)];
-  if (p.steps.length) bits.push(`${p.steps.length} ${p.steps.length === 1 ? 'check' : 'checks'}`);
-  if (p.test_result) bits.push(firstLine(p.test_result, 26));
+  if (p.steps.length && !shared) bits.push(`${p.steps.length} ${p.steps.length === 1 ? 'check' : 'checks'}`);
+  if (p.test_result && !shared) bits.push(firstLine(p.test_result, 26));
   if (card.bounce_count) bits.push(`bounced ${card.bounce_count === 1 ? 'once' : `${card.bounce_count}×`}`);
   return bits.join(' · ');
 }

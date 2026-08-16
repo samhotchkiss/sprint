@@ -1668,7 +1668,14 @@ html.skin-chaos .detail-body { border-top: 2px solid #4a3f8e; }
   font: inherit;
 }
 .review-group:hover { background: var(--hover); }
-.review-chev { flex: 0 0 12px; font-size: 11px; color: var(--faint); }
+.review-chev {
+  flex: 0 0 14px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--dim);
+  text-align: center;
+}
+.review-group:hover .review-chev { color: var(--accent); }
 .review-group-main { flex: 1; min-width: 0; }
 .review-group-title { display: block; font-size: 15.5px; font-weight: 500; color: var(--ink); }
 .review-group-sub {
@@ -1682,6 +1689,17 @@ html.skin-chaos .detail-body { border-top: 2px solid #4a3f8e; }
 }
 .review-group-right { flex: none; text-align: right; }
 .review-members { display: flex; flex-direction: column; border-top: 1px solid var(--rule-row); }
+.review-unit-body {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 0 15px 13px 41px;
+}
+.review-unit-lead { display: flex; gap: 14px; align-items: flex-start; }
+.review-unit-claim { flex: 1; min-width: 0; }
+.review-unit-body .review-claim { margin-top: 0; }
+.btn.review-walk { background: var(--chip); border-color: var(--border-chip); color: var(--dim); }
+.btn.review-walk:hover { border-color: var(--accent); color: var(--ink); }
 
 /* ---- one card, with the verdict on it ----------------------------------- */
 
@@ -1800,8 +1818,31 @@ html.skin-chaos .detail-body { border-top: 2px solid #4a3f8e; }
 .review-block.is-compact .review-head { flex-wrap: wrap; gap: 8px; padding: 0 0 2px 0; }
 .review-block.is-compact .btn.review-next { min-height: 32px; font-size: 12.5px; padding: 0 11px; }
 .review-block.is-compact .review-group { min-height: 48px; padding: 11px 12px; gap: 10px; }
+.review-block.is-compact .review-head { justify-content: flex-end; }
+.review-block.is-compact .review-group { flex-wrap: wrap; row-gap: 6px; }
+.review-block.is-compact .review-group-main { flex: 1 0 70%; }
 .review-block.is-compact .review-group-title { font-size: 13.5px; }
-.review-block.is-compact .review-group-sub { font-size: 11.5px; }
+.review-block.is-compact .review-group-sub {
+  font-size: 11.5px;
+  white-space: normal;
+  overflow: visible;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow-y: hidden;
+}
+.review-block.is-compact .review-group-right {
+  flex: 1 0 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  text-align: left;
+}
+.review-block.is-compact .review-group-right .row-meta { margin-top: 0; }
+.review-block.is-compact .review-unit-body { padding: 0 12px 12px 12px; }
+.review-block.is-compact .review-unit-lead { flex-direction: column; gap: 9px; }
+.review-block.is-compact .review-more { display: none; }
+.review-block.is-compact .review-check p { flex: 1; min-width: 0; }
 .review-block.is-compact .review-item { padding: 12px; gap: 9px; }
 .review-block.is-compact .review-lead { grid-template-columns: 36px 1fr; gap: 9px; }
 .review-block.is-compact .review-claim { font-size: 13.5px; line-height: 1.45; margin-top: 4px; }
@@ -1809,7 +1850,11 @@ html.skin-chaos .detail-body { border-top: 2px solid #4a3f8e; }
 .review-block.is-compact .review-check p { font-size: 12px; }
 .review-block.is-compact .review-thumb { grid-column: 1 / -1; }
 .review-block.is-compact .review-thumb-frame { width: 100%; height: 72px; }
-.review-block.is-compact .review-acts { gap: 6px; }
+.review-block.is-compact .review-acts { gap: 6px; row-gap: 8px; }
+/* the column is 280px: the row-click and the chevron already toggle the unit,
+   and a spacer that forces the meta onto its own line is width nobody has */
+.review-block.is-compact .review-toggle-cards { display: none; }
+.review-block.is-compact .review-acts .grow { display: none; }
 .review-block.is-compact .review-acts .btn.tiny { padding: 0 11px; font-size: 12.5px; }
 .review-block.is-compact .review-meta { flex-basis: 100%; }
 
