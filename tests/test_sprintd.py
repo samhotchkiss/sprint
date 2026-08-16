@@ -4118,5 +4118,202 @@ class TestHubCli(unittest.TestCase):
                              sprintd.read_registry(home_reg))
 
 
+class SiblingsBase(HubBase):
+    """`GET /api/siblings` — the same machine-wide picture as the hub, but read
+    from INSIDE one board so its title can become a switcher.
+
+    Everything runs against a temp registry (RegistryBase) so the real
+    ~/.sprint on this machine is never read or written.
+    """
+
+    def board(self, name, token=None, write_token=True):
+        b = super().board(name, token=token, write_token=write_token)
+        # what `sprintd start` stamps once the socket is really bound
+        b["app"].port = b["port"]
+        b["app"].hosts = ["127.0.0.1"]
+        return b
+
+    def siblings(self, b, fresh=True, token="__own__"):
+        path = "/api/siblings" + ("?fresh=1" if fresh else "")
+        tok = b["token"] if token == "__own__" else token
+        status, raw = sprintd.http_get("127.0.0.1", b["port"], path, tok)
+        body = json.loads(raw.decode("utf-8")) if raw else {}
+        return status, body
+
+    def by_name(self, body):
+        return {r["name"]: r for r in body["sprints"]}
+
+    def _closed_port(self):
+        """A port nothing is listening on — a board that went away."""
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+
+class TestSiblingsEndpoint(SiblingsBase):
+    def test_lists_every_live_sprint_with_this_one_flagged_self(self):
+        a = self.board("alpha")
+        self.board("beta")
+        status, body = self.siblings(a)
+        self.assertEqual(status, 200, body)
+        rows = self.by_name(body)
+        self.assertEqual(set(rows), {"alpha", "beta"})
+        self.assertEqual(body["count"], 2)
+        self.assertTrue(rows["alpha"]["self"], "the board answering is itself in the list")
+        self.assertFalse(rows["beta"]["self"])
+        self.assertTrue(rows["alpha"]["alive"] and rows["beta"]["alive"])
+        # ...and the same question asked from the OTHER board flips the flag
+        _, other = self.siblings(self.boards["beta"])
+        self.assertTrue(self.by_name(other)["beta"]["self"])
+        self.assertFalse(self.by_name(other)["alpha"]["self"])
+
+    def test_a_single_board_lists_only_itself_so_the_title_stays_plain(self):
+        a = self.board("solo")
+        status, body = self.siblings(a)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["count"], 1)
+        self.assertTrue(body["sprints"][0]["self"])
+        self.assertEqual(body["needs_you_elsewhere"], 0)
+
+    def test_the_counts_are_each_board_s_own(self):
+        a = self.board("alpha")
+        b = self.board("beta")
+        self.card_needs_you(a, "a1")
+        self.card_needs_you(b, "b1")
+        self.card_needs_you(b, "b2")
+        self.card_ready(b, "b3")
+        self.card_in_progress(b, "b4")
+        rows = self.by_name(self.siblings(a)[1])
+        self.assertEqual(rows["alpha"]["needs_you"], 1)
+        self.assertEqual((rows["beta"]["needs_you"], rows["beta"]["ready"],
+                          rows["beta"]["in_motion"]), (2, 1, 1))
+
+    def test_needs_you_elsewhere_ignores_this_board_s_own_pile(self):
+        """The dot on the title means ANOTHER sprint wants you — this board's
+        own needs-you cards are already on the page behind the title."""
+        a = self.board("alpha")
+        b = self.board("beta")
+        self.card_needs_you(a, "mine")
+        self.assertEqual(self.siblings(a)[1]["needs_you_elsewhere"], 0)
+        self.card_needs_you(b, "theirs")
+        self.assertEqual(self.siblings(a)[1]["needs_you_elsewhere"], 1)
+        # and from beta's side it is alpha's card that counts
+        self.assertEqual(self.siblings(b)[1]["needs_you_elsewhere"], 1)
+
+    def test_the_sibling_waiting_on_you_sorts_first_after_this_one(self):
+        a = self.board("alpha")
+        self.board("quiet")
+        waiting = self.board("waiting")
+        self.card_needs_you(waiting)
+        names = [r["name"] for r in self.siblings(a)[1]["sprints"]]
+        self.assertEqual(names, ["alpha", "waiting", "quiet"])
+
+    def test_each_row_links_with_that_board_s_own_token(self):
+        a = self.board("alpha", token="alpha-secret")
+        b = self.board("beta", token="beta-secret")
+        rows = self.by_name(self.siblings(a)[1])
+        self.assertEqual(rows["beta"]["url"],
+                         "http://127.0.0.1:%d/?t=beta-secret" % b["port"])
+        self.assertEqual(rows["alpha"]["url"],
+                         "http://127.0.0.1:%d/?t=alpha-secret" % a["port"])
+        # the link really signs you in to that board
+        status, _ = sprintd.http_get("127.0.0.1", b["port"], "/api/board", "beta-secret")
+        self.assertEqual(status, 200)
+
+    def test_a_dead_registry_row_is_left_out_of_the_menu(self):
+        """The hub greys a dead board because its job is to say it died. A
+        dropdown exists to be clicked: a row you cannot navigate to is noise."""
+        a = self.board("alpha")
+        dead_root = os.path.join(self.tmp, "gone")
+        os.makedirs(dead_root, exist_ok=True)
+        sprintd.registry_register(sprintd.registry_entry(
+            dead_root, self._closed_port(), "127.0.0.1", pid=999999,
+            started_at=sprintd.now() - 240))
+        body = self.siblings(a)[1]
+        self.assertEqual([r["name"] for r in body["sprints"]], ["alpha"])
+        # ...and it is NOT pruned from the registry: only the hub prunes
+        self.assertIn(os.path.realpath(dead_root), sprintd.read_registry())
+
+    def test_a_port_stolen_by_another_project_is_never_offered(self):
+        """Ports get recycled. Without the /healthz project_root guard the menu
+        would offer one project's board wearing another project's name."""
+        a = self.board("alpha")
+        impostor_root = os.path.join(self.tmp, "impostor")
+        os.makedirs(impostor_root, exist_ok=True)
+        sprintd.registry_register(sprintd.registry_entry(
+            impostor_root, a["port"], "127.0.0.1", pid=999999))
+        body = self.siblings(a)[1]
+        self.assertEqual([r["name"] for r in body["sprints"]], ["alpha"])
+        self.assertEqual(body["count"], 1)
+
+    def test_a_board_missing_from_the_registry_still_lists_itself(self):
+        a = self.board("alpha")
+        sprintd.registry_unregister(os.path.realpath(a["root"]))
+        body = self.siblings(a)[1]
+        self.assertEqual(body["count"], 1)
+        row = body["sprints"][0]
+        self.assertTrue(row["self"])
+        self.assertEqual(row["name"], "alpha")
+        self.assertEqual(row["url"], "http://127.0.0.1:%d/?t=alpha-token" % a["port"])
+
+    def test_it_needs_the_board_s_token(self):
+        a = self.board("alpha")
+        status, _ = self.siblings(a, token=None)
+        self.assertEqual(status, 401, "the sibling list hands out other boards' tokens")
+        status, _ = self.siblings(a, token="not-the-token")
+        self.assertEqual(status, 401)
+
+    def test_the_snapshot_is_cached_and_fresh_bypasses_the_cache(self):
+        """A dozen tabs polling every 30s must not become a dozen health-check
+        sweeps of every board on the machine."""
+        a = self.board("alpha")
+        b = self.board("beta")
+        self.assertEqual(self.by_name(self.siblings(a, fresh=False)[1])["beta"]["needs_you"], 0)
+        self.card_needs_you(b, "new question")
+        cached = self.by_name(self.siblings(a, fresh=False)[1])
+        self.assertEqual(cached["beta"]["needs_you"], 0, "served from the 10s cache")
+        fresh = self.by_name(self.siblings(a, fresh=True)[1])
+        self.assertEqual(fresh["beta"]["needs_you"], 1)
+
+    def test_the_cache_ttl_is_tunable_and_expires(self):
+        a = self.board("alpha")
+        b = self.board("beta")
+        a["app"].siblings_ttl = 0.05
+        self.siblings(a, fresh=False)
+        self.card_needs_you(b, "later")
+        time.sleep(0.2)
+        self.assertEqual(self.by_name(self.siblings(a, fresh=False)[1])["beta"]["needs_you"], 1)
+
+
+class TestBoardRollupIsSharedWithTheHub(SiblingsBase):
+    def test_the_hub_row_and_the_sibling_row_agree_on_every_count(self):
+        """One counter, two callers: the dropdown and the hub can never drift
+        apart on what "2 need you" means."""
+        a = self.board("alpha")
+        b = self.board("beta")
+        self.card_needs_you(b, "b1")
+        self.card_needs_you(b, "b2")
+        self.card_ready(b, "b3")
+        self.card_in_progress(b, "b4")
+        self.card(b, "b5")
+        hub_row = {r["name"]: r for r in sprintd.HubApp(token="hub-tok").refresh()["sprints"]}["beta"]
+        sib_row = self.by_name(self.siblings(a)[1])["beta"]
+        for field in ("needs_you", "ready", "in_motion", "queued", "blocked"):
+            self.assertEqual(sib_row[field], hub_row[field], field)
+
+    def test_the_self_row_matches_what_the_hub_sees_over_http(self):
+        a = self.board("alpha")
+        self.card_needs_you(a, "a1")
+        self.card_ready(a, "a2")
+        hub_row = {r["name"]: r for r in sprintd.HubApp(token="hub-tok").refresh()["sprints"]}["alpha"]
+        self_row = self.by_name(self.siblings(a)[1])["alpha"]
+        self.assertTrue(self_row["self"])
+        for field in ("needs_you", "ready", "in_motion", "queued", "blocked"):
+            self.assertEqual(self_row[field], hub_row[field], field)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
