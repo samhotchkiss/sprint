@@ -112,6 +112,14 @@ I say okay cool, you reply with a thumbs up or something. any message
 from me needs a response." A user message with no reply is
 indistinguishable from a dead session.
 
+**Interim-ack when the answer needs time.** If a user message needs
+investigation, planning, or a worker cycle before a real answer exists,
+send the holding reply IMMEDIATELY ("👍 on it — back with a proposed
+plan in a few minutes"), then do the work. User verbatim: "don't just
+let me sit waiting for a response. send a message saying something like
+'okay, I'm looking into it, i'll get back to you with a proposed
+plan'."
+
 **On every wakeup — waiter exit, session resume, boot, anything —
 do these in this exact order:**
 
