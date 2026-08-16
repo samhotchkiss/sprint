@@ -7072,10 +7072,14 @@ class TestSidebarReadReceipt(Base):
         self.assertEqual(self.unread(), 0)
 
     def test_the_receipt_never_walks_backwards(self):
-        self.say("first")
+        first = self.say("first")["event"]["seq"]
+        self.say("second")
         top = self.get("/api/board")[1]["seq"]
+        self.assertGreater(top, first, "the two lines must have different seqs")
         self.post("/api/sidebar/seen", {"seq": top})
-        self.post("/api/sidebar/seen", {"seq": 1})
+        self.assertEqual(self.unread(), 0)
+        # A stale tab posting an older seq must not un-read what you have read.
+        self.post("/api/sidebar/seen", {"seq": first})
         self.assertEqual(self.unread(), 0)
 
     def test_a_line_after_the_receipt_is_unread_again(self):
