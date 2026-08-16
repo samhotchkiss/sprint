@@ -14,6 +14,7 @@ The packet file must be a JSON object:
     "validate": ["Run `go run ./cmd/foo --dry-run`", "Confirm it prints \"ok\" not \"error\""],
     "ui_change": false,
     "screenshots": ["/absolute/path/light.png", "/absolute/path/dark.png"],
+    "reports": ["/absolute/path/findings.md"],
     "live_url": "http://100.x.x.x:8402/...",
     "per_card": [{"card_num": 42, "claim": "...", "screenshots": [...]}]
   }
@@ -43,6 +44,12 @@ branch." Every ready card must be validatable with zero code reading.
   8400 + (card_num % 100) (batches: 8400 + (batch_id % 100)), and leave
   it running until the verdict lands — the card's "See it live" button
   links there.
+- reports is OPTIONAL: absolute paths to .md / .html documents your work
+  produced (a findings write-up, a comparison table). They ride the same
+  path screenshots do — the board reads them off disk, renders them, and
+  shows each one in the packet behind a skim line, as well as in the
+  sprint's Reports library. Evidence a human can read is evidence; a
+  report is never a substitute for `validate`.
 - For batches, set per_card to one entry per member card; every entry
   needs card_num and claim.
 
@@ -128,6 +135,18 @@ def validate_packet(packet):
 
     if ui_change and not screenshots:
         fail("screenshots", "required when ui_change is true — capture light AND dark from your own worktree's preview")
+
+    # Optional documents. Checked here the same way screenshots are — a shape
+    # error should name itself at the command line, not come back as a 422.
+    reports = packet.get("reports")
+    if reports is not None:
+        if not (isinstance(reports, list) and all(isinstance(s, str) for s in reports)):
+            fail("reports", "must be a JSON array of .md/.html path/ref strings")
+        for ref in reports:
+            if not ref.strip():
+                fail("reports", "a report entry is empty")
+            if not ref.lower().endswith((".md", ".markdown", ".mdown", ".html", ".htm")):
+                fail("reports", f"a report must be .md or .html — got {ref!r}")
 
     live_url = packet.get("live_url")
     if live_url is not None and not isinstance(live_url, str):

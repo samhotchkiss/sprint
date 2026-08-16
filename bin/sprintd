@@ -614,13 +614,17 @@ def render_inline(text: str) -> str:
         return "\x00%d\x00" % (len(stash) - 1)
 
     out = re.sub(r"`([^`]+)`", lambda m: keep("<code>%s</code>" % m.group(1)), out)
+    # The URL may itself carry one level of balanced parens (`alert(1)`,
+    # `Foo_(disambiguation)`). Without that the trailing `)` escapes the match
+    # and a dropped link leaves a stray bracket in the prose.
+    url_re = r"((?:[^()\s]|\([^()\s]*\))+)"
     out = re.sub(
-        r"!\[([^\]]*)\]\(([^)\s]+)\)",
+        r"!\[([^\]]*)\]\(" + url_re + r"\)",
         lambda m: keep('<img src="%s" alt="%s">' % (safe_url(m.group(2)), m.group(1)))
         if safe_url(m.group(2)) else m.group(1),
         out)
     out = re.sub(
-        r"\[([^\]]+)\]\(([^)\s]+)\)",
+        r"\[([^\]]+)\]\(" + url_re + r"\)",
         lambda m: keep('<a href="%s" rel="noreferrer noopener nofollow" target="_blank">%s</a>'
                        % (safe_url(m.group(2)), m.group(1)))
         if safe_url(m.group(2)) else m.group(1),

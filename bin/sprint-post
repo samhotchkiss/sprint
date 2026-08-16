@@ -5,8 +5,21 @@ Usage:
   sprint-post <num> <kind> <text...> [--detail TEXT | --detail-file PATH]
                                      [--long-running] [--server URL] [--token TOKEN]
   sprint-post <num> phase "<phase>" [--expect 300]
+  sprint-post <num> chat "<summary>" --report path.md [--report other.html]
 
   kind must be one of: progress, chat, note, error, phase
+
+A REPORT is a document — a findings write-up, a comparison table, a migration
+plan — and it does not fit in a one-liner. `--report PATH` attaches a .md or
+.html file to the event as a first-class attachment (repeatable). The board
+renders it in the thread as a skim line (the document's title) that expands
+into the whole rendered page, and lists it in the sprint's report library
+behind the "Reports" link in the header:
+
+  sprint-post 42 chat "findings are in the report" --report /abs/findings.md
+
+Markdown is rendered by the board itself, with raw HTML inside it escaped;
+author-written .html renders in a sandbox. Keep a report under 2 MB.
 
 `phase` is sugar for a progress event that says what you are DOING right now
 rather than what you last finished:
@@ -66,6 +79,11 @@ RECOMMENDED_PHASES = ("reading", "coding", "testing", "capturing evidence",
 ONE_LINER_MAX = 140
 DETAIL_MAX = 200_000
 
+# A report is prose, not a payload. The server enforces the same ceiling; this
+# check is here so you find out before the network call, not after.
+REPORT_EXTS = (".md", ".markdown", ".mdown", ".html", ".htm")
+REPORT_MAX_BYTES = 2 * 1024 * 1024
+
 
 def fail(field, why=""):
     msg = f"sprint-post: missing required field: {field}"
@@ -99,6 +117,11 @@ def parse_args(argv):
                     help="optional expanded version (multi-line ok): output, reasoning, a log")
     p.add_argument("--detail-file", default=None, dest="detail_file",
                     help="read the expanded version from a file (e.g. a captured test log)")
+    p.add_argument("--report", action="append", default=None, dest="reports",
+                    metavar="PATH",
+                    help="attach a .md or .html document to this event (repeatable). "
+                         "It renders in the thread behind a skim line and lands in "
+                         "the sprint's Reports library.")
     p.add_argument("--long-running", action="store_true", dest="long_running",
                     help="mark this as a legit long-running step (suppresses the 5-minute silence timer)")
     p.add_argument("--server", default=os.environ.get("SPRINT_SERVER"),
@@ -131,7 +154,45 @@ def validate(args):
         fail("server", "pass --server or set SPRINT_SERVER")
     if not args.token:
         fail("token", "pass --token or set SPRINT_TOKEN")
-    return num, args.kind, text, read_detail(args)
+    if args.reports and args.kind == PHASE_KIND:
+        fail("report", "a phase says what you are doing right now — attach the "
+                       "document to a chat or progress event instead")
+    return num, args.kind, text, read_detail(args), read_reports(args.reports)
+
+
+def read_reports(paths):
+    """`--report PATH` (repeatable) → absolute paths the server can ingest.
+
+    The server reads the file off disk exactly as it does for screenshots, so
+    what goes on the wire is a path, not the bytes. Everything checkable is
+    checked here so a typo fails at the command line rather than as a 400."""
+    if not paths:
+        return []
+    out = []
+    for raw in paths:
+        path = os.path.abspath(os.path.expanduser(str(raw)))
+        if not os.path.isfile(path):
+            fail("report", f"no such file: {raw}")
+        if not path.lower().endswith(REPORT_EXTS):
+            fail("report", f"a report must be {' / '.join(REPORT_EXTS)} — got {os.path.basename(path)!r}")
+        size = os.path.getsize(path)
+        if size == 0:
+            fail("report", f"{os.path.basename(path)} is empty")
+        if size > REPORT_MAX_BYTES:
+            fail("report", f"{os.path.basename(path)} is {size} bytes — the ceiling is "
+                           f"{REPORT_MAX_BYTES} (a report is prose, not a payload)")
+        try:
+            with open(path, "rb") as fh:
+                blob = fh.read()
+            blob.decode("utf-8")
+        except OSError as e:
+            fail("report", f"could not read {raw}: {e.strerror or e}")
+        except UnicodeDecodeError:
+            fail("report", f"{os.path.basename(path)} is not valid UTF-8 text")
+        if b"\x00" in blob:
+            fail("report", f"{os.path.basename(path)} has NUL bytes — that is not a text document")
+        out.append(path)
+    return out
 
 
 UNITS = {"s": 1, "m": 60, "h": 3600}
@@ -218,7 +279,7 @@ def skim_line(text, detail):
 
 def main(argv):
     args = parse_args(argv)
-    num, kind, text, detail = validate(args)
+    num, kind, text, detail, reports = validate(args)
 
     if kind == PHASE_KIND:
         # Sugar, not a new event kind: the wire still sees a progress event.
@@ -229,6 +290,10 @@ def main(argv):
         payload = {"text": text}
     if detail:
         payload["detail"] = detail
+    if reports:
+        # Paths, not bytes: the server reads and content-addresses them, exactly
+        # as it does the screenshots in an evidence packet.
+        payload["reports"] = reports
     if args.long_running:
         payload["long_running"] = True
 
@@ -247,7 +312,12 @@ def main(argv):
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
-            extra = f" (+{len(detail)} chars of detail)" if detail else ""
+            bits = []
+            if detail:
+                bits.append(f"+{len(detail)} chars of detail")
+            if reports:
+                bits.append("1 report" if len(reports) == 1 else f"{len(reports)} reports")
+            extra = f" ({', '.join(bits)})" if bits else ""
             if "phase" in payload:
                 said = payload["phase"]
                 if payload.get("expected_seconds"):

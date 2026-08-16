@@ -22,6 +22,7 @@ import { attachmentUrl, attachmentCaption } from './api.js';
 import { SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, draft } from './state.js';
 import { detailBlock } from './detail.js';
 import { flowActive } from './review.js';
+import { splitAttachments, docsVer, reportRow } from './reports.js';
 
 const ACTOR = {
   user: { label: 'You', cls: 'from-you' },
@@ -92,11 +93,7 @@ export function threadItems(detail, app) {
     const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
     if (Array.isArray(atts) && atts.length) {
       for (const a of atts) shown.add(attachmentUrl(a));
-      // the version tracks the refs themselves (by length, not by value: a
-      // pasted data: URL is enormous) so an optimistic local thumbnail is
-      // swapped for the stored attachment exactly once
-      out.push({ key: key + ':shots', ver: refsVer(atts),
-        make: () => shotRow(atts, app, ev.actor === 'user') });
+      pushAttachments(out, key, atts, app, ev.actor === 'user');
     }
   });
 
@@ -105,8 +102,7 @@ export function threadItems(detail, app) {
   const loose = (Array.isArray(card && card.attachments) ? card.attachments : [])
     .filter((a) => !shown.has(attachmentUrl(a)));
   if (loose.length) {
-    out.push({ key: 'card-atts', ver: loose.map((a) => attachmentUrl(a)).join(','),
-      make: () => shotRow(loose, app, true, 'you attached this') });
+    pushAttachments(out, 'card-atts', loose, app, true, 'you attached this');
   }
 
   if (state === 'needs_you' && card && card.question) {
@@ -174,14 +170,31 @@ export function chatItems(lines, app) {
     out.push({ key, ver: 1, data: ev, make: () => message(ev, app) });
     const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
     if (Array.isArray(atts) && atts.length) {
-      // the version tracks the refs themselves (by length, not by value: a
-      // pasted data: URL is enormous) so an optimistic local thumbnail is
-      // swapped for the stored attachment exactly once
-      out.push({ key: key + ':shots', ver: refsVer(atts),
-        make: () => shotRow(atts, app, ev.actor === 'user') });
+      pushAttachments(out, key, atts, app, ev.actor === 'user');
     }
   });
   return out;
+}
+
+/**
+ * One event's attachments, as thread items. Pictures and documents arrive in
+ * the SAME list (a report is an attachment, deliberately) and are told apart by
+ * the server-set `doc` field, then rendered as the two different things they
+ * are: a strip of thumbnails, and a skim line that expands into a document.
+ */
+function pushAttachments(out, key, atts, app, mine, fallbackCaption) {
+  const [shots, docs] = splitAttachments(atts);
+  if (shots.length) {
+    // the version tracks the refs themselves (by length, not by value: a
+    // pasted data: URL is enormous) so an optimistic local thumbnail is
+    // swapped for the stored attachment exactly once
+    out.push({ key: key + ':shots', ver: refsVer(shots),
+      make: () => shotRow(shots, app, mine, fallbackCaption) });
+  }
+  if (docs.length) {
+    out.push({ key: key + ':docs', ver: docsVer(docs),
+      make: () => reportRow(docs, app, mine) });
+  }
 }
 
 // ---- item types ----------------------------------------------------------
@@ -351,6 +364,18 @@ function evidencePacket(packet, card, state, app, walking) {
 
   const shots = Array.isArray(p.screenshots) ? p.screenshots : [];
   if (shots.length) box.appendChild(packetShots(shots, app));
+
+  // A packet may ship DOCUMENTS as well as pictures. They read exactly as they
+  // do in the thread — a title you skim, the whole document behind the expand —
+  // so a findings write-up is evidence without becoming a wall of text you have
+  // to scroll past to reach Approve.
+  const [, docs] = splitAttachments(Array.isArray(p.reports) ? p.reports : []);
+  if (docs.length) {
+    const wrap = h('div');
+    wrap.appendChild(h('p.packet-label.accent', docs.length === 1 ? 'Report' : `Reports · ${docs.length}`));
+    wrap.appendChild(reportRow(docs, app, false));
+    box.appendChild(wrap);
+  }
 
   if (p.live_url) {
     box.appendChild(h('a.btn.packet-live', {

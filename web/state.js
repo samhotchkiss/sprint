@@ -111,6 +111,10 @@ export const store = {
   expanded: new Set(),    // event keys whose long version you opened (see detail.js)
   doneOpen: false,
   loaded: false,
+  // How many report documents THIS sprint has. The header's Reports link exists
+  // only when this is > 0 — user, verbatim: "link should only appear once
+  // there's a report within the sprint".
+  reports: 0,
 
   // ---- rail + layout (client only) ----------------------------------------
   // Only one thing owns the rail at a time: a card, or the session chat.
@@ -326,6 +330,11 @@ export function applyBoard(board) {
     const echoes = store.sidebar.filter((e) => e.localEcho && !texts.has(e.payload && e.payload.text));
     store.sidebar = lines.concat(echoes);
   }
+
+  // Scoped to the open sprint by the server — never a lifetime total, because
+  // the header link is a statement about THIS sprint.
+  const reports = num(board.reports);
+  store.reports = reports != null && reports > 0 ? reports : 0;
 
   const seq = num(board.seq != null ? board.seq : board.last_seq);
   if (seq != null) store.seq = Math.max(store.seq, seq);

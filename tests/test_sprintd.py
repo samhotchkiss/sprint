@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import html.parser as html_parser
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -4385,6 +4386,643 @@ class TestSprintPostPhaseHelper(Base):
         self.assertIn("testing", out)
         self.assertIn("5m", out)
 
+
+# ===========================================================================
+# Reports — markdown / HTML documents as first-class attachments (card #33)
+# ===========================================================================
+
+REPORT_MD = """# Findings: the drawer scrim
+
+The scrim reads **too dark** at 980px. Three things are true:
+
+- the token is `--scrim`
+- it is used in exactly one place
+- nothing else reads it
+
+## Numbers
+
+| width | opacity | verdict |
+|---|---|---|
+| 1440 | .62 | fine |
+| 980  | .62 | too dark |
+
+> The Fold is the case that matters.
+
+```css
+.scrim { background: var(--scrim); }
+```
+
+See [the spec](https://example.com/spec) for the rest.
+"""
+
+# The whole safety story in one fixture: every way an author could try to get
+# markup out of a .md file. None of it may reach the browser as markup.
+HOSTILE_MD = """# Hostile report
+
+<script>window.__pwned = 1;</script>
+
+<img src=x onerror="window.__pwned = 2">
+
+<iframe src="javascript:alert(1)"></iframe>
+
+An [innocent link](https://example.com) beside a [bad one](javascript:alert(1))
+and an ![image](javascript:alert(2)).
+
+<div onclick="alert(3)">a div</div>
+
+`<script>inline</script>`
+"""
+
+HOSTILE_HTML = ("<!doctype html><html><head><title>Author page</title></head>"
+                "<body><h1>Author page</h1><script>window.__pwned=3;</script>"
+                "</body></html>")
+
+
+class ReportBase(Base):
+    """Reports ride the same content-addressed store an image does. What is
+    different is the sniff (text has no magic bytes) and the render (markdown is
+    turned into HTML by us; author HTML never is)."""
+
+    def write_doc(self, name, text):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def working_card(self, text="a card that gets a report"):
+        num = self.new_card(text)["num"]
+        self.to_in_progress(num)
+        return num
+
+    def post_report(self, num, path, text="here are the findings", kind="chat"):
+        status, body = self.post("/api/cards/%d/events" % num,
+                                 {"kind": kind,
+                                  "payload": {"text": text, "reports": [path]}})
+        self.assertEqual(status, 201, body)
+        return body
+
+    def last_payload(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return detail["timeline"][-1]["payload"]
+
+    def only_report(self, num):
+        docs = [a for a in (self.last_payload(num).get("attachments") or [])
+                if a.get("doc")]
+        self.assertEqual(len(docs), 1, docs)
+        return docs[0]
+
+    def raw(self, path, token="test-token"):
+        """A raw fetch that keeps the headers — the CSP on author HTML is the
+        point of the test, and `req` throws headers away."""
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        try:
+            conn.request("GET", path, headers={"Authorization": "Bearer " + token})
+            resp = conn.getresponse()
+            return resp.status, resp.read(), dict(resp.getheaders())
+        finally:
+            conn.close()
+
+
+class TestReportAccept(ReportBase):
+    """What counts as a report, and what does not."""
+
+    def test_markdown_attaches_and_carries_a_title(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("findings.md", REPORT_MD))
+        ref = self.only_report(num)
+        self.assertEqual(ref["doc"], "md")
+        self.assertEqual(ref["name"], "findings.md")
+        self.assertEqual(ref["mime"], "text/markdown; charset=utf-8")
+        # the skim line is what the document calls itself, not its filename
+        self.assertEqual(ref["title"], "Findings: the drawer scrim")
+        self.assertRegex(ref["sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(ref["url"].endswith(".md"), ref["url"])
+        self.assertTrue(os.path.isfile(ref["path"]))
+
+    def test_html_attaches_and_titles_from_its_title_tag(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("page.html", HOSTILE_HTML))
+        ref = self.only_report(num)
+        self.assertEqual(ref["doc"], "html")
+        self.assertEqual(ref["title"], "Author page")
+        self.assertEqual(ref["mime"], "text/html; charset=utf-8")
+
+    def test_a_report_with_no_heading_falls_back_to_its_first_line(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("plain.md", "just a sentence\n\nand more"))
+        self.assertEqual(self.only_report(num)["title"], "just a sentence")
+
+    def test_same_bytes_are_stored_once(self):
+        num = self.working_card()
+        a = self.write_doc("one.md", REPORT_MD)
+        b = self.write_doc("two.md", REPORT_MD)
+        self.post_report(num, a)
+        first = self.only_report(num)
+        self.post_report(num, b)
+        second = self.only_report(num)
+        self.assertEqual(first["sha256"], second["sha256"])
+        self.assertEqual(first["path"], second["path"])
+
+    def test_images_door_still_refuses_text(self):
+        """`images:` stays png/jpeg only — nothing that ever worked starts
+        accepting documents because reports arrived."""
+        status, body = self.post("/api/cards", {
+            "images": [base64.b64encode(REPORT_MD.encode()).decode()]})
+        self.assertEqual(status, 400, body)
+
+    def test_a_wrong_extension_is_not_a_report(self):
+        num = self.working_card()
+        path = self.write_doc("notes.txt", "# not a report")
+        status, body = self.post("/api/cards/%d/events" % num,
+                                 {"kind": "chat",
+                                  "payload": {"text": "x", "reports": [path]}})
+        # an unusable path degrades to a name, never to a stored document
+        self.assertEqual(status, 201, body)
+        docs = [a for a in (self.last_payload(num).get("attachments") or [])
+                if a.get("doc")]
+        self.assertEqual(docs, [])
+
+    def test_extension_is_the_whole_sniff_on_the_direct_door(self):
+        status, body = self.post("/api/cards",
+                                 {"text": "x", "reports": [{"name": "notes.txt",
+                                                            "text": "# hi"}]})
+        self.assertEqual(status, 400, body)
+        self.assertIn("md", json.dumps(body))
+
+    def test_a_binary_wearing_a_md_name_is_refused(self):
+        status, body = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "sneaky.md",
+             "data": base64.b64encode(b"MZ\x00\x00\x90binary").decode()}]})
+        self.assertEqual(status, 400, body)
+        self.assertIn("NUL", json.dumps(body))
+
+    def test_invalid_utf8_is_refused(self):
+        status, body = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "bad.md", "data": base64.b64encode(b"\xff\xfe\xfd\xfc").decode()}]})
+        self.assertEqual(status, 400, body)
+        self.assertIn("UTF-8", json.dumps(body))
+
+    def test_an_empty_report_is_refused(self):
+        status, body = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "empty.md", "text": ""}]})
+        self.assertEqual(status, 400, body)
+
+    def test_size_cap_is_enforced_with_a_413(self):
+        big = "x" * (sprintd.REPORT_MAX_BYTES + 1)
+        status, body = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "huge.md", "text": big}]})
+        self.assertEqual(status, 413, body)
+        self.assertIn("exceed", json.dumps(body))
+
+    def test_just_under_the_cap_is_accepted(self):
+        ok = "x" * (sprintd.REPORT_MAX_BYTES - 16)
+        status, body = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "big.md", "text": ok}]})
+        self.assertEqual(status, 201, body)
+
+    def test_a_report_alone_is_a_submission(self):
+        """A document with no words is still work dropped on the board — the
+        card's title becomes the document's."""
+        status, card = self.post("/api/cards", {"reports": [
+            {"name": "findings.md", "text": REPORT_MD}]})
+        self.assertEqual(status, 201, card)
+        self.assertEqual(card["title"], "Findings: the drawer scrim")
+
+    def test_a_report_lands_on_the_sidebar_too(self):
+        status, body = self.post("/api/sidebar", {
+            "text": "wrote this up", "actor": "session",
+            "reports": [{"name": "notes.md", "text": "# Notes\n\nbody"}]})
+        self.assertEqual(status, 201, body)
+        _, board = self.get("/api/board")
+        docs = []
+        for ev in board["sidebar"]:
+            docs += [a for a in (ev["payload"].get("attachments") or []) if a.get("doc")]
+        self.assertEqual(len(docs), 1, docs)
+
+
+class TestReportRenderIsInert(ReportBase):
+    """FALSIFICATION TARGET.
+
+    The claim under test is not "we sanitize markdown" — it is that no author
+    markup is ever TREATED as markup. Markdown is rendered out of text that was
+    escaped before a single tag existed, so a `<script>` in a .md comes back as
+    the characters `<script>`. Break `esc` and every assertion below fails."""
+
+    def rendered(self, text, name="hostile.md"):
+        status, card = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": name, "text": text}]})
+        self.assertEqual(status, 201, card)
+        ref = [a for a in card["attachments"] if a.get("doc")][0]
+        status, detail = self.get("/api/reports/%s.md" % ref["sha256"])
+        self.assertEqual(status, 200, detail)
+        return detail["html"]
+
+    def test_a_script_tag_in_a_md_renders_as_characters_not_a_script(self):
+        html = self.rendered(HOSTILE_MD)
+        # the words survive — the report is still readable
+        self.assertIn("window.__pwned", html)
+        # ...but no browser will ever run them
+        self.assertNotIn("<script", html.lower())
+        self.assertNotIn("</script", html.lower())
+        self.assertIn("&lt;script&gt;", html)
+
+    def parse(self, html):
+        """Every tag and attribute the browser would actually SEE.
+
+        Substring assertions are not enough here: `onerror=` legitimately
+        appears inside `&lt;img src=x onerror=&quot;…&quot;&gt;`, which is inert
+        text. The honest question is structural — what markup does a parser find
+        — so this is the assertion that cannot be satisfied by accident."""
+        seen = []
+
+        class P(html_parser.HTMLParser):
+            def handle_starttag(_self, tag, attrs):
+                seen.append((tag, dict(attrs)))
+            handle_startendtag = handle_starttag
+
+        P(convert_charrefs=True).feed(html)
+        return seen
+
+    # Everything the renderer is allowed to emit. Author markup is not on it,
+    # and cannot get on it: the text is escaped before a tag exists.
+    ALLOWED_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6", "p", "br", "hr",
+                    "ul", "ol", "li", "pre", "code", "blockquote",
+                    "table", "thead", "tbody", "tr", "th", "td",
+                    "a", "img", "strong", "em", "del"}
+
+    def test_a_script_tag_never_becomes_a_tag(self):
+        tags = [t for t, _ in self.parse(self.rendered(HOSTILE_MD))]
+        self.assertNotIn("script", tags)
+        self.assertNotIn("iframe", tags)
+        self.assertNotIn("div", tags)
+
+    def test_only_our_own_tags_are_ever_emitted(self):
+        for tag, _ in self.parse(self.rendered(HOSTILE_MD)):
+            self.assertIn(tag, self.ALLOWED_TAGS, "renderer emitted <%s>" % tag)
+
+    def test_no_event_handler_attribute_survives_as_an_attribute(self):
+        for tag, attrs in self.parse(self.rendered(HOSTILE_MD)):
+            for name in attrs:
+                self.assertFalse(name.startswith("on"),
+                                 "<%s> carries %s" % (tag, name))
+
+    def test_no_attribute_value_is_ever_a_script_url(self):
+        for tag, attrs in self.parse(self.rendered(HOSTILE_MD)):
+            for name, value in attrs.items():
+                v = (value or "").strip().lower().replace("\\t", "").replace("\\n", "")
+                self.assertFalse(v.startswith("javascript:"), "<%s %s>" % (tag, name))
+                self.assertFalse(v.startswith("vbscript:"), "<%s %s>" % (tag, name))
+                self.assertFalse(v.startswith("data:text/html"), "<%s %s>" % (tag, name))
+
+    def test_the_hostile_markup_is_still_READABLE_as_text(self):
+        """Escaping is not deletion. A report about XSS has to be able to say
+        the word `<script>` and have you see it."""
+        html = self.rendered(HOSTILE_MD)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertIn("&lt;iframe", html)
+        self.assertIn("window.__pwned", html)
+
+    def test_a_javascript_link_is_dropped_but_its_words_are_kept(self):
+        html = self.rendered(HOSTILE_MD)
+        hrefs = [a.get("href") for t, a in self.parse(html) if t == "a"]
+        self.assertEqual(hrefs, ["https://example.com"])
+        # the bad link's WORDS survive, without the stray bracket
+        self.assertIn("beside a bad one", html)
+        self.assertNotIn("bad one)", html)
+        srcs = [a.get("src") for t, a in self.parse(html) if t == "img"]
+        self.assertEqual(srcs, [])
+        self.assertIn("and an image.", html)
+
+    def test_a_code_span_containing_a_tag_is_still_inert(self):
+        html = self.rendered(HOSTILE_MD)
+        self.assertIn("<code>&lt;script&gt;inline&lt;/script&gt;</code>", html)
+
+    def test_an_ampersand_is_escaped_exactly_once(self):
+        html = self.rendered("a & b, and &lt; too")
+        self.assertIn("a &amp; b", html)
+        self.assertIn("&amp;lt;", html)
+
+    def test_every_link_we_do_emit_is_defanged(self):
+        html = self.rendered("[x](https://example.com)")
+        self.assertIn('rel="noreferrer noopener nofollow"', html)
+        self.assertIn('target="_blank"', html)
+
+
+class TestReportRenderShape(ReportBase):
+    """The renderer is small on purpose, but it has to actually render a report:
+    a document that comes back as one paragraph is not readable."""
+
+    def html_of(self, text):
+        status, card = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "doc.md", "text": text}]})
+        self.assertEqual(status, 201, card)
+        ref = [a for a in card["attachments"] if a.get("doc")][0]
+        _, detail = self.get("/api/reports/%s.md" % ref["sha256"])
+        return detail["html"]
+
+    def test_the_whole_subset_renders(self):
+        html = self.html_of(REPORT_MD)
+        self.assertIn("<h1>Findings: the drawer scrim</h1>", html)
+        self.assertIn("<h2>Numbers</h2>", html)
+        self.assertIn("<strong>too dark</strong>", html)
+        self.assertIn("<code>--scrim</code>", html)
+        self.assertIn("<ul>", html)
+        self.assertIn("<li>the token is <code>--scrim</code></li>", html)
+        self.assertIn("<table>", html)
+        self.assertIn("<th>width</th>", html)
+        self.assertIn("<td>too dark</td>", html)
+        self.assertIn("<blockquote>", html)
+        self.assertIn('<pre><code class="lang-css">', html)
+        self.assertIn('<a href="https://example.com/spec"', html)
+
+    def test_nested_lists_nest(self):
+        html = self.html_of("- outer\n    - inner\n- back")
+        self.assertIn("<ul>", html)
+        self.assertGreaterEqual(html.count("<ul>"), 2)
+        self.assertIn("inner", html)
+
+    def test_an_ordered_list_is_ordered(self):
+        html = self.html_of("1. first\n2. second")
+        self.assertIn("<ol>", html)
+        self.assertIn("<li>first</li>", html)
+
+    def test_a_fenced_block_is_never_re_scanned_for_markup(self):
+        html = self.html_of("```\n**not bold** and <b>not bold</b>\n```")
+        self.assertNotIn("<strong>", html)
+        self.assertIn("&lt;b&gt;", html)
+
+    def test_a_horizontal_rule(self):
+        self.assertIn("<hr>", self.html_of("above\n\n---\n\nbelow"))
+
+
+class TestReportServing(ReportBase):
+    """How the bytes come back — and why author HTML can never touch the board."""
+
+    def stored(self, name, text):
+        status, card = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": name, "text": text}]})
+        self.assertEqual(status, 201, card)
+        return [a for a in card["attachments"] if a.get("doc")][0]
+
+    def test_markdown_comes_back_as_markdown(self):
+        ref = self.stored("doc.md", REPORT_MD)
+        status, blob, headers = self.raw(ref["url"])
+        self.assertEqual(status, 200)
+        self.assertIn("text/markdown", headers.get("Content-Type", ""))
+        self.assertIn(b"# Findings", blob)
+
+    def test_author_html_is_served_under_a_sandbox_csp(self):
+        ref = self.stored("page.html", HOSTILE_HTML)
+        status, blob, headers = self.raw(ref["url"])
+        self.assertEqual(status, 200)
+        csp = headers.get("Content-Security-Policy", "")
+        # `sandbox` with no allow-list: unique opaque origin, scripts off. Even a
+        # direct navigation to this URL cannot read a cookie or reach the API.
+        self.assertIn("sandbox", csp)
+        self.assertNotIn("allow-scripts", csp)
+        self.assertNotIn("allow-same-origin", csp)
+        self.assertIn("default-src 'none'", csp)
+        self.assertEqual(headers.get("Referrer-Policy"), "no-referrer")
+
+    def test_markdown_gets_no_needless_csp_but_is_not_html(self):
+        ref = self.stored("doc.md", REPORT_MD)
+        _, _, headers = self.raw(ref["url"])
+        self.assertNotIn("text/html", headers.get("Content-Type", ""))
+
+    def test_author_html_is_never_inlined_into_the_boards_dom(self):
+        ref = self.stored("page.html", HOSTILE_HTML)
+        status, detail = self.get("/api/reports/%s.html" % ref["sha256"])
+        self.assertEqual(status, 200, detail)
+        self.assertTrue(detail["sandboxed"])
+        self.assertIn("raw_url", detail)
+        # the ONE thing that must not be there: pre-rendered markup to innerHTML
+        self.assertNotIn("html", detail)
+
+    def test_serving_needs_the_token(self):
+        ref = self.stored("doc.md", REPORT_MD)
+        status, _, _ = self.raw(ref["url"], token="wrong")
+        self.assertEqual(status, 401)
+
+    def test_an_unknown_report_is_a_404(self):
+        status, _ = self.get("/api/reports/%s.md" % ("a" * 64))
+        self.assertEqual(status, 404)
+
+
+class TestReportsIndex(ReportBase):
+    """The library, and the ONE number the header link reads.
+
+    User ruling, verbatim: "link should only appear once there's a report
+    within the sprint" — so the default scope is the OPEN sprint and nothing
+    else."""
+
+    def test_an_empty_sprint_has_no_reports_and_says_so_on_the_board(self):
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 0)
+        _, index = self.get("/api/reports")
+        self.assertEqual(index["count"], 0)
+        self.assertEqual(index["reports"], [])
+
+    def test_the_index_names_the_source_card_author_and_date(self):
+        num = self.working_card("the card that owns the report")
+        self.post("/api/cards/%d/state" % num, {"state": "in_progress",
+                                                "title": "Drawer scrim too dark"})
+        self.post_report(num, self.write_doc("findings.md", REPORT_MD))
+        _, index = self.get("/api/reports")
+        self.assertEqual(index["count"], 1)
+        row = index["reports"][0]
+        self.assertEqual(row["title"], "Findings: the drawer scrim")
+        self.assertEqual(row["card_num"], num)
+        self.assertEqual(row["card_title"], "Drawer scrim too dark")
+        self.assertEqual(row["actor"], "worker")
+        self.assertTrue(row["ts"])
+        self.assertTrue(row["view_url"].startswith("#/report/"))
+
+    def test_the_board_count_matches_the_index(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("a.md", "# A\n\nbody"))
+        self.post_report(num, self.write_doc("b.md", "# B\n\nbody"))
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 2)
+
+    def test_one_document_counts_once_however_often_it_is_posted(self):
+        num = self.working_card()
+        path = self.write_doc("same.md", "# Same\n\nbody")
+        self.post_report(num, path)
+        self.post_report(num, path, text="posting it again")
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 1)
+
+    def test_the_index_is_scoped_to_the_OPEN_sprint(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("old.md", "# Last sprint\n\nbody"))
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 1)
+
+        status, _ = self.post("/api/sprint", {"action": "close"})
+        self.assertEqual(status, 200)
+        status, _ = self.post("/api/sprint", {"action": "open", "title": "round two"})
+        self.assertEqual(status, 200)
+
+        # a fresh sprint: the link must NOT be there, and the library is empty
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 0)
+        _, index = self.get("/api/reports")
+        self.assertEqual(index["count"], 0)
+
+        # history is still reachable — it is just never what decides the link
+        _, allof = self.get("/api/reports?scope=all")
+        self.assertEqual(allof["count"], 1)
+        self.assertEqual(allof["reports"][0]["title"], "Last sprint")
+
+    def test_a_report_in_the_new_sprint_brings_the_link_back(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("old.md", "# Last sprint\n\nbody"))
+        self.post("/api/sprint", {"action": "close"})
+        self.post("/api/sprint", {"action": "open", "title": "round two"})
+        fresh = self.working_card("a new card in the new sprint")
+        self.post_report(fresh, self.write_doc("new.md", "# This sprint\n\nbody"))
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 1)
+        _, index = self.get("/api/reports")
+        self.assertEqual([r["title"] for r in index["reports"]], ["This sprint"])
+
+    def test_newest_first(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("a.md", "# First\n\nbody"))
+        time.sleep(0.01)
+        self.post_report(num, self.write_doc("b.md", "# Second\n\nbody"))
+        _, index = self.get("/api/reports")
+        self.assertEqual([r["title"] for r in index["reports"]], ["Second", "First"])
+
+    def test_the_index_needs_the_token(self):
+        status, _ = self.get("/api/reports", token=None)
+        self.assertEqual(status, 401)
+
+
+class TestReportsInAnEvidencePacket(ReportBase):
+    """A packet is a document envelope as much as a screenshot one."""
+
+    def test_a_packet_reports_field_is_ingested_and_indexed(self):
+        num = self.working_card()
+        path = self.write_doc("findings.md", REPORT_MD)
+        packet = dict(GOOD_PACKET)
+        packet["reports"] = [path]
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": packet})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "ready")
+
+        _, detail = self.get("/api/cards/%d" % num)
+        refs = detail["evidence"]["packet"]["reports"]
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["doc"], "md")
+        self.assertEqual(refs[0]["title"], "Findings: the drawer scrim")
+
+        _, index = self.get("/api/reports")
+        self.assertEqual(index["count"], 1)
+        self.assertEqual(index["reports"][0]["card_num"], num)
+
+    def test_a_packet_without_reports_still_works(self):
+        num = self.working_card()
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200, body)
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 0)
+
+
+class TestSprintPostReportFlag(ReportBase):
+    """`sprint-post <num> chat "summary" --report path.md` — the worker's door."""
+
+    SPRINT_POST = os.path.join(os.path.dirname(HERE), "bin", "sprint-post")
+    SPRINT_READY = os.path.join(os.path.dirname(HERE), "bin", "sprint-ready")
+
+    def run_post(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_POST] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def run_ready(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_READY] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def test_the_flag_attaches_the_document(self):
+        num = self.working_card()
+        path = self.write_doc("findings.md", REPORT_MD)
+        r = self.run_post(num, "chat", "findings are in the report", "--report", path)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("1 report", r.stdout.decode())
+        ref = self.only_report(num)
+        self.assertEqual(ref["title"], "Findings: the drawer scrim")
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 1)
+
+    def test_the_flag_repeats(self):
+        num = self.working_card()
+        a = self.write_doc("a.md", "# A\n\nbody")
+        b = self.write_doc("b.html", "<title>B</title><p>body</p>")
+        r = self.run_post(num, "chat", "two of them", "--report", a, "--report", b)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        docs = [x for x in self.last_payload(num)["attachments"] if x.get("doc")]
+        self.assertEqual(sorted(d["doc"] for d in docs), ["html", "md"])
+
+    def test_a_missing_file_fails_before_the_network(self):
+        num = self.working_card()
+        r = self.run_post(num, "chat", "x", "--report", os.path.join(self.tmp, "nope.md"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("report", r.stderr.decode())
+        self.assertIn("no such file", r.stderr.decode())
+
+    def test_a_wrong_extension_fails_by_name(self):
+        num = self.working_card()
+        r = self.run_post(num, "chat", "x", "--report", self.write_doc("n.txt", "hi"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(".md", r.stderr.decode())
+
+    def test_an_oversized_report_fails_before_the_network(self):
+        num = self.working_card()
+        path = self.write_doc("huge.md", "x" * (2 * 1024 * 1024 + 4))
+        r = self.run_post(num, "chat", "x", "--report", path)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("ceiling", r.stderr.decode())
+
+    def test_a_phase_refuses_a_report(self):
+        """A phase says what you are doing right now. A document is not that."""
+        num = self.working_card()
+        r = self.run_post(num, "phase", "testing", "--report",
+                          self.write_doc("a.md", "# A"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("report", r.stderr.decode())
+
+    def test_sprint_ready_carries_reports_through(self):
+        num = self.working_card()
+        packet = dict(GOOD_PACKET)
+        packet["reports"] = [self.write_doc("findings.md", REPORT_MD)]
+        pfile = os.path.join(self.tmp, "packet.json")
+        with open(pfile, "w", encoding="utf-8") as fh:
+            json.dump(packet, fh)
+        r = self.run_ready(num, pfile)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        _, index = self.get("/api/reports")
+        self.assertEqual(index["count"], 1)
+
+    def test_sprint_ready_names_a_bad_report_entry(self):
+        num = self.working_card()
+        packet = dict(GOOD_PACKET)
+        packet["reports"] = ["/tmp/notes.txt"]
+        pfile = os.path.join(self.tmp, "packet.json")
+        with open(pfile, "w", encoding="utf-8") as fh:
+            json.dump(packet, fh)
+        r = self.run_ready(num, pfile)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("reports", r.stderr.decode())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

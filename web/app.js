@@ -14,6 +14,7 @@ import { initCompose, toBase64List, imageFiles } from './compose.js';
 import { installNotifications, attention, armNotifications, clearBadge } from './notify.js';
 import { loadSkin, installSkinToggle, installBlip } from './skin.js';
 import { startSiblings, renderTitle, closeSiblingMenu } from './siblings.js';
+import { renderReportsPage, renderReportPage } from './reports.js';
 
 const el = {};
 let compose = null;
@@ -23,10 +24,19 @@ const app = {
   eventText,
   render,
   openCard, closeCard,
+  goBoard, goReports,
   answer, chat, sessionChat, verdict, cardAction, markDuplicate, retryCard, retrySubmit,
   lightbox: (urls, i, caps) => openLightbox(el.lightbox, urls, i, caps),
   toast: (msg) => toast(msg),
 };
+
+// ---- pages -----------------------------------------------------------------
+//
+// The board is the app. A "page" is the one exception: a report library and a
+// single rendered report, reached from the header link and from stable URLs
+// (#/reports, #/report/<sha>.<ext>). It takes over `main` — never the rail,
+// never a third column. The user ruled a rail out by name.
+let page = null;      // null | {kind: 'reports'|'report', sha, ext, data, error}
 
 // Which shell we are in. The Fold is the spec's real mobile target (980×740),
 // and the phone below it is an explicit fallback, not an optimisation.
@@ -69,6 +79,14 @@ function paint() {
   document.body.classList.toggle('hold-on', !!(store.sprint && store.sprint.hold_mode));
 
   for (const btn of el.viewBtns) btn.classList.toggle('is-on', btn.dataset.view === store.view);
+  // Quiet, and conditional: the link exists only once this sprint has a report
+  // in it. A link to an empty library is a promise the board cannot keep.
+  if (el.reportsLink) {
+    el.reportsLink.hidden = !(store.loaded && store.reports > 0);
+    el.reportsLink.classList.toggle('is-on', !!page);
+    el.reportsLink.title = store.reports === 1 ? '1 report in this sprint'
+      : `${store.reports} reports in this sprint`;
+  }
   // "Unseen" means exactly that: the moment the session chat is the thing in the
   // rail, you have seen it. Closing a card back onto an already-open chat counts
   // just as much as clicking the button does.
@@ -76,10 +94,13 @@ function paint() {
   paintChatButton();
 
   clear(el.main);
-  if (phoneQuery.matches) renderPhone(el.main, app);
+  if (page && page.kind === 'reports') renderReportsPage(el.main, app, page);
+  else if (page && page.kind === 'report') renderReportPage(el.main, app, page);
+  else if (phoneQuery.matches) renderPhone(el.main, app);
   else if (foldQuery.matches) renderFold(el.main, app);
   else if (store.view === 'board') renderBoard(el.main, app);
   else renderList(el.main, app);
+  document.body.classList.toggle('page-open', !!page);
 
   const railOpen = !!store.detail || store.chatOpen;
   document.body.classList.toggle('rail-open', railOpen);
@@ -579,8 +600,75 @@ function failPending(line, retry) {
 
 // ---- the rail ------------------------------------------------------------
 
+// ---- pages: the report library and one rendered report ---------------------
+
+/** Back to the board from a page. Leaves the rail exactly as it was. */
+function goBoard() {
+  if (!page) return;
+  page = null;
+  if (location.hash.startsWith('#/report')) {
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+  render();
+}
+
+/** The library: every report in THIS sprint. */
+function goReports(replace) {
+  page = { kind: 'reports', data: null, error: null };
+  if (location.hash !== '#/reports') {
+    if (replace) history.replaceState(null, '', '#/reports');
+    else location.hash = '#/reports';
+  }
+  render();
+  loadPage(page, () => api.reports());
+}
+
+/** One report on its own page — a stable, linkable URL. */
+function goReport(sha, ext, replace) {
+  page = { kind: 'report', sha, ext, data: null, error: null };
+  const want = `#/report/${sha}.${ext}`;
+  if (location.hash !== want) {
+    if (replace) history.replaceState(null, '', want);
+    else location.hash = want;
+  }
+  render();
+  loadPage(page, () => api.report(sha, ext));
+}
+
+/** Fetch for the page that is open NOW; a later navigation wins. */
+async function loadPage(target, fetcher) {
+  try {
+    const data = await fetcher();
+    if (page !== target) return;
+    target.data = data;
+  } catch (err) {
+    if (page !== target) return;
+    target.error = err;
+    handleError(err, null);
+  }
+  render();
+}
+
+/** Read the hash and put the app in the state it names. */
+function routeFromHash(replace) {
+  const hash = location.hash;
+  const one = hash.match(/^#\/report\/([0-9a-f]{64})\.(md|html)$/);
+  if (one) { closeRailForPage(); goReport(one[1], one[2], replace); return true; }
+  if (hash === '#/reports') { closeRailForPage(); goReports(replace); return true; }
+  const card = hash.match(/^#\/c\/(\d+)/);
+  if (card) { page = null; openCard(Number(card[1])); return true; }
+  if (page) { page = null; render(); }
+  return false;
+}
+
+/** A page owns the whole main area; a card open behind it is just confusing. */
+function closeRailForPage() {
+  if (store.detail) store.detail = null;
+}
+
 function openCard(num) {
   if (num == null) return;
+  page = null;
   const card = store.cards.get(Number(num)) || null;
   store.detail = {
     num: Number(num), card, timeline: [], evidence: card && card.evidence,
@@ -723,8 +811,11 @@ async function boot() {
   el.bannerSlot = $('#banner-slot');
   el.banner = $('#banner');
   el.composeWrap = $('#compose-wrap');
+  el.reportsLink = $('#reports-link');
   // scoped to the layout control — the skin control is a second .seg beside it
   el.viewBtns = Array.from(document.querySelectorAll('#view-seg .seg-btn'));
+
+  el.reportsLink.addEventListener('click', (e) => { e.preventDefault(); goReports(); });
 
   compose = initCompose({
     form: $('#compose'),
@@ -789,6 +880,7 @@ async function boot() {
       if (!el.lightbox.hidden) { closeLightbox(el.lightbox); return; }
       if (!el.composeWrap.hidden) { closeCompose(); return; }
       if (store.detail) { closeCard(); return; }
+      if (page) { goBoard(); return; }
       if (store.chatOpen) toggleChat(false);
       return;
     }
@@ -805,9 +897,8 @@ async function boot() {
 
   window.addEventListener('focus', () => { clearBadge(); refreshBoard(); });
   window.addEventListener('hashchange', () => {
-    const m = location.hash.match(/^#\/c\/(\d+)/);
-    if (m) openCard(Number(m[1]));
-    else if (store.detail) closeCard();
+    if (routeFromHash()) return;
+    if (store.detail) closeCard();
   });
   for (const q of [foldQuery, phoneQuery]) {
     if (q.addEventListener) q.addEventListener('change', render);
@@ -838,11 +929,11 @@ async function firstLoad() {
     render();
     return;
   }
-  // A deep link opens its card BEFORE the first paint, never after. Painting the
-  // session chat into the rail and then replacing it with the card one frame
-  // later is a blink you cannot un-see, and it costs nothing to get right.
-  const deep = location.hash.match(/^#\/c\/(\d+)/);
-  if (deep) openCard(Number(deep[1]));
+  // A deep link opens its card (or its report) BEFORE the first paint, never
+  // after. Painting the session chat into the rail and then replacing it with
+  // the card one frame later is a blink you cannot un-see, and it costs nothing
+  // to get right.
+  routeFromHash(true);
 
   // The sidebar thread ships with the board (`board.sidebar`) — no event-log scan.
   render();

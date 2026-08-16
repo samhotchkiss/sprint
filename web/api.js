@@ -151,7 +151,40 @@ export const api = {
     images && images.length ? { text, images, actor: 'user' } : { text, actor: 'user' },
     { idempotencyKey: key }),
   holdMode: (on) => req('POST', '/api/sprint', { action: 'set_hold_mode', hold_mode: !!on }),
+
+  // The report library. `scope` defaults to the OPEN sprint server-side — the
+  // header link exists only when THIS sprint has a report, so the default is
+  // the number that decides it. `scope: 'all'` is history, never the condition.
+  reports: (scope) => req('GET', `/api/reports${scope === 'all' ? '?scope=all' : ''}`),
+  // One report, rendered: `.html` for markdown (rendered by the server out of
+  // escaped text), `raw_url` + `sandboxed` for author HTML.
+  report: (sha, ext) => req('GET', `/api/reports/${sha}.${ext}`),
 };
+
+// ---- reports -------------------------------------------------------------
+//
+// A report is an attachment like a screenshot is, so it arrives in the same
+// `payload.attachments` list. It is told apart by ONE field the server sets and
+// a worker cannot forge into existence: `doc` ∈ {md, html}.
+
+/** Is this attachment ref a report document rather than a picture? */
+export function isReportRef(ref) {
+  return !!(ref && typeof ref === 'object'
+    && (ref.doc === 'md' || ref.doc === 'html')
+    && /^[0-9a-f]{64}$/.test(String(ref.sha256 || '')));
+}
+
+/** The stable in-app URL for one report — the thing a link can point at. */
+export function reportHash(ref) {
+  if (!isReportRef(ref)) return null;
+  return `#/report/${ref.sha256}.${ref.doc === 'html' ? 'html' : 'md'}`;
+}
+
+/** What this document calls itself, falling back to its filename. */
+export function reportTitle(ref) {
+  if (!ref || typeof ref !== 'object') return 'report';
+  return ref.title || ref.name || 'report';
+}
 
 /**
  * Attachment refs. The server hands every ref a ready-to-use `url`
