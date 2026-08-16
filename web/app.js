@@ -417,7 +417,14 @@ async function sessionChat(text, images, key, reuse) {
   }
 }
 
-async function verdict(card, kind, notes, key) {
+/**
+ * `opts.quiet` suppresses the per-card toast — one Approve on a work unit is
+ * one decision, and six toasts saying the same sentence about six cards is the
+ * noise card #26 was about. The unit says one thing when it finishes; a FAILED
+ * verdict still speaks, quiet or not.
+ */
+async function verdict(card, kind, notes, key, opts) {
+  const quiet = !!(opts && opts.quiet);
   const before = card.state;
   const idem = key || uid();
   const word = kind === 'approve' ? 'Approve' : kind === 'bounce' ? 'Bounce' : 'Reject';
@@ -427,9 +434,11 @@ async function verdict(card, kind, notes, key) {
   render();
   try {
     await api.verdict(card.num, kind, notes, idem);
-    toast(kind === 'approve' ? `#${card.num} approved — merging now; it moves to Done when the branch lands.`
-      : kind === 'bounce' ? `#${card.num} bounced back with your notes.`
-        : `#${card.num} rejected.`);
+    if (!quiet) {
+      toast(kind === 'approve' ? `#${card.num} approved — merging now; it moves to Done when the branch lands.`
+        : kind === 'bounce' ? `#${card.num} bounced back with your notes.`
+          : `#${card.num} rejected.`);
+    }
     refreshBoard();
     if (store.detail && store.detail.num === card.num) refreshDetail();
     // Whether the verdict actually landed — the Review-next walkthrough only

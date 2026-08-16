@@ -276,7 +276,7 @@ export async function approveUnit(key, nums, app) {
     st.at = card.num;
     app.render();
     // eslint-disable-next-line no-await-in-loop
-    const ok = await app.verdict(card, 'approve');
+    const ok = await app.verdict(card, 'approve', null, null, { quiet: true });
     if (!ok) { st.error = card.num; app.render(); return false; }
     st.done += 1;
     app.render();
