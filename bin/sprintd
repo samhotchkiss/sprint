@@ -1528,6 +1528,26 @@ def clean_executor_name(value, field: str = "executor") -> str:
     return name
 
 
+def reject_reserved_executor_name(name: str, field: str = "worker.executors key"):
+    """`BUILTIN_EXECUTOR` ("subagent") is the board's own word for a plain
+    Claude worker -- an executor claiming that name would shadow the builtin
+    everywhere a card resolves its executor (`resolve_dispatch`,
+    `default_executor`'s own fallback). Same rule the settings sheet already
+    enforces client-side (`RESERVED_NAMES` in web/settings.js) against the
+    same already-trimmed name, so this has to match it exactly: case-
+    sensitive, whitespace already stripped by `clean_executor_name`.
+
+    `default_executor` itself is exempt on purpose -- "subagent" is its own
+    valid, expected value (it means "use the builtin"). Only a *named*
+    executor in `worker.executors` can collide with the builtin's name.
+    """
+    if name == BUILTIN_EXECUTOR:
+        raise _bad(field,
+                   "\"%s\" is the board's own word for a plain Claude worker "
+                   "-- pick another name" % name,
+                   code="reserved_name")
+
+
 def clean_model_name(value, field: str = "model") -> str:
     """A model is a free-form label (`sonnet`, `opus`, `grok-4`) -- we do not
     keep a whitelist of somebody else's product names, we just keep it sane.
@@ -1627,8 +1647,9 @@ def validate_settings(patch, base=None) -> dict:
             raise _bad("worker.executors", "executors must be an object of name -> definition")
         clean = {}
         for name, spec in execs.items():
-            clean[clean_executor_name(name, "worker.executors key")] = \
-                validate_executor(name, spec)
+            clean_name = clean_executor_name(name, "worker.executors key")
+            reject_reserved_executor_name(clean_name)
+            clean[clean_name] = validate_executor(name, spec)
         worker["executors"] = clean
 
     if "concurrency" in worker_patch:
@@ -1686,7 +1707,9 @@ def normalize_settings(raw) -> dict:
         clean = {}
         for name, spec in execs.items():
             try:
-                clean[clean_executor_name(name)] = validate_executor(name, spec)
+                clean_name = clean_executor_name(name)
+                reject_reserved_executor_name(clean_name)
+                clean[clean_name] = validate_executor(name, spec)
             except ApiError:
                 continue
         if clean:

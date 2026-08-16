@@ -7202,6 +7202,18 @@ class TestSettings(Base):
         w = self.settings()["settings"]["worker"]
         self.assertEqual(w["executors"]["grok"]["session"], "sprint-workers")
 
+    def test_a_hand_edited_file_naming_subagent_as_an_executor_is_dropped(self):
+        # normalize_settings() (the load-from-disk path) never 500s on a bad
+        # hand edit -- it drops the offending entry and falls back, same as
+        # any other broken executor. A named "subagent" is no exception.
+        path = os.path.join(self.project_root, ".sprint", "config.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"worker": {
+                "executors": {"subagent": {"kind": "subagent"}}}}, fh)
+        w = self.settings()["settings"]["worker"]
+        self.assertNotIn("subagent", w["executors"])
+        self.assertIn("claude", w["executors"])
+
     def test_a_hand_edited_broken_file_falls_back_to_defaults(self):
         path = os.path.join(self.project_root, ".sprint", "config.json")
         with open(path, "w", encoding="utf-8") as fh:
@@ -8826,6 +8838,51 @@ class TestExecutorNameValidation(Base):
             "executors": {"grok": {"kind": "tmux", "command": "grok", "model": 4}}}})
         self.assertEqual(status, 400, body)
         self.assertEqual(body["field"], "worker.executors.grok.model")
+
+    # -- the reserved name ------------------------------------------------
+    #
+    # "subagent" is the board's built-in word for a plain Claude worker
+    # (BUILTIN_EXECUTOR). An executor claiming that name would shadow the
+    # builtin everywhere a card resolves its executor. The settings sheet
+    # already refuses it client-side (RESERVED_NAMES in web/settings.js) --
+    # these prove the server refuses it too, since the sheet's JSON textarea
+    # and a raw curl both skip the client entirely.
+
+    def test_an_executor_named_subagent_is_refused(self):
+        status, body = self.put({"worker": {
+            "executors": {"subagent": {"kind": "subagent"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "reserved_name")
+        self.assertEqual(body["field"], "worker.executors key")
+        self.assertIn("subagent", body["message"])
+        # ...and nothing was written
+        self.assertFalse(os.path.isfile(
+            os.path.join(self.project_root, ".sprint", "config.json")))
+
+    def test_settings_are_unchanged_after_a_reserved_name_attempt(self):
+        self.put({"worker": {"concurrency": 5}})
+        status, body = self.put({"worker": {
+            "executors": {"subagent": {"kind": "subagent"}}}})
+        self.assertEqual(status, 400, body)
+        w = self.get("/api/settings")[1]["settings"]["worker"]
+        self.assertEqual(w["concurrency"], 5)
+        self.assertNotIn("subagent", w["executors"])
+
+    def test_the_reserved_name_is_caught_after_trimming_whitespace(self):
+        # Same normalization the client applies before it compares against
+        # RESERVED_NAMES: whitespace is trimmed first, then matched exactly.
+        status, body = self.put({"worker": {
+            "executors": {"  subagent  ": {"kind": "subagent"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "reserved_name")
+
+    def test_a_case_variant_of_subagent_is_not_reserved(self):
+        # The client's check is an exact, case-sensitive match after trim --
+        # RESERVED_NAMES.includes(name), no case-folding. The server matches
+        # that rule exactly, on purpose: "Subagent" is a free name.
+        status, body = self.put({"worker": {
+            "executors": {"Subagent": {"kind": "subagent"}}}})
+        self.assertEqual(status, 200, body)
 
 
 class TestExecutorPanelSource(Base):
