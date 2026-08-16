@@ -105,6 +105,13 @@ board is missing content: post it before you finish. The user's words
 when this failed: "you're responding to my board messages here in the
 chat."
 
+**Never let the user have the last word.** Every user message gets a
+reply on its surface — even a bare acknowledgement ("👍") when there is
+nothing to add. User verbatim: "don't EVER let me have the last word.
+I say okay cool, you reply with a thumbs up or something. any message
+from me needs a response." A user message with no reply is
+indistinguishable from a dead session.
+
 **On every wakeup — waiter exit, session resume, boot, anything —
 do these in this exact order:**
 
