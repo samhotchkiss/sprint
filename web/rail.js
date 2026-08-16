@@ -14,7 +14,7 @@
 // nothing, the thread reconciles item by item, and the composer (where you may
 // be mid-sentence with a screenshot attached) is never thrown away unless what
 // it is for actually changed.
-import { h, clear, reconcile } from './util.js';
+import { h, clear, reconcile, autolink } from './util.js';
 import { store, cardState, isSilent, draft, attachedImages } from './state.js';
 import { phaseOf, phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
@@ -43,6 +43,10 @@ export function renderRail(root, app) {
     const card = detail.card;
     syncPart(root, 'rail-head', headSig(detail, card), () => cardHead(detail, card, app));
     if (!thread.parentNode) root.appendChild(thread);
+    // "Blocked by #58 — needs the endpoint first", directly under the head, so
+    // the answer to "why is this sitting here" is the first thing in the card's
+    // details rather than something you have to find in the thread (#61).
+    syncBlockedLine(root, card, app);
     if (!card) {
       reconcile(thread, [{ key: 'loading', ver: detail.error || 1,
         make: () => h('p.thread-empty', detail.error || 'Loading card…') }]);
@@ -119,6 +123,44 @@ function syncOptional(root, cls, sig, build) {
   if (found) root.replaceChild(node, found);
   else root.insertBefore(node, root.querySelector('.composer') || null);
   return node;
+}
+
+/**
+ * The card's wall, when the wall is another card. It sits between the head and
+ * the thread and it is the only thing in the rail that is neither an event nor
+ * a control: a fact about this card that the thread would bury.
+ *
+ * Same signature contract as the other parts — a card whose blocker changed
+ * repaints one line, and a card with nothing in its way carries no line at all.
+ */
+function syncBlockedLine(root, card, app) {
+  const found = root.querySelector('.rail-blocked');
+  const sig = (card && card.blocked_by != null)
+    ? `${card.blocked_by}|${card.blocked_reason || ''}` : null;
+  if (sig == null) {
+    if (found) root.removeChild(found);
+    return;
+  }
+  if (found && found.dataset.sig === sig) return;
+  const node = blockedLine(card, app);
+  node.dataset.sig = sig;
+  if (found) root.replaceChild(node, found);
+  else root.insertBefore(node, root.querySelector('.thread') || null);
+}
+
+function blockedLine(card, app) {
+  const line = h('div.rail-blocked');
+  line.appendChild(h('span.rail-blocked-label', 'Blocked by'));
+  // The ordinary in-app card link (#54's autolink), so #58 here behaves
+  // exactly like #58 anywhere else on the board: one click, same rail.
+  line.appendChild(h('span.rail-blocked-num',
+    autolink('#' + card.blocked_by, app && app.openCard)));
+  if (card.blocked_reason) {
+    line.appendChild(h('span.rail-blocked-why', '— ' + card.blocked_reason));
+  }
+  line.appendChild(h('span.rail-blocked-note',
+    'It clears itself when that card lands.'));
+  return line;
 }
 
 /**

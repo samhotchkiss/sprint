@@ -7,7 +7,7 @@
 import { h, timeEl, firstLine } from './util.js';
 import {
   sections, meterSegments, cardState, needsKind, motionState, blockedReason,
-  waitingMark, isStuck, BLOCKED_NOTE,
+  waitingMark, isStuck, BLOCKED_NOTE, blockedByMark,
 } from './state.js';
 import { phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
@@ -208,6 +208,8 @@ export function blockedRow(card, app) {
   row.appendChild(h('span.row-main',
     h('span.row-title', card.title),
     h('span.row-reason', { class: r.bad ? 'row-reason is-bad' : 'row-reason' }, r.text)));
+  const waitingOn = blockedByMark(card);
+  if (waitingOn) row.appendChild(waitingOn);
   row.appendChild(h('span.row-age', timeEl(card.state_since || card.updated_at, { suffix: false })));
   return row;
 }
@@ -239,6 +241,10 @@ export function waitingPill(card, app) {
   },
     h('span.pill-num', '#' + card.num),
     h('span.pill-title', card.title),
+    // A queued card can be perfectly dispatchable and still going nowhere,
+    // because it is behind another card. Saying so here is what keeps the
+    // queue honest (#61).
+    blockedByMark(card),
     h('span.pill-mark', mark));
 }
 

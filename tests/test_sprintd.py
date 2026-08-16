@@ -8038,6 +8038,179 @@ class TestSprintLimitCli(Base):
 
 
 # --------------------------------------------------------------------------
+# Adding an executor is a guided flow (#58)
+#
+# User verbatim: "make it easy to add executors." The panel now offers presets
+# instead of a JSON textarea, which is only an improvement if the shapes those
+# presets write are the exact shapes the server takes and the session reads.
+# So the presets are parsed straight out of the shipped web/settings.js and put
+# through the real round trip: PUT, GET, resolve a dispatch from it.
+# --------------------------------------------------------------------------
+
+
+class TestExecutorPresets(Base):
+    """The four presets the Settings sheet offers, tested as data."""
+
+    def presets(self):
+        path = os.path.join(os.path.dirname(HERE), "web", "settings.js")
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        start = src.index("/* PRESETS_JSON_START */") + len("/* PRESETS_JSON_START */")
+        end = src.index("/* PRESETS_JSON_END */")
+        block = src[start:end].strip()
+        self.assertTrue(block.startswith("const PRESETS ="), block[:40])
+        block = block[len("const PRESETS ="):].strip().rstrip(";")
+        # Strict JSON on purpose: the presets are data the server has to accept,
+        # so they are kept in a form this test can hand to the server verbatim.
+        return json.loads(block)
+
+    def put(self, patch, **kw):
+        return self.req("PUT", "/api/settings", patch, **kw)
+
+    def test_there_are_four_and_they_cover_the_named_cases(self):
+        presets = self.presets()
+        self.assertEqual(sorted(presets), ["claude", "cli", "codex", "grok"])
+        for key, p in presets.items():
+            self.assertTrue(p["label"], key)
+            self.assertTrue(p["blurb"], key)
+
+    def test_every_preset_field_is_one_the_server_knows(self):
+        for key, p in self.presets().items():
+            for field in p["spec"]:
+                self.assertIn(field, sprintd.EXECUTOR_FIELDS,
+                              "preset %s writes an unknown field %r" % (key, field))
+            self.assertIn(p["spec"]["kind"], sprintd.EXECUTOR_KINDS)
+
+    def test_a_preset_round_trips_and_resolves_a_dispatch_label(self):
+        """save → GET → the code that draws "grok · tmux", with no translation
+        anywhere in between."""
+        presets = self.presets()
+        for key, p in presets.items():
+            name = p["name"] or "my-agent"
+            spec = dict(p["spec"])
+            if spec.get("kind") == "tmux" and not spec.get("command"):
+                # the "another CLI" preset ships blank on purpose: the form
+                # makes you fill it in, and the server refuses it empty
+                status, body = self.put({"worker": {"executors": {name: spec}}})
+                self.assertEqual(status, 400, body)
+                self.assertEqual(body["field"], "worker.executors.%s.command" % name)
+                spec["command"] = "aider"
+
+            status, body = self.put({"worker": {"executors": {name: spec}}})
+            self.assertEqual(status, 200, body)
+
+            # read it back: byte-for-byte the same object the preset carries
+            stored = self.settings_worker()["executors"][name]
+            self.assertEqual(stored, spec, "preset %s did not round-trip" % key)
+
+            # ...and the resolution the card face's tag is built from
+            d = sprintd.resolve_dispatch({"worker": self.settings_worker()}, name, None)
+            self.assertEqual(d["executor"], name)
+            self.assertEqual(d["kind"], spec["kind"])
+            self.assertEqual(d["command"], spec.get("command"))
+            self.assertEqual(d["session"], spec.get("session"))
+            if spec.get("model"):
+                self.assertEqual(d["model"], spec["model"],
+                                 "an executor's model is what a card gets")
+
+    def test_the_grok_preset_matches_the_shape_the_skill_dispatches(self):
+        """SKILL.md's tmux block reads command and session off the executor.
+        If the preset drifted from it, a dispatch would be typed into the wrong
+        window with the wrong command — so the two are pinned together here."""
+        grok = self.presets()["grok"]["spec"]
+        self.assertEqual(grok["kind"], "tmux")
+        self.assertEqual(grok["command"], "grok")
+        self.assertEqual(grok["session"], "sprint-workers")
+        path = os.path.join(os.path.dirname(HERE), "skills", "sprint", "SKILL.md")
+        with open(path, encoding="utf-8") as fh:
+            skill = fh.read()
+        self.assertIn('{"kind": "tmux", "command": "grok", "session": "sprint-workers"}',
+                      skill)
+
+    def settings_worker(self):
+        status, body = self.get("/api/settings")
+        self.assertEqual(status, 200, body)
+        return body["settings"]["worker"]
+
+
+class TestExecutorNameValidation(Base):
+    """The names the form refuses, refused again by the server — the form is a
+    faster answer, never the only one."""
+
+    def put(self, patch, **kw):
+        return self.req("PUT", "/api/settings", patch, **kw)
+
+    def test_a_name_with_a_space_is_refused_by_name(self):
+        status, body = self.put({"worker": {
+            "executors": {"my grok": {"kind": "subagent"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors key")
+        self.assertIn("letters, digits", body["message"])
+
+    def test_an_empty_name_is_refused(self):
+        status, body = self.put({"worker": {"executors": {"": {"kind": "subagent"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors key")
+
+    def test_a_name_that_is_too_long_is_refused(self):
+        status, body = self.put({"worker": {
+            "executors": {"g" * 41: {"kind": "subagent"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors key")
+
+    def test_command_and_session_are_refused_on_a_subagent(self):
+        status, body = self.put({"worker": {
+            "executors": {"claude": {"kind": "subagent", "command": "claude"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors.claude.command")
+
+    def test_a_blank_session_is_refused(self):
+        status, body = self.put({"worker": {
+            "executors": {"grok": {"kind": "tmux", "command": "grok", "session": "  "}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors.grok.session")
+
+    def test_a_model_that_is_not_a_string_is_refused(self):
+        status, body = self.put({"worker": {
+            "executors": {"grok": {"kind": "tmux", "command": "grok", "model": 4}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors.grok.model")
+
+
+class TestExecutorPanelSource(Base):
+    """The panel itself. Not a screenshot test — these are the promises the
+    card made about the form, checked where they are written."""
+
+    def source(self, *parts):
+        path = os.path.join(os.path.dirname(HERE), *parts)
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_raw_json_is_still_reachable(self):
+        js = self.source("web", "settings.js")
+        self.assertIn("Edit as JSON", js)
+        self.assertIn("settings-executors", js)
+
+    def test_removing_never_uses_a_browser_confirm(self):
+        js = self.source("web", "settings.js")
+        self.assertNotIn("window.confirm", js)
+        self.assertNotIn("confirm(", js)
+        self.assertIn("exec-confirm", js)
+
+    def test_every_field_carries_a_plain_words_hint(self):
+        js = self.source("web", "settings.js")
+        for field in ("name", "kind", "command", "session", "model", "note"):
+            self.assertRegex(js, r"\n  %s: '" % field,
+                             "%s needs a hint in FIELD_HINT" % field)
+
+    def test_the_form_validates_before_it_saves(self):
+        js = self.source("web", "settings.js")
+        self.assertIn("There is already an executor called", js)
+        self.assertIn("A tmux worker needs a command", js)
+        self.assertIn("NAME_RE", js)
+
+
+# --------------------------------------------------------------------------
 # blocked_by (#61)
 #
 # User verbatim: "when one card is blocked by another, show that in the card

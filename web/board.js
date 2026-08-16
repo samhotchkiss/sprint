@@ -17,6 +17,7 @@ import { h, timeEl, firstLine } from './util.js';
 import {
   boardColumns, cardState, needsKind, motionState, blockedReason, waitingMark,
   meterSegments, sections, isSilent, isStuck, STUCK_HINT, STATE_LABEL,
+  blockedByMark,
 } from './state.js';
 import { phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
@@ -138,6 +139,9 @@ export function renderCardFace(card, app) {
   face.appendChild(h('div.card-foot',
     h('span', shortAgent(card.agent_name)),
     executorTag(card, { compact: true }),
+    // "waiting on #58" — the one thing that stops a card looking abandoned
+    // when it is merely queued behind another card (#61).
+    blockedByMark(card),
     h('span.grow'),
     h('span', { class: isStuck(card) ? 'is-stuck-age' : null,
       title: isStuck(card) ? STUCK_HINT : null },
@@ -236,6 +240,7 @@ function elsewhereStrip(app) {
     },
       h('span.pill-num', '#' + card.num),
       h('span.pill-title', card.title),
+      blockedByMark(card),
       h('span.pill-mark', mark)));
   }
   return strip;
