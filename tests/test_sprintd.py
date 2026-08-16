@@ -3094,6 +3094,55 @@ class TestTail(unittest.TestCase):
         self.assertTrue(session["waiter_polling"])
         self.assertNotEqual(session["status"], "offline")
 
+    # -- self-echo suppression (card #39) ---------------------------------
+
+    def test_the_session_is_not_woken_by_its_own_posts(self):
+        """The session's standing tail must never wake it on its own writing.
+
+        Reported live: every sidebar reply the orchestrator posted came straight
+        back down its own ingress and woke it to read what it had just said.
+        Heartbeats and cursor frames were already suppressed for exactly this
+        reason; the session's own echo is the same class of non-event.
+        """
+        _proc, lines, noise = self.tail("--after", str(self.head()))
+        self.session_says("a reply the session posted itself")
+        self.user_says("and then the human said something")
+        got = self.wait_lines(lines, 1)
+        # The user line is the FIRST thing on stdout: the session's own post
+        # never appeared, it was not merely printed later.
+        self.assertEqual([ev["text"] for ev in got],
+                         ["and then the human said something"])
+        self.assertTrue(all(ev["actor"] != "session" for ev in got), got)
+        self.assertEqual(noise, [])
+
+    def test_include_self_restores_the_raw_log(self):
+        """Suppression is a default, not a hole: --include-self prints them."""
+        _proc, lines, noise = self.tail("--after", str(self.head()),
+                                        "--include-self")
+        self.session_says("a reply the session posted itself")
+        self.user_says("and then the human said something")
+        got = self.wait_lines(lines, 2)
+        self.assertEqual([ev["actor"] for ev in got], ["session", "user"])
+        self.assertEqual([ev["text"] for ev in got],
+                         ["a reply the session posted itself",
+                          "and then the human said something"])
+        # ...and the biconditional still holds on the line: only the human's
+        # carries a routing key.
+        self.assertIsNone(got[0]["reply_to"])
+        self.assertEqual(got[1]["reply_to"], "sidebar")
+
+    def test_worker_and_server_events_still_wake_the_session(self):
+        """Only the session's OWN voice is dropped. A worker's progress and the
+        server's own state lines are exactly what the tail exists to carry."""
+        _proc, lines, noise = self.tail("--after", str(self.head()))
+        card = self.new_card("something to work")
+        self.api("POST", "/api/cards/%d/events" % card["num"],
+                 {"kind": "progress", "actor": "worker",
+                  "payload": {"text": "worker reporting in"}})
+        got = self.wait_lines(lines, 3)      # submitted, state (server), progress
+        self.assertEqual(sorted({ev["actor"] for ev in got}),
+                         ["server", "user", "worker"])
+
 
 class TestEventDetail(Base):
     """Skim then dig in: every event keeps a one-line `text`, and an OPTIONAL
@@ -5176,6 +5225,594 @@ class TestMarkdownIsTheRecommendedFormat(ReportBase):
         self.assertIn("md reports are preferable to html", spec)
         readme = self.read_repo_file("README.md")
         self.assertIn("sandboxed", readme)
+
+
+class TestBulkCreate(Base):
+    """Importing N issues must never flood the board against intent.
+
+    User's live incident: importing a list meant N POSTs, and 14 cards were
+    created against intent before there was any chance to say stop -- then 14
+    hand-written cancels to undo it. So a bulk import lands HELD (the preview
+    IS the hold), all-or-nothing, under a cap.
+    """
+
+    def bulk(self, items, **body):
+        payload = {"items": items}
+        payload.update(body)
+        return self.post("/api/cards/bulk", payload)
+
+    def test_bulk_holds_by_default_so_nothing_dispatches(self):
+        status, body = self.bulk(["first issue", {"text": "second issue"},
+                                  {"text": "third issue"}])
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["count"], 3)
+        self.assertTrue(body["hold"], "silence means hold -- this is the point")
+        self.assertEqual(body["state"], "held")
+        for num in body["card_nums"]:
+            self.assertEqual(self.state_of(num), "held")
+        # ...and nothing is dispatchable: the queue is empty.
+        _, board = self.get("/api/board")
+        queued = [c for c in board["cards"] if c["state"] == "queued"]
+        self.assertEqual(queued, [], "a bulk import must never reach the queue")
+
+    def test_hold_false_is_explicit_opt_in(self):
+        status, body = self.bulk(["go now", "and this one"], hold=False)
+        self.assertEqual(status, 201, body)
+        self.assertFalse(body["hold"])
+        for num in body["card_nums"]:
+            self.assertEqual(self.state_of(num), "queued")
+
+    def test_over_the_cap_is_a_413_and_creates_nothing(self):
+        before = len(self.get("/api/board")[1]["cards"])
+        status, body = self.bulk(["issue %d" % i
+                                  for i in range(sprintd.BULK_MAX + 1)])
+        self.assertEqual(status, 413, body)
+        self.assertEqual(body["error"], "too_many")
+        self.assertEqual(body["max"], sprintd.BULK_MAX)
+        self.assertEqual(len(self.get("/api/board")[1]["cards"]), before)
+
+    def test_at_the_cap_is_allowed(self):
+        status, body = self.bulk(["issue %d" % i for i in range(sprintd.BULK_MAX)])
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["count"], sprintd.BULK_MAX)
+
+    def test_one_bad_item_creates_nothing_at_all(self):
+        """Atomicity is the difference between an import and a mess: a half
+        landed import is the same flood-then-clean-up problem, smaller."""
+        before = len(self.get("/api/board")[1]["cards"])
+        status, body = self.bulk(["fine", "also fine", {"text": "   "},
+                                  "would have been fine"])
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "empty_submission")
+        self.assertEqual(body["index"], 2)
+        after = self.get("/api/board")[1]["cards"]
+        self.assertEqual(len(after), before,
+                         "not one card may survive a rejected import")
+
+    def test_empty_items_is_a_named_field_error(self):
+        status, body = self.post("/api/cards/bulk", {"items": []})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "items")
+
+    def test_bulk_action_cancels_the_whole_import_in_one_call(self):
+        """The undo the user had to hand-write fourteen times."""
+        _, made = self.bulk(["a", "b", "c", "d"])
+        nums = made["card_nums"]
+        status, body = self.post("/api/cards/bulk-action",
+                                 {"card_nums": nums, "action": "cancel"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["applied"], nums)
+        self.assertEqual(body["failed"], [])
+        for num in nums:
+            self.assertEqual(self.state_of(num), "canceled")
+
+    def test_bulk_action_releases_a_held_import(self):
+        _, made = self.bulk(["a", "b"])
+        status, body = self.post("/api/cards/bulk-action",
+                                 {"card_nums": made["card_nums"],
+                                  "action": "release"})
+        self.assertEqual(status, 200, body)
+        for num in made["card_nums"]:
+            self.assertEqual(self.state_of(num), "queued")
+
+    def test_an_unknown_card_stops_the_whole_bulk_action(self):
+        _, made = self.bulk(["a", "b"])
+        status, body = self.post("/api/cards/bulk-action",
+                                 {"card_nums": made["card_nums"] + [99999],
+                                  "action": "cancel"})
+        self.assertEqual(status, 404, body)
+        for num in made["card_nums"]:
+            self.assertEqual(self.state_of(num), "held",
+                             "a typo in the list moves nothing")
+
+    def test_one_illegal_move_does_not_abandon_the_rest(self):
+        """One card that cannot move is not a reason to leave twelve held."""
+        _, made = self.bulk(["a", "b", "c"], hold=False)
+        first = made["card_nums"][0]
+        self.assertEqual(self.post("/api/cards/%d/action" % first,
+                                   {"action": "cancel"})[0], 200)
+        # Re-park the pile. The canceled one cannot go back on hold (only the
+        # user's `reopen` moves a closed card); the other two must still park.
+        status, body = self.post("/api/cards/bulk-action",
+                                 {"card_nums": made["card_nums"],
+                                  "action": "hold"})
+        self.assertEqual(status, 200, body)
+        self.assertFalse(body["ok"])
+        self.assertEqual([f["card_num"] for f in body["failed"]], [first])
+        self.assertEqual(body["failed"][0]["error"], "illegal_transition")
+        self.assertEqual(body["applied"], made["card_nums"][1:])
+        self.assertEqual(self.state_of(first), "canceled")
+        for num in made["card_nums"][1:]:
+            self.assertEqual(self.state_of(num), "held")
+
+    def test_cancelling_an_already_cancelled_card_is_a_no_op(self):
+        """Re-running the undo must be safe: the whole point is one call
+        instead of fourteen, and a retry after a partial failure is normal."""
+        _, made = self.bulk(["a", "b"])
+        nums = made["card_nums"]
+        self.assertEqual(self.post("/api/cards/bulk-action",
+                                   {"card_nums": nums, "action": "cancel"})[0], 200)
+        status, body = self.post("/api/cards/bulk-action",
+                                 {"card_nums": nums, "action": "cancel"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["applied"], nums)
+
+    def test_bulk_action_rejects_verbs_outside_the_flood_control_set(self):
+        _, made = self.bulk(["a"])
+        status, body = self.post("/api/cards/bulk-action",
+                                 {"card_nums": made["card_nums"],
+                                  "action": "retry"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "bad_action")
+
+    def test_bulk_cards_carry_their_text_and_a_submitted_event(self):
+        _, made = self.bulk([{"text": "the mailbox reprocess never finished"}])
+        num = made["card_nums"][0]
+        _, detail = self.get("/api/cards/%d" % num)
+        submitted = [e for e in detail["timeline"] if e["kind"] == "submitted"]
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(submitted[0]["payload"]["text"],
+                         "the mailbox reprocess never finished")
+        self.assertTrue(submitted[0]["payload"]["hold"])
+        self.assertEqual(submitted[0]["payload"]["bulk"], 1)
+
+
+class TestActorAttribution(Base):
+    """Who a card says wrote it.
+
+    User's report: cards the SESSION created over the API showed their
+    `submitted` events as the user's -- so `reply_to` claimed a human was
+    waiting behind the session's own writing. A bearer-holding script may now
+    say who it is; a browser never can, whatever it puts in the body.
+    """
+
+    # Headers a browser sets on every fetch and page JS cannot remove. Any one
+    # of them is enough on its own.
+    BROWSERISH = ({"Origin": "http://127.0.0.1:8377"},
+                  {"Sec-Fetch-Site": "same-origin"},
+                  {"Sec-Fetch-Mode": "cors"},
+                  {"Cookie": "sprint_token_8377=test-token"})
+
+    def submitted_actor(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        ev = [e for e in detail["timeline"] if e["kind"] == "submitted"][0]
+        return ev["actor"], ev["payload"].get("reply_to")
+
+    def test_a_script_may_say_it_is_the_session(self):
+        status, card = self.post("/api/cards",
+                                 {"text": "filed by the session", "actor": "session"})
+        self.assertEqual(status, 201, card)
+        actor, reply_to = self.submitted_actor(card["num"])
+        self.assertEqual(actor, "session")
+        self.assertIsNone(reply_to,
+                          "nobody is waiting behind the session's own writing")
+
+    def test_a_browser_can_never_claim_to_be_the_session(self):
+        """FALSIFICATION: this is the whole security property. Every browser
+        marker, one at a time, and the claim is dropped every time."""
+        for headers in self.BROWSERISH:
+            with self.subTest(headers=headers):
+                status, card = self.post(
+                    "/api/cards",
+                    {"text": "typed by a person", "actor": "session"},
+                    headers=headers)
+                self.assertEqual(status, 201, card)
+                actor, reply_to = self.submitted_actor(card["num"])
+                self.assertEqual(actor, "user",
+                                 "a browser is the user's hands: %r" % headers)
+                self.assertEqual(reply_to, "card:%d" % card["num"])
+
+    def test_no_claim_still_means_user(self):
+        """Fails CLOSED: silence is never an upgrade."""
+        card = self.new_card("plain submission")
+        actor, reply_to = self.submitted_actor(card["num"])
+        self.assertEqual(actor, "user")
+        self.assertEqual(reply_to, "card:%d" % card["num"])
+
+    def test_the_server_voice_is_never_borrowable(self):
+        """`server` is the board's own voice -- agent_silent, stuck. No client
+        may wear it, bearer token or not."""
+        status, card = self.post("/api/cards",
+                                 {"text": "pretending", "actor": "server"})
+        self.assertEqual(status, 201, card)
+        self.assertEqual(self.submitted_actor(card["num"])[0], "user")
+
+    def test_bulk_import_carries_the_actor_too(self):
+        status, body = self.post("/api/cards/bulk",
+                                 {"items": ["one", "two"], "actor": "session"})
+        self.assertEqual(status, 201, body)
+        for num in body["card_nums"]:
+            self.assertEqual(self.submitted_actor(num)[0], "session")
+
+    def test_a_browser_bulk_import_is_still_the_user(self):
+        status, body = self.post("/api/cards/bulk",
+                                 {"items": ["one"], "actor": "session"},
+                                 headers={"Sec-Fetch-Site": "same-origin"})
+        self.assertEqual(status, 201, body)
+        self.assertEqual(self.submitted_actor(body["card_nums"][0])[0], "user")
+
+    def test_the_user_still_owns_verdicts_on_a_session_authored_card(self):
+        """Attribution changes who WROTE the card, never who it belongs to. A
+        human talking on a session-authored card is still a human waiting."""
+        _, card = self.post("/api/cards",
+                            {"text": "filed by the session", "actor": "session"})
+        num = card["num"]
+        status, _ = self.post("/api/cards/%d/chat" % num,
+                              {"text": "what is the status here?"},
+                              headers={"Sec-Fetch-Site": "same-origin"})
+        self.assertEqual(status, 201)
+        _, detail = self.get("/api/cards/%d" % num)
+        chat = [e for e in detail["timeline"] if e["kind"] == "chat"][-1]
+        self.assertEqual(chat["actor"], "user")
+        self.assertEqual(chat["payload"]["reply_to"], "card:%d" % num)
+
+    def test_a_browser_cannot_post_worker_telemetry_either(self):
+        card = self.new_card("a card")
+        self.to_in_progress(card["num"])
+        status, body = self.post("/api/cards/%d/chat" % card["num"],
+                                 {"text": "on it", "actor": "worker"},
+                                 headers={"Origin": "http://127.0.0.1:8377"})
+        self.assertEqual(status, 201, body)
+        _, detail = self.get("/api/cards/%d" % card["num"])
+        chat = [e for e in detail["timeline"] if e["kind"] == "chat"][-1]
+        self.assertEqual(chat["actor"], "user")
+
+
+class TestOpsCards(Base):
+    """Non-code work is first-class, with its own shape of proof.
+
+    A mailbox reprocess has no diff, no branch and no preview. Demanding them
+    made ops cards either liars or second-class, so `work_kind: "ops"` SWAPS
+    the required set -- claim, validate, readback -- rather than relaxing it.
+    """
+
+    OPS_PACKET = {
+        "work_kind": "ops",
+        "claim": "Reprocessed the stuck mailbox backlog.",
+        "readback": "$ russ mail reprocess --since 2026-08-14\n"
+                    "processed=412 skipped=0 errors=0\nqueue depth now 0",
+        "validate": ["Run `russ mail stats`.",
+                     "Confirm the queued count reads 0, not 412."],
+    }
+
+    def ready_card(self):
+        num = self.new_card("reprocess the stuck mailbox")["num"]
+        self.to_in_progress(num)
+        return num
+
+    def submit(self, num, packet):
+        return self.post("/api/cards/%d/ready" % num, {"packet": packet})
+
+    def test_an_ops_packet_is_accepted_without_diff_branch_or_tests(self):
+        num = self.ready_card()
+        status, body = self.submit(num, dict(self.OPS_PACKET))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "ready")
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["work_kind"], "ops")
+        self.assertIn("processed=412",
+                      detail["card"]["evidence"]["packet"]["readback"])
+
+    def test_an_ops_packet_without_a_readback_is_rejected(self):
+        """The one thing ops work owes: what actually came back."""
+        num = self.ready_card()
+        packet = dict(self.OPS_PACKET)
+        packet.pop("readback")
+        status, body = self.submit(num, packet)
+        self.assertEqual(status, 422, body)
+        self.assertEqual(body["missing"], ["readback"])
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_an_ops_packet_still_owes_a_claim_and_validate_steps(self):
+        num = self.ready_card()
+        packet = dict(self.OPS_PACKET)
+        packet.pop("claim")
+        packet.pop("validate")
+        status, body = self.submit(num, packet)
+        self.assertEqual(status, 422, body)
+        self.assertEqual(sorted(body["missing"]), ["claim", "validate"])
+
+    def test_a_blank_readback_is_not_a_readback(self):
+        num = self.ready_card()
+        for empty in ("", "   \n  ", [], ["", "  "], 17, None):
+            with self.subTest(readback=empty):
+                packet = dict(self.OPS_PACKET, readback=empty)
+                status, body = self.submit(num, packet)
+                self.assertEqual(status, 422, body)
+                self.assertIn("readback", body["missing"])
+
+    def test_a_readback_may_arrive_as_lines(self):
+        num = self.ready_card()
+        packet = dict(self.OPS_PACKET,
+                      readback=["$ russ mail reprocess", "processed=412"])
+        status, body = self.submit(num, packet)
+        self.assertEqual(status, 200, body)
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["evidence"]["packet"]["readback"],
+                         "$ russ mail reprocess\nprocessed=412")
+
+    def test_test_result_is_optional_for_ops_but_still_needs_counts(self):
+        num = self.ready_card()
+        status, body = self.submit(num, dict(self.OPS_PACKET,
+                                             test_result="tests pass"))
+        self.assertEqual(status, 422, body)
+        self.assertEqual(body["missing"], ["test_result"])
+        status, body = self.submit(num, dict(self.OPS_PACKET,
+                                             test_cmd="make check",
+                                             test_result="3 pass, 0 fail"))
+        self.assertEqual(status, 200, body)
+
+    def test_an_ops_packet_that_claims_a_ui_change_still_owes_screenshots(self):
+        num = self.ready_card()
+        status, body = self.submit(num, dict(self.OPS_PACKET, ui_change=True))
+        self.assertEqual(status, 422, body)
+        self.assertEqual(body["missing"], ["screenshots"])
+
+    def test_a_code_card_may_not_skip_the_code_fields(self):
+        """The gate is swapped, not weakened: default work still owes it all."""
+        num = self.ready_card()
+        packet = dict(self.OPS_PACKET)
+        packet.pop("work_kind")
+        status, body = self.submit(num, packet)
+        self.assertEqual(status, 422, body)
+        self.assertEqual(sorted(body["missing"]),
+                         ["branch", "diffstat", "test_cmd", "test_result",
+                          "ui_change"])
+
+    def test_assign_may_omit_the_worktree_and_branch_for_ops(self):
+        num = self.new_card("reprocess the mailbox")["num"]
+        status, body = self.post("/api/cards/%d/assign" % num,
+                                 {"agent_name": "russ-ops", "work_kind": "ops"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["card"]["work_kind"], "ops")
+        self.assertIsNone(body["card"]["worktree"])
+        self.assertIsNone(body["card"]["branch"])
+        self.assertEqual(body["card"]["state"], "triaging")
+
+    def test_the_card_remembers_it_is_ops_across_a_bounce(self):
+        """A second packet after a bounce is judged by the same rules."""
+        num = self.new_card("reprocess the mailbox")["num"]
+        self.assertEqual(self.post("/api/cards/%d/assign" % num,
+                                   {"agent_name": "russ-ops",
+                                    "work_kind": "ops"})[0], 200)
+        self.assertEqual(self.post("/api/cards/%d/state" % num,
+                                   {"state": "in_progress"})[0], 200)
+        bare = dict(self.OPS_PACKET)
+        bare.pop("work_kind")            # the packet forgot; the card did not
+        status, body = self.submit(num, bare)
+        self.assertEqual(status, 200, body)
+
+    def test_a_nonsense_work_kind_on_assign_is_named(self):
+        num = self.new_card("something")["num"]
+        status, body = self.post("/api/cards/%d/assign" % num,
+                                 {"agent_name": "a", "work_kind": "vibes"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "work_kind")
+
+
+class TestExternalAgentsAndLongRunning(Base):
+    """The silence timer, for work it cannot watch.
+
+    `long_running` was worker-only, so when the session ran work as an ordinary
+    background agent -- which emits no worker telemetry at all -- nothing could
+    turn the clock off and the card re-ambered every five minutes for its whole
+    build. Two card actions fix it, and the session's own notes now count as
+    activity, because posting one means it just went and looked.
+    """
+
+    SILENCE_SECONDS = 1.0
+    SILENCE_TICK = 0.15
+    START_BACKGROUND = True
+
+    def silent_events(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return [e for e in detail["timeline"] if e["kind"] == "agent_silent"]
+
+    def await_silence(self, num, timeout=10.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            got = self.silent_events(num)
+            if got:
+                return got
+            time.sleep(0.1)
+        return []
+
+    def test_the_session_can_mark_a_card_long_running(self):
+        num = self.new_card("a slow migration")["num"]
+        self.to_in_progress(num)
+        status, body = self.post("/api/cards/%d/action" % num,
+                                 {"action": "long_running", "actor": "session",
+                                  "note": "the full suite takes ~40 minutes"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["card"]["long_running"])
+        time.sleep(2.0)
+        self.assertEqual(self.silent_events(num), [],
+                         "a declared long job must not amber")
+        _, detail = self.get("/api/cards/%d" % num)
+        note = [e for e in detail["timeline"] if e["kind"] == "note"][-1]
+        self.assertIn("40 minutes", note["payload"]["text"])
+
+    def test_long_running_can_be_cleared_again(self):
+        num = self.new_card("a slow migration")["num"]
+        self.to_in_progress(num)
+        self.post("/api/cards/%d/action" % num,
+                  {"action": "long_running", "actor": "session"})
+        status, body = self.post("/api/cards/%d/action" % num,
+                                 {"action": "long_running", "value": False,
+                                  "actor": "session"})
+        self.assertEqual(status, 200, body)
+        self.assertFalse(body["card"]["long_running"])
+        self.assertTrue(self.await_silence(num), "the clock runs again")
+
+    def test_an_external_agent_never_ambers(self):
+        """It emits no worker telemetry, so the clock can never be satisfied --
+        so it does not run. The session owns checking on it."""
+        outside = self.new_card("built by an ordinary background agent")["num"]
+        inside = self.new_card("built by a sprint worker")["num"]
+        self.to_in_progress(outside)
+        self.to_in_progress(inside)
+        status, body = self.post("/api/cards/%d/action" % outside,
+                                 {"action": "external_agent", "actor": "session",
+                                  "note": "russ-codex seat 4"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["card"]["external_agent"])
+
+        self.assertTrue(self.await_silence(inside),
+                        "an ordinary card must still amber")
+        self.assertEqual(self.silent_events(outside), [])
+
+    def test_a_session_note_counts_as_activity(self):
+        """The session investigating a card IS the check agent_silent asked
+        for; nagging it again five minutes later is nagging it about work it
+        already did."""
+        num = self.new_card("a card the session is watching")["num"]
+        self.to_in_progress(num)
+        self.assertTrue(self.await_silence(num))
+        before = len(self.silent_events(num))
+        status, _ = self.post("/api/cards/%d/events" % num,
+                              {"kind": "note", "actor": "session",
+                               "payload": {"text": "checked the seat — it is "
+                                                   "mid-build, log is moving"}})
+        self.assertEqual(status, 201)
+        time.sleep(0.5)
+        self.assertEqual(len(self.silent_events(num)), before,
+                         "the note reset the clock")
+        # ...and it is only a reprieve, not a mute: silence resumes after it.
+        deadline = time.time() + 10.0
+        while time.time() < deadline and len(self.silent_events(num)) <= before:
+            time.sleep(0.1)
+        self.assertGreater(len(self.silent_events(num)), before)
+
+    def test_a_session_note_counts_on_an_ASSIGNED_card_too(self):
+        """The clock keys on the AGENT, so the agent-wide branch of the
+        baseline has to agree with the per-card one."""
+        num = self.new_card("assigned to an outside seat")["num"]
+        self.assertEqual(self.post("/api/cards/%d/assign" % num,
+                                   {"agent_name": "russ-codex-4"})[0], 200)
+        self.assertEqual(self.post("/api/cards/%d/state" % num,
+                                   {"state": "in_progress"})[0], 200)
+        self.assertTrue(self.await_silence(num))
+        before = len(self.silent_events(num))
+        self.assertEqual(self.post("/api/cards/%d/events" % num,
+                                   {"kind": "note", "actor": "session",
+                                    "payload": {"text": "pinged the seat, "
+                                                        "it is alive"}})[0], 201)
+        time.sleep(0.5)
+        self.assertEqual(len(self.silent_events(num)), before,
+                         "a session note on an assigned card resets the clock")
+        # The proof the clock RESET rather than merely stayed quiet: the next
+        # episode arms off the note, so silence fires again after it.
+        deadline = time.time() + 10.0
+        while time.time() < deadline and len(self.silent_events(num)) <= before:
+            time.sleep(0.1)
+        self.assertGreater(len(self.silent_events(num)), before,
+                           "the note re-armed the episode")
+
+    def test_a_server_reminder_never_counts_as_activity(self):
+        """The sweep's own noise must not reset the clock it is complaining
+        about -- that is how a nag becomes permanent silence."""
+        num = self.new_card("quiet")["num"]
+        self.to_in_progress(num)
+        self.assertTrue(self.await_silence(num))
+        ts, _seq = self.app.card_baseline(num)
+        _, detail = self.get("/api/cards/%d" % num)
+        server_events = [e for e in detail["timeline"] if e["actor"] == "server"]
+        self.assertTrue(server_events)
+        self.assertLess(ts, max(e["ts"] for e in server_events))
+
+    def test_the_board_may_not_set_either_flag(self):
+        """These turn the silence timer OFF. The user has no way to know
+        whether an agent is legitimately quiet, so it is not their switch."""
+        num = self.new_card("a card")["num"]
+        self.to_in_progress(num)
+        for action in ("long_running", "external_agent"):
+            with self.subTest(action=action):
+                status, body = self.post(
+                    "/api/cards/%d/action" % num, {"action": action},
+                    headers={"Sec-Fetch-Site": "same-origin"})
+                self.assertEqual(status, 403, body)
+                self.assertEqual(body["error"], "session_only")
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertFalse(detail["card"]["long_running"])
+        self.assertFalse(detail["card"]["external_agent"])
+
+    def test_retry_forgets_both_flags(self):
+        """A fresh agent starts on a fresh clock."""
+        num = self.new_card("a card")["num"]
+        self.to_in_progress(num)
+        for action in ("long_running", "external_agent"):
+            self.post("/api/cards/%d/action" % num,
+                      {"action": action, "actor": "session"})
+        self.assertEqual(self.post("/api/cards/%d/state" % num,
+                                   {"state": "failed", "actor": "session",
+                                    "reason": "agent died"})[0], 200)
+        status, body = self.post("/api/cards/%d/action" % num, {"action": "retry"})
+        self.assertEqual(status, 200, body)
+        self.assertFalse(body["card"]["long_running"])
+        self.assertFalse(body["card"]["external_agent"])
+
+    def test_assign_can_declare_an_external_agent_up_front(self):
+        num = self.new_card("built outside")["num"]
+        status, body = self.post("/api/cards/%d/assign" % num,
+                                 {"agent_name": "russ-codex-4",
+                                  "external_agent": True})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["card"]["external_agent"])
+
+    def test_a_bad_action_names_the_whole_enum(self):
+        num = self.new_card("a card")["num"]
+        status, body = self.post("/api/cards/%d/action" % num,
+                                 {"action": "teleport"})
+        self.assertEqual(status, 400, body)
+        self.assertIn("long_running", body["message"])
+        self.assertIn("external_agent", body["message"])
+
+
+class TestMigratedColumns(unittest.TestCase):
+    """A board that has been running since before a column landed must open."""
+
+    def test_an_old_database_gains_the_new_columns(self):
+        tmp = tempfile.mkdtemp(prefix="sprintd-migrate-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        root = os.path.join(tmp, "project")
+        os.makedirs(root)
+        app = sprintd.App(root, token="t")
+        # Rewind: drop the columns the way an older sprintd would never have
+        # had them, then reopen and read a card through the normal path.
+        app.conn.execute("ALTER TABLE cards DROP COLUMN external_agent")
+        app.conn.execute("ALTER TABLE cards DROP COLUMN work_kind")
+        app.conn.execute(
+            "INSERT INTO cards(sprint_id, state, title, body, created_at, updated_at) "
+            "VALUES(NULL,'queued','old','old card',1.0,1.0)")
+        app.close()
+
+        app2 = sprintd.App(root, token="t")
+        self.addCleanup(app2.close)
+        card = app2.card_json(app2.card_row(1))
+        self.assertFalse(card["external_agent"])
+        self.assertEqual(card["work_kind"], "code")
 
 
 if __name__ == "__main__":

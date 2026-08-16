@@ -353,6 +353,39 @@ worktree root — not committed) shaped like:
   Call `sprint-ready` once (any one member card number) with the full
   packet — the server flips every member together.
 
+### Ops cards — a different shape of proof
+
+Some cards aren't code. Reprocessing a mailbox, rerunning a job,
+rotating a key, checking a production number: there's no diff, no
+branch, no preview, and often no test suite. If your brief says the card
+is **ops work** (or the card was assigned with `work_kind: "ops"`), send
+an ops packet instead — the gate swaps its required fields rather than
+relaxing them:
+
+```json
+{
+  "work_kind": "ops",
+  "claim": "Reprocessed the stuck mailbox backlog.",
+  "readback": "$ russ mail reprocess --since 2026-08-14\nprocessed=412 skipped=0 errors=0\nqueue depth now 0",
+  "validate": ["Run `russ mail stats`.", "Confirm the queued count reads 0, not 412."]
+}
+```
+
+- **`readback` is the whole evidence**: what you actually OBSERVED — a
+  log excerpt, the command and its output, the before/after number.
+  Paste the real thing, not a summary of it; the board renders it
+  preformatted and verbatim, and it is what the user reads instead of a
+  diff. A string, or an array of lines.
+- `claim` and `validate` are required exactly as always.
+- `diffstat`, `branch`, `ui_change` and `screenshots` are NOT required.
+  `test_cmd`/`test_result` are optional — include them if you ran
+  something, and they still need real counts ("3 pass, 0 fail").
+- You get no worktree and no branch for an ops card, and you don't need
+  one. Work wherever the task actually lives, keep the "no writes
+  outside what you were asked to touch" discipline, and remember that
+  the readback is the only thing standing between the user and taking
+  your word for it.
+
 On success the card (or whole batch) moves to `ready` and waits for the
 user's verdict. You're not done-done until you see an `approve` — a
 `bounce` means notes came back; read them, fix, and call `sprint-ready`

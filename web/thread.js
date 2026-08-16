@@ -362,6 +362,17 @@ function evidencePacket(packet, card, state, app, walking) {
     box.appendChild(h('div', h('p.packet-label.accent', 'Check it yourself'), list));
   }
 
+  // Ops work has no diff and no preview — what it has is a readback: the log
+  // line or command output showing the thing actually happened. It is evidence,
+  // so it renders verbatim and preformatted, never reflowed into prose.
+  const readback = Array.isArray(p.readback) ? p.readback.join('\n')
+    : (typeof p.readback === 'string' ? p.readback : '');
+  if (readback.trim()) {
+    box.appendChild(h('div',
+      h('p.packet-label.accent', 'What came back'),
+      h('pre.packet-readback', readback.trim())));
+  }
+
   const shots = Array.isArray(p.screenshots) ? p.screenshots : [];
   if (shots.length) box.appendChild(packetShots(shots, app));
 
@@ -383,7 +394,9 @@ function evidencePacket(packet, card, state, app, walking) {
     }, 'See it live ↗'));
   }
 
-  const meta = [p.branch, p.diffstat, p.test_cmd && p.test_result ? `${p.test_cmd} → ${p.test_result}` : p.test_result]
+  const meta = [p.work_kind === 'ops' ? 'ops — no branch, no diff' : null,
+    p.branch, p.diffstat,
+    p.test_cmd && p.test_result ? `${p.test_cmd} → ${p.test_result}` : p.test_result]
     .filter(Boolean).join(' · ');
   if (meta) box.appendChild(h('p.packet-meta', meta));
 

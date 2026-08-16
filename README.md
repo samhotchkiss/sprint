@@ -96,8 +96,9 @@ either way. **`sprintd tail`** is the primary one — it holds a single
 streaming connection to the board open and prints exactly one compact
 JSON line per real event, so the session runs it under its streaming
 monitor and gets woken once per thing that actually happened and never
-in between (heartbeats and cursor moves never reach it; a quiet board
-costs zero wakeups). It never exits on its own: it reconnects through
+in between (heartbeats, cursor moves and the session's own posts never
+reach it — pass `--include-self` if you want the raw stream; a quiet
+board costs zero wakeups). It never exits on its own: it reconnects through
 dropped connections by itself and resumes from the last event it saw,
 tells the session in one line if the board has been unreachable for a
 minute or if it restarted underneath, and counts as session liveness for
