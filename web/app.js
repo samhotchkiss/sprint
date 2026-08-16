@@ -7,7 +7,7 @@ import { Live } from './live.js';
 import {
   store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
   sections, headline, countFor, loadView, setView, setChatOpen, bounceComposing,
-  activeLimits, limitLine, accountLimit,
+  activeLimits, limitLine, accountLimit, autohealNote,
 } from './state.js';
 import { renderList } from './list.js';
 import { renderBoard, renderFold } from './board.js';
@@ -216,7 +216,14 @@ function renderSessionBanner() {
   el.bannerSlot.hidden = el.banner.hidden && !limits;
   if (el.banner.hidden) return;
   const cls = offline ? 'banner warn' : 'banner dim';
-  const text = offline ? 'session offline — items will queue'
+  // Autoheal's one clause (card #68). When the board has decided its own
+  // session died and the hub has already reached for the keyboard, saying
+  // "items will queue" to a person watching a board nobody is reading is the
+  // wrong half of the truth — "revival attempted 12:03" is the useful half,
+  // and "autoheal gave up …" is the one he has to act on.
+  const note = offline ? autohealNote() : null;
+  const text = offline ? (note ? `session offline — ${note}`
+    : 'session offline — items will queue')
     : 'lost the board connection — retrying';
   // Same words, same banner: rewriting it on every paint is one more thing
   // flickering on a page that should be still.

@@ -5,6 +5,8 @@
 //   &session=busy      session attached but its drain cursor is behind (dot only, no banner)
 //   &live=1            drip a few scripted events (chime + badge + reconciliation)
 //   &limited=1         a provider limit window is open (board line + model tags)
+//   &autoheal=sent     the session is dead and the hub already sent a wake-up
+//   &autoheal=gaveup   ...and it gave up after three, with the words to act on
 // It stubs window.fetch (for /api/* only) and window.EventSource.
 
 const now = Date.now();
@@ -63,6 +65,9 @@ const state = {
   // Open provider limit windows (?limited=1). Empty by default: a board with
   // nothing limited is the normal board.
   limits: [],
+  // Dead-session autoheal (?autoheal=sent | gaveup). Null is the normal board:
+  // a session that is alive has nothing to heal.
+  autoheal: null,
 };
 
 function card(c) {
@@ -354,6 +359,7 @@ function boardPayload() {
     sidebar: state.sidebar,
     default_model: 'fable',
     limits: state.limits,
+    autoheal: state.autoheal,
   };
 }
 
@@ -539,6 +545,25 @@ export function installMock(params) {
   const sess = params.get('session');
   if (sess === 'busy' || sess === 'offline' || sess === 'online') state.sessionStatus = sess;
   if (params.get('unauth')) unauth = true;   // &unauth=1 exercises the 401 re-auth wall
+  // &autoheal=sent|gaveup — the board decided its own session died and the hub
+  // went to wake it. Forces the offline banner too: an autoheal note on a live
+  // session would be a state that cannot happen.
+  const heal = params.get('autoheal');
+  if (heal) {
+    state.sessionStatus = 'offline';
+    const at = new Date(now - 9 * MIN);
+    state.autoheal = {
+      registered: true, tmux_window: 'russ-machine', dead: true, reason: null,
+      attempts: heal === 'gaveup' ? 3 : 1, max_attempts: 3,
+      last_attempt_at: at.toISOString(),
+      last_attempt_label: `${at.getHours() % 12 || 12}:${String(at.getMinutes()).padStart(2, '0')}${at.getHours() < 12 ? 'am' : 'pm'}`,
+      delivered_but_silent: heal === 'gaveup',
+      gave_up: heal === 'gaveup',
+      gave_up_text: heal === 'gaveup'
+        ? 'autoheal gave up after 3 tries — the wake-up was delivered but the session never stirred; its terminal may be blocked by an open dialog. Check the window by hand.'
+        : null,
+    };
+  }
   // &limited=1 — a provider limit window is open and two cards were re-dispatched
   // onto the fallback because of it. The board line and the model tags together.
   if (params.get('limited')) {

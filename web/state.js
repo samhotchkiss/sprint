@@ -140,6 +140,11 @@ export const store = {
   // every board on the machine shows, and the Resume button in it. Null means
   // the server said there is none.
   accountLimit: null,
+  // Dead-session autoheal (card #68). Null means the server has no opinion —
+  // older code, or nothing to say. When the session is offline AND the hub has
+  // already tried to wake it, the offline banner says so instead of repeating
+  // "items will queue" at somebody who is watching a board nobody is reading.
+  autoheal: null,
 
   // ---- rail + layout (client only) ----------------------------------------
   // Only one thing owns the rail at a time: a card, or the session chat.
@@ -447,6 +452,11 @@ export function applyBoard(board) {
   // have); `null` means the server looked and there is none.
   if (board.account_limit !== undefined) {
     store.accountLimit = board.account_limit ? normLimit(board.account_limit) : null;
+  }
+  // Same contract as the limits above: `undefined` is an older server with no
+  // opinion (leave what we have), an object replaces it.
+  if (board.autoheal !== undefined) {
+    store.autoheal = board.autoheal ? normAutoheal(board.autoheal) : null;
   }
 
   const seq = num(board.seq != null ? board.seq : board.last_seq);
@@ -1059,6 +1069,49 @@ export function normLimit(l) {
     source: l.source || null,
     note: l.note || null,
   };
+}
+
+/**
+ * Dead-session autoheal, as the banner needs it (card #68).
+ *
+ * The board decides all of this; the tab only renders it. `lastAttemptLabel`
+ * is the server's own clock rendering, kept for the same reason the limit
+ * lines keep theirs — one composed string, no second opinion.
+ */
+export function normAutoheal(a) {
+  if (!a || typeof a !== 'object') return null;
+  return {
+    registered: !!a.registered,
+    window: a.tmux_window || null,
+    dead: !!a.dead,
+    reason: a.reason || null,
+    attempts: num(a.attempts) || 0,
+    maxAttempts: num(a.max_attempts) || 0,
+    lastAttemptAt: ms(a.last_attempt_at),
+    lastAttemptLabel: a.last_attempt_label || null,
+    gaveUp: !!a.gave_up,
+    gaveUpText: a.gave_up_text || null,
+    deliveredButSilent: !!a.delivered_but_silent,
+  };
+}
+
+/**
+ * What the offline banner says after "session offline". Three endings, in
+ * decreasing order of how much the user has to do about them:
+ *
+ *   * autoheal gave up  — go look at the terminal, in the server's own words.
+ *   * a wake-up was sent — the machine is on it; here is when it tried.
+ *   * nothing              — the original line, unchanged.
+ *
+ * Returns null when there is nothing extra worth saying, so the banner's
+ * default text is never rewritten for the sake of it.
+ */
+export function autohealNote() {
+  const a = store.autoheal;
+  if (!a || !a.dead) return null;
+  if (a.gaveUp && a.gaveUpText) return a.gaveUpText;
+  if (a.lastAttemptLabel) return `revival attempted ${a.lastAttemptLabel}`;
+  return null;
 }
 
 /**

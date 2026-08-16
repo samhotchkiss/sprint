@@ -239,6 +239,16 @@ DEFAULT_SETTINGS = {
     # different things: the board is called "Billing week", the colleague
     # running it is called Chuck.
     "agent_name": "",
+    # WHERE that session can be reached, as a tmux target ("russ-machine",
+    # "sess:1", "%5"). The session writes this at boot when it can see it is
+    # running inside tmux; empty means it is not, and dead-session autoheal
+    # simply does not apply to this board (see the Autoheal note below).
+    #
+    # Unlike `agent_name`, LAST write wins. A name is an identity and must
+    # survive a restart untouched; a window is an ADDRESS, and a session that
+    # moved to a new window has to be able to say so or the hub will keep
+    # typing into somebody else's terminal.
+    "session_tmux_window": "",
 }
 # `default_executor` accepts either a named executor or the bare kind
 # "subagent" -- the out-of-the-box board has no named executors worth typing.
@@ -427,6 +437,77 @@ ACCOUNT_LIMIT_HEADLINE = "Claude account limit reached — nothing can run"
 ACCOUNT_LIMIT_ACTION = ("Log out of Claude, sign in with another Claude "
                         "session, then press Resume.")
 ACCOUNT_RESUME_LABEL = "Resume"
+
+# --------------------------------------------------------------------------
+# Dead-session autoheal
+#
+# The incident, twice in one day: a Claude session is killed at a provider
+# limit. Its board server is untouched -- it keeps serving, keeps sweeping,
+# keeps accepting cards -- but the brain is gone. Five cards the user had
+# already approved sat in `integrating` for six hours because nobody was left
+# to merge them, and the board had every fact needed to notice: its
+# orchestrator cursor stopped at 11:15 and never moved again. Sam, verbatim:
+# "but also, how can we help this autoheal in the future?"
+#
+# Three pieces, in three different places, because no single process can do it:
+#
+#   1. REGISTRATION (the session). At boot the session records its own tmux
+#      window in settings (`session_tmux_window`). A session outside tmux
+#      registers nothing and is simply not autohealable -- there is no channel
+#      to wake it on, and guessing one is how you type a wake-up brief into
+#      somebody else's terminal.
+#   2. DETECTION (the board). The sweep already knows what the offline banner
+#      knows. Past `session_dead_seconds` with no proof of life at all AND with
+#      work owed to the session, it says so once, out loud, as a `session_dead`
+#      event.
+#   3. REVIVAL (the hub). A dead session cannot restart itself and its board
+#      must not spawn processes, so the hand that reaches for the keyboard is
+#      the one machine-wide process that already watches every board: the hub
+#      runs `tmux-send <window> <brief>`, where the brief is built by the board
+#      out of its own state.
+#
+# Two guards, both learned the hard way:
+#
+#   * The account limit owns the parked case. While a machine-wide account
+#     window is on, a silent session is not dead, it is PARKED, and poking it
+#     achieves nothing -- #47's Resume flow is what re-arms everything.
+#   * SUBMISSION IS NOT REVIVAL. The second outage of the day had the session's
+#     process alive with a `/status` dialog open in its terminal: tmux-send
+#     reported "submitted and verified" and absolutely nothing happened,
+#     because an undismissed modal blocks the session from processing
+#     anything. So a wake-up only counts as a success if the board's cursor
+#     actually MOVES inside `revive_grace_seconds`; a delivered message that
+#     never stirs the session is a failed attempt, and the give-up line has to
+#     say the thing the user can physically act on -- go look at the window.
+DEFAULT_SESSION_DEAD_SECONDS = 1200.0    # 20 min with no proof of life at all
+
+# Which states mean "the session owes this card an action". A board full of
+# cards waiting on the USER (`needs_you`, `ready`) is not a board with a dead
+# session worth waking -- nothing would happen if it woke. `blocked` and
+# `failed` are excluded for the same reason from the other direction: they are
+# already parked with a named reason. That leaves the three the russ outage
+# actually stranded, which is the whole set this rule exists for.
+SESSION_OWED_STATES = ("queued", "in_progress", "integrating")
+
+# Crash-loop guard, mirrored from the board's own self-restart (#62): the same
+# three questions (how recently, how many, inside what window) and the same
+# bias -- when in doubt, do not.
+DEFAULT_REVIVE_MIN_INTERVAL = 600.0      # never twice inside 10 min per board
+DEFAULT_REVIVE_MAX_BURST = 3            # at most 3 wake-ups...
+DEFAULT_REVIVE_BURST_WINDOW = 3600.0    # ...inside an hour, then give up
+# How long a woken session gets to prove it woke, before the attempt is judged.
+DEFAULT_REVIVE_GRACE_SECONDS = 180.0     # 3 min
+
+# Where the hub's hand is. The tmux-send skill installs it here; a machine
+# without it is a machine where autoheal logs one line and skips, which is the
+# correct degrade -- never a crashed hub.
+DEFAULT_TMUX_SEND = "~/.local/bin/tmux-send"
+TMUX_WINDOW_MAX = 80
+# A tmux target: session, session:window, session:window.pane, or a pane id.
+# Deliberately strict -- this string is handed to a subprocess, so anything
+# that could be read as a second argument or a shell fragment is refused at
+# the door rather than quoted at the call site.
+TMUX_WINDOW_RE = re.compile(r"^[A-Za-z0-9%][A-Za-z0-9._:@/-]{0,79}$")
 
 STATES = (
     "held", "queued", "triaging", "in_progress", "needs_you", "blocked",
@@ -1336,6 +1417,37 @@ def clean_agent_name(value, limit: int = AGENT_NAME_MAX) -> str:
     return text
 
 
+def clean_tmux_window(value) -> str:
+    """Normalize the session's wake channel, or "" for "not reachable".
+
+    This string is handed to a subprocess as `tmux-send <target> <brief>`, so
+    it is validated as an ADDRESS and not as prose: one token, no spaces, no
+    leading dash (which argparse-style tools would read as an option), and
+    only the characters a real tmux target uses. `null`/`""` unregister --
+    which is how a session that leaves tmux takes its channel back.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ApiError(400, "bad_tmux_window",
+                       "session_tmux_window must be a string",
+                       field="session_tmux_window")
+    text = value.strip()
+    if not text:
+        return ""
+    if len(text) > TMUX_WINDOW_MAX:
+        raise ApiError(400, "bad_tmux_window",
+                       "session_tmux_window must be %d characters or fewer "
+                       "(this one is %d)" % (TMUX_WINDOW_MAX, len(text)),
+                       field="session_tmux_window")
+    if not TMUX_WINDOW_RE.match(text):
+        raise ApiError(400, "bad_tmux_window",
+                       "session_tmux_window must be a tmux target — a name, "
+                       "\"session:window\", or a pane id like \"%%5\" — with no "
+                       "spaces (got \"%s\")" % text, field="session_tmux_window")
+    return text
+
+
 def clean_model(value):
     """Normalize a model name, or None. Free-form on purpose: the board records
     what the session says it dispatched on and never adjudicates the list."""
@@ -1628,13 +1740,17 @@ def validate_settings(patch, base=None) -> dict:
         raise _bad("settings", "settings must be an object")
     current = normalize_settings(base)
     for key in patch:
-        if key not in ("worker", "agent_name"):
+        if key not in ("worker", "agent_name", "session_tmux_window"):
             raise ApiError(400, "unknown_key",
-                           "%s is not a setting (\"worker\" and \"agent_name\" "
-                           "are the two that exist today)" % key, field=key)
+                           "%s is not a setting (\"worker\", \"agent_name\" and "
+                           "\"session_tmux_window\" are the three that exist "
+                           "today)" % key, field=key)
     agent_name = current["agent_name"]
     if "agent_name" in patch:
         agent_name = clean_agent_name(patch["agent_name"])
+    tmux_window = current["session_tmux_window"]
+    if "session_tmux_window" in patch:
+        tmux_window = clean_tmux_window(patch["session_tmux_window"])
     worker_patch = patch.get("worker", {})
     if not isinstance(worker_patch, dict):
         raise _bad("worker", "worker must be an object")
@@ -1686,7 +1802,8 @@ def validate_settings(patch, base=None) -> dict:
                    "default_executor \"%s\" is not in worker.executors "
                    "(known: %s)" % (default, ", ".join(
                        sorted(list(worker["executors"].keys()) + [BUILTIN_EXECUTOR]))))
-    return {"worker": worker, "agent_name": agent_name}
+    return {"worker": worker, "agent_name": agent_name,
+            "session_tmux_window": tmux_window}
 
 
 def normalize_settings(raw) -> dict:
@@ -1694,7 +1811,8 @@ def normalize_settings(raw) -> dict:
     default for that key rather than 500-ing the board -- a hand-edited file
     must never be able to take the sprint down."""
     out = {"worker": dict(DEFAULT_SETTINGS["worker"]),
-           "agent_name": DEFAULT_SETTINGS["agent_name"]}
+           "agent_name": DEFAULT_SETTINGS["agent_name"],
+           "session_tmux_window": DEFAULT_SETTINGS["session_tmux_window"]}
     out["worker"]["executors"] = {
         k: dict(v) for k, v in DEFAULT_SETTINGS["worker"]["executors"].items()}
     if not isinstance(raw, dict):
@@ -1705,6 +1823,14 @@ def normalize_settings(raw) -> dict:
         # A hand-edited name that is too long or not a string is a nameless
         # session, not a dead board.
         out["agent_name"] = ""
+    try:
+        out["session_tmux_window"] = clean_tmux_window(
+            raw.get("session_tmux_window"))
+    except ApiError:
+        # A hand-edited window that is not a legal tmux target is NO window.
+        # Falling back to a broken address would mean the hub types a wake-up
+        # brief at whatever that string happens to hit.
+        out["session_tmux_window"] = ""
     worker = raw.get("worker")
     if not isinstance(worker, dict):
         return out
@@ -1775,6 +1901,11 @@ class App:
                  worker_longrun_factor: float = None,
                  default_model: str = None,
                  code_path: str = None,
+                 session_dead_seconds: float = None,
+                 revive_min_interval: float = None,
+                 revive_max_burst: int = None,
+                 revive_burst_window: float = None,
+                 revive_grace_seconds: float = None,
                  log=None):
         self.project_root = os.path.realpath(project_root)
         self.data_dir = os.path.realpath(data_dir or os.path.join(self.project_root, DATA_DIRNAME))
@@ -1853,6 +1984,24 @@ class App:
         self.default_model = clean_model(
             default_model if default_model is not None
             else os.environ.get("SPRINT_DEFAULT_MODEL", DEFAULT_MODEL)) or DEFAULT_MODEL
+
+        # Dead-session autoheal. Same reasoning as every other clock in here:
+        # a twenty-minute rule that cannot be made two seconds cannot be tested.
+        self.session_dead_seconds = (
+            session_dead_seconds if session_dead_seconds is not None
+            else env_float("SPRINT_SESSION_DEAD_SECONDS", DEFAULT_SESSION_DEAD_SECONDS))
+        self.revive_min_interval = (
+            revive_min_interval if revive_min_interval is not None
+            else env_float("SPRINT_REVIVE_MIN_INTERVAL", DEFAULT_REVIVE_MIN_INTERVAL))
+        self.revive_max_burst = (
+            int(revive_max_burst) if revive_max_burst is not None
+            else env_int("SPRINT_REVIVE_MAX_BURST", DEFAULT_REVIVE_MAX_BURST))
+        self.revive_burst_window = (
+            revive_burst_window if revive_burst_window is not None
+            else env_float("SPRINT_REVIVE_BURST_WINDOW", DEFAULT_REVIVE_BURST_WINDOW))
+        self.revive_grace_seconds = (
+            revive_grace_seconds if revive_grace_seconds is not None
+            else env_float("SPRINT_REVIVE_GRACE_SECONDS", DEFAULT_REVIVE_GRACE_SECONDS))
 
         self._log = log
         self.lock = threading.RLock()
@@ -2097,6 +2246,25 @@ class App:
                 with self.lock:
                     self._append_event(None, "server", "note", {
                         "text": text, "agent_name": now, "was": was or None,
+                        "by": actor if actor in ACTORS else "user",
+                    })
+            # Registering a wake channel is neither a policy change nor an
+            # introduction: it is the session telling the board where it can be
+            # reached if it dies. One quiet line, so the fact is in the log the
+            # hub's revive attempts will later refer to.
+            if merged["session_tmux_window"] != current["session_tmux_window"]:
+                was, win = current["session_tmux_window"], merged["session_tmux_window"]
+                if not win:
+                    text = "the session is no longer reachable in tmux"
+                elif not was:
+                    text = "the session can be woken in tmux window “%s”" % win
+                else:
+                    text = ("the session moved to tmux window “%s” (was “%s”)"
+                            % (win, was))
+                with self.lock:
+                    self._append_event(None, "server", "note", {
+                        "text": text, "session_tmux_window": win or None,
+                        "was": was or None,
                         "by": actor if actor in ACTORS else "user",
                     })
             if not changed:
@@ -3881,6 +4049,13 @@ class App:
             # An account limit somebody else declared, and its end: the sweep is
             # how a board with nobody looking at it stays in step.
             self.reconcile_account_limit()
+            # ...and LAST, because it reads the answer that call just wrote: a
+            # session silent under an account limit is parked, not dead, and
+            # asking before reconciling would call it dead for one tick.
+            try:
+                self.sweep_session_dead()
+            except Exception:
+                self.log("dead-session sweep failed: %s" % traceback.format_exc())
 
     def sweep_stuck(self) -> int:
         placeholders = ",".join("?" * len(STUCK_STATES))
@@ -4486,6 +4661,518 @@ class App:
             "waiter_online_seconds": self.waiter_online_seconds,
             "waiter_gone_seconds": self.waiter_gone_seconds,
         }
+
+    # -- dead-session autoheal --------------------------------------------
+    #
+    # See the module note for WHY. This half is DETECTION and BOOKKEEPING: the
+    # board decides whether its own session is dead, writes the one event that
+    # says so, builds the wake-up brief out of its own state, and owns the
+    # crash-loop guard. It never runs a process -- the hub does that, because a
+    # dead session's own board reaching for a keyboard is one more thing that
+    # can go wrong at 2am with nobody watching.
+
+    def session_tmux_window(self) -> str:
+        """Where this board's session can be woken, or "" for nowhere."""
+        return self.settings().get("session_tmux_window") or ""
+
+    def claim_tmux_window(self, value, actor: str = "session") -> dict:
+        """Register (or clear) the wake channel. LAST write wins, deliberately:
+        a window is an address, not an identity, and a session that moved has
+        to be able to correct it or the hub types into the wrong terminal."""
+        wanted = clean_tmux_window(value)
+        settings = self.save_settings({"session_tmux_window": wanted}, actor=actor)
+        return {"ok": True, "session_tmux_window": settings["session_tmux_window"],
+                "wanted": wanted}
+
+    def session_last_seen(self):
+        """The most recent thing the SESSION demonstrably did, and what it was.
+
+        Three signals, all of them acts and none of them inferred:
+          * `cursor`  -- it drained the event log (the strongest: it read).
+          * `waiter`  -- its long-poll asked us for the next event.
+          * `spoke`   -- it posted something as `actor: "session"`.
+
+        Any one of them is proof of life; the latest wins. A `user` event is
+        deliberately NOT on this list -- the russ outage had the user still
+        typing into a board whose session had been dead for five hours -- and
+        neither is a `server` event, or the sweep's own reminders would keep
+        resurrecting the session they are complaining about.
+        """
+        row = self.q1("SELECT * FROM cursors WHERE name='orchestrator'")
+        best = float(row["updated_at"]) if row else self.started_at
+        how = "cursor" if row else "boot"
+        waiter = self.waiter_seen_at()
+        if waiter is not None and waiter > best:
+            best, how = float(waiter), "waiter"
+        spoke = self.q1("SELECT ts FROM events WHERE actor='session' "
+                        "ORDER BY seq DESC LIMIT 1")
+        if spoke is not None and float(spoke["ts"]) > best:
+            best, how = float(spoke["ts"]), "spoke"
+        return best, how
+
+    def session_owed_cards(self) -> dict:
+        """The cards the session -- not the user -- owes an action on, by state."""
+        owed = {}
+        for state in SESSION_OWED_STATES:
+            nums = [r["num"] for r in self.q(
+                "SELECT num FROM cards WHERE state=? ORDER BY num", (state,))]
+            if nums:
+                owed[state] = nums
+        return owed
+
+    def account_limit_active(self, at: float = None) -> bool:
+        at = now() if at is None else at
+        return self.q1("SELECT id FROM limits WHERE kind='account' "
+                       "AND cleared_at IS NULL AND resets_at > ? LIMIT 1",
+                       (at,)) is not None
+
+    def session_dead_state(self, at: float = None) -> dict:
+        """Is this board's session dead, and everything the answer stands on.
+
+        Pure read. Three conditions, and the reason it is NOT dead is returned
+        by name so each guard is testable one at a time:
+
+          * `account_limited` -- a machine-wide account window is open. A
+            silent session under an account limit is PARKED, not dead: nothing
+            it could be woken to do would run. #47's Resume flow re-arms it,
+            and this rule stays out of the way. Checked first because it is the
+            strongest: it is true no matter how quiet or how loaded the board.
+          * `alive` -- something the session did is inside the window.
+          * `no_work` -- nothing is owed to the session. A board whose cards are
+            all `needs_you`/`ready`/`blocked` is waiting on a HUMAN, and waking
+            a session to look at it would achieve nothing.
+        """
+        at = now() if at is None else at
+        seen_at, seen_by = self.session_last_seen()
+        quiet = max(0.0, at - seen_at)
+        owed = self.session_owed_cards()
+        owed_count = sum(len(v) for v in owed.values())
+        limited = self.account_limit_active(at)
+        cursor = self.cursor_seq()
+        head = self.max_seq()
+        if limited:
+            reason = "account_limited"
+        elif quiet < self.session_dead_seconds:
+            reason = "alive"
+        elif not owed_count:
+            reason = "no_work"
+        else:
+            reason = None
+        return {
+            "dead": reason is None,
+            "reason": reason,
+            "last_seen_at": seen_at,
+            "last_seen_by": seen_by,
+            "quiet_for_seconds": round(quiet, 1),
+            "dead_after_seconds": self.session_dead_seconds,
+            "cursor": cursor,
+            "head": head,
+            "pending": max(0, head - cursor),
+            "owed": owed,
+            "owed_count": owed_count,
+            "account_limited": limited,
+            "tmux_window": self.session_tmux_window(),
+        }
+
+    def _sprint_events(self, kind: str, since_ts: float = None) -> list:
+        """Sprint-level (card_num IS NULL) events of one kind, oldest first."""
+        if since_ts is None:
+            return self.q("SELECT seq, ts, payload FROM events WHERE card_num IS NULL "
+                          "AND kind=? ORDER BY seq", (kind,))
+        return self.q("SELECT seq, ts, payload FROM events WHERE card_num IS NULL "
+                      "AND kind=? AND ts>? ORDER BY seq", (kind, since_ts))
+
+    def revive_state(self, at: float = None, dead=None) -> dict:
+        """The crash-loop guard's whole answer, mirrored from self-restart (#62).
+
+        Three questions, in the same order and with the same bias toward doing
+        nothing: how recently did we wake this board, how many times lately,
+        and did the last wake-up actually WORK.
+
+        That last one is the lesson from the second outage of the day. The
+        session's process was alive with a `/status` dialog open in its
+        terminal; tmux-send delivered and verified the message and the session
+        never processed a thing, because an undismissed modal blocks it. So a
+        delivered message proves delivery and nothing else: an attempt counts
+        as having worked only if the session showed proof of life inside
+        `revive_grace_seconds`, and one that did not is a failed attempt that
+        spends its slot like any other.
+        """
+        at = now() if at is None else at
+        ds = dead if dead is not None else self.session_dead_state(at)
+        window = ds["tmux_window"]
+        episode = self._sprint_events("revive_attempted", ds["last_seen_at"])
+        recent = self._sprint_events("revive_attempted", at - self.revive_burst_window)
+        last = recent[-1] if recent else (episode[-1] if episode else None)
+        last_at = float(last["ts"]) if last is not None else None
+        # Did it stir? Any proof of life recorded AFTER the poke. An episode
+        # that ended is an episode whose wake-up worked.
+        stirred = last_at is not None and ds["last_seen_at"] > last_at
+        delivered = None
+        if last is not None:
+            result = self.revive_result_for(int(last["seq"]))
+            delivered = None if result is None else bool(result.get("sent"))
+        hold = None
+        if last_at is not None and (at - last_at) < self.revive_min_interval:
+            hold = ("held off — this board was woken %s ago"
+                    % human_span(at - last_at))
+        gave_up = (len(episode) >= self.revive_max_burst
+                   or len(recent) >= self.revive_max_burst)
+        if gave_up:
+            hold = ("paused — %d wake-ups inside %s and the session never came "
+                    "back" % (max(len(episode), len(recent)),
+                              human_span(self.revive_burst_window)))
+        return {
+            "attempts_this_episode": len(episode),
+            "attempts_this_hour": len(recent),
+            "max_attempts": self.revive_max_burst,
+            "burst_window_seconds": self.revive_burst_window,
+            "min_interval_seconds": self.revive_min_interval,
+            "grace_seconds": self.revive_grace_seconds,
+            "last_attempt_at": last_at,
+            "last_attempt_seq": int(last["seq"]) if last is not None else None,
+            "last_attempt_label": clock_label(last_at) if last_at else None,
+            "last_attempt_delivered": delivered,
+            "stirred": bool(stirred),
+            # A delivered wake-up past its grace window with no proof of life:
+            # the message landed and the session did not process it.
+            "delivered_but_silent": bool(
+                last_at is not None and not stirred and delivered is not False
+                and (at - last_at) >= self.revive_grace_seconds),
+            "gave_up": bool(gave_up),
+            "hold": hold,
+            "wanted": bool(ds["dead"] and window and not hold),
+        }
+
+    def gave_up_text(self, rev: dict, window: str) -> str:
+        """What the board says when autoheal stops trying, in words that name
+        the next physical act. Two different failures need two different
+        sentences: one is "the message never landed", the other is "the message
+        landed and nothing happened", and only the second one means go look at
+        the terminal."""
+        if rev.get("last_attempt_delivered") is False:
+            return ("autoheal gave up after %d tries — the wake-up could not be "
+                    "delivered to tmux window “%s”. Check the window by hand."
+                    % (rev["attempts_this_episode"] or rev["attempts_this_hour"],
+                       window or "?"))
+        return ("autoheal gave up after %d tries — the wake-up was delivered but "
+                "the session never stirred; its terminal may be blocked by an "
+                "open dialog. Check the window by hand."
+                % (rev["attempts_this_episode"] or rev["attempts_this_hour"]))
+
+    AUTOHEAL_CARD_LIST_MAX = 12
+
+    @staticmethod
+    def _card_list(nums, limit: int = 12) -> str:
+        shown = ", ".join("#%d" % n for n in nums[:limit])
+        if len(nums) > limit:
+            shown += " (+%d more)" % (len(nums) - limit)
+        return shown
+
+    def board_self_url(self) -> str:
+        host = (list(self.hosts or []) or ["127.0.0.1"])[0]
+        port = self.port or 0
+        return board_url(host, port, self.token) if port else ""
+
+    def revive_brief(self, at: float = None, dead=None, attempt: int = 1) -> str:
+        """The wake-up, built from this board's own state.
+
+        Same shape as the one a human typed into the russ session by hand, for
+        the reason that one worked: it opens with the verdict, gives the
+        evidence, names the stranded cards by number, and then gives an ORDER
+        of operations whose first instruction is "do not dispatch anything".
+
+        The ownership header is there because of the other half of that
+        incident: the wrong tmux window was guessed first, and a session that
+        did not own that board started posting to it before it was retracted.
+        Registration mostly kills the guessing; naming the project root in the
+        message kills the rest, cheaply.
+        """
+        at = now() if at is None else at
+        ds = dead if dead is not None else self.session_dead_state(at)
+        owed = ds["owed"]
+        lines = []
+        lines.append("Your sprint board thinks this session died — nothing it "
+                     "can see has moved for %s." % human_span(ds["quiet_for_seconds"]))
+        lines.append("")
+        lines.append("board: %s" % (self.sprint_name() or "sprint"))
+        lines.append("project: %s (port %s)" % (self.project_root, self.port or "?"))
+        url = self.board_self_url()
+        if url:
+            lines.append("url: %s" % url)
+        lines.append("cursor: %d of %d — %d events you never read"
+                     % (ds["cursor"], ds["head"], ds["pending"]))
+        lines.append("")
+        lines.append("FIRST, check this is your board. If %s is not the project "
+                     "this session runs, reply “wrong session”, touch nothing, "
+                     "and stop." % self.project_root)
+        lines.append("")
+        if ds["owed_count"]:
+            lines.append("Stranded right now:")
+            if owed.get("integrating"):
+                lines.append("- approved by the user but never merged: %s"
+                             % self._card_list(owed["integrating"],
+                                               self.AUTOHEAL_CARD_LIST_MAX))
+            if owed.get("in_progress"):
+                lines.append("- in motion, agent probably dead: %s"
+                             % self._card_list(owed["in_progress"],
+                                               self.AUTOHEAL_CARD_LIST_MAX))
+            if owed.get("queued"):
+                lines.append("- queued and never dispatched: %d card%s (%s)"
+                             % (len(owed["queued"]),
+                                "" if len(owed["queued"]) == 1 else "s",
+                                self._card_list(owed["queued"],
+                                                self.AUTOHEAL_CARD_LIST_MAX)))
+            lines.append("")
+        lines.append("Then do these in order, and do NOT dispatch anything first:")
+        lines.append("1. Read the event log from seq %d to the head and catch "
+                     "your cursor up." % ds["cursor"])
+        if owed.get("integrating"):
+            lines.append("2. Land the approved branches one at a time, gating "
+                         "each: %s." % self._card_list(
+                             owed["integrating"], self.AUTOHEAL_CARD_LIST_MAX))
+            lines.append("3. Re-dispatch what is in motion and what is queued, "
+                         "reading each card's timeline for where it got to.")
+        else:
+            lines.append("2. Re-dispatch what is in motion and what is queued, "
+                         "reading each card's timeline for where it got to.")
+        lines.append("")
+        lines.append("(sprint autoheal, attempt %d of %d — nobody typed this)"
+                     % (attempt, self.revive_max_burst))
+        return "\n".join(lines)
+
+    def autoheal_json(self, at: float = None) -> dict:
+        """What `/api/board` carries: enough for the hub to decide and for the
+        banner to say one honest extra clause. Deliberately NOT the brief --
+        composing it on every browser poll would be work nobody asked for."""
+        at = now() if at is None else at
+        ds = self.session_dead_state(at)
+        rev = self.revive_state(at, dead=ds)
+        declared = self.session_dead_declared(ds["last_seen_at"])
+        return {
+            # Is there a channel at all? No tmux window means this board is not
+            # autohealable, and saying so is better than a silent no-op.
+            "registered": bool(ds["tmux_window"]),
+            "tmux_window": ds["tmux_window"] or None,
+            "dead": ds["dead"],
+            "reason": ds["reason"],
+            "declared_at": float(declared["ts"]) if declared is not None else None,
+            "quiet_for_seconds": ds["quiet_for_seconds"],
+            "dead_after_seconds": ds["dead_after_seconds"],
+            "owed": ds["owed"],
+            "owed_count": ds["owed_count"],
+            "cursor": ds["cursor"],
+            "head": ds["head"],
+            "account_limited": ds["account_limited"],
+            "revive_wanted": rev["wanted"],
+            "attempts": rev["attempts_this_episode"],
+            "max_attempts": rev["max_attempts"],
+            "last_attempt_at": rev["last_attempt_at"],
+            "last_attempt_label": rev["last_attempt_label"],
+            "delivered_but_silent": rev["delivered_but_silent"],
+            "gave_up": rev["gave_up"],
+            "gave_up_text": (self.gave_up_text(rev, ds["tmux_window"])
+                             if rev["gave_up"] and ds["dead"] else None),
+            "hold": rev["hold"],
+        }
+
+    def session_dead_declared(self, since_ts: float):
+        """The `session_dead` event for the CURRENT death episode, or None.
+
+        An episode runs from the session's last proof of life, exactly the way
+        a card's stuck episode runs from its last transition (#67): coming back
+        to life is the one act that re-arms the notice, and it re-arms it by
+        moving `since_ts` past the event we already wrote.
+        """
+        row = self.q1("SELECT seq, ts, payload FROM events WHERE card_num IS NULL "
+                      "AND kind='session_dead' ORDER BY seq DESC LIMIT 1")
+        if row is None or float(row["ts"]) <= since_ts:
+            return None
+        return row
+
+    def _gave_up_declared(self, since_ts: float):
+        row = self.q1("SELECT seq, ts FROM events WHERE card_num IS NULL "
+                      "AND kind='revive_gave_up' ORDER BY seq DESC LIMIT 1")
+        if row is None or float(row["ts"]) <= since_ts:
+            return None
+        return row
+
+    def sweep_session_dead(self) -> int:
+        """One `session_dead` per death episode, and one `revive_gave_up` per
+        episode after that. Runs on the sweep tick beside the other rules.
+
+        Both writes re-check under the lock for the same reason every other
+        sweep does: the session can come back between the loose read and the
+        write, and an event that says the session is dead is worth exactly as
+        much as the instant it was true.
+        """
+        fired = 0
+        at = now()
+        ds = self.session_dead_state(at)
+        if not ds["dead"]:
+            return 0
+        if self.session_dead_declared(ds["last_seen_at"]) is None:
+            with self.lock:
+                fresh = self.session_dead_state()
+                if fresh["dead"] and \
+                        self.session_dead_declared(fresh["last_seen_at"]) is None:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        self._append_event(None, "server", "session_dead", {
+                            "quiet_for_seconds": fresh["quiet_for_seconds"],
+                            "dead_after_seconds": fresh["dead_after_seconds"],
+                            "last_seen_at": fresh["last_seen_at"],
+                            "last_seen_by": fresh["last_seen_by"],
+                            "cursor": fresh["cursor"], "head": fresh["head"],
+                            "pending": fresh["pending"],
+                            "owed": fresh["owed"], "owed_count": fresh["owed_count"],
+                            "tmux_window": fresh["tmux_window"] or None,
+                            "text": "the session has not read this board for %s "
+                                    "— %d card%s waiting on it"
+                                    % (human_span(fresh["quiet_for_seconds"]),
+                                       fresh["owed_count"],
+                                       "" if fresh["owed_count"] == 1 else "s"),
+                            "detail": "Last thing it did: %s. Cursor %d of %d. "
+                                      "Autoheal %s."
+                                      % (fresh["last_seen_by"], fresh["cursor"],
+                                         fresh["head"],
+                                         "will try tmux window “%s”"
+                                         % fresh["tmux_window"]
+                                         if fresh["tmux_window"]
+                                         else "cannot reach it — no tmux window "
+                                              "was registered at boot"),
+                        })
+                        self.conn.execute("COMMIT")
+                    except Exception:
+                        self.conn.execute("ROLLBACK")
+                        raise
+                    fired += 1
+        # ...and the ending: autoheal tried its three and stopped. This is the
+        # line the OTHER boards' user sees on the hub, so it has to say what to
+        # physically do rather than that a counter hit a limit.
+        rev = self.revive_state(at, dead=ds)
+        if rev["gave_up"] and ds["tmux_window"] and \
+                self._gave_up_declared(ds["last_seen_at"]) is None:
+            with self.lock:
+                fresh = self.session_dead_state()
+                frev = self.revive_state(dead=fresh)
+                if fresh["dead"] and frev["gave_up"] and \
+                        self._gave_up_declared(fresh["last_seen_at"]) is None:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        self._append_event(None, "server", "revive_gave_up", {
+                            "attempts": frev["attempts_this_episode"],
+                            "attempts_this_hour": frev["attempts_this_hour"],
+                            "max_attempts": frev["max_attempts"],
+                            "tmux_window": fresh["tmux_window"],
+                            "delivered_but_silent": frev["delivered_but_silent"],
+                            "text": self.gave_up_text(frev, fresh["tmux_window"]),
+                        })
+                        self.conn.execute("COMMIT")
+                    except Exception:
+                        self.conn.execute("ROLLBACK")
+                        raise
+                    fired += 1
+        if fired:
+            self.notify()
+        return fired
+
+    def claim_revive(self, by: str = "hub") -> dict:
+        """`POST /api/autoheal/revive` — the hub asking permission to wake this
+        board's session, and being told what to say.
+
+        The claim is written BEFORE the message is sent, for exactly the reason
+        the self-restart stamp is (#62): the case this guard exists for is the
+        one where what happens next never comes back. A slot spent on an
+        attempt that vanished is the safe direction; a slot handed out twice
+        because two hub ticks raced is not, which is why the whole check-and-
+        write happens once, under the lock.
+        """
+        with self.lock:
+            at = now()
+            ds = self.session_dead_state(at)
+            rev = self.revive_state(at, dead=ds)
+            if not ds["dead"]:
+                return {"ok": False, "reason": ds["reason"], "autoheal": True,
+                        "detail": "this board's session is not dead (%s)"
+                                  % ds["reason"]}
+            if not ds["tmux_window"]:
+                return {"ok": False, "reason": "no_tmux_window",
+                        "detail": "no tmux window is registered for this "
+                                  "board's session, so there is nowhere to "
+                                  "send a wake-up"}
+            if rev["gave_up"]:
+                return {"ok": False, "reason": "gave_up", "detail": rev["hold"]}
+            if rev["hold"]:
+                return {"ok": False, "reason": "held", "detail": rev["hold"]}
+            attempt = rev["attempts_this_episode"] + 1
+            brief = self.revive_brief(at, dead=ds, attempt=attempt)
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                seq = self._append_event(None, "server", "revive_attempted", {
+                    "attempt": attempt, "max_attempts": rev["max_attempts"],
+                    "tmux_window": ds["tmux_window"], "by": by,
+                    "cursor": ds["cursor"], "head": ds["head"],
+                    "quiet_for_seconds": ds["quiet_for_seconds"],
+                    "owed": ds["owed"],
+                    # Whether the message actually got out is a SEPARATE
+                    # `revive_result` event keyed on this one's seq -- and
+                    # "delivered" still is not "awake". See `revive_state`.
+                    "text": "waking the session in tmux window “%s” (try %d of "
+                            "%d)" % (ds["tmux_window"], attempt,
+                                     rev["max_attempts"]),
+                })
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.notify()
+        return {"ok": True, "attempt": attempt, "attempt_seq": seq,
+                "max_attempts": rev["max_attempts"],
+                "tmux_window": ds["tmux_window"], "brief": brief,
+                "grace_seconds": self.revive_grace_seconds,
+                "project_root": self.project_root}
+
+    def record_revive_result(self, attempt_seq: int, sent: bool,
+                             detail: str = None) -> dict:
+        """The sender reporting back on a claim it already made.
+
+        This does NOT spend a slot and cannot create one -- it only writes down
+        whether the message got out, which is what decides which of the two
+        give-up sentences this board will eventually say. It is a NEW event
+        rather than an edit of the attempt: the log is append-only, and a
+        payload rewritten under a client that already streamed it is a fact
+        that reads differently depending on when you looked.
+        """
+        row = self.q1("SELECT seq, payload FROM events WHERE seq=? "
+                      "AND kind='revive_attempted'", (int(attempt_seq),))
+        if row is None:
+            raise ApiError(404, "no_such_attempt",
+                           "no revive attempt #%s on this board" % attempt_seq)
+        attempt = jload(row["payload"], {}) or {}
+        window = attempt.get("tmux_window") or "?"
+        with self.lock:
+            self._append_event(None, "server", "revive_result", {
+                "attempt_seq": int(attempt_seq), "sent": bool(sent),
+                "tmux_window": attempt.get("tmux_window"),
+                "detail": one_line(str(detail), 400) if detail else None,
+                "text": ("wake-up delivered to tmux window “%s” — waiting to "
+                         "see if the session actually stirs" % window) if sent
+                        else "could not deliver the wake-up to tmux window “%s”"
+                             % window,
+            })
+        self.notify()
+        return {"ok": True, "attempt_seq": int(attempt_seq), "sent": bool(sent)}
+
+    def revive_result_for(self, attempt_seq: int):
+        """Did the sender ever report back on this attempt? Newest first, so a
+        retry that reported twice is read as its latest word."""
+        for row in self.q("SELECT payload FROM events WHERE card_num IS NULL "
+                          "AND kind='revive_result' ORDER BY seq DESC LIMIT 50"):
+            p = jload(row["payload"], {}) or {}
+            if int(p.get("attempt_seq") or 0) == int(attempt_seq):
+                return p
+        return None
 
     # -- evidence gate ----------------------------------------------------
 
@@ -5834,6 +6521,11 @@ class App:
             # this is the same fact hoisted so the banner needs no filtering,
             # and it is what a board with NO session attached still serves.
             "account_limit": self.account_limit_banner(),
+            # Dead-session autoheal: whether this board thinks its own session
+            # died, and what has been done about it. The hub reads this to
+            # decide whether to reach for tmux-send; the banner reads it for
+            # one extra clause ("revival attempted 12:03").
+            "autoheal": self.autoheal_json(),
             # `integrating` stays in the Ready column with a "merging…" note --
             # a card only reaches Done once its branch actually landed.
             "column_of": dict(COLUMN_OF),
@@ -6277,6 +6969,18 @@ def make_handler(app: App):
                 # computation, not a column: nothing here depends on a sweep
                 # having run.
                 return self.json_out(200, app.limits_index())
+            if path == "/api/autoheal":
+                # Dead-session autoheal, whole: the verdict, what it stands on,
+                # and the crash-loop guard's state. `?brief=1` also composes the
+                # wake-up the hub would send -- which is how a human reads the
+                # message before trusting a machine to type it.
+                out = dict(app.autoheal_json())
+                if (query.get("brief") or ["0"])[0] in ("1", "true", "yes"):
+                    dead = app.session_dead_state()
+                    out["brief"] = app.revive_brief(
+                        dead=dead,
+                        attempt=app.revive_state(dead=dead)["attempts_this_episode"] + 1)
+                return self.json_out(200, out)
             if path == "/api/sprints":
                 rows = app.q("SELECT * FROM sprints ORDER BY id DESC")
                 return self.json_out(200, {"sprints": [app.sprint_json(r) for r in rows]})
@@ -6298,6 +7002,11 @@ def make_handler(app: App):
                     # it is hoisted here too so a panel never has to know that.
                     "agent_name": app.agent_name(),
                     "agent_name_max": AGENT_NAME_MAX,
+                    # ...and WHERE that session is, for the same reason: a
+                    # panel should be able to show "reachable in tmux window
+                    # russ-machine" without knowing which file it came from.
+                    "session_tmux_window": app.session_tmux_window(),
+                    "session_tmux_window_max": TMUX_WINDOW_MAX,
                     "defaults": DEFAULT_SETTINGS,
                     "choices": {
                         "model_policy": list(MODEL_POLICIES),
@@ -6530,6 +7239,9 @@ def make_handler(app: App):
                          "name_max": SPRINT_NAME_MAX,
                          "agent_name": settings.get("agent_name") or "",
                          "agent_name_max": AGENT_NAME_MAX,
+                         "session_tmux_window":
+                             settings.get("session_tmux_window") or "",
+                         "session_tmux_window_max": TMUX_WINDOW_MAX,
                          "sprint": app.sprint_json(app.open_sprint(create=True)),
                          "defaults": DEFAULT_SETTINGS}
 
@@ -6604,6 +7316,28 @@ def make_handler(app: App):
             m = re.match(r"^/api/limits/(\d+)/clear$", path)
             if m:
                 return 200, app.clear_limit(int(m.group(1)))
+
+            # Dead-session autoheal. The hub calls this; nothing else should.
+            # Two shapes on one path: with `attempt_seq` it is the sender
+            # reporting back on a claim it already holds, without it is a new
+            # claim. Keeping them together keeps the guard in one place.
+            if path == "/api/autoheal/revive":
+                if body.get("attempt_seq") is not None:
+                    try:
+                        seq = int(body["attempt_seq"])
+                    except (TypeError, ValueError):
+                        raise ApiError(400, "bad_value",
+                                       "attempt_seq must be a whole number",
+                                       field="attempt_seq")
+                    return 200, app.record_revive_result(
+                        seq, bool(body.get("sent")), detail=body.get("detail"))
+                by = body.get("by")
+                out = app.claim_revive(
+                    by=clean_short_text(by, "by", 40) if by else "hub")
+                # 409, not 400: nothing is wrong with the request -- the board
+                # is simply not in a state where a wake-up is the right act,
+                # and the reason names which guard said so.
+                return (200 if out.get("ok") else 409), out
 
             if path == "/api/sprint":
                 return 200, app.sprint_action(body.get("action"), body)
@@ -7253,11 +7987,9 @@ def http_get(host: str, port: int, path: str, token: str = None, timeout: float 
             pass
 
 
-def http_put_json(host: str, port: int, path: str, token: str, obj,
-                  timeout: float = 5.0):
-    """PUT one small JSON document. Used by `sprintd start --name` to name a
-    board that is ALREADY running: the live process owns the database, so the
-    name has to go through it and not around it."""
+def http_send_json(method: str, host: str, port: int, path: str, token: str, obj,
+                   timeout: float = 5.0):
+    """Send one small JSON document to a board and read the answer back."""
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         headers = {"Accept": "application/json",
@@ -7265,7 +7997,7 @@ def http_put_json(host: str, port: int, path: str, token: str, obj,
                    "Idempotency-Key": secrets.token_hex(8)}
         if token:
             headers["Authorization"] = "Bearer " + token
-        conn.request("PUT", path, body=jdump(obj).encode("utf-8"), headers=headers)
+        conn.request(method, path, body=jdump(obj).encode("utf-8"), headers=headers)
         resp = conn.getresponse()
         return resp.status, resp.read()
     finally:
@@ -7273,6 +8005,21 @@ def http_put_json(host: str, port: int, path: str, token: str, obj,
             conn.close()
         except Exception:
             pass
+
+
+def http_put_json(host: str, port: int, path: str, token: str, obj,
+                  timeout: float = 5.0):
+    """PUT one small JSON document. Used by `sprintd start --name` to name a
+    board that is ALREADY running: the live process owns the database, so the
+    name has to go through it and not around it."""
+    return http_send_json("PUT", host, port, path, token, obj, timeout)
+
+
+def http_post_json(host: str, port: int, path: str, token: str, obj,
+                   timeout: float = 5.0):
+    """POST one small JSON document. Used by the hub's reviver, which is the
+    one thing on this machine that writes to a board it does not own."""
+    return http_send_json("POST", host, port, path, token, obj, timeout)
 
 
 def probe_server(info: dict, timeout: float = 3.0):
@@ -7413,6 +8160,25 @@ def cmd_start(args) -> int:
                     except (OSError, http.client.HTTPException) as exc:
                         print("notice: could not set the session's name (%s)" % exc,
                               file=sys.stderr)
+            # `--tmux-window` on a board that is already up is the OPPOSITE of
+            # `--agent-name`: last write wins. The window is where this session
+            # can be woken right now, and a resumed session in a new window
+            # must be able to correct it or the hub types into the old one.
+            if getattr(args, "tmux_window", None) is not None:
+                try:
+                    st, raw = http_put_json(
+                        "127.0.0.1", info.get("port"), "/api/settings",
+                        info.get("token"),
+                        {"session_tmux_window": args.tmux_window,
+                         "actor": "session"})
+                    body = jload(raw.decode("utf-8", "replace"), {}) or {}
+                    if st != 200:
+                        print("notice: could not register the session's tmux "
+                              "window (%s)" % (body.get("message") or "HTTP %s" % st),
+                              file=sys.stderr)
+                except (OSError, http.client.HTTPException) as exc:
+                    print("notice: could not register the session's tmux window "
+                          "(%s)" % exc, file=sys.stderr)
             # Idempotent reuse -- and re-assert the registry row, so a board
             # that was already up before the hub existed still shows up on it.
             try:
@@ -7550,6 +8316,16 @@ def cmd_start(args) -> int:
                 print("notice: this session is already called “%s” — keeping it "
                       "(a name does not change on restart)" % claim["agent_name"],
                       file=sys.stderr)
+        except ApiError as exc:
+            print("error: %s" % exc.message, file=sys.stderr)
+            report(False, error=exc.message)
+            app.close()
+            return 1
+    # `--tmux-window` is how the session registers its wake channel at boot
+    # (card #68). Last write wins: an address, not an identity.
+    if getattr(args, "tmux_window", None) is not None:
+        try:
+            app.claim_tmux_window(args.tmux_window, actor="session")
         except ApiError as exc:
             print("error: %s" % exc.message, file=sys.stderr)
             report(False, error=exc.message)
@@ -8211,6 +8987,10 @@ def hub_summarize(entry: dict, timeout: float = 2.5) -> dict:
         "last_activity": None,
         "stuck_seconds": None,
         "stuck_card": None,
+        # Dead-session autoheal, straight off that board's own `/api/board`.
+        # None means the board is answering older code and simply has no
+        # opinion -- which the reviver reads as "do nothing", never as "dead".
+        "autoheal": None,
         "url": None,
         "detail": None,
     }
@@ -8250,6 +9030,8 @@ def hub_summarize(entry: dict, timeout: float = 2.5) -> dict:
         return row
     board = jload(raw.decode("utf-8", "replace"), {}) or {}
     row.update(board_rollup(board))
+    auto = board.get("autoheal")
+    row["autoheal"] = auto if isinstance(auto, dict) else None
     # A live board is the authority on its own name; the registry row is what we
     # fall back to when it is not answering. Without this, a sprint renamed on
     # one board would keep its old label on the hub until the registry caught up.
@@ -8424,7 +9206,8 @@ class HubApp:
 
     def __init__(self, registry: str = None, token: str = None, log=None,
                  poll_seconds: float = None, prune_seconds: float = None,
-                 timeout: float = 2.5):
+                 timeout: float = 2.5, tmux_send: str = None,
+                 autoheal: bool = None):
         self.registry = registry
         self.registry_file = registry_path(registry)
         self.token = token or secrets.token_urlsafe(24)
@@ -8439,6 +9222,25 @@ class HubApp:
         self.snapshot = None
         self.stop_event = threading.Event()
         self.thread = None
+        # -- dead-session autoheal ----------------------------------------
+        #
+        # The hub is the reviver because it is the only process on this machine
+        # that watches every board and is not itself one of the sessions that
+        # can die. It does exactly one thing a board cannot: run a subprocess.
+        # Every decision -- is it dead, may we try, what do we say -- belongs to
+        # the board, which owns the event log the guard is written in.
+        self.tmux_send = os.path.expanduser(
+            tmux_send if tmux_send is not None
+            else os.environ.get("SPRINT_TMUX_SEND", DEFAULT_TMUX_SEND))
+        self.autoheal = (autoheal if autoheal is not None
+                         else os.environ.get("SPRINT_AUTOHEAL", "1")
+                         not in ("0", "no", "off", "false"))
+        self.send_timeout = env_float("SPRINT_TMUX_SEND_TIMEOUT", 90.0)
+        # Seam: the tests swap this for a recorder and nothing else touches it.
+        # A test that really ran tmux-send would type a wake-up brief into
+        # whatever window the developer happened to have open.
+        self._run = subprocess.run
+        self.revived = []               # what this hub has done, for the log
 
     def log(self, msg: str):
         if not self.logfh:
@@ -8469,6 +9271,15 @@ class HubApp:
                     registry_touch(key, {"last_seen": row["last_seen"]}, self.registry)
                 except OSError:
                     pass
+                # A board that says its own session died gets woken. Wrapped,
+                # because the hub's whole job is to keep answering: a reviver
+                # that throws must never be able to stop the landing page from
+                # rendering the other nine boards.
+                try:
+                    self.maybe_revive(entry, row)
+                except Exception:
+                    self.log("revive check failed for %s: %s"
+                             % (key, traceback.format_exc()))
             rows.append(row)
         for key in pruned:
             try:
@@ -8488,6 +9299,85 @@ class HubApp:
         with self.lock:
             self.snapshot = snap
         return snap
+
+    def tmux_send_ready(self) -> bool:
+        """Is there a hand to reach with? Checked BEFORE claiming an attempt,
+        deliberately: a claim spends one of three slots, and spending one on a
+        machine that has no tmux-send installed would burn the board's whole
+        budget on a wake-up nobody could ever have sent."""
+        path = self.tmux_send
+        return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+    def maybe_revive(self, entry: dict, row: dict):
+        """Wake one board's dead session, if its board says that is the right
+        act right now. Returns a short machine reason, for the tests and the log.
+
+        Nothing here decides anything about deadness. The board has already
+        weighed the cursor, the owed cards, the account limit and the crash-loop
+        guard; this reads one boolean, asks for a slot, and types.
+        """
+        if not self.autoheal:
+            return "disabled"
+        auto = row.get("autoheal") or {}
+        if not auto.get("revive_wanted"):
+            return "not_wanted"
+        window = auto.get("tmux_window")
+        if not window:
+            # The board should not have asked, but a board is another program:
+            # never take its word for the one field this turns into argv.
+            return "no_window"
+        if not self.tmux_send_ready():
+            self.log("no tmux-send at %s — cannot wake %s (its session has been "
+                     "gone %s)" % (self.tmux_send, row.get("name") or "a board",
+                                   human_span(auto.get("quiet_for_seconds") or 0)))
+            return "no_tmux_send"
+        port = int(entry.get("port") or row.get("port") or 0)
+        token = board_token_for(entry)
+        if not port or not token:
+            return "unreachable"
+        try:
+            status, raw = http_post_json("127.0.0.1", port, "/api/autoheal/revive",
+                                         token, {"by": "hub"}, timeout=self.timeout)
+        except (OSError, http.client.HTTPException) as exc:
+            self.log("could not claim a wake-up on %s (%s)" % (row.get("name"), exc))
+            return "claim_failed"
+        claim = jload(raw.decode("utf-8", "replace"), {}) or {}
+        if status != 200 or not claim.get("ok"):
+            # 409 with a reason is the normal answer, not an error: the board
+            # is holding us off, or it gave up, or it is not dead any more.
+            return "refused:%s" % (claim.get("reason") or status)
+        attempt_seq = claim.get("attempt_seq")
+        brief = claim.get("brief") or ""
+        sent, detail = False, None
+        try:
+            proc = self._run([self.tmux_send, str(window), brief],
+                             capture_output=True, timeout=self.send_timeout)
+            sent = getattr(proc, "returncode", 1) == 0
+            if not sent:
+                err = getattr(proc, "stderr", b"") or b""
+                if isinstance(err, bytes):
+                    err = err.decode("utf-8", "replace")
+                detail = "tmux-send exited %s: %s" % (
+                    getattr(proc, "returncode", "?"), " ".join(str(err).split())[:300])
+        except Exception as exc:
+            detail = "tmux-send could not run: %s" % exc
+        self.log("wake-up %s for %s (window %s, try %s of %s)"
+                 % ("sent" if sent else "FAILED", row.get("name") or entry.get("project_root"),
+                    window, claim.get("attempt"), claim.get("max_attempts")))
+        self.revived.append({"project_root": entry.get("project_root"),
+                             "window": window, "attempt": claim.get("attempt"),
+                             "sent": sent, "at": now()})
+        try:
+            http_post_json("127.0.0.1", port, "/api/autoheal/revive", token,
+                           {"attempt_seq": attempt_seq, "sent": sent,
+                            "detail": detail}, timeout=self.timeout)
+        except (OSError, http.client.HTTPException) as exc:
+            # The attempt happened whether or not we could write it down. The
+            # board still counts it (the claim is what spends the slot), so the
+            # cap holds either way -- only the give-up WORDING loses detail.
+            self.log("could not report the wake-up result to %s (%s)"
+                     % (row.get("name"), exc))
+        return "sent" if sent else "send_failed"
 
     def get(self, max_age: float = None) -> dict:
         if max_age is None:
@@ -8558,6 +9448,10 @@ HUB_HTML = """<!doctype html>
   .counts .hot{color:var(--amber)}
   .meta{color:var(--faint);font-size:12.5px;overflow:hidden;
         text-overflow:ellipsis;white-space:nowrap;max-width:52ch}
+  /* Autoheal's one line. It wraps where every other line here truncates: it
+     is the only row content that ends in an instruction, and half of "check
+     the window by hand" is worse than none of it. */
+  .heal{color:var(--amber);font-size:12.5px;max-width:62ch;line-height:1.45}
   .right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;
          flex:0 0 auto}
   a.open{color:#8ab4f8;text-decoration:none;font-size:13.5px;
@@ -8603,6 +9497,18 @@ function sessionLabel(s){
   if(s==="offline") return "session offline";
   return "session unknown";
 }
+// Dead-session autoheal, as one line on this board's row. This is the ONLY
+// place a person finds out — the board it happened on has no session left to
+// tell anyone, which is the whole point of a landing page that outlives them.
+function healLine(r){
+  var a=r.autoheal; if(!a||!a.dead) return "";
+  if(a.gave_up&&a.gave_up_text) return a.gave_up_text;
+  if(a.last_attempt_label) return "session died — wake-up sent at "+
+    a.last_attempt_label+" (try "+a.attempts+" of "+a.max_attempts+")";
+  if(!a.registered) return "session died — no tmux window was registered, "+
+    "so nothing can wake it";
+  return "session died — a wake-up is on its way";
+}
 function render(data){
   var t=data.server_time, rows=data.sprints||[];
   var ul=document.getElementById("rows");
@@ -8620,7 +9526,9 @@ function render(data){
     return;
   }
   ul.innerHTML=rows.map(function(r){
-    var cls=[]; if(!r.reachable) cls.push("dead"); else if(r.needs_you) cls.push("attn");
+    var heal = healLine(r);
+    var cls=[]; if(!r.reachable) cls.push("dead");
+    else if(r.needs_you || heal) cls.push("attn");
     var stuck = (r.needs_you && r.stuck_seconds!=null)
       ? '<span class="stuck">stuck '+age(r.stuck_seconds)+'</span>' : '';
     var counts = r.reachable
@@ -8641,6 +9549,7 @@ function render(data){
           '"></span>'+esc(r.name)+stuck+'</span>'+
         '<span class="counts">'+counts+'</span>'+
         '<span class="meta">'+meta+'</span>'+
+        (heal? '<span class="heal">'+esc(heal)+'</span>' : '')+
       '</span>'+
       '<span class="right">'+right+
         '<span class="gone">'+(r.reachable? esc(sessionLabel(r.session))
@@ -9032,6 +9941,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "a restart is the same colleague coming back. Rename on "
                         "purpose from the board's settings panel."
                         % AGENT_NAME_MAX)
+    s.add_argument("--tmux-window", default=None,
+                   help="the tmux target this session can be WOKEN at, if it is "
+                        "running inside tmux (e.g. \"russ-machine\", "
+                        "\"sess:1\", \"%%5\"). If this session's board later "
+                        "decides the session died, the hub types a recovery "
+                        "brief here. Unlike --agent-name, last write wins: it "
+                        "is an address, and a session that moved windows has to "
+                        "correct it. Outside tmux, pass nothing — autoheal then "
+                        "does not apply to this board. Pass \"\" to unregister.")
     s.add_argument("--token", default=None, help="force a bearer token")
     s.add_argument("--new-token", action="store_true",
                    help="mint a fresh token (default: reuse the existing one so "
