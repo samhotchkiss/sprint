@@ -90,8 +90,10 @@ recovery must be easy. The user always runs claude inside tmux.
   verdict as `card:<num>`, because attribution says who WROTE a card, never who owns it.
 - `evidence(card_num, packet JSON, created_at)`.
 - `cursors(name PRIMARY KEY, seq)` — the session persists its drain cursor here (`orchestrator`).
-- `questions(id, card_num, text, options JSON NULL, answered_at NULL)` — answer idempotency: second
-  answer to the same question id is a 409, surfaced gently in UI.
+- `questions(id, card_num, text, options JSON NULL, artifacts JSON NULL, answered_at NULL)` — answer
+  idempotency: second answer to the same question id is a 409, surfaced gently in UI. `artifacts`
+  is what a **decision request** hands over with its question (`{url?, attachments?, notes?}`) —
+  NULL for a plain question, and added by the idempotent ALTER pass on boards created before it.
 
 ## Card states
 
@@ -111,6 +113,18 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 - **needs_you**: a question the user can answer fixes it. **blocked**: external wall (CI red, overlaps
   another card, dependency) — machine-named reason required; distinct column; nothing the user types
   fixes it; the session re-checks blocked cards periodically.
+- **needs_you vs ready — the user's definition, verbatim**: *"needs you is where we talk through
+  things. review means the session genuinely thinks the card is 100% complete. needs you is that the
+  card is waiting for my input before it can keep moving forward."* So an agent has **two** handoffs
+  and they mean different things: an **evidence packet** (`sprint-ready` → `ready`) says "I believe
+  this is done", and a **decision request** (`sprint-ask` → `needs_you`) says "I need you to
+  choose/answer before I continue". Mockups to pick between, a design call, "which of these three",
+  "is this the behaviour you meant" are all decision requests — never packets. A decision request
+  carries **artifacts** so the choice can actually be made: `{url?, attachments?, notes?}` on the
+  question (see the API + worker contract), rendered in the rail **above** the answer box.
+  `sprint-ready` prints an advisory stderr notice — never a refusal — when a packet looks like a
+  question in disguise (a `validate` step that is a question, a `claim` that is a question, an
+  `options`/`artifacts` field a packet has no room for).
 - **ready**: ONLY reachable via a validated evidence packet (server 422s otherwise — see gate).
 - **failed**: agent died/unrecoverable; card shows last error + Retry (fresh agent, full timeline as
   brief, honestly labeled as a new agent). **stale**: no activity across a session gap.
@@ -158,7 +172,12 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 - `POST /api/cards/:num/integrated` `{ok: bool, reason?}` (session surface) — integrating→completed,
   or integrating→in_progress with an `error` event on failure.
 - Worker surface (bearer token): `POST /api/cards/:num/events` `{kind: progress|chat|note|error,
-  payload}`; `POST /api/cards/:num/question` `{text, options?}` (→needs_you);
+  payload}`; `POST /api/cards/:num/question` `{text, options?, artifacts?}` (→needs_you) — a
+  **decision request** is this same call with `artifacts: {url?: http(s), attachments?: [abs path |
+  ref], notes?: str}`; attachments are ingested exactly like a packet's screenshots (read off disk,
+  content-addressed, served back as `/api/attachments/...`), the whole payload is stored on the
+  question and echoed on the `question` event, and the rail renders it above the answer box. A
+  malformed/empty `artifacts` is a `400 bad_artifacts` naming the field;
   `POST /api/cards/:num/ready` `{packet}` (the gate); `POST /api/cards/:num/state`
   `{state: triaging|in_progress|blocked, reason?, title?}`; `{long_running: true, note}` flag via
   events to suppress the silence timer during legit long jobs.
@@ -421,10 +440,11 @@ retries and brings it to the user for co-design.
 Ready cards are reviewed **by work unit**, not one identical row at a time. A unit is a batch, or
 failing that an agent, and it renders as one expandable row; a card on its own is a unit of one and
 renders as it always did. Every row leads with the packet's claim and its first "Check it yourself"
-step, carries the first screenshot as a thumbnail plus the live link, and puts Approve / Bounce
-right on the row — the drawer is one click away, never the price of an easy yes. **Review next** is
-a filled button in its own bar above the stack (never another row) and walks the queue oldest-first
-in the rail, one STEP at a time with a running "3 of 13".
+step and carries the first screenshot as a thumbnail. **The row itself does nothing but open the
+card** (card #53 — see "Every action lives in the rail"): the verdict, the live link and the
+lightbox are all on the open card in the rail, one click away and pinned where they cannot be
+scrolled off. **Review next** is a filled button in its own bar above the stack (never another row)
+and walks the queue oldest-first in the rail, one STEP at a time with a running "3 of 13".
 
 - **Naming.** A unit row is named after the WORK in it: the member cards' own condensed titles
   joined ("Restart-proof tabs + reply routing · 2 cards"), falling back to the branch's claim, then
@@ -440,9 +460,10 @@ in the rail, one STEP at a time with a running "3 of 13".
   and not a new endpoint: it issues the same per-card `POST /api/cards/:num/verdict` for every
   member in order, so every card keeps its own verdict event and its own record. It reports
   "approving 3 of 6…" in words (no spinner) and **stops on the first failure**, saying which card it
-  stopped at and that nothing after it was sent. Expanding the unit still offers per-member Approve
-  and Bounce, and the walkthrough treats a shared-packet unit as one step: approve the unit, bounce
-  the member you are reading, or skip.
+  stopped at and that nothing after it was sent. Since card #53 that button lives in the RAIL, on
+  any member of the unit, over the packet you are actually reading — the unit ROW only expands and
+  opens. The walkthrough treats a shared-packet unit as one step: approve the unit, bounce the
+  member you are reading, or skip.
 
 ## Batching & hold mode
 
@@ -504,8 +525,11 @@ be able to freeze the session; treat "would prompt" as: post a `blocked` event a
 via helpers: `sprint-post <num> progress "one-liner"` after each meaningful step;
 `sprint-post <num> phase "testing" [--expect 300]` at every stretch boundary (see Phases);
 `sprint-ask <num>
-"question" [--options json]` then END YOUR TURN; `sprint-ready <num> packet.json` (client-side
-validates, then POSTs; on 422 fix and retry). First act on pickup: state→triaging + one-line
+"question" [--options json] [--url URL] [--attach PATH …] [--notes TEXT]` then END YOUR TURN — the
+artifact flags are what make it a **decision request** rather than a bare question, and the rule for
+which handoff to use is the needs_you/ready definition above; `sprint-ready <num> packet.json`
+(client-side validates, then POSTs; on 422 fix and retry; advisory stderr notice when the packet
+reads like a question). First act on pickup: state→triaging + one-line
 restatement ("I read this as: X") + a condensed ≤8-word `title` on that same state POST. Long jobs: set `long_running` with a note first. Work only in
 your assigned worktree; one branch; never push to main; never touch other cards' files.
 
@@ -557,16 +581,52 @@ your assigned worktree; one branch; never push to main; never touch other cards'
   `prefers-reduced-motion`. Sound is Chaos-only; Calm's only sound is the needs_you/ready chime.
   **Both skins hold the same readability floor: no 11–13px text below 4.5:1** (Chaos checks against
   the worst stop of every gradient it sits on).
-- **Answering**: a question with options answers inline from its row in the List — one tap, no
-  navigation. Free text, and every question on the Board layout, answers in the rail: Board cards
-  are never interactive surfaces, so a decision is never half on a tile and half in a panel.
+- **Every action lives in the rail.** User ruling, verbatim: *"get the actions out of cards. I click
+  the card, it loads in the sidebar, and that's where I review and act."* So a card face (Board
+  tile, List row, review row, Done row, Elsewhere pill) is a **single click target and nothing
+  else** — no verdict buttons, no quick-reply chips, no thumbnail lightbox, no live link, no
+  expander. Clicking anywhere on it opens the card in the rail; Enter/Space does the same from the
+  keyboard. Approve / Bounce / Reject, the quick-reply options, pin/hold/cancel/retry/duplicate
+  (the ⋯ menu) and the bounce notes are all in the rail, on the open card.
+  **The verdict is a bar pinned at the bottom of the rail**, above the composer, in the same place
+  the Review-next walkthrough's bar sits — exactly one of the two is ever up, and neither can be
+  scrolled off by a packet with six screenshots in it. Card #26's *one Approve per work unit* moved
+  with it: on any member of a unit that shipped as one branch with one packet, the rail's bar reads
+  **"Approve all N"** and issues the same per-card POSTs in order. The one exception is a card that
+  does not exist yet — an un-submitted card's "not sent — retry" stays on its pill, because there is
+  no card to open.
+  The Review-next walkthrough keeps its own **navigation** controls (next / skip / stop) and the
+  Awaiting-review unit rows keep their expander and "Review these N": those move you around, they
+  do not act on a card.
+- **Answering**: every question answers in the rail, on the card — options as ≥46px rows under the
+  question, free text in the composer under them. The List row says *"3 options — open it to
+  choose"* rather than carrying the chips itself (see above): a decision is never half on a row and
+  half in a panel.
+- **A decision request renders above the answer box.** A question carrying `artifacts` (card #50)
+  puts the agent's notes, its screenshots and an **Open the preview ↗** button in a panel directly
+  above the options/composer, so you are never asked to choose between three mockups you cannot
+  see. Once answered the panel stays in the thread, dimmed, as the history of the choice.
+- **A report's sidebar is its card.** User ruling, verbatim: *"when I'm looking at a report, the
+  sidebar should be the card that created it, not the session chat."* Opening `#/report/<sha>.<ext>`
+  loads the originating card into the rail (thread + composer, #46's focus behaviour minus the
+  caret grab — you came to read, not to type) while the report keeps the main area and the URL. A
+  report with no originating card (one posted into the sidebar) keeps the session chat, and the page
+  says so in one line rather than leaving you to guess.
+- **URLs in prose are links.** User ruling, verbatim: *"make links clickable and should auto open in
+  a new tab."* Every surface that renders agent/user text through `autolink`/`richText` — thread
+  messages, session chat, card bodies, expanded `detail` bodies, a packet's claim, its check steps
+  and its `readback` — turns a bare `http(s)://…` into `target="_blank" rel="noopener noreferrer"`.
+  `#N` stays what it was: an in-app card link, same tab. Links are built from text nodes, never by
+  injecting markup, so agent-authored text can still never become markup. Markdown reports get the
+  same treatment server-side (bare URLs autolink; `[text](url)` already did).
 - **Right rail (480px)**: the session chat OR one card's thread, never both. Card thread is one
   interleaved timeline of four item types — message bubbles (yours right-aligned, a "More context"
   disclosure only where an event really carries `payload.detail`), screenshot tiles → lightbox,
   question panels of ≥46px option rows, and centred status changes (events, not speech). The
   evidence packet renders **as a message in the stream** — claim, "Check it yourself" numbered
-  steps, screenshots, mono metadata (branch, diffstat, test counts), live URL, then Approve /
-  Bounce-with-notes / Reject. Composer pinned at the bottom: Return sends, Shift+Return newlines —
+  steps, screenshots, mono metadata (branch, diffstat, test counts), live URL. The verdict is NOT
+  in it: Approve / Bounce-with-notes / Reject are the pinned bar above the composer (see "Every
+  action lives in the rail"). Composer pinned at the bottom: Return sends, Shift+Return newlines —
   and it takes images exactly like the Drop-work sheet does (paste, drop, or the file picker →
   removable thumbnails above the line → sent with the text as one message → screenshot tiles in the
   thread → lightbox). Card threads and the session chat share one implementation (`compose.js`).

@@ -696,11 +696,29 @@ function goReport(sha, ext, replace) {
     else location.hash = want;
   }
   render();
-  loadPage(page, () => api.report(sha, ext));
+  loadPage(page, () => api.report(sha, ext), railToReportCard);
+}
+
+/**
+ * Card #52, user verbatim: "when I'm looking at a report, the sidebar should be
+ * the card that created it, not the session chat."
+ *
+ * A report is something an agent wrote ON a card, so the conversation that
+ * belongs beside it is that card's — thread above, composer below, exactly as
+ * if you had clicked the card. The report keeps the main area and the URL; only
+ * the rail changes hands. A report with no card behind it (one posted into the
+ * sidebar) keeps the session chat, and the page says so out loud rather than
+ * leaving you to wonder which conversation you are in.
+ */
+function railToReportCard(target) {
+  if (!target || target.kind !== 'report' || !target.data) return;
+  const num = target.data.card_num;
+  if (num == null) return;
+  openCard(Number(num), { keepPage: true });
 }
 
 /** Fetch for the page that is open NOW; a later navigation wins. */
-async function loadPage(target, fetcher) {
+async function loadPage(target, fetcher, then) {
   try {
     const data = await fetcher();
     if (page !== target) return;
@@ -710,6 +728,7 @@ async function loadPage(target, fetcher) {
     target.error = err;
     handleError(err, null);
   }
+  if (then) then(target);
   render();
 }
 
@@ -743,7 +762,13 @@ function openCard(num, opts) {
   if (num == null) return;
   const n = Number(num);
   const kind = (opts && opts.focus) || 'composer';
-  page = null;
+  // Card #52, user verbatim: "when I'm looking at a report, the sidebar should
+  // be the card that created it, not the session chat." A report page keeps the
+  // main area and hands the RAIL to its originating card, so `keepPage` opens
+  // the card without navigating away from what you are reading — and without
+  // taking the report's URL off the address bar.
+  const keepPage = !!(opts && opts.keepPage);
+  if (!keepPage) page = null;
   const card = store.cards.get(n) || null;
   if (!store.detail || store.detail.num !== n) {
     store.detail = {
@@ -755,8 +780,11 @@ function openCard(num, opts) {
   // #46): opening the card is what puts you in it, and `askFocus` is what puts
   // the caret in the box once the rail has painted it.
   if (kind === 'bounce') bounceComposing(n, true);
-  askFocus(n, kind);
-  if (location.hash !== `#/c/${n}`) history.replaceState(null, '', `#/c/${n}`);
+  // ...but never when the card arrived UNDER something you opened to read: you
+  // asked for a report, not for a caret. #46's "focus my cursor in the reply
+  // box" is about clicking a card, and this is not that.
+  if (!keepPage) askFocus(n, kind);
+  if (!keepPage && location.hash !== `#/c/${n}`) history.replaceState(null, '', `#/c/${n}`);
   render();
   refreshDetail();
 }

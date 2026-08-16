@@ -238,8 +238,30 @@ function normQuestion(q) {
     id: q.id != null ? q.id : (q.question_id != null ? q.question_id : null),
     text: q.text || q.question || '',
     options,
+    // A DECISION REQUEST hands over the thing you need in order to answer —
+    // a live URL, screenshots, a note. Null on a plain question, and null on
+    // a board whose server is too old to have the field at all.
+    artifacts: normArtifacts(q.artifacts),
     answered_at: q.answered_at || null,
   };
+}
+
+/**
+ * What the agent attached to its question. Card #50, user verbatim: "needs you
+ * is where we talk through things. review means the session genuinely thinks
+ * the card is 100% complete. needs you is that the card is waiting for my input
+ * before it can keep moving forward." Tolerant like every normalizer here: a
+ * shape we do not recognise degrades to nothing rather than throwing.
+ */
+export function normArtifacts(a) {
+  let raw = a;
+  if (typeof raw === 'string') { try { raw = JSON.parse(raw); } catch { raw = null; } }
+  if (!raw || typeof raw !== 'object') return null;
+  const url = typeof raw.url === 'string' && /^https?:\/\//.test(raw.url.trim()) ? raw.url.trim() : null;
+  const notes = typeof raw.notes === 'string' && raw.notes.trim() ? raw.notes.trim() : null;
+  const attachments = Array.isArray(raw.attachments) ? raw.attachments.filter(Boolean) : [];
+  if (!url && !notes && !attachments.length) return null;
+  return { url, notes, attachments };
 }
 
 // online | busy | offline. `busy` means the session is attached and polling but

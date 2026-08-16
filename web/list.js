@@ -88,19 +88,18 @@ export function needsRow(card, app) {
     h('span.row-title', card.title),
     h('span.row-ask', askLine(card, kind, state)));
 
-  // Options answer inline, right here, because they are one tap and the design
-  // says the top of the page is where decisions get made. Free-text answers open
-  // the card — a sentence deserves the thread it lands in.
+  // Card #53, user verbatim: "get the actions out of cards. I click the card, it
+  // loads in the sidebar, and that's where I review and act." The quick-reply
+  // chips used to answer from this row; they are the same chips, in the rail, on
+  // the question panel, with the thread and the agent's artifacts around them.
+  // What the row keeps is the news that there are options at all.
   if (q && q.options && q.options.length) {
-    const chips = h('span.chips');
-    for (const opt of q.options) {
-      chips.appendChild(h('button.chip-btn', {
-        type: 'button',
-        title: `answer #${card.num}: ${opt.label}`,
-        onclick: (e) => { e.stopPropagation(); app.answer(card, q, opt.value); },
-      }, opt.label));
-    }
-    main.appendChild(chips);
+    main.appendChild(h('span.row-optnote',
+      `${q.options.length} options — open it to choose`));
+  }
+  if (q && q.artifacts) {
+    main.appendChild(h('span.row-optnote.is-artifacts',
+      artifactNote(q.artifacts)));
   }
 
   row.appendChild(h('span.row-num', '#' + card.num));
@@ -109,6 +108,21 @@ export function needsRow(card, app) {
     h('span.row-tag', kind === 'question' ? 'Asks' : state === 'integrating' ? 'Merging' : 'Signoff'),
     h('span.row-meta', shortAgent(card.agent_name), ' · ', timeEl(card.last_activity_at, { suffix: false }))));
   return row;
+}
+
+/**
+ * What a DECISION REQUEST brought with it, in a few words. Card #50: the point
+ * of the row is to say "there is something to look at in here", not to be the
+ * place you look at it.
+ */
+function artifactNote(a) {
+  const bits = [];
+  if (a.attachments && a.attachments.length) {
+    bits.push(a.attachments.length === 1 ? 'a screenshot' : `${a.attachments.length} screenshots`);
+  }
+  if (a.url) bits.push('a live preview');
+  if (!bits.length && a.notes) bits.push('context');
+  return `Handed over ${bits.join(' + ')} to look at`;
 }
 
 function askLine(card, kind, state) {
