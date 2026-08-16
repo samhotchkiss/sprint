@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import datetime
 import errno
 import hashlib
 import http.client
@@ -105,6 +106,11 @@ CLIENT_ACTORS = ("user", "session", "worker")
 EVENT_KINDS = (
     "submitted", "state", "chat", "question", "answer", "progress",
     "evidence", "verdict", "agent_silent", "stuck", "note", "error",
+    # A provider limit window opened / ended. Sprint-level (card_num NULL),
+    # written only by the board itself. `limit_cleared` is the one the session
+    # ACTS on: it means the model is available again and whatever was
+    # downgraded for that window can go back.
+    "limit_declared", "limit_cleared",
 )
 
 # Headers page JavaScript is FORBIDDEN to set or remove on `fetch` (the fetch
@@ -203,6 +209,34 @@ WORKER_GONE_STATES = ("triaging", "in_progress", "needs_you")
 # a badge that is on every card says nothing.
 DEFAULT_MODEL = "fable"
 MODEL_MAX = 40
+# Why this card is not on the default model, in the session's own words
+# ("fable limited until 23:50"). Free text, one line, read by a human -- and by
+# the session, which uses its presence to know which cards to restore when the
+# limit window ends.
+MODEL_REASON_MAX = 140
+
+# --------------------------------------------------------------------------
+# Provider limit windows
+#
+# The incident this exists for, verbatim from the board: three workers were
+# killed at once by a provider usage limit, and the kill message SAID when it
+# would end -- "You've hit your session limit · resets 11:50pm (America/Denver)".
+# Nothing captured that sentence, so the cards sat open for hours until the user
+# counted them himself.
+#
+# A limit window is that sentence, made into a fact the board holds: which model
+# is unavailable and until when. Two things fall out of it -- a quiet line on
+# the board while the window is open, and exactly ONE `limit_cleared` event when
+# it ends, which is the session's cue to put the downgraded work back on the
+# model it was supposed to be on.
+#
+# Activeness is COMPUTED (`cleared_at IS NULL AND resets_at > now`), never
+# stored: a board that was asleep across 11:50pm must come back up knowing the
+# window is over, and a cleanup job that did not run is not an excuse for
+# telling the user that fable is still limited at noon the next day.
+LIMIT_SOURCE_MAX = 80          # where the reset time came from ("kill message")
+LIMIT_NOTE_MAX = 280
+LIMIT_RECENT_MAX = 20          # how many finished windows GET /api/limits shows
 
 STATES = (
     "held", "queued", "triaging", "in_progress", "needs_you", "blocked",
@@ -330,6 +364,21 @@ CREATE TABLE IF NOT EXISTS questions (
   created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS questions_card ON questions(card_num, id);
+
+-- A provider usage limit with a known end. `cleared_at` is bookkeeping for the
+-- one-shot `limit_cleared` event, NOT the definition of active: a window whose
+-- `resets_at` has passed is over whether or not anything got round to writing
+-- that down.
+CREATE TABLE IF NOT EXISTS limits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  model TEXT NOT NULL,
+  resets_at REAL NOT NULL,
+  declared_at REAL NOT NULL,
+  cleared_at REAL,
+  source TEXT,
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS limits_open ON limits(cleared_at, resets_at);
 
 CREATE TABLE IF NOT EXISTS idempotency (
   key TEXT PRIMARY KEY,
@@ -946,6 +995,151 @@ def clean_model(value):
     return text[:MODEL_MAX]
 
 
+def clean_model_reason(value, field: str = "model_reason"):
+    """Why this card is not on the default model. One line, capped, free text.
+
+    An EMPTY string is meaningful and is not the same as omitting the field:
+    omitting leaves whatever is on the card alone, "" clears it. That is what
+    the session sends when it puts a card back on its original model.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApiError(400, "bad_model_reason", "%s must be a string" % field,
+                       field=field)
+    text = " ".join(value.split())
+    if not text:
+        return ""
+    return text[:MODEL_REASON_MAX]
+
+
+def clean_short_text(value, field: str, limit: int):
+    """A free-text one-liner or None (`source`, `note` on a limit window)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApiError(400, "bad_" + field, "%s must be a string" % field, field=field)
+    text = " ".join(value.split())
+    return text[:limit] if text else None
+
+
+# `11:50pm`, `11:50 PM`, `23:50`, `9pm`, and any of those with the provider's
+# own parenthetical zone on the end: `11:50pm (America/Denver)`.
+CLOCK_RE = re.compile(r"^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?$", re.I)
+CLOCK24_RE = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$")
+TZ_PAREN_RE = re.compile(r"^(.*?)\s*\(\s*([A-Za-z][A-Za-z0-9_+\-/]*)\s*\)\s*$")
+EPOCH_RE = re.compile(r"^\d{9,14}(?:\.\d+)?$")
+# Anything past this is milliseconds, not seconds: 1e11 seconds is the year 5138
+# and 1e11 milliseconds is 1973. Nobody means the year 5138.
+EPOCH_MS_CUTOFF = 1e11
+
+
+def _zone(name: str):
+    """A tzinfo for a provider's zone name, or a 400 that says why not."""
+    try:
+        from zoneinfo import ZoneInfo          # stdlib 3.9+
+    except ImportError:
+        raise ApiError(400, "bad_resets_at",
+                       "this python has no zoneinfo — pass an ISO 8601 time "
+                       "with an offset instead of a zone name",
+                       field="resets_at")
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        raise ApiError(400, "bad_resets_at",
+                       "unknown timezone %r — pass an ISO 8601 time with an "
+                       "offset instead" % name, field="resets_at")
+
+
+def parse_reset_time(value, ref: float = None) -> float:
+    """When a limit window ends, as epoch seconds.
+
+    Accepts, in this order:
+
+      * a number — epoch seconds (or milliseconds, if it is absurdly large);
+      * an ISO 8601 timestamp, with or without an offset (naive = local);
+      * a HUMAN CLOCK TIME — `11:50pm`, `9pm`, `23:50` — meaning the **next
+        occurrence** of that time. This is the shape a provider's kill message
+        actually uses, and it is the whole reason a human ever types one of
+        these: at 11:52pm, "11:50pm" means tomorrow, not two minutes ago.
+
+    Any of the string forms may carry the provider's own zone in parentheses
+    (`11:50pm (America/Denver)`), so the kill message can be pasted verbatim
+    instead of being converted in someone's head. Without one, local time.
+    """
+    ref = now() if ref is None else float(ref)
+    if isinstance(value, bool):
+        raise ApiError(400, "bad_resets_at", "resets_at must be a time",
+                       field="resets_at")
+    if isinstance(value, (int, float)):
+        secs = float(value)
+        return secs / 1000.0 if secs > EPOCH_MS_CUTOFF else secs
+    if not isinstance(value, str):
+        raise ApiError(400, "missing_field", "resets_at is required",
+                       field="resets_at")
+    text = value.strip()
+    if not text:
+        raise ApiError(400, "missing_field", "resets_at is required",
+                       field="resets_at")
+
+    tz = None
+    m = TZ_PAREN_RE.match(text)
+    if m and m.group(1).strip():
+        text, tz = m.group(1).strip(), _zone(m.group(2))
+
+    if EPOCH_RE.match(text):
+        secs = float(text)
+        return secs / 1000.0 if secs > EPOCH_MS_CUTOFF else secs
+
+    iso = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        dt = None
+    if dt is not None:
+        if dt.tzinfo is None and tz is not None:
+            dt = dt.replace(tzinfo=tz)
+        # A naive datetime with no zone named is local time -- `.timestamp()`
+        # already means exactly that.
+        return dt.timestamp()
+
+    hour = minute = None
+    m = CLOCK_RE.match(text)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2) or 0)
+        if not (1 <= hour <= 12) or minute > 59:
+            raise ApiError(400, "bad_resets_at",
+                           "%r is not a clock time" % value, field="resets_at")
+        half = m.group(3).lower()
+        hour = (hour % 12) + (12 if half == "p" else 0)
+    else:
+        m = CLOCK24_RE.match(text)
+        if m:
+            hour, minute = int(m.group(1)), int(m.group(2))
+            if hour > 23 or minute > 59:
+                raise ApiError(400, "bad_resets_at",
+                               "%r is not a clock time" % value, field="resets_at")
+    if hour is None:
+        raise ApiError(400, "bad_resets_at",
+                       "could not read %r as a time — use ISO 8601, an epoch, "
+                       "or a clock time like 11:50pm" % value, field="resets_at")
+
+    # The next occurrence, in whichever zone we were told to read it in.
+    base = datetime.datetime.fromtimestamp(ref, tz) if tz is not None \
+        else datetime.datetime.fromtimestamp(ref)
+    target = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target.timestamp() <= ref:
+        target += datetime.timedelta(days=1)
+    return target.timestamp()
+
+
+def clock_label(ts: float) -> str:
+    """`11:50pm` — a reset time in the words the board says it in. Local."""
+    lt = time.localtime(ts)
+    hour = lt.tm_hour % 12 or 12
+    return "%d:%02d%s" % (hour, lt.tm_min, "am" if lt.tm_hour < 12 else "pm")
+
+
 # --------------------------------------------------------------------------
 # App: all state, no decisions
 # --------------------------------------------------------------------------
@@ -1082,6 +1276,12 @@ class App:
         # Which model the agent on this card was dispatched on. NULL means
         # "the sprint default" -- the face only ever shows the exception.
         ("cards", "model", "TEXT"),
+        # WHY it is on that model, in the session's words ("fable limited until
+        # 23:50"). Without this, "downgraded because of a limit" is not a fact
+        # anyone can query when the window ends -- it is a thing the session
+        # would have to remember across a restart, which is exactly what it
+        # failed to do the night this card was written.
+        ("cards", "model_reason", "TEXT"),
     )
 
     def _add_missing_columns(self):
@@ -1384,6 +1584,11 @@ class App:
             # is worth saying out loud. NULL model or the sprint default means
             # the face shows nothing: a badge on every card is decoration.
             "model": (row["model"] if "model" in self.columns("cards") else None),
+            # Why it is on that model. Rides the board payload so the session
+            # can find every card downgraded for a limit when the window ends,
+            # without a filter endpoint nobody else would ever call.
+            "model_reason": (row["model_reason"]
+                             if "model_reason" in self.columns("cards") else None),
             "default_model": self.default_model,
             # An assignee that emits no worker telemetry (an ordinary background
             # agent, a human, a cron). The silence timer cannot watch it, so it
@@ -2365,6 +2570,10 @@ class App:
                 self.sweep_worker_gone()
             except Exception:  # ...and one rule's bug must not silence the other
                 self.log("worker-gone sweep failed: %s" % traceback.format_exc())
+            try:
+                self.sweep_limits()
+            except Exception:
+                self.log("limit sweep failed: %s" % traceback.format_exc())
 
     def sweep_stuck(self) -> int:
         placeholders = ",".join("?" * len(STUCK_STATES))
@@ -2549,6 +2758,168 @@ class App:
         if fired:
             self.notify()
         return fired
+
+    # -- provider limit windows -------------------------------------------
+    #
+    # See the module-level note. Three moving parts and no more: declare one,
+    # read them, and end one -- either because the clock got there or because
+    # somebody said so early. The only rule that matters for correctness is
+    # that ending a window emits `limit_cleared` EXACTLY once, because the
+    # session's reaction to that event is to re-dispatch work: a duplicate
+    # storm is not a duplicate line in a log, it is duplicate agents on the
+    # same cards.
+
+    def limit_json(self, row, at: float = None) -> dict:
+        at = now() if at is None else at
+        resets_at = float(row["resets_at"])
+        cleared_at = row["cleared_at"]
+        # Computed, never read off a column: a board that was down across the
+        # reset time must come back up knowing the window is over.
+        active = cleared_at is None and resets_at > at
+        return {
+            "id": row["id"],
+            "model": row["model"],
+            "resets_at": resets_at,
+            "resets_at_label": clock_label(resets_at),
+            "resets_in_seconds": round(resets_at - at, 1),
+            "declared_at": row["declared_at"],
+            "cleared_at": cleared_at,
+            "source": row["source"],
+            "note": row["note"],
+            "active": active,
+        }
+
+    def limit_row(self, limit_id: int):
+        row = self.q1("SELECT * FROM limits WHERE id=?", (limit_id,))
+        if row is None:
+            raise ApiError(404, "no_such_limit", "no limit window #%s" % limit_id)
+        return row
+
+    def active_limits(self, at: float = None) -> list:
+        at = now() if at is None else at
+        rows = self.q("SELECT * FROM limits WHERE cleared_at IS NULL AND resets_at > ? "
+                      "ORDER BY resets_at", (at,))
+        return [self.limit_json(r, at) for r in rows]
+
+    def limits_index(self) -> dict:
+        at = now()
+        recent = self.q(
+            "SELECT * FROM limits WHERE cleared_at IS NOT NULL OR resets_at <= ? "
+            "ORDER BY COALESCE(cleared_at, resets_at) DESC LIMIT ?",
+            (at, LIMIT_RECENT_MAX))
+        return {
+            "active": self.active_limits(at),
+            "recent": [self.limit_json(r, at) for r in recent],
+            "server_time": at,
+        }
+
+    def declare_limit(self, model, resets_at, source=None, note=None) -> dict:
+        """Record that `model` is unavailable until `resets_at`.
+
+        One ACTIVE window per model, always. Re-declaring the same window (the
+        session sees the same kill message on the second and third dead agent)
+        updates the one that is already there instead of stacking three
+        identical lines on the board, and a corrected reset time moves the
+        window it corrects rather than opening a rival one.
+        """
+        model = clean_model(model)
+        if not model:
+            raise ApiError(400, "missing_field", "model is required", field="model")
+        if resets_at is None:
+            raise ApiError(400, "missing_field", "resets_at is required",
+                           field="resets_at")
+        at = now()
+        resets = parse_reset_time(resets_at, ref=at)
+        source = clean_short_text(source, "source", LIMIT_SOURCE_MAX)
+        note = clean_short_text(note, "note", LIMIT_NOTE_MAX)
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.conn.execute(
+                    "SELECT * FROM limits WHERE model=? AND cleared_at IS NULL "
+                    "AND resets_at > ? ORDER BY id DESC LIMIT 1",
+                    (model, at)).fetchone()
+                if row is not None:
+                    changed = abs(float(row["resets_at"]) - resets) >= 1.0
+                    self.conn.execute(
+                        "UPDATE limits SET resets_at=?, source=COALESCE(?,source), "
+                        "note=COALESCE(?,note) WHERE id=?",
+                        (resets, source, note, row["id"]))
+                    limit_id, created = row["id"], False
+                else:
+                    cur = self.conn.execute(
+                        "INSERT INTO limits(model, resets_at, declared_at, cleared_at,"
+                        " source, note) VALUES(?,?,?,NULL,?,?)",
+                        (model, resets, at, source, note))
+                    limit_id, created, changed = cur.lastrowid, True, True
+                if created or changed:
+                    self._append_event(None, "server", "limit_declared", {
+                        "limit_id": limit_id, "model": model, "resets_at": resets,
+                        "source": source, "note": note,
+                        "text": "%s is rate-limited until %s"
+                                % (model, clock_label(resets))})
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.notify()
+        return {"ok": True, "created": created,
+                "limit": self.limit_json(self.limit_row(limit_id))}
+
+    def end_limit(self, limit_id: int, at: float = None) -> bool:
+        """End one window and emit `limit_cleared` — at most once, ever.
+
+        The single-writer guarantee is the conditional UPDATE: whoever wins
+        `cleared_at IS NULL` writes the event, and everybody else -- a second
+        sweep tick, a manual clear racing the clock, another thread -- sees
+        rowcount 0 and says nothing. Returns whether THIS call was the one.
+        """
+        at = now() if at is None else at
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.conn.execute("SELECT * FROM limits WHERE id=?",
+                                        (limit_id,)).fetchone()
+                if row is None:
+                    self.conn.execute("ROLLBACK")
+                    return False
+                cur = self.conn.execute(
+                    "UPDATE limits SET cleared_at=? WHERE id=? AND cleared_at IS NULL",
+                    (at, limit_id))
+                if cur.rowcount != 1:
+                    self.conn.execute("ROLLBACK")
+                    return False
+                resets = float(row["resets_at"])
+                passed = at >= resets
+                self._append_event(None, "server", "limit_cleared", {
+                    "limit_id": limit_id, "model": row["model"],
+                    "resets_at": resets, "declared_at": row["declared_at"],
+                    "cleared_at": at,
+                    "reason": "window_passed" if passed else "cleared_early",
+                    "text": "%s's limit window is over — anything downgraded for "
+                            "it can go back on %s" % (row["model"], row["model"])})
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.notify()
+        return True
+
+    def clear_limit(self, limit_id: int) -> dict:
+        """`POST /api/limits/:id/clear` — the limit lifted early. Idempotent:
+        clearing an already-finished window is a 200 and no second event."""
+        self.limit_row(limit_id)
+        cleared = self.end_limit(limit_id)
+        return {"ok": True, "cleared": cleared,
+                "limit": self.limit_json(self.limit_row(limit_id))}
+
+    def sweep_limits(self) -> int:
+        """Windows whose reset time has arrived. Runs on the sweep tick beside
+        the other two rules; `end_limit` is what makes it safe to run often."""
+        at = now()
+        rows = self.q("SELECT id FROM limits WHERE cleared_at IS NULL AND resets_at <= ?",
+                      (at,))
+        return sum(1 for r in rows if self.end_limit(r["id"]))
 
     def cursor_seq(self, name: str = "orchestrator") -> int:
         """How far the session has actually drained. A user message with seq <= this
@@ -3244,10 +3615,14 @@ class App:
 
     def assign(self, num: int, agent_name, worktree, branch,
                title=None, model=None, actor: str = "session", work_kind=None,
-               external_agent=None) -> dict:
+               external_agent=None, model_reason=None) -> dict:
         self.card_row(num)
         title = clean_title(title) if title is not None else None
         model = clean_model(model)
+        # "" is how the session says "this is no longer a downgrade" when it
+        # puts the card back on its original model, so it is not the same as
+        # leaving the field out.
+        model_reason = clean_model_reason(model_reason)
         # Ops work has no worktree and no branch to give -- assigning it means
         # naming who is doing it and saying what shape of evidence to expect.
         if work_kind is not None:
@@ -3268,10 +3643,13 @@ class App:
                     "UPDATE cards SET agent_name=COALESCE(?,agent_name), "
                     "worktree=COALESCE(?,worktree), branch=COALESCE(?,branch), "
                     "model=COALESCE(?,model), "
+                    "model_reason=CASE WHEN ? IS NULL THEN model_reason "
+                    "                  WHEN ?='' THEN NULL ELSE ? END, "
                     "work_kind=COALESCE(?,work_kind), "
                     "external_agent=COALESCE(?,external_agent), "
                     "updated_at=? WHERE num=?",
-                    (agent_name, worktree, branch, model, work_kind,
+                    (agent_name, worktree, branch, model,
+                     model_reason, model_reason, model_reason, work_kind,
                      None if external_agent is None else (1 if external_agent else 0),
                      now(), num))
                 note = {
@@ -3285,6 +3663,13 @@ class App:
                     note["text"] += " on %s" % model
                 if model:
                     note["model"] = model
+                # ...and the reason says WHICH fable ran out, so the line reads
+                # as a sentence: "assigned to sprint-card-42 on opus — fable
+                # limited until 11:50pm".
+                if model_reason:
+                    note["text"] += " — %s" % model_reason
+                if model_reason is not None:
+                    note["model_reason"] = model_reason
                 self._append_event(num, actor, "note", note)
                 if title is not None:
                     self._write_title(num, title, actor)
@@ -3543,6 +3928,10 @@ class App:
             "states": list(STATES),
             # What "no badge" means on a card face.
             "default_model": self.default_model,
+            # Provider limit windows that are open RIGHT NOW (computed off the
+            # clock, so an expired one is simply not here). The board draws one
+            # quiet line per window; `GET /api/limits` has the finished ones.
+            "limits": self.active_limits(),
             # `integrating` stays in the Ready column with a "merging…" note --
             # a card only reaches Done once its branch actually landed.
             "column_of": dict(COLUMN_OF),
@@ -3923,6 +4312,11 @@ def make_handler(app: App):
                 # one flagged `self`. `?fresh=1` skips the 10s cache (tests).
                 fresh = (query.get("fresh") or ["0"])[0] in ("1", "true", "yes")
                 return self.json_out(200, app.siblings(max_age=0 if fresh else None))
+            if path == "/api/limits":
+                # Active windows plus the recently finished ones. Active is a
+                # computation, not a column: nothing here depends on a sweep
+                # having run.
+                return self.json_out(200, app.limits_index())
             if path == "/api/sprints":
                 rows = app.q("SELECT * FROM sprints ORDER BY id DESC")
                 return self.json_out(200, {"sprints": [app.sprint_json(r) for r in rows]})
@@ -4162,6 +4556,18 @@ def make_handler(app: App):
                 return 201, app.make_batch(body.get("card_nums"), body.get("agent_name"),
                                            body.get("branch"), body.get("worktree"))
 
+            # A provider said when it would let us back in. Session surface:
+            # `bin/sprint-limit declare --model fable --resets 11:50pm`.
+            if path == "/api/limits":
+                out = app.declare_limit(body.get("model"), body.get("resets_at"),
+                                        source=body.get("source"),
+                                        note=body.get("note"))
+                return (201 if out.get("created") else 200), out
+
+            m = re.match(r"^/api/limits/(\d+)/clear$", path)
+            if m:
+                return 200, app.clear_limit(int(m.group(1)))
+
             if path == "/api/sprint":
                 return 200, app.sprint_action(body.get("action"), body)
 
@@ -4271,6 +4677,7 @@ def make_handler(app: App):
                 return 200, app.assign(num, body.get("agent_name"), body.get("worktree"),
                                        body.get("branch"), title=body.get("title"),
                                        model=body.get("model"),
+                                       model_reason=body.get("model_reason"),
                                        work_kind=body.get("work_kind"),
                                        external_agent=body.get("external_agent"))
             raise ApiError(404, "no_such_route", "no route for %s" % path)
