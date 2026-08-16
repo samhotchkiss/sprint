@@ -4,8 +4,24 @@
 Usage:
   sprint-post <num> <kind> <text...> [--detail TEXT | --detail-file PATH]
                                      [--long-running] [--server URL] [--token TOKEN]
+  sprint-post <num> phase "<phase>" [--expect 300]
 
-  kind must be one of: progress, chat, note, error
+  kind must be one of: progress, chat, note, error, phase
+
+`phase` is sugar for a progress event that says what you are DOING right now
+rather than what you last finished:
+
+  sprint-post 42 phase "reading"
+  sprint-post 42 phase "testing" --expect 300
+  sprint-post 42 phase "capturing evidence" --expect 4m
+
+The card face renders it as a chip on its own clock ("testing · 2m") in place
+of a status line that goes stale the moment you write it. Recommended (not
+enforced) vocabulary: reading, coding, testing, capturing evidence, assembling
+packet, waiting. Declare one at every stretch boundary, and pass --expect for
+anything slower than two minutes: while a declared phase is inside the time it
+claimed, the board holds off its five-minute silence timer — and once that time
+is up with no new word, the chip goes amber and says so.
 
 Every event is TWO things: a one-line `text` you can skim in a scrolling
 timeline, and an OPTIONAL `detail` you can expand when you want to dig in
@@ -36,6 +52,13 @@ import urllib.error
 import urllib.request
 
 KINDS = ("progress", "chat", "note", "error")
+# `phase` is not an event kind on the wire — it is a progress event carrying
+# payload.phase. One word at the command line, one concept on the board.
+PHASE_KIND = "phase"
+PHASE_MAX = 40
+PHASE_EXPECT_MAX = 24 * 3600
+RECOMMENDED_PHASES = ("reading", "coding", "testing", "capturing evidence",
+                      "assembling packet", "waiting")
 
 # The one-liner is what a human skims in a scrolling timeline; anything longer
 # belongs in --detail. Big detail still gets a ceiling so a runaway log can't
@@ -67,8 +90,11 @@ def parse_args(argv):
         description="Post a progress/chat/note/error event to a sprint card.",
     )
     p.add_argument("num", nargs="?", help="card number")
-    p.add_argument("kind", nargs="?", help="progress|chat|note|error")
+    p.add_argument("kind", nargs="?", help="progress|chat|note|error|phase")
     p.add_argument("text", nargs="*", help="event text (quote it, or pass multiple words)")
+    p.add_argument("--expect", default=None,
+                    help="phase only: how long this stretch should take — seconds, "
+                         "or 90s / 5m / 1h")
     p.add_argument("--detail", default=None,
                     help="optional expanded version (multi-line ok): output, reasoning, a log")
     p.add_argument("--detail-file", default=None, dest="detail_file",
@@ -90,17 +116,70 @@ def validate(args):
     except ValueError:
         fail("num", f"must be an integer, got {args.num!r}")
     if not args.kind:
-        fail("kind", f"must be one of: {', '.join(KINDS)}")
-    if args.kind not in KINDS:
-        fail("kind", f"{args.kind!r} is not one of: {', '.join(KINDS)}")
+        fail("kind", f"must be one of: {', '.join(KINDS + (PHASE_KIND,))}")
+    if args.kind not in KINDS and args.kind != PHASE_KIND:
+        fail("kind", f"{args.kind!r} is not one of: {', '.join(KINDS + (PHASE_KIND,))}")
     text = " ".join(args.text).strip()
     if not text:
-        fail("text", "the event text is empty")
+        fail("text", "the event text is empty"
+                     if args.kind != PHASE_KIND else
+                     "name the phase, e.g. sprint-post %d phase \"testing\"" % num)
+    if args.expect is not None and args.kind != PHASE_KIND:
+        fail("expect", "--expect only means anything on a phase: "
+                       "sprint-post %d phase \"testing\" --expect 300" % num)
     if not args.server:
         fail("server", "pass --server or set SPRINT_SERVER")
     if not args.token:
         fail("token", "pass --token or set SPRINT_TOKEN")
     return num, args.kind, text, read_detail(args)
+
+
+UNITS = {"s": 1, "m": 60, "h": 3600}
+
+
+def parse_expect(raw):
+    """`--expect` → whole seconds. Plain seconds, or 90s / 5m / 1h."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    mult = 1
+    if s and s[-1] in UNITS:
+        mult, s = UNITS[s[-1]], s[:-1].strip()
+    try:
+        value = float(s)
+    except ValueError:
+        fail("expect", f"must be a number of seconds (or 90s / 5m / 1h), got {raw!r}")
+    seconds = value * mult
+    if seconds <= 0:
+        fail("expect", f"must be greater than zero, got {raw!r}")
+    if seconds > PHASE_EXPECT_MAX:
+        fail("expect", f"must be no more than 24h, got {raw!r}")
+    return int(round(seconds))
+
+
+def human_duration(seconds):
+    """"5m" / "90s" / "1h 30m" — how the expectation reads back to a human."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return "%ds" % seconds
+    minutes, rest = divmod(seconds, 60)
+    if minutes < 60:
+        return "%dm" % minutes if not rest else "%dm %ds" % (minutes, rest)
+    hours, mins = divmod(minutes, 60)
+    return "%dh" % hours if not mins else "%dh %dm" % (hours, mins)
+
+
+def phase_payload(phase, expect):
+    """The progress event a `phase` post really is: a chip, a clock, and a
+    one-liner that still stands on its own in the timeline."""
+    phase = one_line(phase, PHASE_MAX)
+    payload = {"phase": phase}
+    if expect is None:
+        payload["text"] = "phase: %s" % phase
+    else:
+        payload["expected_seconds"] = expect
+        payload["text"] = "phase: %s (expect ~%s)" % (phase, human_duration(expect))
+    return payload
 
 
 def read_detail(args):
@@ -140,9 +219,14 @@ def skim_line(text, detail):
 def main(argv):
     args = parse_args(argv)
     num, kind, text, detail = validate(args)
-    text, detail = skim_line(text, detail)
 
-    payload = {"text": text}
+    if kind == PHASE_KIND:
+        # Sugar, not a new event kind: the wire still sees a progress event.
+        payload = phase_payload(text, parse_expect(args.expect))
+        kind = "progress"
+    else:
+        text, detail = skim_line(text, detail)
+        payload = {"text": text}
     if detail:
         payload["detail"] = detail
     if args.long_running:
@@ -164,7 +248,13 @@ def main(argv):
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
             extra = f" (+{len(detail)} chars of detail)" if detail else ""
-            print(f"sprint-post: posted {kind} event to #{num}{extra}")
+            if "phase" in payload:
+                said = payload["phase"]
+                if payload.get("expected_seconds"):
+                    said += " (expect ~%s)" % human_duration(payload["expected_seconds"])
+                print(f"sprint-post: #{num} is now {said}{extra}")
+            else:
+                print(f"sprint-post: posted {kind} event to #{num}{extra}")
             return 0
     except urllib.error.HTTPError as e:
         why = e.read().decode("utf-8", "replace")

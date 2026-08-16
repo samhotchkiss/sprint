@@ -4118,5 +4118,273 @@ class TestHubCli(unittest.TestCase):
                              sprintd.read_registry(home_reg))
 
 
+class TestPhases(Base):
+    """A phase is what the agent says it is DOING, on its own clock. It is a
+    projection of the event log, so a card that moved on can't still be
+    'testing'."""
+
+    def phase(self, num, phase, expect=None, kind="progress"):
+        payload = {"text": "phase: %s" % phase, "phase": phase}
+        if expect is not None:
+            payload["expected_seconds"] = expect
+        return self.post("/api/cards/%d/events" % num, {"kind": kind, "payload": payload})
+
+    def card_of(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return detail["card"]
+
+    def board_card(self, num):
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        return {c["num"]: c for c in board["cards"]}[num]
+
+    def test_a_phase_event_shows_up_on_the_card_and_the_board(self):
+        num = self.new_card("phase me")["num"]
+        self.to_in_progress(num)
+        before = self.card_of(num)
+        self.assertIsNone(before["phase"])
+        self.assertIsNone(before["phase_since"])
+        self.assertIsNone(before["phase_expected_seconds"])
+
+        status, body = self.phase(num, "testing", expect=300)
+        self.assertEqual(status, 201, body)
+
+        for card in (self.card_of(num), self.board_card(num), body["card"]):
+            self.assertEqual(card["phase"], "testing")
+            self.assertEqual(card["phase_expected_seconds"], 300.0)
+            self.assertIsNotNone(card["phase_since"])
+            self.assertGreater(card["phase_since"], 0)
+
+    def test_the_latest_phase_wins_and_plain_events_do_not_clear_it(self):
+        num = self.new_card("many phases")["num"]
+        self.to_in_progress(num)
+        self.phase(num, "reading")
+        self.phase(num, "coding", expect=600)
+        self.post("/api/cards/%d/events" % num,
+                  {"kind": "progress", "payload": {"text": "found the bug"}})
+        card = self.card_of(num)
+        self.assertEqual(card["phase"], "coding",
+                         "a plain progress line is not the end of a phase")
+        self.assertEqual(card["phase_expected_seconds"], 600.0)
+
+    def test_a_state_change_clears_the_phase(self):
+        num = self.new_card("phase then move")["num"]
+        self.to_in_progress(num)
+        self.phase(num, "assembling packet", expect=120)
+        self.assertEqual(self.card_of(num)["phase"], "assembling packet")
+
+        status, _ = self.post("/api/cards/%d/state" % num,
+                              {"state": "blocked", "reason": "ci_red"})
+        self.assertEqual(status, 200)
+        card = self.card_of(num)
+        self.assertIsNone(card["phase"], "a card that moved on is not still packing")
+        self.assertIsNone(card["phase_since"])
+        self.assertIsNone(card["phase_expected_seconds"])
+
+    def test_an_expectation_without_a_phase_carries_no_clock(self):
+        num = self.new_card("no phase")["num"]
+        self.to_in_progress(num)
+        status, _ = self.post("/api/cards/%d/events" % num,
+                              {"kind": "progress",
+                               "payload": {"text": "x", "expected_seconds": 300}})
+        self.assertEqual(status, 201)
+        self.assertIsNone(self.card_of(num)["phase"])
+
+    def test_junk_phases_are_named_400s_not_empty_chips(self):
+        num = self.new_card("junk")["num"]
+        self.to_in_progress(num)
+        for bad in ("", "   ", 7, None):
+            status, body = self.post("/api/cards/%d/events" % num,
+                                     {"kind": "progress",
+                                      "payload": {"text": "x", "phase": bad}})
+            self.assertEqual(status, 400, body)
+            self.assertEqual(body["error"], "bad_phase")
+        for bad in (0, -5, "soon", 25 * 3600, True):
+            status, body = self.phase(num, "testing", expect=bad)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(body["error"], "bad_expected_seconds")
+        self.assertIsNone(self.card_of(num)["phase"], "nothing junk was recorded")
+
+    def test_a_long_phase_is_clipped_to_a_chip(self):
+        num = self.new_card("long phase")["num"]
+        self.to_in_progress(num)
+        self.phase(num, "capturing evidence " * 10)
+        card = self.card_of(num)
+        self.assertLessEqual(len(card["phase"]), 40)
+        self.assertTrue(card["phase"].startswith("capturing evidence"))
+
+
+class TestPhaseAndSilence(Base):
+    """The falsification pair: the SAME quiet stretch, one card shielded by a
+    phase that claimed it and one not. If the shield stopped working, the first
+    assertion below is the one that fails."""
+
+    SILENCE_SECONDS = 2.0
+    SILENCE_TICK = 0.2
+    START_BACKGROUND = True
+
+    def silent_events(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return [e for e in detail["timeline"] if e["kind"] == "agent_silent"]
+
+    def wait_for_silent(self, num, timeout=12.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            events = self.silent_events(num)
+            if events:
+                return events
+            time.sleep(0.1)
+        return []
+
+    def phase(self, num, phase, expect=None):
+        payload = {"text": "phase: %s" % phase, "phase": phase}
+        if expect is not None:
+            payload["expected_seconds"] = expect
+        status, body = self.post("/api/cards/%d/events" % num,
+                                 {"kind": "progress", "payload": payload})
+        self.assertEqual(status, 201, body)
+
+    def test_a_declared_phase_holds_the_timer_and_a_bare_line_does_not(self):
+        shielded = self.new_card("declared a long phase")["num"]
+        control = self.new_card("just said something")["num"]
+        for num in (shielded, control):
+            self.post("/api/cards/%d/assign" % num,
+                      {"agent_name": "sprint-card-%d" % num, "worktree": "/tmp/wt",
+                       "branch": "sprint/card-%d" % num})
+            self.to_in_progress(num)
+
+        # Same instant, same silence afterwards. The only difference is that one
+        # of them said how long it would be quiet for.
+        self.phase(shielded, "testing", expect=8)
+        self.post("/api/cards/%d/events" % control,
+                  {"kind": "progress", "payload": {"text": "running the tests"}})
+
+        # Past the 2s threshold: the control ambers, the shielded card does not.
+        self.assertEqual(len(self.wait_for_silent(control)), 1,
+                         "the control card proves the timer is armed and firing")
+        self.assertEqual(self.silent_events(shielded), [],
+                         "a phase inside the time it claimed is not silence")
+        _, board = self.get("/api/board")
+        by_num = {c["num"]: c for c in board["cards"]}
+        self.assertFalse(by_num[shielded]["silent"])
+        self.assertTrue(by_num[control]["silent"])
+
+    def test_the_shield_lasts_exactly_as_long_as_the_claim(self):
+        num = self.new_card("overran its phase")["num"]
+        self.to_in_progress(num)
+        self.phase(num, "testing", expect=3)
+        time.sleep(2.4)
+        self.assertEqual(self.silent_events(num), [], "still inside the claim")
+        # ...and once the claim runs out with no new word, it ambers as usual.
+        self.assertEqual(len(self.wait_for_silent(num)), 1,
+                         "an expectation that ran out is exactly what amber is for")
+        self.assertTrue(self.get("/api/cards/%d" % num)[1]["card"]["silent"])
+
+    def test_a_phase_with_no_expectation_shields_nothing(self):
+        num = self.new_card("no expectation")["num"]
+        self.to_in_progress(num)
+        self.phase(num, "coding")
+        self.assertEqual(len(self.wait_for_silent(num)), 1,
+                         "the default clock is the promise you didn't make")
+
+    def test_a_new_phase_re_arms_the_shield(self):
+        num = self.new_card("phase after phase")["num"]
+        self.to_in_progress(num)
+        self.phase(num, "coding")
+        self.assertEqual(len(self.wait_for_silent(num)), 1)
+        self.phase(num, "testing", expect=8)
+        _, board = self.get("/api/board")
+        self.assertFalse({c["num"]: c for c in board["cards"]}[num]["silent"])
+        time.sleep(self.SILENCE_SECONDS + 1.0)
+        self.assertEqual(len(self.silent_events(num)), 1,
+                         "declaring a phase is an act of liveness")
+
+
+class TestSprintPostPhaseHelper(Base):
+    """`sprint-post 42 phase "testing" --expect 5m` — sugar over a progress
+    event, validated before it ever hits the network."""
+
+    SPRINT_POST = os.path.join(os.path.dirname(HERE), "bin", "sprint-post")
+
+    def run_post(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_POST] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def last_payload(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return detail["timeline"][-1]["payload"]
+
+    def working_card(self, text="phase helper"):
+        num = self.new_card(text)["num"]
+        self.to_in_progress(num)
+        return num
+
+    def test_phase_posts_a_progress_event_carrying_the_phase(self):
+        num = self.working_card()
+        r = self.run_post(num, "phase", "capturing evidence")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        p = self.last_payload(num)
+        self.assertEqual(p["phase"], "capturing evidence")
+        self.assertNotIn("expected_seconds", p)
+        self.assertEqual(p["text"], "phase: capturing evidence")
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["timeline"][-1]["kind"], "progress",
+                         "phase is sugar, not a new event kind on the wire")
+        self.assertEqual(detail["card"]["phase"], "capturing evidence")
+
+    def test_expect_takes_seconds_or_a_unit(self):
+        for raw, want in (("300", 300), ("90s", 90), ("5m", 300), ("1h", 3600)):
+            num = self.working_card("expect " + raw)
+            r = self.run_post(num, "phase", "testing", "--expect", raw)
+            self.assertEqual(r.returncode, 0, r.stderr.decode())
+            p = self.last_payload(num)
+            self.assertEqual(p["expected_seconds"], want)
+            self.assertIn("expect ~", p["text"],
+                          "the timeline line says the expectation out loud")
+            self.assertEqual(self.get("/api/cards/%d" % num)[1]["card"]
+                             ["phase_expected_seconds"], float(want))
+
+    def test_a_bad_expectation_is_a_named_client_side_failure(self):
+        num = self.working_card()
+        for bad in ("soon", "0", "-30", "25h", ""):
+            r = self.run_post(num, "phase", "testing", "--expect", bad)
+            self.assertEqual(r.returncode, 2, "%r should not post" % bad)
+            self.assertIn("expect", r.stderr.decode())
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertNotIn("phase", detail["timeline"][-1]["payload"],
+                         "nothing reached the server")
+
+    def test_expect_without_a_phase_is_rejected(self):
+        num = self.working_card()
+        r = self.run_post(num, "progress", "running tests", "--expect", "300")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("expect", r.stderr.decode())
+
+    def test_a_phase_with_no_name_names_the_missing_field(self):
+        num = self.working_card()
+        r = self.run_post(num, "phase")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("text", r.stderr.decode())
+
+    def test_a_long_phase_is_clipped_before_it_is_sent(self):
+        num = self.working_card()
+        r = self.run_post(num, "phase", "testing " * 20)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertLessEqual(len(self.last_payload(num)["phase"]), 40)
+
+    def test_it_tells_you_what_the_card_now_says(self):
+        num = self.working_card()
+        r = self.run_post(num, "phase", "testing", "--expect", "5m")
+        out = r.stdout.decode()
+        self.assertIn("testing", out)
+        self.assertIn("5m", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
