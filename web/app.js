@@ -6,7 +6,7 @@ import {
 import { Live } from './live.js';
 import {
   store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
-  sections, headline, loadView, setView, setChatOpen, bounceComposing,
+  sections, headline, countFor, loadView, setView, setChatOpen, bounceComposing,
 } from './state.js';
 import { renderList } from './list.js';
 import { renderBoard, renderFold } from './board.js';
@@ -83,7 +83,8 @@ function paint() {
   renderTitle(el.titleWrap, title);
   // On the Fold the header is 54px and the whole headline will not fit; the one
   // number that changes what you do next survives, in the accent colour.
-  const needs = secs.needs_you.cards.length;
+  // Decisions, not cards: a six-card branch is one thing waiting on you.
+  const needs = countFor('needs_you', secs);
   el.headline.classList.toggle('fold-need', foldQuery.matches);
   el.headline.textContent = !store.loaded ? ''
     : foldQuery.matches ? (needs ? `${needs} need you` : 'nothing needs you')

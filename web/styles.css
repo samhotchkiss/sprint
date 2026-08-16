@@ -2676,3 +2676,13 @@ html.skin-chaos .unit-changes-label { border-top: 2px solid var(--border); }
 html.skin-chaos .unit-title,
 html.skin-chaos .unit-change-title { line-height: 1.5; }
 html.skin-chaos .unit-intro, html.skin-chaos .unit-error { line-height: 1.7; }
+
+/* A member's own screenshots are a thumbnail strip inside a 480px rail, not a
+   full-width plate that pushes the other five changes off the screen. */
+.unit-change-body .shots { max-width: 100%; flex-wrap: wrap; }
+.unit-change-body .shot { flex: 0 0 132px; }
+
+/* The verdict bar is pinned over the bottom of the outline, so anything the
+   caret lands in has to leave room for it — otherwise focusing a section's
+   notes box scrolls it just far enough to hide its own Send button. */
+.unit-change, .unit-bounce, .unit-outline .bounce-notes { scroll-margin-bottom: 150px; }

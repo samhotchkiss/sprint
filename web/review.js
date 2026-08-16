@@ -387,29 +387,40 @@ export function unitOutline(unit, app) {
   const root = h('div.unit-outline');
   const p = unit.packet;
 
+  // Order matters here and it is the whole card: what the branch says it did,
+  // how to check it, then EVERYTHING THAT CHANGED. The branch's own pictures,
+  // reports and diffstat are supporting evidence and sit below the changes —
+  // put them on top and you scroll past a screen of preamble to reach the six
+  // things you were actually asked about.
+  if (p && p.claim) {
+    root.appendChild(h('div.unit-sec',
+      h('p.packet-label.good', 'What the branch says it did'),
+      h('p.packet-claim', p.claim)));
+  }
   root.appendChild(h('p.unit-intro',
-    `These ${plural(unit.size, 'card')} shipped together on one branch. `
-    + 'Everything that changed is below — approve them together at the bottom, '
+    `${plural(unit.size, 'card')} on one branch — approve them together at the bottom, `
     + 'or send back just the part that is wrong.'));
 
+  if (p && p.steps.length) {
+    const list = h('div.steps');
+    p.steps.forEach((s, i) => {
+      list.appendChild(h('div.step', h('span.step-n', String(i + 1)), h('p', s)));
+    });
+    root.appendChild(h('div.unit-sec', h('p.packet-label.accent', 'Check it yourself'), list));
+  }
+  if (p && p.readback.trim()) {
+    root.appendChild(h('div.unit-sec',
+      h('p.packet-label.accent', 'What came back'),
+      h('pre.packet-readback', p.readback.trim())));
+  }
+
+  root.appendChild(h('p.packet-label.accent.unit-changes-label',
+    `Everything that changed · ${unit.size}`));
+  unit.cards.forEach((card, i) => {
+    root.appendChild(changeSection(unit, card, i + 1, app));
+  });
+
   if (p) {
-    if (p.claim) {
-      root.appendChild(h('div.unit-sec',
-        h('p.packet-label.good', 'What the branch says it did'),
-        h('p.packet-claim', p.claim)));
-    }
-    if (p.steps.length) {
-      const list = h('div.steps');
-      p.steps.forEach((s, i) => {
-        list.appendChild(h('div.step', h('span.step-n', String(i + 1)), h('p', s)));
-      });
-      root.appendChild(h('div.unit-sec', h('p.packet-label.accent', 'Check it yourself'), list));
-    }
-    if (p.readback.trim()) {
-      root.appendChild(h('div.unit-sec',
-        h('p.packet-label.accent', 'What came back'),
-        h('pre.packet-readback', p.readback.trim())));
-    }
     if (p.shots.length) {
       root.appendChild(h('div.unit-sec',
         h('p.packet-label.accent', 'The branch, in pictures'),
@@ -431,12 +442,6 @@ export function unitOutline(unit, app) {
       .filter(Boolean).join(' · ');
     if (meta) root.appendChild(h('p.packet-meta', meta));
   }
-
-  root.appendChild(h('p.packet-label.accent.unit-changes-label',
-    `Everything that changed · ${unit.size}`));
-  unit.cards.forEach((card, i) => {
-    root.appendChild(changeSection(unit, card, i + 1, app));
-  });
   return root;
 }
 

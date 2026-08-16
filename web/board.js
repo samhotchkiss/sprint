@@ -67,7 +67,7 @@ function boardGrid(app, { fold }) {
         body.appendChild(h('div.col-sec',
           h('span.col-sec-name', sec.label),
           h('span.grow'),
-          h('span.col-sec-count', String(sec.cards.length))));
+          h('span.col-sec-count', String(sec.count != null ? sec.count : sec.cards.length))));
       }
       if (sec.note) body.appendChild(h('p.col-note', sec.note));
       // Awaiting review is the one section whose tiles ARE interactive, on the

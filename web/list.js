@@ -6,7 +6,7 @@
 // compressed table, blocked work is dimmer still, and the queue is pills.
 import { h, timeEl, firstLine } from './util.js';
 import {
-  sections, meterSegments, cardState, needsKind, motionState, blockedReason,
+  sections, meterSegments, cardState, needsKind, needsYouCount, motionState, blockedReason,
   waitingMark, isStuck, BLOCKED_NOTE,
   modelTag, MODEL_HINT,
 } from './state.js';
@@ -60,7 +60,9 @@ const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 function needsSection(col, app) {
   const sec = h('section.section');
-  sec.appendChild(head('Needs you', col.cards.length, { accent: true, tight: true }));
+  // The count is DECISIONS, not cards: a six-card branch is one thing waiting
+  // on you (card #55), and it renders as one card in the list below.
+  sec.appendChild(head('Needs you', needsYouCount(col.cards), { accent: true, tight: true }));
   sec.appendChild(h('p.section-intro', needsIntro(col.cards)));
 
   // The section still holds both shapes of asking, and they are still told apart
