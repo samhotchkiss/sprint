@@ -128,6 +128,44 @@ STUCK_TEXT = {
     "ready": "ready for review %s — it is waiting on a verdict",
 }
 
+# --------------------------------------------------------------------------
+# Killed-agent detection
+#
+# Three workers were killed mid-flight when the session hit a provider usage
+# limit. Nothing recovered them: their cards sat in In motion for hours until
+# the user counted nine open cards and asked why. `agent_silent` had already
+# fired and said its piece at five minutes -- but saying "quiet" forever is
+# exactly what a dead agent looks like, and amber is not an escalation.
+#
+# So the sweep keeps a second, much longer clock on the same cards. Past
+# `worker_gone_seconds` it says out loud that the worker is probably dead; past
+# `worker_dead_seconds` it stops guessing and moves the card to `failed` with a
+# machine reason, which is the one state that carries a Retry the user can hit.
+# `failed` preserves the timeline, the evidence, the branch and the worktree --
+# Retry re-dispatches a fresh agent with all of it as the brief.
+#
+# The bar for "provably gone" is deliberately high, because declaring a working
+# agent dead is worse than waiting: the card must have an agent on it, must have
+# no live phase claim, must not be an external agent, and its quiet stretch is
+# measured per AGENT (any worker event on any of its cards counts), never per
+# card.
+DEFAULT_WORKER_GONE_SECONDS = 1200.0     # 20 min: say the worker may be dead
+DEFAULT_WORKER_DEAD_SECONDS = 2400.0     # 40 min total: declare it failed
+# A `long_running` card promised in advance that it would be quiet, so the
+# clock is stretched rather than switched off -- an agent killed in the middle
+# of a long test run is the exact shape of the incident this rule exists for,
+# and an exemption with no end would be a hole big enough to drive it through.
+DEFAULT_WORKER_LONGRUN_FACTOR = 6.0      # 2 h notice, 4 h failed
+WORKER_GONE_STATES = ("triaging", "in_progress", "needs_you")
+
+# Which model the session dispatches on unless something went wrong. Recorded
+# per card at assign time so that a fallback -- "fable hit its usage limit, this
+# one is running on opus" -- is a fact on the board and not a thing the user has
+# to remember. The face shows the model ONLY when it differs from this, because
+# a badge that is on every card says nothing.
+DEFAULT_MODEL = "fable"
+MODEL_MAX = 40
+
 STATES = (
     "held", "queued", "triaging", "in_progress", "needs_you", "blocked",
     "ready", "integrating", "completed", "rejected", "failed", "stale",
@@ -556,6 +594,19 @@ def clean_title(value, limit: int = 90) -> str:
     return text
 
 
+def clean_model(value):
+    """Normalize a model name, or None. Free-form on purpose: the board records
+    what the session says it dispatched on and never adjudicates the list."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApiError(400, "bad_model", "model must be a string", field="model")
+    text = " ".join(value.split())
+    if not text:
+        return None
+    return text[:MODEL_MAX]
+
+
 # --------------------------------------------------------------------------
 # App: all state, no decisions
 # --------------------------------------------------------------------------
@@ -571,6 +622,10 @@ class App:
                  sse_heartbeat: float = None, max_upload: int = None,
                  sweep_tick: float = None, sweep_thresholds: dict = None,
                  sweep_backoff=None, sweep_max_reminders: int = None,
+                 worker_gone_seconds: float = None,
+                 worker_dead_seconds: float = None,
+                 worker_longrun_factor: float = None,
+                 default_model: str = None,
                  log=None):
         self.project_root = os.path.realpath(project_root)
         self.data_dir = os.path.realpath(data_dir or os.path.join(self.project_root, DATA_DIRNAME))
@@ -629,6 +684,22 @@ class App:
             int(sweep_max_reminders) if sweep_max_reminders is not None
             else env_int("SPRINT_SWEEP_MAX_REMINDERS", DEFAULT_SWEEP_MAX_REMINDERS))
 
+        # Killed-agent detection. Same reasoning as the sweep thresholds: a
+        # twenty-minute rule is only testable if twenty minutes can be two
+        # seconds.
+        self.worker_gone_seconds = (
+            worker_gone_seconds if worker_gone_seconds is not None
+            else env_float("SPRINT_WORKER_GONE_SECONDS", DEFAULT_WORKER_GONE_SECONDS))
+        self.worker_dead_seconds = (
+            worker_dead_seconds if worker_dead_seconds is not None
+            else env_float("SPRINT_WORKER_DEAD_SECONDS", DEFAULT_WORKER_DEAD_SECONDS))
+        self.worker_longrun_factor = (
+            worker_longrun_factor if worker_longrun_factor is not None
+            else env_float("SPRINT_WORKER_LONGRUN_FACTOR", DEFAULT_WORKER_LONGRUN_FACTOR))
+        self.default_model = clean_model(
+            default_model if default_model is not None
+            else os.environ.get("SPRINT_DEFAULT_MODEL", DEFAULT_MODEL)) or DEFAULT_MODEL
+
         self._log = log
         self.lock = threading.RLock()
         self.cond = threading.Condition()
@@ -638,6 +709,7 @@ class App:
         self.conn.row_factory = sqlite3.Row
         with self.lock:
             self.conn.executescript(SCHEMA)
+            self._migrate_columns()
         self._silence_thread = None
         self._sweep_thread = None
         # Waiter proof-of-life. In memory for the hot path (every poll), flushed
@@ -660,6 +732,49 @@ class App:
         self._siblings_snap = None
 
     # -- infra ------------------------------------------------------------
+
+    # `CREATE TABLE IF NOT EXISTS` never adds a column to a database that
+    # already exists, so a board that has been running since before a field
+    # shipped would 500 on the first query that mentions it. Every additive
+    # column goes here: one ALTER, guarded on what the table actually has.
+    ADDED_COLUMNS = (
+        # Which model the agent on this card was dispatched on. NULL means
+        # "the sprint default" -- the face only ever shows the exception.
+        ("cards", "model", "TEXT"),
+    )
+
+    def _migrate_columns(self):
+        for table, column, decl in self.ADDED_COLUMNS:
+            have = {r["name"] for r in
+                    self.conn.execute("PRAGMA table_info(%s)" % table).fetchall()}
+            if column not in have:
+                self.conn.execute("ALTER TABLE %s ADD COLUMN %s %s"
+                                  % (table, column, decl))
+        self._columns = {}
+
+    def columns(self, table: str = "cards") -> set:
+        """What this database's table actually has, cached.
+
+        Read by anything that must cope with a column it did not create --
+        `external_agent` lands from another change, and a rule that guards on
+        it has to degrade to "no such flag" rather than crash on an older DB.
+        """
+        cached = getattr(self, "_columns", None)
+        if cached is None:
+            cached = self._columns = {}
+        if table not in cached:
+            cached[table] = {r["name"] for r in
+                             self.q("PRAGMA table_info(%s)" % table)}
+        return cached[table]
+
+    def card_flag(self, row, name: str) -> bool:
+        """A boolean column that may not exist in this database yet."""
+        if name not in self.columns("cards"):
+            return False
+        try:
+            return bool(row[name])
+        except (IndexError, KeyError):
+            return False
 
     def log(self, msg: str):
         line = "%s sprintd %s" % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg)
@@ -881,6 +996,11 @@ class App:
             "pinned": bool(row["pinned"]),
             "dup_of": row["dup_of"],
             "long_running": bool(row["long_running"]),
+            # Which model this card's agent was dispatched on, and whether that
+            # is worth saying out loud. NULL model or the sprint default means
+            # the face shows nothing: a badge on every card is decoration.
+            "model": (row["model"] if "model" in self.columns("cards") else None),
+            "default_model": self.default_model,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -1435,7 +1555,13 @@ class App:
         """Has the sweep flagged this card and it still hasn't moved? The board
         reads this to amber the card's age text."""
         row = row if row is not None else self.q1("SELECT * FROM cards WHERE num=?", (num,))
-        if row is None or row["state"] not in STUCK_STATES:
+        if row is None:
+            return False
+        # Two rules write `stuck`: the parked-card sweep (five states somebody
+        # owes an action on) and the dead-worker notice (three states an agent
+        # is supposed to be working in). Both mean the same thing on the face --
+        # this has been sitting here too long -- so both amber the age.
+        if row["state"] not in STUCK_STATES and row["state"] not in WORKER_GONE_STATES:
             return False
         return bool(self._stuck_events_since(num, self._last_state_seq(num)))
 
@@ -1445,6 +1571,10 @@ class App:
                 self.sweep_stuck()
             except Exception:  # never let the timer thread die
                 self.log("staleness sweep failed: %s" % traceback.format_exc())
+            try:
+                self.sweep_worker_gone()
+            except Exception:  # ...and one rule's bug must not silence the other
+                self.log("worker-gone sweep failed: %s" % traceback.format_exc())
 
     def sweep_stuck(self) -> int:
         placeholders = ",".join("?" * len(STUCK_STATES))
@@ -1469,6 +1599,162 @@ class App:
                 except Exception:
                     self.conn.execute("ROLLBACK")
                     raise
+            fired += 1
+        if fired:
+            self.notify()
+        return fired
+
+    # -- killed-agent detection -------------------------------------------
+    #
+    # `agent_silent` ambers a card at five minutes and then has nothing further
+    # to say. That is the right volume for an agent that is merely quiet and the
+    # wrong ending for one that is dead: three cards sat in In motion for hours
+    # after their workers were killed by a provider usage limit, and the board
+    # never escalated because "quiet" is all it knew how to be.
+    #
+    # This is the ending. One notice when the worker is probably gone, and one
+    # transition to `failed` -- the state that carries a Retry -- when it has
+    # been gone long enough that waiting is no longer the cautious choice.
+
+    def worker_gone_exempt(self, row):
+        """Why this card is NOT a candidate for the dead-worker rule, or None.
+
+        Returns a short machine reason so the guards are testable one at a time
+        and readable in one place. Declaring a live agent dead is the expensive
+        mistake here, so every one of these is a bias toward waiting.
+        """
+        if row["state"] not in WORKER_GONE_STATES:
+            return "state"
+        if not row["agent_name"]:
+            # Nothing to be dead. A card with no agent is a dispatch problem,
+            # and the `queued` sweep rule already owns that.
+            return "no_agent"
+        if self.card_flag(row, "external_agent"):
+            # Somebody else's process on somebody else's clock. The board has
+            # no standing to call it dead and no way to restart it.
+            return "external_agent"
+        num = row["num"]
+        if self.phase_shields(num, row):
+            # It said in advance that this stretch would be quiet, and it is
+            # still inside the time it claimed. That is a live claim, not
+            # silence.
+            return "phase"
+        if row["state"] == "needs_you" and self.q1(
+                "SELECT id FROM questions WHERE card_num=? AND answered_at IS NULL "
+                "LIMIT 1", (num,)) is not None:
+            # A worker parked on an open question is SUPPOSED to be silent --
+            # it ended its turn and the user has the ball. That quiet says
+            # nothing about whether the process is alive, and the `needs_you`
+            # sweep rule is already nagging the right person about it.
+            return "open_question"
+        return None
+
+    def worker_gone_window(self, row):
+        """(notice, failed) seconds for this card. A `long_running` card
+        promised the quiet in advance, so its window stretches by the factor
+        rather than disappearing."""
+        scale = self.worker_longrun_factor if row["long_running"] else 1.0
+        return self.worker_gone_seconds * scale, self.worker_dead_seconds * scale
+
+    def worker_gone_notified(self, num: int) -> bool:
+        """Has this episode already had its opening notice? An episode runs from
+        the card's last transition, so escalating to `failed` ends it."""
+        for row in self._stuck_events_since(num, self._last_state_seq(num)):
+            ev = self.q1("SELECT payload FROM events WHERE seq=?", (row["seq"],))
+            if (jload(ev["payload"], {}) or {}).get("rule") == "worker_gone":
+                return True
+        return False
+
+    def worker_gone_due(self, row):
+        """What this card owes right now: a notice, an escalation, or nothing.
+
+        Pure read — `sweep_worker_gone` calls it once loose and once under the
+        lock, because a worker can come back to life between the two.
+        """
+        if self.worker_gone_exempt(row) is not None:
+            return None
+        num = row["num"]
+        # Per AGENT, not per card: while it is posting on card A it is
+        # demonstrably not dead on card B. `card_baseline` already knows this,
+        # and falls back to the card's last transition for an agent that was
+        # assigned and never said a word -- which is exactly what a worker
+        # killed at dispatch looks like.
+        ts, _seq = self.card_baseline(num, row)
+        quiet = now() - ts
+        notice_after, fail_after = self.worker_gone_window(row)
+        payload = {
+            "card_num": num,
+            "state": row["state"],
+            "rule": "worker_gone",
+            "agent_name": row["agent_name"],
+            "quiet_for_seconds": round(quiet, 1),
+            "last_activity_at": ts,
+            "notice_after_seconds": notice_after,
+            "fail_after_seconds": fail_after,
+        }
+        if quiet >= fail_after:
+            payload["stage"] = "failed"
+            payload["reason"] = "worker gone: no events for %s" % human_span(quiet)
+            return payload
+        if quiet >= notice_after and not self.worker_gone_notified(num):
+            payload["stage"] = "notice"
+            payload["threshold_seconds"] = notice_after
+            payload["stuck_for_seconds"] = round(quiet, 1)
+            payload["text"] = (
+                "%s has said nothing for %s — it may have been killed; "
+                "check it, or the board fails this card at %s"
+                % (row["agent_name"], human_span(quiet), human_span(fail_after)))
+            return payload
+        return None
+
+    def sweep_worker_gone(self) -> int:
+        placeholders = ",".join("?" * len(WORKER_GONE_STATES))
+        rows = self.q("SELECT * FROM cards WHERE state IN (%s) AND agent_name IS NOT NULL"
+                      % placeholders, WORKER_GONE_STATES)
+        fired = 0
+        for row in rows:
+            num = row["num"]
+            if self.worker_gone_due(row) is None:
+                continue
+            with self.lock:
+                fresh = self.q1("SELECT * FROM cards WHERE num=?", (num,))
+                if fresh is None:
+                    continue
+                payload = self.worker_gone_due(fresh)
+                if payload is None:
+                    continue
+                if payload["stage"] == "notice":
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        self._append_event(num, "server", "stuck", payload)
+                        self.conn.execute("COMMIT")
+                    except Exception:
+                        self.conn.execute("ROLLBACK")
+                        raise
+                else:
+                    # `failed` keeps everything: the timeline, the evidence, the
+                    # branch and the worktree all stay exactly where they are,
+                    # because Retry re-dispatches a fresh agent with all of it
+                    # as the brief. The only thing that changes is that the card
+                    # stops pretending somebody is working on it.
+                    reason = payload["reason"]
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        # The face reads `error` first for a failed card, so the
+                        # machine reason goes there too -- otherwise an older,
+                        # unrelated error would be what the user sees.
+                        self._append_event(num, "server", "error", {
+                            "text": reason, "rule": "worker_gone",
+                            "agent_name": fresh["agent_name"],
+                            "quiet_for_seconds": payload["quiet_for_seconds"]})
+                        self._write_transition(
+                            num, fresh["state"], "failed", "server", reason,
+                            extra={"rule": "worker_gone",
+                                   "agent_name": fresh["agent_name"]})
+                        self.conn.execute("COMMIT")
+                    except Exception:
+                        self.conn.execute("ROLLBACK")
+                        raise
             fired += 1
         if fired:
             self.notify()
@@ -2102,20 +2388,30 @@ class App:
         return title
 
     def assign(self, num: int, agent_name, worktree, branch,
-               title=None, actor: str = "session") -> dict:
+               title=None, model=None, actor: str = "session") -> dict:
         self.card_row(num)
         title = clean_title(title) if title is not None else None
+        model = clean_model(model)
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 self.conn.execute(
                     "UPDATE cards SET agent_name=COALESCE(?,agent_name), "
                     "worktree=COALESCE(?,worktree), branch=COALESCE(?,branch), "
+                    "model=COALESCE(?,model), "
                     "updated_at=? WHERE num=?",
-                    (agent_name, worktree, branch, now(), num))
-                self._append_event(num, actor, "note", {
+                    (agent_name, worktree, branch, model, now(), num))
+                note = {
                     "text": "assigned to %s" % (agent_name or "(unchanged)"),
-                    "agent_name": agent_name, "worktree": worktree, "branch": branch})
+                    "agent_name": agent_name, "worktree": worktree, "branch": branch}
+                # A re-dispatch onto a different model is the whole point of
+                # recording it: the user should be able to read "this one is on
+                # opus because fable ran out" off the timeline, not infer it.
+                if model and model != self.default_model:
+                    note["text"] += " on %s" % model
+                if model:
+                    note["model"] = model
+                self._append_event(num, actor, "note", note)
                 if title is not None:
                     self._write_title(num, title, actor)
                 # Handing a card to an agent IS the start of work, so a queued
@@ -2321,6 +2617,8 @@ class App:
             # Flat mirror of session.cursor: how far the session has drained.
             "cursor": self.cursor_seq(),
             "states": list(STATES),
+            # What "no badge" means on a card face.
+            "default_model": self.default_model,
             # `integrating` stays in the Ready column with a "merging…" note --
             # a card only reaches Done once its branch actually landed.
             "column_of": dict(COLUMN_OF),
@@ -2952,7 +3250,8 @@ def make_handler(app: App):
                     actor=actor_hint if actor_hint in ACTORS else "session")
             if verb == "assign":
                 return 200, app.assign(num, body.get("agent_name"), body.get("worktree"),
-                                       body.get("branch"), title=body.get("title"))
+                                       body.get("branch"), title=body.get("title"),
+                                       model=body.get("model"))
             raise ApiError(404, "no_such_route", "no route for %s" % path)
 
     return Handler
