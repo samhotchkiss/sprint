@@ -1114,8 +1114,9 @@ body.rail-open .rail { display: flex; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 40px;
-  min-width: 40px;
+  /* the same height as Submit bounce beside it, whatever that turns out to be */
+  align-self: stretch;
+  min-width: 44px;
   border: 1px solid var(--border);
   border-radius: var(--radius-ctl);
   background: var(--input);
