@@ -468,6 +468,7 @@ function verdictBar(card, app) {
   const composing = bounceComposing(card.num) || !!draft(key);
 
   const notes = h('textarea.bounce-notes', {
+    id: 'bounce-' + card.num,
     rows: '2',
     placeholder: 'What has to change? (goes straight to the agent)',
     oninput: (e) => draft(key, e.target.value),
@@ -499,7 +500,10 @@ function verdictBar(card, app) {
     wrap.appendChild(h('div.verdicts.is-bouncing',
       h('button.btn.bounce', { type: 'button', onclick: () => sendBounce() }, 'Submit bounce'),
       h('button.btn.ghost', { type: 'button', onclick: () => cancelBounce() }, 'Cancel')));
-    setTimeout(() => notes.focus(), 0);
+    // No focus grab here. Card #46: focus is asked for ONCE, when you press
+    // Bounce (app.composeBounce), and restored by id on every re-render after
+    // that. Re-focusing on every rebuild would yank the caret out of whatever
+    // else you had clicked into — which is the bug this card is about.
     return wrap;
   }
 
@@ -508,7 +512,7 @@ function verdictBar(card, app) {
     h('button.btn.bounce', {
       type: 'button',
       title: 'send it back with notes',
-      onclick: () => { bounceComposing(card.num, true); app.render(); },
+      onclick: () => app.composeBounce(card.num),
     }, 'Bounce'),
     h('button.btn.reject', {
       type: 'button',

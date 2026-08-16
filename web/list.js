@@ -8,9 +8,9 @@ import { h, timeEl, firstLine } from './util.js';
 import {
   sections, meterSegments, cardState, needsKind, motionState, blockedReason,
   waitingMark, isStuck, BLOCKED_NOTE,
-  modelTag, MODEL_HINT,
 } from './state.js';
 import { phaseChip } from './phase.js';
+import { executorTag } from './settings.js';
 import { renderMeter } from './meter.js';
 import { renderDone } from './done.js';
 import { reviewBlock } from './review.js';
@@ -157,13 +157,10 @@ export function motionRow(card, app) {
   row.appendChild(h('span.row-prog', { title: st.title },
     h('span.prog-track', h('span.prog-fill', { style: { width: st.pct + '%', background: st.color } })),
     chip || h('span.prog-label', { style: { color: st.color } }, st.label)));
-  // ...and, only when it isn't the sprint default, what it is running on. A
-  // card re-dispatched on a fallback model after its agent was killed should
-  // say so where the agent's name already is.
-  const model = modelTag(card);
-  row.appendChild(h('span.row-agent',
-    shortAgent(card.agent_name),
-    model ? h('span.model-tag', { title: MODEL_HINT }, model) : null));
+  // The agent's name, and — only when this card is not on the board's default
+  // executor/model — how it was dispatched: "grok · tmux", or just "opus" for
+  // a card whose only exception is the fallback model it was re-dispatched on.
+  row.appendChild(h('span.row-agent', shortAgent(card.agent_name), executorTag(card, { compact: true })));
   return row;
 }
 

@@ -17,6 +17,7 @@
 import { h, clear, reconcile } from './util.js';
 import { store, cardState, isSilent, draft, attachedImages } from './state.js';
 import { phaseOf, phaseChip } from './phase.js';
+import { executorTag } from './settings.js';
 import { renderThread, renderChat } from './thread.js';
 import { initCompose } from './compose.js';
 import { flowBarSig, reviewBar } from './review.js';
@@ -53,12 +54,18 @@ export function renderRail(root, app) {
     // while it is up — the packet drops its own buttons rather than showing you
     // two Approves that do the same thing.
     syncOptional(root, 'review-bar', barSig(card), () => reviewBar(card, app));
-    syncPart(root, 'composer', composerSig(card), () => composer(card, app));
+    // The composer is the ONE thing on this page you may be mid-sentence in, so
+    // it is keyed on the card alone and never rebuilt for anything else: a state
+    // flip, a silence, a question arriving all *tune* it in place. Rebuilding it
+    // is what took the caret away mid-word (card #46).
+    const box = syncPart(root, 'composer', composerKey(card), () => composer(card, app));
+    if (box && box._tune) box._tune(card);
   } else {
     syncPart(root, 'rail-head', store.session.online ? 'on' : 'off', () => chatHead());
     if (!thread.parentNode) root.appendChild(thread);
     renderChat(thread, store.sidebar.slice().sort(byOrder), app);
-    syncPart(root, 'composer', store.session.online ? 'on' : 'off', () => chatComposer(app));
+    const box = syncPart(root, 'composer', 'sidebar', () => chatComposer(app));
+    if (box && box._tune) box._tune();
   }
 
   // Open at the newest word; a re-render while you are reading history stays put.
@@ -121,14 +128,28 @@ function headSig(detail, card) {
   // now, so it has to be part of what makes the head repaint.
   const ph = phaseOf(card);
   return [detail.num, card.title, cardState(card), card.pinned ? 'p' : '',
-    ph ? `${ph.name}@${ph.since}${ph.overdue ? '!' : ''}` : ''].join('|');
+    ph ? `${ph.name}@${ph.since}${ph.overdue ? '!' : ''}` : '',
+    // the executor tag lives in the head too, so a re-dispatch on grok repaints it
+    card.executor || '', card.model || ''].join('|');
 }
 
-function composerSig(card) {
-  if (!card) return 'none';
-  const state = cardState(card);
-  const q = state === 'needs_you' && card.question ? (card.question.id || 'q') : '';
-  return [card.num, state, q, isSilent(card) ? 'quiet' : ''].join('|');
+/**
+ * One composer per card, and that is the whole signature. Everything that used
+ * to be in here — the state, the open question, whether the agent has gone
+ * quiet — changes what the box SAYS, not what it IS, so it is tuned rather than
+ * replaced (see `_tune` below).
+ */
+function composerKey(card) {
+  return card ? 'card:' + card.num : 'none';
+}
+
+/**
+ * One draft per card, whichever thing the box is currently for. It used to be
+ * `answer:N` and `chat:N`, which meant a half-typed reply evaporated the moment
+ * the agent asked a question (or the answer landed) underneath you.
+ */
+function draftKey(card) {
+  return 'card:' + card.num;
 }
 
 function railOwner() {
@@ -161,6 +182,10 @@ function cardHead(detail, card, app) {
   // one line that says what its agent is doing right now.
   const chip = card ? phaseChip(card) : null;
   if (chip) head.appendChild(chip);
+  // ...and, when this card is not running on the board's defaults, what it was
+  // dispatched as: "grok · tmux".
+  const exec = card ? executorTag(card) : null;
+  if (exec) head.appendChild(exec);
   if (card) head.appendChild(cardMenu(card, state, app));
   head.appendChild(h('button.rail-close', {
     type: 'button', onclick: () => app.closeCard(),
@@ -214,38 +239,65 @@ function cardMenu(card, state, app) {
 function composer(card, app) {
   if (!card) return h('form.composer');
 
-  const state = cardState(card);
-  const answering = state === 'needs_you' && !!card.question;
-  const key = (answering ? 'answer:' : 'chat:') + card.num;
+  // What the box does is re-bound on every tune, so the closure never holds a
+  // stale card: the node is long-lived, the card object is not.
+  const live = { send: () => {} };
 
-  return composerBox({
+  const box = composerBox({
     id: `composer-${card.num}`,
-    key,
-    placeholder: answering ? 'Answer in your own words… (paste a screenshot too)'
-      : (state === 'ready' ? 'Reply, or bounce with notes…' : 'Reply to this card — paste a screenshot if it is easier'),
-    hint: isSilent(card)
+    key: draftKey(card),
+    placeholder: '',
+    hint: '',
+    send: (text, images) => live.send(text, images),
+  });
+
+  box._tune = (c) => {
+    if (!c) return;
+    const state = cardState(c);
+    const answering = state === 'needs_you' && !!c.question;
+    setText(box, 'textarea', 'placeholder', answering
+      ? 'Answer in your own words… (paste a screenshot too)'
+      : (state === 'ready' ? 'Reply, or bounce with notes…'
+        : 'Reply to this card — paste a screenshot if it is easier'));
+    setText(box, '.composer-hint', 'textContent', isSilent(c)
       ? 'Quiet for five minutes — the session is already checking on the agent.'
-      : 'Everything here appends — nothing is rewritten.',
-    send: (text, images) => {
+      : 'Everything here appends — nothing is rewritten.');
+    box.classList.toggle('is-answering', answering);
+    live.send = (text, images) => {
       // An answer is a question's answer, not an attachment carrier — so a
       // screenshot pasted while answering goes to the agent as its own line
       // first, and the answer follows and unblocks the card.
-      if (answering) app.answer(card, card.question, text, images);
-      else app.chat(card, text, images);
-    },
-  });
+      if (answering) app.answer(c, c.question, text, images);
+      else app.chat(c, text, images);
+    };
+  };
+  box._tune(card);
+  return box;
 }
 
 function chatComposer(app) {
-  return composerBox({
+  const box = composerBox({
     id: 'sidebar-text',
     key: 'sidebar',
     placeholder: 'Ask the session anything… (paste a screenshot too)',
-    hint: store.session.online
-      ? 'Everything here appends — nothing is rewritten.'
-      : 'The session is not reading right now — what you send waits in the queue.',
+    hint: '',
     send: (text, images) => app.sessionChat(text, images),
   });
+  // The session going offline changes one sentence under the box, and it used
+  // to change the whole box — with your half-written question inside it.
+  box._tune = () => {
+    setText(box, '.composer-hint', 'textContent', store.session.online
+      ? 'Everything here appends — nothing is rewritten.'
+      : 'The session is not reading right now — what you send waits in the queue.');
+  };
+  box._tune();
+  return box;
+}
+
+/** Patch one word of a long-lived node, and only when it actually changed. */
+function setText(root, sel, prop, value) {
+  const node = root.querySelector(sel);
+  if (node && node[prop] !== value) node[prop] = value;
 }
 
 /**

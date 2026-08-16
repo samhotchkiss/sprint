@@ -133,6 +133,54 @@ BULK_MAX = 50
 WORK_KINDS = ("code", "ops")
 
 # --------------------------------------------------------------------------
+# Settings -- .sprint/config.json
+#
+# Per-project policy the SESSION reads at dispatch time. The server stores and
+# validates it and does nothing else with it: it still runs no agents and makes
+# no decisions. Two things live here, both of them the user's call rather than
+# the orchestrator's:
+#
+#   * which MODEL a worker should get (user, verbatim: "our standing
+#     instructions should be to use the lowest feasible model (sonnet by
+#     default, opus if the orchestrator deems that necessary)"), and
+#   * which EXECUTOR runs it -- a Claude subagent, or a command driven in its
+#     own tmux window via the tmux-send skill ("so I may want it to use grok
+#     subagents via tmux, for example").
+#
+# It is a file, not a table: it is hand-editable, it survives `sprintd stop`
+# and a DB wipe, and it diffs in a terminal.
+CONFIG_FILENAME = "config.json"
+
+MODEL_POLICIES = ("lowest_feasible", "always_opus", "always_sonnet")
+EXECUTOR_KINDS = ("subagent", "tmux")
+
+# What a policy resolves to when nothing on the card says otherwise. Per-card
+# `model` always wins over the policy -- the policy is the DEFAULT, and
+# "the orchestrator deems opus necessary" is expressed by stamping opus on
+# that one card, never by flipping the whole board.
+POLICY_MODEL = {
+    "lowest_feasible": "sonnet",
+    "always_sonnet": "sonnet",
+    "always_opus": "opus",
+}
+
+DEFAULT_EXECUTORS = {"claude": {"kind": "subagent"}}
+DEFAULT_SETTINGS = {
+    "worker": {
+        "model_policy": "lowest_feasible",
+        "default_executor": "subagent",
+        "executors": dict(DEFAULT_EXECUTORS),
+        "concurrency": 3,
+    },
+}
+# `default_executor` accepts either a named executor or the bare kind
+# "subagent" -- the out-of-the-box board has no named executors worth typing.
+BUILTIN_EXECUTOR = "subagent"
+SETTINGS_KEYS = tuple(DEFAULT_SETTINGS["worker"].keys())
+EXECUTOR_FIELDS = ("kind", "command", "session", "model", "note")
+MAX_CONCURRENCY = 20
+
+# --------------------------------------------------------------------------
 # Staleness sweep
 #
 # `agent_silent` watches a working AGENT. This watches a PARKED CARD: a state
@@ -372,6 +420,10 @@ CREATE TABLE IF NOT EXISTS cards (
   long_running INTEGER NOT NULL DEFAULT 0,
   external_agent INTEGER NOT NULL DEFAULT 0,
   work_kind TEXT NOT NULL DEFAULT 'code',
+  -- Which executor ran this card (a name from settings' worker.executors) and
+  -- which model it was dispatched with. NULL means "whatever the board's
+  -- defaults were" -- the card face only tags a choice that differs.
+  executor TEXT,
   model TEXT,
   model_reason TEXT,
   created_at REAL NOT NULL,
@@ -1209,6 +1261,213 @@ def clock_label(ts: float) -> str:
 
 
 # --------------------------------------------------------------------------
+# Settings validation
+#
+# Rejecting an unknown key is the whole point. A settings file is read by the
+# SESSION at dispatch, hours after it was written, and a typo that is silently
+# accepted ("model_polciy") reads back as "the default is fine" -- the board
+# would look configured and behave like it never was. So every key is named
+# here, anything else is a 400 that says which key it choked on, and the
+# response never guesses what you meant.
+
+
+def _bad(field: str, message: str, code: str = "bad_value"):
+    return ApiError(400, code, message, field=field)
+
+
+def clean_executor_name(value, field: str = "executor") -> str:
+    """An executor name is a short identifier -- it names a row in `executors`."""
+    if not isinstance(value, str) or not value.strip():
+        raise _bad(field, "%s must be a non-empty string" % field)
+    name = value.strip()
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$", name):
+        raise _bad(field, "%s must be 1-40 chars of letters, digits, . _ -" % field)
+    return name
+
+
+def clean_model_name(value, field: str = "model") -> str:
+    """A model is a free-form label (`sonnet`, `opus`, `grok-4`) -- we do not
+    keep a whitelist of somebody else's product names, we just keep it sane.
+
+    The strict sibling of `clean_model`: settings and an explicit per-card
+    dispatch have a human on the other end of the 400, so a blank or a number
+    is refused by name rather than quietly recorded as "no model"."""
+    if not isinstance(value, str) or not value.strip():
+        raise _bad(field, "%s must be a non-empty string" % field)
+    model = " ".join(value.split())
+    if len(model) > 60:
+        raise _bad(field, "%s is too long (60 chars max)" % field)
+    return model
+
+
+def validate_executor(name: str, spec) -> dict:
+    field = "worker.executors.%s" % name
+    if not isinstance(spec, dict):
+        raise _bad(field, "%s must be an object" % field)
+    for key in spec:
+        if key not in EXECUTOR_FIELDS:
+            raise ApiError(400, "unknown_key",
+                           "%s.%s is not a known executor field (allowed: %s)"
+                           % (field, key, ", ".join(EXECUTOR_FIELDS)),
+                           field="%s.%s" % (field, key))
+    kind = spec.get("kind")
+    if kind not in EXECUTOR_KINDS:
+        raise _bad("%s.kind" % field,
+                   "kind must be one of %s" % ", ".join(EXECUTOR_KINDS))
+    out = {"kind": kind}
+    if kind == "tmux":
+        # Without a command there is nothing to start in the window, and the
+        # session would have to guess -- which is exactly how a "configured"
+        # tmux executor silently becomes a subagent.
+        if not isinstance(spec.get("command"), str) or not spec["command"].strip():
+            raise _bad("%s.command" % field,
+                       "a tmux executor needs a command to run (e.g. \"grok\")",
+                       code="missing_field")
+        out["command"] = spec["command"].strip()
+        session = spec.get("session", "sprint-workers")
+        if not isinstance(session, str) or not session.strip():
+            raise _bad("%s.session" % field, "session must be a non-empty string")
+        out["session"] = session.strip()
+    elif spec.get("command") or spec.get("session"):
+        raise _bad("%s.command" % field,
+                   "command/session only apply to a tmux executor")
+    if spec.get("model") is not None:
+        out["model"] = clean_model_name(spec["model"], "%s.model" % field)
+    if spec.get("note") is not None:
+        if not isinstance(spec["note"], str):
+            raise _bad("%s.note" % field, "note must be a string")
+        out["note"] = " ".join(spec["note"].split())[:200]
+    return out
+
+
+def validate_settings(patch, base=None) -> dict:
+    """Merge a patch onto `base` (or the defaults) and hand back whole settings.
+
+    Per-key merge, EXCEPT `worker.executors`: a patch that carries it replaces
+    the map wholesale, because that is what an editor sends and there is no
+    honest way to express "delete this executor" in a merge.
+    """
+    if patch is None:
+        patch = {}
+    if not isinstance(patch, dict):
+        raise _bad("settings", "settings must be an object")
+    current = normalize_settings(base)
+    for key in patch:
+        if key != "worker":
+            raise ApiError(400, "unknown_key",
+                           "%s is not a settings section (only \"worker\" exists today)"
+                           % key, field=key)
+    worker_patch = patch.get("worker", {})
+    if not isinstance(worker_patch, dict):
+        raise _bad("worker", "worker must be an object")
+    for key in worker_patch:
+        if key not in SETTINGS_KEYS:
+            raise ApiError(400, "unknown_key",
+                           "worker.%s is not a setting (allowed: %s)"
+                           % (key, ", ".join(SETTINGS_KEYS)),
+                           field="worker.%s" % key)
+    worker = dict(current["worker"])
+
+    if "model_policy" in worker_patch:
+        value = worker_patch["model_policy"]
+        if value not in MODEL_POLICIES:
+            raise _bad("worker.model_policy",
+                       "model_policy must be one of %s" % ", ".join(MODEL_POLICIES))
+        worker["model_policy"] = value
+
+    if "executors" in worker_patch:
+        execs = worker_patch["executors"]
+        if not isinstance(execs, dict):
+            raise _bad("worker.executors", "executors must be an object of name -> definition")
+        clean = {}
+        for name, spec in execs.items():
+            clean[clean_executor_name(name, "worker.executors key")] = \
+                validate_executor(name, spec)
+        worker["executors"] = clean
+
+    if "concurrency" in worker_patch:
+        value = worker_patch["concurrency"]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise _bad("worker.concurrency", "concurrency must be a whole number")
+        if value < 1 or value > MAX_CONCURRENCY:
+            raise _bad("worker.concurrency",
+                       "concurrency must be between 1 and %d" % MAX_CONCURRENCY)
+        worker["concurrency"] = value
+
+    if "default_executor" in worker_patch:
+        worker["default_executor"] = clean_executor_name(
+            worker_patch["default_executor"], "worker.default_executor")
+
+    # Last, so it is checked against the executors this same request defined:
+    # a default pointing at an executor nobody declared is a dispatch that
+    # fails at 2am, not a settings file.
+    default = worker["default_executor"]
+    if default != BUILTIN_EXECUTOR and default not in worker["executors"]:
+        raise _bad("worker.default_executor",
+                   "default_executor \"%s\" is not in worker.executors "
+                   "(known: %s)" % (default, ", ".join(
+                       sorted(list(worker["executors"].keys()) + [BUILTIN_EXECUTOR]))))
+    return {"worker": worker}
+
+
+def normalize_settings(raw) -> dict:
+    """Whatever is on disk, made whole. Unknown/broken content falls back to the
+    default for that key rather than 500-ing the board -- a hand-edited file
+    must never be able to take the sprint down."""
+    out = {"worker": dict(DEFAULT_SETTINGS["worker"])}
+    out["worker"]["executors"] = {
+        k: dict(v) for k, v in DEFAULT_SETTINGS["worker"]["executors"].items()}
+    if not isinstance(raw, dict):
+        return out
+    worker = raw.get("worker")
+    if not isinstance(worker, dict):
+        return out
+    if worker.get("model_policy") in MODEL_POLICIES:
+        out["worker"]["model_policy"] = worker["model_policy"]
+    if isinstance(worker.get("concurrency"), int) and \
+            not isinstance(worker.get("concurrency"), bool) and \
+            1 <= worker["concurrency"] <= MAX_CONCURRENCY:
+        out["worker"]["concurrency"] = worker["concurrency"]
+    execs = worker.get("executors")
+    if isinstance(execs, dict):
+        clean = {}
+        for name, spec in execs.items():
+            try:
+                clean[clean_executor_name(name)] = validate_executor(name, spec)
+            except ApiError:
+                continue
+        if clean:
+            out["worker"]["executors"] = clean
+    default = worker.get("default_executor")
+    if isinstance(default, str) and (
+            default == BUILTIN_EXECUTOR or default in out["worker"]["executors"]):
+        out["worker"]["default_executor"] = default
+    return out
+
+
+def resolve_dispatch(settings: dict, executor=None, model=None) -> dict:
+    """What a card actually gets at dispatch: {executor, kind, model, command,
+    session, source}. `source` says whether the choice came from the card or
+    from the board's defaults -- the card face uses it to decide whether this
+    is worth a tag."""
+    worker = normalize_settings(settings)["worker"]
+    name = executor or worker["default_executor"]
+    spec = worker["executors"].get(name)
+    if spec is None:
+        spec = {"kind": "subagent"} if name == BUILTIN_EXECUTOR else {"kind": "subagent"}
+    out = {
+        "executor": name,
+        "kind": spec.get("kind", "subagent"),
+        "command": spec.get("command"),
+        "session": spec.get("session"),
+        "model": model or spec.get("model") or POLICY_MODEL.get(
+            worker["model_policy"], "sonnet"),
+        "source": "card" if (executor or model) else "settings",
+    }
+    return out
+
+
+# --------------------------------------------------------------------------
 # App: all state, no decisions
 # --------------------------------------------------------------------------
 
@@ -1233,6 +1492,11 @@ class App:
         self.attach_dir = os.path.join(self.data_dir, ATTACH_DIRNAME)
         os.makedirs(self.attach_dir, exist_ok=True)
         self.db_path = os.path.join(self.data_dir, DB_FILENAME)
+        # Per-project settings (model policy, executors, concurrency). A file
+        # beside the DB, deliberately: hand-editable, survives `stop`, diffable.
+        self.config_path = os.path.join(self.data_dir, CONFIG_FILENAME)
+        self._settings_lock = threading.Lock()
+        self._settings_cache = None
         self.started_at = now()
         # One id per server PROCESS. An open tab that sees this change knows the
         # backend it was talking to is gone -- its SSE stream, its in-flight
@@ -1341,6 +1605,8 @@ class App:
     ADDED_COLUMNS = (
         ("cards", "external_agent", "INTEGER NOT NULL DEFAULT 0"),
         ("cards", "work_kind", "TEXT NOT NULL DEFAULT 'code'"),
+        # the per-card dispatch choice: NULL means "the board's defaults"
+        ("cards", "executor", "TEXT"),
         # Which model the agent on this card was dispatched on. NULL means
         # "the sprint default" -- the face only ever shows the exception.
         ("cards", "model", "TEXT"),
@@ -1403,6 +1669,74 @@ class App:
                 pass
         else:
             sys.stderr.write(line + "\n")
+
+    # -- settings ---------------------------------------------------------
+
+    def settings(self) -> dict:
+        """Whole, valid settings -- defaults where the file is silent.
+
+        Read from disk (so `$EDITOR .sprint/config.json` is a first-class way
+        to change it) but cached on the file's mtime+size, because every card
+        on every board fetch asks what the defaults are. The cache holds the
+        RAW json and normalizes per call, so no caller can mutate a shared
+        dict out from under the next one.
+        """
+        try:
+            st = os.stat(self.config_path)
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            stamp = None
+        cached = getattr(self, "_settings_cache", None)
+        if cached is not None and cached[0] == stamp:
+            return normalize_settings(cached[1])
+        raw = None
+        if stamp is not None:
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as fh:
+                    raw = json.load(fh)
+            except (OSError, ValueError) as err:
+                # A hand-edited file with a stray comma must not take the board
+                # down; it falls back to defaults and says so in the log.
+                self.log("config.json unreadable (%s) -- using defaults" % err)
+                raw = None
+        self._settings_cache = (stamp, raw)
+        return normalize_settings(raw)
+
+    def save_settings(self, patch, actor: str = "user") -> dict:
+        """Validate a patch against what is on disk and write the whole file.
+
+        Atomic (tmp + rename) so a crash mid-write can never leave the board
+        with half a config. Writes a sprint-level `note` event too -- as
+        `actor: "server"`, like the sweep, so it rides the session's tail
+        (a policy change the session never hears about takes effect
+        invisibly) without ever pretending a human is waiting for a reply.
+        """
+        with self._settings_lock:
+            current = self.settings()
+            merged = validate_settings(patch, current)
+            if merged == current:
+                return merged
+            tmp = self.config_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(jdump(merged) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.config_path)
+            changed = [k for k in SETTINGS_KEYS
+                       if merged["worker"].get(k) != current["worker"].get(k)]
+            w = merged["worker"]
+            with self.lock:
+                self._append_event(None, "server", "note", {
+                    "text": "settings changed: %s — in effect for the next dispatch"
+                            % (", ".join(changed) or "worker"),
+                    "settings": merged,
+                    "changed": changed,
+                    "by": actor if actor in ACTORS else "user",
+                    "detail": "model policy %s · default executor %s · concurrency %d"
+                              % (w["model_policy"], w["default_executor"], w["concurrency"]),
+                })
+            self.notify()
+            return merged
 
     def close(self):
         self.stopping.set()
@@ -1637,6 +1971,12 @@ class App:
 
     def card_json(self, row, brief: bool = False) -> dict:
         num = row["num"]
+        # A board that has been up since before either column landed gets them
+        # ALTERed in on open, but read defensively anyway: a 500 on every card
+        # read is not the way to find out the migration did not run.
+        have = self.columns("cards")
+        c_model = row["model"] if "model" in have else None
+        c_executor = row["executor"] if "executor" in have else None
         out = {
             "num": num,
             "sprint_id": row["sprint_id"],
@@ -1654,12 +1994,11 @@ class App:
             # Which model this card's agent was dispatched on, and whether that
             # is worth saying out loud. NULL model or the sprint default means
             # the face shows nothing: a badge on every card is decoration.
-            "model": (row["model"] if "model" in self.columns("cards") else None),
+            "model": c_model,
             # Why it is on that model. Rides the board payload so the session
             # can find every card downgraded for a limit when the window ends,
             # without a filter endpoint nobody else would ever call.
-            "model_reason": (row["model_reason"]
-                             if "model_reason" in self.columns("cards") else None),
+            "model_reason": (row["model_reason"] if "model_reason" in have else None),
             "default_model": self.default_model,
             # An assignee that emits no worker telemetry (an ordinary background
             # agent, a human, a cron). The silence timer cannot watch it, so it
@@ -1668,7 +2007,17 @@ class App:
             "work_kind": row["work_kind"] or "code",
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            # Who ran this card and with what. NULL on both means "the board's
+            # defaults" -- which is why the face only tags a card that differs.
+            "executor": c_executor,
         }
+        # Resolved for the face: "grok · tmux" needs the executor's KIND, and
+        # the card alone does not know it. `is_default` is the tag's whole
+        # question -- a board where everything runs on the default should
+        # carry no executor chrome at all.
+        dispatch = resolve_dispatch(self.settings(), c_executor, c_model)
+        dispatch["is_default"] = (c_executor is None and c_model is None)
+        out["dispatch"] = dispatch
         last = self.q1(
             "SELECT * FROM events WHERE card_num=? ORDER BY seq DESC LIMIT 1", (num,))
         out["last_event"] = self.event_json(last) if last else None
@@ -3848,12 +4197,39 @@ class App:
         self.notify()
         return title
 
+    def dispatch_label(self, executor, model) -> str:
+        """" — grok · tmux · sonnet" when a card names its own executor, and
+        " on opus" when the only thing that changed is the model. Nothing at
+        all when the card is running on the board's defaults: the timeline is
+        for reading the exception off, not the norm. It is a suffix on the
+        assign note, so it says how a card was dispatched, not just to whom."""
+        if not executor and not model:
+            return ""
+        d = resolve_dispatch(self.settings(), executor, model)
+        if not executor:
+            # A re-dispatch onto a different model is the whole point of
+            # recording it: "this one is on opus because fable ran out" has to
+            # be readable off the timeline, not inferred.
+            return (" on %s" % model) if model != self.default_model else ""
+        bits = [d["executor"]]
+        if d["kind"] != "subagent":
+            bits.append(d["kind"])
+        if model:
+            bits.append(d["model"])
+        return " — " + " · ".join(bits)
+
     def assign(self, num: int, agent_name, worktree, branch,
-               title=None, model=None, actor: str = "session", work_kind=None,
+               title=None, executor=None, model=None,
+               actor: str = "session", work_kind=None,
                external_agent=None, model_reason=None) -> dict:
         self.card_row(num)
         title = clean_title(title) if title is not None else None
-        model = clean_model(model)
+        # NOTE: the model is validated further down, strictly, alongside the
+        # executor -- a blank or an over-long model on an explicit dispatch is a
+        # named 400, not something quietly recorded as "no model". (The lenient
+        # `clean_model` still normalizes the board-wide default, where the input
+        # is an env var and there is nobody to hand a 400 to.)
+        #
         # "" is how the session says "this is no longer a downgrade" when it
         # puts the card back on its original model, so it is not the same as
         # leaving the field out.
@@ -3871,31 +4247,42 @@ class App:
             raise ApiError(400, "bad_external_agent",
                            "external_agent must be true or false",
                            field="external_agent")
+        # Which executor and model this card is being dispatched with. Both are
+        # optional; unset means "the board's defaults at dispatch time". An
+        # executor nobody declared is refused here rather than at 2am in a
+        # tmux window that never opens.
+        if executor is not None:
+            executor = clean_executor_name(executor, "executor")
+            known = self.settings()["worker"]["executors"]
+            if executor != BUILTIN_EXECUTOR and executor not in known:
+                raise _bad("executor",
+                           "executor \"%s\" is not in worker.executors "
+                           "(known: %s)" % (executor, ", ".join(
+                               sorted(list(known.keys()) + [BUILTIN_EXECUTOR]))))
+        if model is not None:
+            model = clean_model_name(model, "model")
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 self.conn.execute(
                     "UPDATE cards SET agent_name=COALESCE(?,agent_name), "
                     "worktree=COALESCE(?,worktree), branch=COALESCE(?,branch), "
-                    "model=COALESCE(?,model), "
                     "model_reason=CASE WHEN ? IS NULL THEN model_reason "
                     "                  WHEN ?='' THEN NULL ELSE ? END, "
                     "work_kind=COALESCE(?,work_kind), "
                     "external_agent=COALESCE(?,external_agent), "
+                    "executor=COALESCE(?,executor), model=COALESCE(?,model), "
                     "updated_at=? WHERE num=?",
-                    (agent_name, worktree, branch, model,
+                    (agent_name, worktree, branch,
                      model_reason, model_reason, model_reason, work_kind,
                      None if external_agent is None else (1 if external_agent else 0),
-                     now(), num))
+                     executor, model, now(), num))
+                how = self.dispatch_label(executor, model)
                 note = {
-                    "text": "assigned to %s" % (agent_name or "(unchanged)"),
+                    "text": "assigned to %s%s" % (agent_name or "(unchanged)", how),
                     "agent_name": agent_name, "worktree": worktree, "branch": branch,
-                    "work_kind": work_kind, "external_agent": external_agent}
-                # A re-dispatch onto a different model is the whole point of
-                # recording it: the user should be able to read "this one is on
-                # opus because fable ran out" off the timeline, not infer it.
-                if model and model != self.default_model:
-                    note["text"] += " on %s" % model
+                    "work_kind": work_kind, "external_agent": external_agent,
+                    "executor": executor}
                 if model:
                     note["model"] = model
                 # ...and the reason says WHICH fable ran out, so the line reads
@@ -4162,6 +4549,10 @@ class App:
             # only appear once there's a report within the sprint".
             "reports": self.report_count(),
             "session": self.session_liveness(),
+            # The board's own dispatch policy, so a card face can tell a
+            # deliberate "grok · tmux" from whatever the defaults happen to be
+            # without a second fetch.
+            "settings": self.settings(),
             # Flat mirror of session.cursor: how far the session has drained.
             "cursor": self.cursor_seq(),
             "states": list(STATES),
@@ -4226,6 +4617,7 @@ class App:
                     "SELECT * FROM evidence WHERE card_num=? ORDER BY created_at", (num,))],
             "batch": self.batch_json(row["batch_id"]) if row["batch_id"] else None,
             "column_of": dict(COLUMN_OF),
+            "settings": self.settings(),
             # The drawer needs the drain cursor too: it is what tells the user
             # whether the message they just sent has been picked up yet.
             "session": self.session_liveness(),
@@ -4472,6 +4864,11 @@ def make_handler(app: App):
         def do_POST(self):  # noqa: N802
             self._route("POST")
 
+        def do_PUT(self):  # noqa: N802
+            # Only /api/settings answers here: settings are a document you
+            # replace, not an event you append.
+            self._route("PUT")
+
         def _route(self, method: str):
             try:
                 parsed = urllib.parse.urlsplit(self.path)
@@ -4509,6 +4906,8 @@ def make_handler(app: App):
                     return self._send(302, b"", "text/plain",
                                       [("Set-Cookie", cookie), ("Location", location)])
 
+                if method == "PUT":
+                    return self._put(path, query)
                 if method == "POST":
                     return self._post(path, query)
                 return self._get(path, query)
@@ -4564,6 +4963,22 @@ def make_handler(app: App):
             if path == "/api/sprints":
                 rows = app.q("SELECT * FROM sprints ORDER BY id DESC")
                 return self.json_out(200, {"sprints": [app.sprint_json(r) for r in rows]})
+            if path == "/api/settings":
+                # `defaults` ships alongside so a UI can say "this is the
+                # out-of-the-box value" without hardcoding it, and `choices`
+                # so the panel's dropdowns come from the server, not from a
+                # list in JS that drifts.
+                return self.json_out(200, {
+                    "settings": app.settings(),
+                    "defaults": DEFAULT_SETTINGS,
+                    "choices": {
+                        "model_policy": list(MODEL_POLICIES),
+                        "executor_kind": list(EXECUTOR_KINDS),
+                        "policy_model": dict(POLICY_MODEL),
+                        "builtin_executor": BUILTIN_EXECUTOR,
+                        "max_concurrency": MAX_CONCURRENCY,
+                    }})
+
             if path == "/api/cursors/orchestrator":
                 row = app.q1("SELECT * FROM cursors WHERE name='orchestrator'")
                 return self.json_out(200, {
@@ -4762,8 +5177,33 @@ def make_handler(app: App):
             return self._send(status, body.encode("utf-8"),
                               "application/json; charset=utf-8")
 
+        # -- PUT --------------------------------------------------------
+
+        def _put(self, path, query):
+            if path != "/api/settings":
+                self.drain_body()
+                raise ApiError(404, "no_such_route", "no route for PUT %s" % path)
+            body = self.json_body()
+            patch = body.get("settings", body)
+            if isinstance(patch, dict):
+                patch = {k: v for k, v in patch.items() if k != "actor"}
+            settings = app.save_settings(patch, actor=self.actor_or(body, "user"))
+            return self.json_out(200, {"ok": True, "settings": settings,
+                                       "defaults": DEFAULT_SETTINGS})
+
         def _dispatch_post(self, path, query):
             body = self.json_body()
+
+            if path == "/api/settings":
+                # POST is the same write as PUT. curl-from-a-worker and the
+                # browser's own retry path both reach for POST; refusing it
+                # buys nothing but a confused 404 at 2am.
+                patch = body.get("settings", body)
+                if isinstance(patch, dict):
+                    patch = {k: v for k, v in patch.items() if k != "actor"}
+                settings = app.save_settings(patch, actor=self.actor_or(body, "user"))
+                return 200, {"ok": True, "settings": settings,
+                             "defaults": DEFAULT_SETTINGS}
 
             if path == "/api/cards":
                 card = app.create_card(body.get("text"), body.get("images") or [],
@@ -4923,10 +5363,11 @@ def make_handler(app: App):
                 # worktree/branch are optional on purpose: ops work has neither.
                 return 200, app.assign(num, body.get("agent_name"), body.get("worktree"),
                                        body.get("branch"), title=body.get("title"),
-                                       model=body.get("model"),
                                        model_reason=body.get("model_reason"),
                                        work_kind=body.get("work_kind"),
-                                       external_agent=body.get("external_agent"))
+                                       external_agent=body.get("external_agent"),
+                                       executor=body.get("executor"),
+                                       model=body.get("model"))
             raise ApiError(404, "no_such_route", "no route for %s" % path)
 
     return Handler

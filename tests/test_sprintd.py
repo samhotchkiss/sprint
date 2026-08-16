@@ -6392,6 +6392,333 @@ class TestMigratedColumns(unittest.TestCase):
         card = app2.card_json(app2.card_row(1))
         self.assertFalse(card["external_agent"])
         self.assertEqual(card["work_kind"], "code")
+class TestSettings(Base):
+    """.sprint/config.json — the board's dispatch policy.
+
+    The server stores and validates it and does nothing else with it: the
+    SESSION reads it at dispatch. Which is exactly why an unknown key has to
+    be a loud 400 — a typo that is quietly accepted reads back, hours later,
+    as "the defaults are fine".
+    """
+
+    def settings(self):
+        status, body = self.get("/api/settings")
+        self.assertEqual(status, 200, body)
+        return body
+
+    def put(self, patch, **kw):
+        return self.req("PUT", "/api/settings", patch, **kw)
+
+    # -- read -----------------------------------------------------------
+
+    def test_defaults_before_anything_is_written(self):
+        body = self.settings()
+        w = body["settings"]["worker"]
+        self.assertEqual(w["model_policy"], "lowest_feasible")
+        self.assertEqual(w["default_executor"], "subagent")
+        self.assertEqual(w["concurrency"], 3)
+        self.assertIn("claude", w["executors"])
+        self.assertEqual(body["defaults"]["worker"]["model_policy"], "lowest_feasible")
+        # the panel's dropdowns come from the server, not a list in JS
+        self.assertEqual(body["choices"]["model_policy"],
+                         ["lowest_feasible", "always_opus", "always_sonnet"])
+
+    def test_settings_need_the_token(self):
+        status, _ = self.get("/api/settings", token=None)
+        self.assertEqual(status, 401)
+        status, _ = self.put({"worker": {"concurrency": 5}}, token=None)
+        self.assertEqual(status, 401)
+
+    # -- write ----------------------------------------------------------
+
+    def test_write_persists_to_config_json_and_reads_back(self):
+        status, body = self.put({"worker": {
+            "model_policy": "always_sonnet",
+            "concurrency": 5,
+            "executors": {"grok": {"kind": "tmux", "command": "grok",
+                                   "session": "sprint-workers"},
+                          "claude": {"kind": "subagent"}},
+            "default_executor": "grok",
+        }})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["settings"]["worker"]["default_executor"], "grok")
+
+        path = os.path.join(self.project_root, ".sprint", "config.json")
+        self.assertTrue(os.path.isfile(path), "config.json was written")
+        with open(path, encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        self.assertEqual(on_disk["worker"]["concurrency"], 5)
+        self.assertEqual(on_disk["worker"]["executors"]["grok"]["command"], "grok")
+
+        # ...and a fresh read comes back with what we wrote
+        again = self.settings()["settings"]["worker"]
+        self.assertEqual(again["model_policy"], "always_sonnet")
+        self.assertEqual(again["executors"]["grok"]["kind"], "tmux")
+
+    def test_a_partial_write_leaves_everything_else_alone(self):
+        self.put({"worker": {"concurrency": 7}})
+        self.put({"worker": {"model_policy": "always_opus"}})
+        w = self.settings()["settings"]["worker"]
+        self.assertEqual(w["concurrency"], 7)
+        self.assertEqual(w["model_policy"], "always_opus")
+
+    def test_post_writes_the_same_as_put(self):
+        status, body = self.post("/api/settings", {"worker": {"concurrency": 4}})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.settings()["settings"]["worker"]["concurrency"], 4)
+
+    def test_a_change_lands_on_the_event_log_for_the_session_to_see(self):
+        before = self.get("/api/events?after=0&limit=500")[1]["head"]
+        self.put({"worker": {"concurrency": 6}})
+        status, page = self.get("/api/events?after=%d&limit=50" % before)
+        self.assertEqual(status, 200)
+        notes = [e for e in page["events"] if e["kind"] == "note"
+                 and e["payload"].get("settings")]
+        self.assertEqual(len(notes), 1, page["events"])
+        note = notes[0]
+        self.assertEqual(note["actor"], "server")
+        self.assertIn("next dispatch", note["payload"]["text"])
+        # a server event is never a human waiting for a reply
+        self.assertNotIn("reply_to", note["payload"])
+        # ...and it is not sidebar chatter either
+        self.assertEqual([e for e in self.get("/api/sidebar")[1]["events"]
+                          if e["payload"].get("settings")], [])
+
+    def test_a_write_that_changes_nothing_writes_no_event(self):
+        self.put({"worker": {"concurrency": 5}})
+        head = self.get("/api/events?after=0&limit=500")[1]["head"]
+        status, _ = self.put({"worker": {"concurrency": 5}})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.get("/api/events?after=0&limit=500")[1]["head"], head)
+
+    # -- validation ------------------------------------------------------
+
+    def test_unknown_key_is_rejected_and_named(self):
+        status, body = self.put({"worker": {"model_polciy": "always_opus"}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "unknown_key")
+        self.assertEqual(body["field"], "worker.model_polciy")
+        # ...and nothing was written
+        self.assertFalse(os.path.isfile(
+            os.path.join(self.project_root, ".sprint", "config.json")))
+
+    def test_unknown_top_level_section_is_rejected(self):
+        status, body = self.put({"orchestrator": {"model": "opus"}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "unknown_key")
+        self.assertEqual(body["field"], "orchestrator")
+
+    def test_bad_enum_is_rejected(self):
+        status, body = self.put({"worker": {"model_policy": "haiku_always"}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.model_policy")
+        self.assertIn("lowest_feasible", body["message"])
+
+    def test_concurrency_must_be_a_sane_whole_number(self):
+        for bad in ("3", 0, -1, 999, 2.5, True):
+            status, body = self.put({"worker": {"concurrency": bad}})
+            self.assertEqual(status, 400, "%r should be refused: %s" % (bad, body))
+            self.assertEqual(body["field"], "worker.concurrency")
+
+    def test_a_tmux_executor_without_a_command_is_refused(self):
+        status, body = self.put({"worker": {"executors": {"grok": {"kind": "tmux"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors.grok.command")
+
+    def test_an_unknown_executor_kind_is_refused(self):
+        status, body = self.put({"worker": {
+            "executors": {"grok": {"kind": "ssh", "command": "grok"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors.grok.kind")
+
+    def test_an_unknown_field_inside_an_executor_is_refused(self):
+        status, body = self.put({"worker": {
+            "executors": {"grok": {"kind": "tmux", "command": "grok",
+                                   "windo": "sprint"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "unknown_key")
+        self.assertIn("windo", body["field"])
+
+    def test_default_executor_must_be_one_that_exists(self):
+        status, body = self.put({"worker": {"default_executor": "grok"}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.default_executor")
+        # ...but declaring it in the same request is fine
+        status, body = self.put({"worker": {
+            "executors": {"grok": {"kind": "tmux", "command": "grok"}},
+            "default_executor": "grok"}})
+        self.assertEqual(status, 200, body)
+
+    def test_a_tmux_executor_gets_a_default_session_name(self):
+        self.put({"worker": {"executors": {"grok": {"kind": "tmux", "command": "grok"}}}})
+        w = self.settings()["settings"]["worker"]
+        self.assertEqual(w["executors"]["grok"]["session"], "sprint-workers")
+
+    def test_a_hand_edited_broken_file_falls_back_to_defaults(self):
+        path = os.path.join(self.project_root, ".sprint", "config.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{ this is not json,, }")
+        w = self.settings()["settings"]["worker"]
+        self.assertEqual(w["model_policy"], "lowest_feasible")
+        self.assertEqual(w["concurrency"], 3)
+
+    def test_a_hand_edited_file_is_picked_up_without_a_restart(self):
+        self.put({"worker": {"concurrency": 4}})
+        path = os.path.join(self.project_root, ".sprint", "config.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"worker": {"concurrency": 9,
+                                  "model_policy": "always_opus"}}, fh)
+        w = self.settings()["settings"]["worker"]
+        self.assertEqual(w["concurrency"], 9)
+        self.assertEqual(w["model_policy"], "always_opus")
+
+    def test_put_to_anything_else_is_a_404(self):
+        status, body = self.req("PUT", "/api/board", {})
+        self.assertEqual(status, 404, body)
+
+
+class TestPerCardExecutor(Base):
+    """A card can name its own executor and model at assign time.
+
+    User's scope call, verbatim: "Peer per card — mix grok-via-tmux and claude
+    subagents". So the choice lives on the card, not on the board, and the
+    board's settings are only what an unset card falls back to.
+    """
+
+    def declare_grok(self):
+        status, body = self.req("PUT", "/api/settings", {"worker": {"executors": {
+            "grok": {"kind": "tmux", "command": "grok", "session": "sprint-workers"},
+            "claude": {"kind": "subagent"}}}})
+        self.assertEqual(status, 200, body)
+
+    def card_of(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return detail["card"]
+
+    def board_card(self, num):
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        return next(c for c in board["cards"] if c["num"] == num)
+
+    def test_assign_records_executor_and_model(self):
+        self.declare_grok()
+        card = self.new_card("make the header calm")
+        status, body = self.post("/api/cards/%d/assign" % card["num"], {
+            "agent_name": "sprint-card-%d" % card["num"],
+            "worktree": "/tmp/wt", "branch": "sprint/card-x",
+            "executor": "grok", "model": "grok-4"})
+        self.assertEqual(status, 200, body)
+
+        for got in (self.card_of(card["num"]), self.board_card(card["num"])):
+            self.assertEqual(got["executor"], "grok")
+            self.assertEqual(got["model"], "grok-4")
+            self.assertEqual(got["dispatch"]["kind"], "tmux")
+            self.assertEqual(got["dispatch"]["command"], "grok")
+            self.assertEqual(got["dispatch"]["session"], "sprint-workers")
+            self.assertFalse(got["dispatch"]["is_default"])
+
+    def test_the_timeline_says_how_it_was_dispatched(self):
+        self.declare_grok()
+        card = self.new_card("something for grok")
+        self.post("/api/cards/%d/assign" % card["num"], {
+            "agent_name": "sprint-card-9", "executor": "grok", "model": "grok-4"})
+        status, detail = self.get("/api/cards/%d" % card["num"])
+        self.assertEqual(status, 200)
+        notes = [e for e in detail["timeline"] if e["kind"] == "note"
+                 and "assigned to" in (e["payload"].get("text") or "")]
+        self.assertTrue(notes)
+        self.assertIn("grok · tmux · grok-4", notes[-1]["payload"]["text"])
+
+    def test_defaults_apply_when_the_card_says_nothing(self):
+        card = self.new_card("ordinary work")
+        self.post("/api/cards/%d/assign" % card["num"],
+                  {"agent_name": "sprint-card-1"})
+        got = self.card_of(card["num"])
+        self.assertIsNone(got["executor"])
+        self.assertIsNone(got["model"])
+        # resolved from the board's policy: lowest feasible == sonnet
+        self.assertEqual(got["dispatch"]["executor"], "subagent")
+        self.assertEqual(got["dispatch"]["kind"], "subagent")
+        self.assertEqual(got["dispatch"]["model"], "sonnet")
+        self.assertTrue(got["dispatch"]["is_default"],
+                        "a card on the defaults carries no executor tag")
+
+    def test_the_model_policy_moves_the_default_model(self):
+        card = self.new_card("ordinary work")
+        self.post("/api/cards/%d/assign" % card["num"], {"agent_name": "a"})
+        self.assertEqual(self.card_of(card["num"])["dispatch"]["model"], "sonnet")
+        self.req("PUT", "/api/settings", {"worker": {"model_policy": "always_opus"}})
+        self.assertEqual(self.card_of(card["num"])["dispatch"]["model"], "opus")
+
+    def test_the_default_executor_moves_an_unset_card(self):
+        self.declare_grok()
+        card = self.new_card("ordinary work")
+        self.post("/api/cards/%d/assign" % card["num"], {"agent_name": "a"})
+        self.req("PUT", "/api/settings", {"worker": {"default_executor": "grok"}})
+        got = self.card_of(card["num"])
+        self.assertEqual(got["dispatch"]["executor"], "grok")
+        self.assertEqual(got["dispatch"]["kind"], "tmux")
+        # still no per-card choice, so still nothing to tag
+        self.assertTrue(got["dispatch"]["is_default"])
+
+    def test_an_undeclared_executor_is_refused_at_assign(self):
+        card = self.new_card("who runs this")
+        status, body = self.post("/api/cards/%d/assign" % card["num"],
+                                 {"agent_name": "a", "executor": "grok"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "executor")
+        self.assertIsNone(self.card_of(card["num"])["executor"])
+
+    def test_a_bad_model_is_refused(self):
+        card = self.new_card("who runs this")
+        for bad in ("", "   ", 7, "x" * 61):
+            status, body = self.post("/api/cards/%d/assign" % card["num"],
+                                     {"agent_name": "a", "model": bad})
+            self.assertEqual(status, 400, "%r should be refused: %s" % (bad, body))
+            self.assertEqual(body["field"], "model")
+
+    def test_assigning_again_never_clears_a_recorded_choice(self):
+        self.declare_grok()
+        card = self.new_card("keep it")
+        self.post("/api/cards/%d/assign" % card["num"],
+                  {"agent_name": "a", "executor": "grok", "model": "grok-4"})
+        self.post("/api/cards/%d/assign" % card["num"], {"worktree": "/tmp/wt2"})
+        got = self.card_of(card["num"])
+        self.assertEqual(got["executor"], "grok")
+        self.assertEqual(got["model"], "grok-4")
+
+    def test_the_board_ships_the_settings_the_faces_need(self):
+        self.declare_grok()
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200)
+        self.assertEqual(board["settings"]["worker"]["executors"]["grok"]["kind"], "tmux")
+
+    def test_an_existing_board_gains_the_columns(self):
+        """A board that predates this feature must not need a fresh DB."""
+        import sqlite3 as _sqlite3
+        db = os.path.join(self.tmp, "old.db")
+        conn = _sqlite3.connect(db)
+        conn.executescript(
+            "CREATE TABLE cards (num INTEGER PRIMARY KEY AUTOINCREMENT, sprint_id "
+            "INTEGER, state TEXT NOT NULL, title TEXT, body TEXT, batch_id INTEGER, "
+            "agent_name TEXT, worktree TEXT, branch TEXT, bounce_count INTEGER NOT "
+            "NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, dup_of INTEGER, "
+            "long_running INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, "
+            "updated_at REAL NOT NULL);")
+        conn.execute("INSERT INTO cards(sprint_id, state, title, body, created_at, "
+                     "updated_at) VALUES(1,'queued','old','old',1,1)")
+        conn.commit()
+        conn.close()
+        old_root = os.path.join(self.tmp, "oldproject")
+        os.makedirs(os.path.join(old_root, ".sprint"))
+        shutil.copy(db, os.path.join(old_root, ".sprint", "sprint.db"))
+        app = sprintd.App(old_root, log=self.logfh, token="test-token")
+        self.addCleanup(app.close)
+        cols = {r["name"] for r in app.conn.execute("PRAGMA table_info(cards)")}
+        self.assertIn("executor", cols)
+        self.assertIn("model", cols)
+        self.assertIsNone(app.card_json(app.card_row(1), brief=True)["executor"])
 class TestSprintIsNamedAfterTheProject(Base):
     """A board's title defaults to the PROJECT, never the literal "sprint".
 

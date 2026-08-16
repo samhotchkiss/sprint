@@ -226,6 +226,11 @@ export const api = {
   clearLimit: (id, key) => req('POST', `/api/limits/${id}/clear`, {},
     { idempotencyKey: key }),
 
+  // Dispatch policy: model policy, executors, concurrency. A document you
+  // replace, not an event you append — hence PUT.
+  settings: () => req('GET', '/api/settings'),
+  saveSettings: (patch) => req('PUT', '/api/settings', patch),
+
   // The report library. `scope` defaults to the OPEN sprint server-side — the
   // header link exists only when THIS sprint has a report, so the default is
   // the number that decides it. `scope: 'all'` is history, never the condition.

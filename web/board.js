@@ -17,9 +17,9 @@ import { h, timeEl, firstLine } from './util.js';
 import {
   boardColumns, cardState, needsKind, motionState, blockedReason, waitingMark,
   meterSegments, sections, isSilent, isStuck, STUCK_HINT, STATE_LABEL,
-  modelTag, MODEL_HINT,
 } from './state.js';
 import { phaseChip } from './phase.js';
+import { executorTag } from './settings.js';
 import { renderMeter } from './meter.js';
 import { shortAgent } from './list.js';
 import { reviewBlock } from './review.js';
@@ -131,13 +131,13 @@ export function renderCardFace(card, app) {
 
   // The age is the only thing on the face that can say "this has been sitting
   // here too long", so that is where the sweep's amber goes. No new chrome.
-  // The agent's name, and — only when it isn't the sprint default — what it is
-  // running on. A fallback after a killed agent should be readable off the
-  // face; an ordinary dispatch says nothing.
-  const model = modelTag(card);
+  // "grok · tmux" sits with the agent name, and only when this card was
+  // dispatched differently from the board's default — a tag on every card
+  // would say nothing. It is one tag, not two: a card whose only exception is
+  // the model (#41's "on opus because fable ran out") still reads there.
   face.appendChild(h('div.card-foot',
     h('span', shortAgent(card.agent_name)),
-    model ? h('span.model-tag', { title: MODEL_HINT }, model) : null,
+    executorTag(card, { compact: true }),
     h('span.grow'),
     h('span', { class: isStuck(card) ? 'is-stuck-age' : null,
       title: isStuck(card) ? STUCK_HINT : null },
