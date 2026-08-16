@@ -56,9 +56,16 @@ export function threadItems(detail, app) {
 
   // The user's own words, verbatim, are the first thing in the thread — the face
   // carries a condensed title, and this is where the untouched submission lives.
+  // On a fresh load the card arrives before its timeline does, so this stands in
+  // for the `submitted` event for a beat. It carries the SAME key and version as
+  // the real one, so when the timeline lands the node is reused and rebound
+  // rather than swapped — a bubble that repaints itself with identical words is
+  // exactly the flicker we are here to remove.
   if (card && card.body && !items.some((e) => e.kind === 'submitted')) {
-    const ev = { actor: 'user', ts: card.created_at, payload: { text: card.body } };
-    out.push({ key: 'body', ver: card.body.length, make: () => message(ev, app) });
+    const ev = { actor: 'user', ts: card.created_at, kind: 'submitted',
+      payload: { text: card.body } };
+    out.push({ key: 'submitted', ver: bodyVer(card.body), data: ev,
+      make: () => message(ev, app) });
   }
 
   // The question the card is actually waiting on renders as a panel at the
@@ -69,13 +76,18 @@ export function threadItems(detail, app) {
   const shown = new Set();
   items.forEach((ev, i) => {
     if (i === liveQuestion) return;
-    const key = eventKey(ev);
+    const key = ev.kind === 'submitted' ? 'submitted' : eventKey(ev);
     if (SYSTEM_KINDS.has(ev.kind) && ev.kind !== 'submitted' && ev.kind !== 'evidence') {
-      out.push({ key, ver: 1, make: () => statusChange(ev, app) });
+      out.push({ key, ver: 1, data: ev, make: () => statusChange(ev, app) });
       return;
     }
     if (ev.kind === 'evidence') return;        // the packet itself renders below
-    out.push({ key, ver: 1, make: () => message(ev, app) });
+    out.push({
+      key,
+      ver: ev.kind === 'submitted' ? bodyVer(eventText(ev)) : 1,
+      data: ev,
+      make: () => message(ev, app),
+    });
     const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
     if (Array.isArray(atts) && atts.length) {
       for (const a of atts) shown.add(attachmentUrl(a));
@@ -120,6 +132,11 @@ export function threadItems(detail, app) {
   return out;
 }
 
+/** Same number for the card's body and for the submitted event that carries it. */
+function bodyVer(text) {
+  return String(text == null ? '' : text).trim().length;
+}
+
 function refsVer(refs) {
   return refs.length + ':' + refs.map((r) => String(attachmentUrl(r) || '').length).join('.');
 }
@@ -150,7 +167,7 @@ export function chatItems(lines, app) {
   const out = [];
   lines.forEach((ev, i) => {
     const key = ev.seq != null ? 's' + ev.seq : 'echo' + i;
-    out.push({ key, ver: 1, make: () => message(ev, app) });
+    out.push({ key, ver: 1, data: ev, make: () => message(ev, app) });
     const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
     if (Array.isArray(atts) && atts.length) {
       // the version tracks the refs themselves (by length, not by value: a
@@ -165,7 +182,8 @@ export function chatItems(lines, app) {
 
 // ---- item types ----------------------------------------------------------
 
-function message(ev, app) {
+function message(first, app) {
+  let ev = first;                    // rebound by _sync when a fresher copy lands
   const who = ACTOR[ev.actor] || ACTOR.worker;
   const mine = ev.actor === 'user';
 
@@ -194,7 +212,8 @@ function message(ev, app) {
   // on it") while the message itself never changes. That transition is the most
   // frequent thing on the wire, so it is patched in place: the bubble, and any
   // image in it, is never re-created for it.
-  item._sync = () => {
+  item._sync = (next) => {
+    if (next && next !== ev) ev = next;
     const st = mine ? messageStatus(ev) : null;
     item.className = `item ${who.cls}${mine ? ' mine' : ''}`
       + `${ev.pending || ev.local ? ' is-pending' : ''}${ev.failed ? ' is-failed' : ''}`;

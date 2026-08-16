@@ -110,10 +110,15 @@ function renderSessionBanner() {
   const transportDown = app.transport === 'error';
   if (!offline && !transportDown) { el.bannerSlot.hidden = true; return; }
   el.bannerSlot.hidden = false;
-  clear(el.banner);
-  el.banner.className = offline ? 'banner warn' : 'banner dim';
-  el.banner.appendChild(h('span',
-    offline ? 'session offline — items will queue' : 'lost the board connection — retrying'));
+  const cls = offline ? 'banner warn' : 'banner dim';
+  const text = offline ? 'session offline — items will queue' : 'lost the board connection — retrying';
+  // Same words, same banner: rewriting it on every paint is one more thing
+  // flickering on a page that should be still.
+  if (el.banner.className !== cls) el.banner.className = cls;
+  if (el.banner.textContent !== text) {
+    clear(el.banner);
+    el.banner.appendChild(h('span', text));
+  }
 }
 
 /** Is the caret in something that takes text? Then a keystroke is not a shortcut. */
@@ -159,11 +164,15 @@ const refreshDetail = debounce(async () => {
     if (!store.detail || store.detail.num !== num) return;
     const d = normDetail(res, num);
     store.detail = { ...store.detail, ...d, pendingLines: (store.detail.pendingLines || []).filter((p) => p.pending) };
-    render();
+    // Only the rail changed. On a fresh load this fetch lands a beat after the
+    // board does, and repainting the whole page for it is the "card comes in
+    // and then blinks" the user saw: the board is redrawn by its own refresh,
+    // driven by events, not by one card's timeline arriving.
+    paintRail();
   } catch (err) {
     if (store.detail && store.detail.num === num && !store.detail.card) store.detail.error = 'Could not load this card.';
     handleError(err, null);
-    render();
+    paintRail();
   }
 }, 150);
 
@@ -661,6 +670,12 @@ async function firstLoad() {
     render();
     return;
   }
+  // A deep link opens its card BEFORE the first paint, never after. Painting the
+  // session chat into the rail and then replacing it with the card one frame
+  // later is a blink you cannot un-see, and it costs nothing to get right.
+  const deep = location.hash.match(/^#\/c\/(\d+)/);
+  if (deep) openCard(Number(deep[1]));
+
   // The sidebar thread ships with the board (`board.sidebar`) — no event-log scan.
   render();
 
@@ -672,7 +687,10 @@ async function firstLoad() {
       if (store.detail && (out.touched.has(store.detail.num) || out.needsBoard)) refreshDetail();
       render();
     },
-    onStatus: (mode) => { app.transport = mode; render(); },
+    // The transport's only reader is the banner, and it flips idle → sse on
+    // every single load. Repainting the whole page for it was the second half
+    // of the "it comes in and then blinks" on a fresh load.
+    onStatus: (mode) => { app.transport = mode; renderSessionBanner(); },
     // The session drained further: messages it has now read flip to
     // "session is on it" without waiting for the next board fetch.
     //
@@ -687,8 +705,6 @@ async function firstLoad() {
   });
   live.start(store.seq);
 
-  const m = location.hash.match(/^#\/c\/(\d+)/);
-  if (m) openCard(Number(m[1]));
   setTimeout(armNotifications, 1500);
 }
 
