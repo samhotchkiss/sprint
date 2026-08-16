@@ -475,6 +475,12 @@ class App:
         os.makedirs(self.attach_dir, exist_ok=True)
         self.db_path = os.path.join(self.data_dir, DB_FILENAME)
         self.started_at = now()
+        # One id per server PROCESS. An open tab that sees this change knows the
+        # backend it was talking to is gone -- its SSE stream, its in-flight
+        # POSTs and (if the token was rotated) its credentials all died with it.
+        # The tab re-syncs from its cursor instead of sitting there silently
+        # believing a connection that no longer exists.
+        self.generation = "%d-%s" % (int(self.started_at * 1000), secrets.token_hex(4))
         self.token = token or secrets.token_urlsafe(24)
 
         self.silence_seconds = (
@@ -605,6 +611,31 @@ class App:
                 out[key] = self.ingest_refs(out[key])
         return out
 
+    @staticmethod
+    def stamp_reply_to(card_num, actor: str, payload: dict) -> dict:
+        """Where an answer to this event belongs, as a machine-readable string.
+
+        Every user-originated event -- a card submission, card chat, an answer,
+        a verdict, a sidebar line, a card action -- carries
+        `payload.reply_to`: `"sidebar"` for sprint-level events, `"card:<num>"`
+        for anything attached to a card. Any orchestrator (this session or a
+        future one) routes its reply off that field alone; nothing has to be
+        inferred from a doc, from the shape of the payload, or from which
+        endpoint happened to be hit.
+
+        Deliberately DUMB and TOTAL: it is the actor and the card number, and
+        nothing else. It is also a biconditional -- the field is stamped on
+        every `user` event and stripped from every worker/session/server event
+        -- so `reply_to` present means "a human said this and is waiting", with
+        no exceptions to remember.
+        """
+        out = dict(payload or {})
+        if actor == "user":
+            out["reply_to"] = "sidebar" if card_num is None else "card:%d" % int(card_num)
+        else:
+            out.pop("reply_to", None)
+        return out
+
     def _append_event(self, card_num, actor: str, kind: str, payload: dict) -> int:
         """Append to the log. MUST be called with self.lock held."""
         if actor not in ACTORS:
@@ -612,6 +643,7 @@ class App:
         if kind not in EVENT_KINDS:
             raise ApiError(400, "bad_kind", "kind must be one of %s" % (EVENT_KINDS,))
         payload = self.normalize_payload(payload)
+        payload = self.stamp_reply_to(card_num, actor, payload)
         ts = now()
         cur = self.conn.execute(
             "INSERT INTO events(card_num, ts, actor, kind, payload) VALUES(?,?,?,?,?)",
@@ -1953,6 +1985,9 @@ class App:
             # a card only reaches Done once its branch actually landed.
             "column_of": dict(COLUMN_OF),
             "seq": self.max_seq(),
+            # Which server process answered. A tab compares it against the one
+            # it booted on and re-syncs itself if it changed.
+            "generation": self.generation,
             "server_time": now(),
         }
 
@@ -2198,6 +2233,9 @@ def make_handler(app: App):
                         "project_root": app.project_root,
                         "data_dir": app.data_dir,
                         "started_at": app.started_at,
+                        # The one field an open tab polls to tell "the server is
+                        # slow" apart from "the server I knew is gone".
+                        "generation": app.generation,
                         "seq": app.max_seq()})
 
                 if not self.authed(query):
@@ -2249,6 +2287,9 @@ def make_handler(app: App):
                                            # so a polling browser learns cursor
                                            # moves without a second round trip
                                            "cursor": app.cursor_seq(),
+                                           # ...and learns about a restart on
+                                           # the polling path too, not just SSE
+                                           "generation": app.generation,
                                            "next": events[-1]["seq"] if events else after})
             if path == "/api/stream":
                 return self._stream(query)
@@ -2335,11 +2376,29 @@ def make_handler(app: App):
                 # the drain cursor is not an event, so it must never become the
                 # browser's Last-Event-ID. The browser listens for it to flip a
                 # sent message from "landed" to "session is on it".
+                # `generation` rides along on every cursor frame too: the cursor
+                # is the most frequent thing on the wire, so a tab that somehow
+                # missed the hello still learns within a second that it is
+                # talking to a different server than the one it connected to.
                 return ("event: cursor\ndata: %s\n\n"
-                        % jdump({"cursor": cur, "head": app.max_seq()})).encode("utf-8")
+                        % jdump({"cursor": cur, "head": app.max_seq(),
+                                 "generation": app.generation})).encode("utf-8")
+
+            def hello_frame():
+                # The first frame of every stream, named so it can never be
+                # mistaken for an event (no `id:` -- it must not become the
+                # browser's Last-Event-ID). It says which server this is and
+                # where the log currently ends.
+                return ("event: hello\ndata: %s\n\n"
+                        % jdump({"generation": app.generation,
+                                 "started_at": app.started_at,
+                                 "cursor": app.cursor_seq(),
+                                 "head": app.max_seq(),
+                                 "after": after})).encode("utf-8")
 
             try:
                 self.wfile.write(b": connected\n\nretry: 2000\n\n")
+                self.wfile.write(hello_frame())
                 cursor = app.cursor_seq()
                 self.wfile.write(cursor_frame(cursor))
                 self.wfile.flush()
