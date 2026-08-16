@@ -4072,6 +4072,219 @@ class TestHubDeadBoards(HubBase):
         return port
 
 
+class TestSwitcherOrderIsStable(HubBase):
+    """Card #57, the bounce, user verbatim: "the order of sprints should stay
+    the same in the list, so I can count on .1 always going to session a, .2
+    always going to session b, etc, and not have to reassess the list each
+    time."
+
+    So the ONE property every test here defends: two reads of `/api/siblings`
+    that differ only in who is waiting on you come back in the same order. The
+    boards are deliberately registered out of alphabetical order, so a list
+    that fell back to sorting by name would fail too.
+    """
+
+    def order(self, board):
+        snap = sprintd.siblings_snapshot(board["app"])
+        return [s["name"] for s in snap["sprints"]]
+
+    def three(self):
+        """zeta, then alpha, then mid -- first seen is neither alphabetical nor
+        reverse-alphabetical, so only registry order can produce it."""
+        return self.board("zeta"), self.board("alpha"), self.board("mid")
+
+    def closed_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def kill(self, board):
+        """Make a board unreachable the way a real one goes: its registry row
+        points at a port with nothing behind it."""
+        sprintd.registry_touch(board["root"], {"port": self.closed_port()})
+
+    def revive(self, board):
+        sprintd.registry_touch(board["root"], {"port": board["port"]})
+
+    # -- the order itself ---------------------------------------------------
+
+    def test_the_list_is_first_seen_order_not_alphabetical(self):
+        zeta, alpha, mid = self.three()
+        self.assertEqual(self.order(zeta), ["zeta", "alpha", "mid"])
+
+    def test_every_board_on_the_machine_reports_the_same_order(self):
+        """".2" has to mean one sprint, not "the second one from wherever you
+        happen to be standing"."""
+        zeta, alpha, mid = self.three()
+        self.assertEqual(self.order(zeta), self.order(alpha))
+        self.assertEqual(self.order(alpha), self.order(mid))
+
+    def test_the_board_you_are_on_keeps_its_place_instead_of_floating_first(self):
+        zeta, alpha, mid = self.three()
+        snap = sprintd.siblings_snapshot(mid["app"])
+        self.assertEqual([s["name"] for s in snap["sprints"]],
+                         ["zeta", "alpha", "mid"])
+        # it is still marked, so the menu can still say "here" beside it
+        self.assertEqual([s["name"] for s in snap["sprints"] if s["self"]], ["mid"])
+
+    # -- attention may be SHOWN, never SORTED BY -----------------------------
+
+    def test_two_reads_with_the_attention_moved_are_the_same_order(self):
+        """The falsification: the sprint that starts wanting you is the LAST
+        one in the list and has the oldest question on the machine, which is
+        exactly what the old sort floated to the top."""
+        zeta, alpha, mid = self.three()
+        before = self.order(zeta)
+        self.assertEqual(before, ["zeta", "alpha", "mid"])
+
+        num = self.card_needs_you(mid, "stuck one", "which colour?")
+        mid["app"].conn.execute(
+            "UPDATE questions SET created_at=created_at-3600 WHERE card_num=?", (num,))
+        mid["app"].conn.commit()
+        self.card_ready(alpha)
+
+        after = sprintd.siblings_snapshot(zeta["app"])["sprints"]
+        self.assertEqual([s["name"] for s in after], before,
+                         "attention moved a row -- that is the whole bug")
+        # ...and it is still SHOWN, which is why it never needed to be sorted:
+        # the row carries the dot's number and the wait it has been waiting.
+        loud = [s for s in after if s["name"] == "mid"][0]
+        self.assertEqual(loud["needs_you"], 1)
+        self.assertGreater(loud["stuck_seconds"], 3500)
+        self.assertEqual([s for s in after if s["name"] == "alpha"][0]["ready"], 1)
+
+    def test_answering_the_question_does_not_move_the_row_back(self):
+        """The reverse move, which is the one that would make the user reassess
+        the list twice: a sprint that STOPS needing him."""
+        zeta, alpha, mid = self.three()
+        num = self.card_needs_you(alpha, "ask", "well?")
+        loud = self.order(zeta)
+        status, body = self.bpost(alpha, "/api/cards/%d/answer" % num,
+                                  {"text": "the green one"})
+        self.assertIn(status, (200, 201), body)
+        self.assertEqual(
+            [s["needs_you"] for s in sprintd.siblings_snapshot(zeta["app"])["sprints"]],
+            [0, 0, 0], "the question really was answered")
+        self.assertEqual(self.order(zeta), loud)
+
+    # -- boards arriving and leaving ----------------------------------------
+
+    def test_a_new_board_appends_and_renumbers_nobody(self):
+        zeta, alpha, mid = self.three()
+        before = self.order(zeta)
+        # a fourth sprint, alphabetically first, and needing you on arrival
+        late = self.board("aaa-latecomer")
+        self.card_needs_you(late, "brand new", "look at me")
+        after = self.order(zeta)
+        self.assertEqual(after[:3], before,
+                         "an arrival must not shift anyone already numbered")
+        self.assertEqual(after[3], "aaa-latecomer")
+
+    def test_a_restart_puts_a_board_back_in_its_own_slot(self):
+        """A restart is the same board (same project root), so it keeps its
+        number rather than going to the back of the queue."""
+        zeta, alpha, mid = self.three()
+        before = self.order(zeta)
+        sprintd.registry_register(sprintd.registry_entry(
+            alpha["root"], alpha["port"], "127.0.0.1",
+            data_dir=alpha["data_dir"], pid=os.getpid()))
+        self.assertEqual(self.order(zeta), before)
+
+    def test_a_dead_board_closes_the_gap_and_comes_back_to_its_own_place(self):
+        """A dropped row compacts: this list exists to be clicked, and a number
+        that navigates nowhere is worse than a number that moved. What must NOT
+        happen is the survivors also shuffling."""
+        zeta, alpha, mid = self.three()
+        self.kill(alpha)
+        self.assertEqual(self.order(zeta), ["zeta", "mid"])
+        self.revive(alpha)
+        self.assertEqual(self.order(zeta), ["zeta", "alpha", "mid"])
+
+    def test_a_board_with_no_registry_row_lists_itself_last(self):
+        """Registry write failed, or the board predates the registry. It is
+        demonstrably alive -- it is answering -- so it is listed, but at the end
+        where it cannot push anybody else's number along."""
+        zeta, alpha, mid = self.three()
+        sprintd.registry_unregister(zeta["root"])
+        self.assertEqual(self.order(zeta), ["alpha", "mid", "zeta"])
+        self.assertEqual(self.order(alpha), ["alpha", "mid"],
+                         "the other boards simply cannot see it")
+
+
+class TestRegistryOrdinals(RegistryBase):
+    """The number itself: handed out once, on first sight, and never edited."""
+
+    def ordinals(self):
+        return {e["name"]: e.get("ordinal")
+                for e in sprintd.read_registry().values()}
+
+    def test_ordinals_are_handed_out_in_registration_order(self):
+        sprintd.registry_register(self.entry("zeta", 9101))
+        sprintd.registry_register(self.entry("alpha", 9102))
+        self.assertEqual(self.ordinals(), {"zeta": 0, "alpha": 1})
+
+    def test_re_registering_never_changes_the_number(self):
+        root = os.path.join(self.tmp, "alpha")
+        sprintd.registry_register(self.entry("zeta", 9101))
+        sprintd.registry_register(self.entry("alpha", 9102, root=root, pid=111))
+        sprintd.registry_register(self.entry("alpha", 9209, root=root, pid=222))
+        self.assertEqual(self.ordinals(), {"zeta": 0, "alpha": 1})
+        self.assertEqual(sprintd.read_registry()[os.path.realpath(root)]["port"], 9209)
+
+    def test_a_fresh_entry_carries_no_ordinal_of_its_own(self):
+        """If it did, every restart would overwrite the row's real place."""
+        self.assertNotIn("ordinal", self.entry("alpha", 9101))
+
+    def test_a_departed_board_s_number_is_not_reused(self):
+        """Reuse is how a brand-new sprint would inherit someone else's muscle
+        memory. The next board takes the next number, gaps and all."""
+        a = self.entry("alpha", 9101)
+        sprintd.registry_register(a)
+        sprintd.registry_register(self.entry("beta", 9102))
+        sprintd.registry_unregister(a["project_root"])
+        sprintd.registry_register(self.entry("gamma", 9103))
+        self.assertEqual(self.ordinals(), {"beta": 1, "gamma": 2})
+
+    def test_rows_from_an_older_sprintd_are_numbered_oldest_first(self):
+        """Upgrade path: the registry on disk has no ordinals at all. The
+        backfill has to land on the order those rows were ALREADY being read
+        in, so nobody is renumbered by the upgrade itself."""
+        now = sprintd.now()
+        legacy = {}
+        for name, age in (("newer", 100), ("oldest", 900), ("middle", 500)):
+            e = self.entry(name, 9100 + age, started_at=now - age)
+            e.pop("ordinal", None)
+            legacy[e["project_root"]] = e
+        sprintd.write_registry(legacy)
+        self.assertEqual(self.ordinals(),
+                         {"newer": None, "oldest": None, "middle": None})
+        by_age = sorted(legacy.items(),
+                        key=lambda kv: sprintd.registry_order_key(*kv))
+        self.assertEqual([kv[1]["name"] for kv in by_age],
+                         ["oldest", "middle", "newer"])
+        # the first board to register anything numbers them all, in that order
+        sprintd.registry_register(self.entry("brand-new", 9999))
+        self.assertEqual(self.ordinals(), {"oldest": 0, "middle": 1, "newer": 2,
+                                           "brand-new": 3})
+
+    def test_an_unnumbered_row_sorts_behind_every_numbered_one(self):
+        """Where the backfill is about to put it, so the two agree."""
+        numbered = {"ordinal": 7, "started_at": 1.0}
+        legacy = {"started_at": 0.0}
+        self.assertLess(sprintd.registry_order_key("/a", numbered),
+                        sprintd.registry_order_key("/b", legacy))
+
+    def test_a_garbled_ordinal_is_treated_as_absent_not_as_a_crash(self):
+        for bad in (None, "", "two", -1, {}, [3]):
+            self.assertIsNone(sprintd.entry_ordinal({"ordinal": bad}), bad)
+        self.assertEqual(sprintd.entry_started_at({"started_at": "soon"}), 0.0)
+        # ...and a registry full of junk still numbers cleanly
+        self.assertEqual(sprintd.next_ordinal({"a": {"ordinal": "x"}}), 0)
+
+
 class TestHubServer(HubBase):
     """The hub page and its API, over real HTTP."""
 

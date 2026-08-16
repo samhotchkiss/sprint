@@ -335,6 +335,16 @@ root; several run at once in different tmux windows.
   board is always in the list flagged `self: true` and rolled up straight from its own DB, never over
   HTTP. Unreachable rows are **dropped**, not greyed: a hub row exists to tell you a board died, a
   menu row exists to be clicked. Cached 10s server-side (`SPRINT_SIBLINGS_TTL`).
+  **Order is stable and server-side**, user verbatim: "the order of sprints should stay the same in
+  the list, so I can count on .1 always going to session a, .2 always going to session b, etc, and not
+  have to reassess the list each time." The registry stamps every project an `ordinal` the first time
+  it registers and never edits it again, so a board keeps its place across restarts and a new one
+  appends. `/api/siblings` sorts by that and by nothing else — including the `self` row, which sits in
+  its own place rather than first, so all boards on the machine agree on what "2" means. Attention is
+  **shown** (the dot, the counts) and never sorted by. Dropping a dead row compacts the list: a number
+  that navigates nowhere is worse than one that shifted, and the board gets its place back when it
+  returns. The hub page keeps its attention sort — it is read cold, top to bottom, and nothing on it
+  is keyed to a number.
   UI: >1 live board and the header title becomes a dropdown — one ≥44px row per sprint (name, its
   counts, a dot when that sprint has `needs_you > 0`, "here" on the current one), clicking navigates
   to that board's signed URL in the same tab, on the host you are already using. The title carries a
