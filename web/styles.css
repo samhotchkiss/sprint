@@ -1611,3 +1611,252 @@ html.skin-chaos .detail-body { border-top: 2px solid #4a3f8e; }
   /* the list is one tile wide on a phone — 268px minima would overflow */
   html.skin-chaos .rows { grid-template-columns: 1fr; }
 }
+
+/* ===========================================================================
+   AWAITING REVIEW, REWORKED — card #25.
+   A self-contained section appended at the end of the file: nothing above this
+   line is edited, so this lands cleanly next to other work in flight.
+
+   Three shapes live here. A GROUP ROW is one work unit (one branch) collapsed
+   to a single line you can expand. A REVIEW ITEM is one card with its claim,
+   its first check, a thumbnail and the verdict on the row. The REVIEW BAR is
+   the Review-next walkthrough, pinned to the bottom of the rail.
+   =========================================================================== */
+
+.review-block { display: flex; flex-direction: column; gap: 10px; }
+
+.review-head { display: flex; align-items: center; gap: 14px; padding: 2px 0 2px 2px; }
+.review-head-name {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--good);
+}
+.review-head-note { font-size: 13px; color: var(--faint); }
+.btn.review-next {
+  min-height: 36px;
+  background: var(--chip);
+  border-color: var(--border-chip);
+  color: var(--dim);
+  font-weight: 500;
+}
+.btn.review-next:hover { border-color: var(--accent); color: var(--ink); }
+
+/* ---- a work unit, collapsed --------------------------------------------- */
+
+.review-unit {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--rail-signoff);
+  border-radius: var(--radius);
+  box-shadow: var(--row-shadow);
+  overflow: hidden;
+}
+.review-group {
+  display: flex;
+  width: 100%;
+  gap: 14px;
+  align-items: center;
+  min-height: 56px;
+  padding: 13px 15px;
+  background: none;
+  border: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.review-group:hover { background: var(--hover); }
+.review-chev { flex: 0 0 12px; font-size: 11px; color: var(--faint); }
+.review-group-main { flex: 1; min-width: 0; }
+.review-group-title { display: block; font-size: 15.5px; font-weight: 500; color: var(--ink); }
+.review-group-sub {
+  display: block;
+  margin-top: 5px;
+  font-size: 12.5px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.review-group-right { flex: none; text-align: right; }
+.review-members { display: flex; flex-direction: column; border-top: 1px solid var(--rule-row); }
+
+/* ---- one card, with the verdict on it ----------------------------------- */
+
+.review-item {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 15px 15px 13px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--rail-signoff);
+  border-radius: var(--radius);
+  box-shadow: var(--row-shadow);
+}
+.review-item.in-group {
+  border: none;
+  border-top: 1px solid var(--rule-row);
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+.review-members > .review-item:first-child { border-top: none; }
+.review-item.is-merging { border-left-color: var(--good); }
+
+.review-lead {
+  display: grid;
+  grid-template-columns: 48px 1fr auto;
+  gap: 14px;
+  align-items: start;
+  cursor: pointer;
+  text-align: left;
+}
+.review-lead:hover .review-claim { color: var(--accent-hi); }
+.review-body { min-width: 0; }
+.review-title { display: block; font-size: 12.5px; color: var(--faint); }
+.review-claim {
+  margin-top: 5px;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--ink);
+  text-wrap: pretty;
+  max-width: 78ch;
+}
+.review-check { display: flex; gap: 11px; align-items: flex-start; margin-top: 11px; max-width: 78ch; }
+.review-check p { padding-top: 1px; font-size: 13px; line-height: 1.55; color: var(--dim); text-wrap: pretty; }
+.review-more { flex: none; padding-top: 3px; font-family: var(--font-mono); font-size: 11px; color: var(--faint); }
+
+.review-thumb {
+  flex: none;
+  position: relative;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+.review-thumb-frame {
+  display: block;
+  width: 104px;
+  height: 66px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  background: var(--input);
+}
+.review-thumb-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.review-thumb:hover .review-thumb-frame { border-color: var(--accent); }
+.review-thumb-n {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--scrim);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink);
+}
+
+.review-actwrap { display: flex; flex-direction: column; gap: 9px; }
+.review-acts { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.review-acts .btn.tiny { min-height: 34px; padding: 0 14px; font-weight: 500; }
+.review-acts .btn.ghost { color: var(--faint); font-weight: 400; }
+.review-acts .btn.ghost:hover { color: var(--ink); }
+.review-meta { font-family: var(--font-mono); font-size: 11.5px; color: var(--faint); }
+.review-merging { font-size: 13px; color: var(--good); }
+.bounce-pop { display: flex; flex-direction: column; gap: 8px; }
+.bounce-pop-acts { display: flex; gap: 8px; }
+
+/* ---- the Review-next walkthrough, pinned in the rail --------------------- */
+
+.review-bar {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--rule);
+  background: var(--panel);
+}
+.review-bar-head { display: flex; align-items: baseline; gap: 10px; }
+.review-count {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.review-bar-note { font-size: 11.5px; color: var(--faint); }
+.review-bar .btn.skip { flex: 0 0 86px; color: var(--faint); font-weight: 400; }
+.review-bar .btn.skip:hover { color: var(--ink); border-color: var(--border-chip); }
+.packet-walking { font-family: var(--font-mono); font-size: 11px; color: var(--faint); line-height: 1.6; }
+
+/* ---- the Board's narrow column ------------------------------------------ */
+
+.review-block.is-compact { gap: 8px; }
+.review-block.is-compact .review-head { flex-wrap: wrap; gap: 8px; padding: 0 0 2px 0; }
+.review-block.is-compact .btn.review-next { min-height: 32px; font-size: 12.5px; padding: 0 11px; }
+.review-block.is-compact .review-group { min-height: 48px; padding: 11px 12px; gap: 10px; }
+.review-block.is-compact .review-group-title { font-size: 13.5px; }
+.review-block.is-compact .review-group-sub { font-size: 11.5px; }
+.review-block.is-compact .review-item { padding: 12px; gap: 9px; }
+.review-block.is-compact .review-lead { grid-template-columns: 36px 1fr; gap: 9px; }
+.review-block.is-compact .review-claim { font-size: 13.5px; line-height: 1.45; margin-top: 4px; }
+.review-block.is-compact .review-check { margin-top: 8px; gap: 8px; }
+.review-block.is-compact .review-check p { font-size: 12px; }
+.review-block.is-compact .review-thumb { grid-column: 1 / -1; }
+.review-block.is-compact .review-thumb-frame { width: 100%; height: 72px; }
+.review-block.is-compact .review-acts { gap: 6px; }
+.review-block.is-compact .review-acts .btn.tiny { padding: 0 11px; font-size: 12.5px; }
+.review-block.is-compact .review-meta { flex-basis: 100%; }
+
+/* ---- Fold and phone ------------------------------------------------------ */
+
+@media (max-width: 1199px) {
+  /* 44px minimum on anything you can tap, and the claim gives up the width it
+     was borrowing for a wide screen. */
+  .review-acts .btn.tiny,
+  .review-block.is-compact .review-acts .btn.tiny { min-height: 44px; }
+  .review-group { min-height: 52px; }
+  .btn.review-next { min-height: 44px; }
+  .review-head-note { display: none; }
+  .review-claim, .review-check { max-width: none; }
+  .review-bar { padding: 12px 14px; }
+  .review-bar .verdicts .btn { min-height: 48px; }
+}
+
+@media (max-width: 600px) {
+  .review-lead { grid-template-columns: 40px 1fr; }
+  .review-thumb { grid-column: 1 / -1; }
+  .review-thumb-frame { width: 100%; height: 92px; }
+  .review-acts { gap: 6px; }
+  .review-bar .btn.skip { flex: 1 0 100%; order: 3; }
+}
+
+/* ---- Chaos ---------------------------------------------------------------
+   Same information, same words: only the surface changes. Hard bevels, ink
+   outlines, and the signoff rail stays green so a review still reads as a
+   review at a glance. */
+
+html.skin-chaos .review-unit,
+html.skin-chaos .review-item {
+  border: 2px solid var(--border);
+  border-left: 3px solid var(--rail-signoff);
+  box-shadow: var(--panel-shadow);
+}
+html.skin-chaos .review-item.in-group {
+  border: none;
+  border-top: 2px solid var(--border);
+  box-shadow: none;
+}
+html.skin-chaos .review-members > .review-item:first-child { border-top: none; }
+html.skin-chaos .review-item.is-merging { border-left-color: var(--good); }
+html.skin-chaos .review-members { border-top: 2px solid var(--border); }
+html.skin-chaos .review-thumb-frame { border: 2px solid var(--border); }
+html.skin-chaos .review-bar { border-top: 2px solid var(--border); box-shadow: var(--panel-shadow); }
+html.skin-chaos .btn.review-next { border: 2px solid var(--border-chip); }
+html.skin-chaos .review-group-title { line-height: 1.5; }
+html.skin-chaos .review-claim { line-height: 1.6; }

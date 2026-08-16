@@ -24,6 +24,7 @@ const app = {
   openCard, closeCard,
   answer, chat, sessionChat, verdict, cardAction, markDuplicate, retryCard, retrySubmit,
   lightbox: (urls, i, caps) => openLightbox(el.lightbox, urls, i, caps),
+  toast: (msg) => toast(msg),
 };
 
 // Which shell we are in. The Fold is the spec's real mobile target (980×740),
@@ -373,12 +374,16 @@ async function verdict(card, kind, notes) {
         : `#${card.num} rejected.`);
     refreshBoard();
     if (store.detail && store.detail.num === card.num) refreshDetail();
+    // Whether the verdict actually landed — the Review-next walkthrough only
+    // moves to the next card once the server has taken this one.
+    return true;
   } catch (err) {
     store.patches.delete(card.num);
     card.state = before;
     toast(errText(err, 'verdict did not stick'));
     handleError(err, null);
     render();
+    return false;
   }
 }
 

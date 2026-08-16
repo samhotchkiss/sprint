@@ -21,6 +21,7 @@ import { h, ageSuffix, richText, firstLine, reconcile, timeEl } from './util.js'
 import { attachmentUrl, attachmentCaption } from './api.js';
 import { SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, draft } from './state.js';
 import { detailBlock } from './detail.js';
+import { flowActive } from './review.js';
 
 const ACTOR = {
   user: { label: 'You', cls: 'from-you' },
@@ -122,11 +123,14 @@ export function threadItems(detail, app) {
       out.push({ key: 'merging', ver: card.state_since || 1,
         make: () => statusLine('Approved — merging', ageSuffix(card.state_since), 'good') });
     }
+    // While the Review-next walkthrough is standing on this card, the verdict
+    // lives in its pinned bar instead — one Approve on screen, in one place.
+    const walking = !!card && flowActive(card.num);
     out.push({
       key: 'packet',
       ver: `${state}:${card ? card.bounce_count : 0}:${(packet && packet.claim) || ''}`.length
-        + ':' + state + ':' + (card ? card.bounce_count : 0),
-      make: () => evidencePacket(packet, card, state, app),
+        + ':' + state + ':' + (card ? card.bounce_count : 0) + ':' + (walking ? 'w' : ''),
+      make: () => evidencePacket(packet, card, state, app, walking),
     });
   }
   return out;
@@ -315,7 +319,7 @@ function questionPanel(card, q, app) {
 
 // ---- the evidence packet -------------------------------------------------
 
-function evidencePacket(packet, card, state, app) {
+function evidencePacket(packet, card, state, app, walking) {
   const p = packet || {};
   const item = h('div.item');
   const box = h('div.packet');
@@ -361,7 +365,11 @@ function evidencePacket(packet, card, state, app) {
     box.appendChild(per);
   }
 
-  if (state === 'ready') box.appendChild(verdictBar(card, app));
+  if (state === 'ready' && !walking) box.appendChild(verdictBar(card, app));
+  else if (state === 'ready') {
+    box.appendChild(h('p.packet-walking',
+      'Approve, Bounce or Skip are pinned at the bottom of this panel while you are walking the queue.'));
+  }
   item.appendChild(box);
   return item;
 }

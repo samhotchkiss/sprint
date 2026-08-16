@@ -11,6 +11,7 @@ import {
 } from './state.js';
 import { renderMeter } from './meter.js';
 import { renderDone } from './done.js';
+import { reviewBlock } from './review.js';
 
 export function renderList(root, app) {
   const secs = sections();
@@ -55,9 +56,23 @@ function needsSection(col, app) {
   const sec = h('section.section');
   sec.appendChild(head('Needs you', col.cards.length, { accent: true, tight: true }));
   sec.appendChild(h('p.section-intro', needsIntro(col.cards)));
+
+  // The section still holds both shapes of asking, and they are still told apart
+  // by rail colour and tag — but they no longer interleave. An open question is
+  // answered in one line; a finished branch is a review, and reviews come in
+  // work units with the verdict on the row (see review.js). Mixing the two by
+  // age made every pass through this section start over from scratch.
+  const asks = col.cards.filter((c) => needsKind(c) === 'question');
+  const signoffs = col.cards.filter((c) => needsKind(c) !== 'question');
+
   const rows = h('div.rows');
-  for (const card of col.cards) rows.appendChild(needsRow(card, app));
-  sec.appendChild(col.cards.length ? rows : h('p.section-empty', 'Nothing needs you.'));
+  for (const card of asks) rows.appendChild(needsRow(card, app));
+  if (asks.length) sec.appendChild(rows);
+
+  const review = reviewBlock(signoffs, app);
+  if (review) sec.appendChild(review);
+
+  if (!col.cards.length) sec.appendChild(h('p.section-empty', 'Nothing needs you.'));
   return sec;
 }
 
