@@ -187,6 +187,17 @@ Each line it prints is one event, pre-summarised:
 - Heartbeats and cursor moves are consumed and never printed, so an idle
   board costs you **zero** wakeups (the old 60s long-poll cost you one a
   minute, forever, whether or not anything happened).
+- **Your own posts are suppressed by default, so your standing tail never
+  wakes you on your own writing.** Everything you write as
+  `actor: "session"` — sidebar replies, notes on cards, status lines —
+  used to come straight back down this stream and wake you to read what
+  you had just said. `actor: "session"` events are now dropped here for
+  the same reason heartbeats are: a wakeup should mean *somebody else
+  moved*. Nothing else changes — user, worker and server events (that
+  includes `agent_silent` and `stuck`) all still wake you, and the event
+  is still in the log, so a cursor drain still sees it. Pass
+  `--include-self` if you ever want the raw stream back (debugging the
+  board itself, mostly).
 - It **never exits on its own.** It reconnects through drops by itself,
   resuming from the last seq — so one Monitor call lasts the sprint.
   Re-arm only if the monitor itself reports that the process exited.
@@ -352,6 +363,31 @@ user's verb" in step 6. Dispatch it, or answer it into `ready`, or say
 your piece in the sidebar and leave it queued. `cancel`, `complete`,
 `reject` and `duplicate` are user verbs.
 
+### Importing a list — bulk create, and say it was you
+
+Anything that would be N card POSTs is one call:
+`POST /api/cards/bulk {"items": [{"text": "…"}, …], "hold": true,
+"actor": "session"}`.
+
+- **It holds by DEFAULT and you should leave it that way.** Importing a
+  backlog created 14 cards against the user's intent once, and undoing
+  it took 14 hand-written cancels. Held cards are the preview: they are
+  on the board, nothing is dispatched, and the user releases the ones
+  they want. Only pass `"hold": false` for work the user has already
+  said yes to (a split, a card you were told to file).
+- All-or-nothing, and capped at 50 items per call (a bigger import is a
+  `413` — split it). One bad item creates nothing.
+- The undo is one call too:
+  `POST /api/cards/bulk-action {"card_nums": [...], "action": "cancel"}`
+  (also `release` and `hold`). Cards that can't move are reported per
+  number in `failed` and the rest still go through.
+- **Say who wrote it.** `actor` is `"session"` for anything YOU file and
+  `"worker"` for an agent; leave it off and the card is attributed to
+  the user, which makes `reply_to` claim a human is waiting behind your
+  own writing. Cards the user typed in the browser are always `user` —
+  the server enforces that and a claim from a browser is ignored, so
+  `actor` is only ever a way to tell the truth about yourself.
+
 ### Auto-split multi-complaint dumps
 
 Before dispatching a card, check whether its text is actually several
@@ -359,11 +395,14 @@ unrelated complaints bundled into one submission (a common shape when
 the user "dumps a bunch of issues" in one box). If so, **split it
 immediately, without asking**:
 
-1. `POST /api/cards` once per complaint, each body prefixed
-   `"[split from #<original>] "` followed by that complaint's own text
-   (carry over any attachments that clearly belong to that complaint;
-   if you can't tell which sub-complaint an image belongs to, attach it
-   to all the resulting siblings rather than dropping it).
+1. `POST /api/cards/bulk` with one `items[]` entry per complaint, each
+   `text` prefixed `"[split from #<original>] "` followed by that
+   complaint's own text (carry over any attachments that clearly belong
+   to that complaint; if you can't tell which sub-complaint an image
+   belongs to, attach it to all the resulting siblings rather than
+   dropping it). Set `"actor": "session"` — you wrote these, not the
+   user — and `"hold": false`, since a split is work the user already
+   asked for. One call, one atomic write, no half-split.
 2. `POST /api/cards/:original/action {"action":"cancel"}` and post a
    `note` on the original listing the new card numbers (`split into
    #131, #132, #133`) — the UI autolinks `#N` so this is one-click
@@ -377,6 +416,30 @@ If the user later wants two split cards treated as one again, use the
 existing `duplicate_of` action as the merge-back primitive (mark one
 `dup_of` the other) — there's no purpose-built "un-split" mechanic in
 the schema, and this is the closest existing tool.
+
+### Ops cards — non-code work needs no worktree
+
+Not every card is a diff. Reprocessing a mailbox, rotating a key,
+rerunning a job, checking a production number: there is nothing to
+branch, nothing to preview, and often nothing to test. Dispatch these as
+**ops** work and skip the git ceremony entirely:
+
+```
+POST /api/cards/:num/assign {"agent_name": "…", "work_kind": "ops"}
+```
+
+- `worktree` and `branch` are **omitted on purpose** — an ops card has
+  neither, and inventing them makes the card lie about itself.
+- The evidence gate validates per kind. An ops packet owes **claim,
+  validate and readback**; `readback` is the observed evidence (the log
+  excerpt, the command output) and the board renders it verbatim.
+  `diffstat`, `branch`, `ui_change` and `screenshots` are not required,
+  and `test_result` is optional (but still needs real counts if given).
+- Tell the worker in its brief that this is ops work, so it doesn't
+  spend a cycle looking for a worktree that isn't there.
+- Everything else is unchanged: it still restates at triage, still posts
+  phases, still finishes through `sprint-ready`, and closing it is still
+  the user's verb.
 
 ### Worktree lifecycle
 
@@ -513,6 +576,36 @@ There is no manual nudge button by design — this procedure is what
 replaces it. If you find yourself wanting the user to manually check on
 something, that's a sign this step needs to run, not a sign to wait for
 them.
+
+**Your own note counts as activity.** Posting what you found (step 3) is
+the check the event asked for, so it resets that card's clock — you will
+not be nagged again about work you just went and looked at. The clock
+starts again from your note, so a card that stays quiet will ask you a
+second time; that is the point.
+
+**Two flags you can set yourself, when the clock cannot do its job:**
+
+```
+POST /api/cards/:num/action {"action":"long_running","actor":"session",
+                             "note":"full suite, ~40 min"}
+POST /api/cards/:num/action {"action":"external_agent","actor":"session",
+                             "note":"running as an ordinary background agent"}
+```
+
+- `long_running` is a **stretch**: this particular job is slow. Clear it
+  with `{"value": false}` when the stretch ends. Prefer telling the
+  worker to declare a phase with `--expect`, which expires by itself;
+  reach for the flag when you can't reach the worker.
+- `external_agent` is **permanent for the card**: its assignee is not a
+  sprint worker and emits no worker telemetry at all (an ordinary
+  background agent, a human, a cron). The silence timer can never be
+  satisfied by such a card, so it does not run on it — **which means you
+  own checking on it.** Put it in your rotation; nothing will remind
+  you. You can also declare it at dispatch:
+  `POST /api/cards/:num/assign {"agent_name":…, "external_agent": true}`.
+- Both are session-only. A request from the browser gets a `403
+  session_only` — the user has no way to know whether an agent is
+  legitimately quiet, so turning the alarm off is not their switch.
 
 ---
 

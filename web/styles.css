@@ -2254,3 +2254,39 @@ html.skin-chaos .review-acts .btn.review-approve-unit {
 }
 html.skin-chaos .review-item .review-title { line-height: 1.5; }
 html.skin-chaos .review-unit-error, html.skin-chaos .review-bar-unit { line-height: 1.7; }
+
+/* ==========================================================================
+   Appended: ops evidence readback (card #38)
+   Non-code work proves itself with observed output — a log excerpt, a command
+   result — not a diff. It is EVIDENCE, so it renders verbatim: monospace,
+   preformatted, its own scroll rather than the page's, and never reflowed.
+   ========================================================================== */
+
+.packet-readback {
+  margin-top: 10px;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  background: var(--canvas);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink);
+  /* pre-WRAP, not pre: a command line that runs off the right edge of a 480px
+     rail is evidence the user cannot read, and a horizontal scrollbar they
+     have to discover is not an answer. Whitespace and newlines are still
+     preserved verbatim -- only overlong lines soft-wrap. overflow-x stays as
+     a safety net for genuinely unbreakable content. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: auto;
+  max-height: 320px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+html.skin-chaos .packet-readback {
+  border: 2px solid var(--border);
+  border-radius: 0;
+  line-height: 1.7;
+}

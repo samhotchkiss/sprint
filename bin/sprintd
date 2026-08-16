@@ -83,10 +83,33 @@ TAIL_READ_TIMEOUT = 45.0       # 3 missed 15s heartbeats == this stream is dead
 TAIL_UNREACHABLE_SECONDS = 60.0  # down this long: say so ONCE, then keep trying
 
 ACTORS = ("user", "session", "worker", "server")
+# What a CLIENT may ever claim to be. `server` is the board's own voice --
+# agent_silent, stuck, the state line under a submission -- and nothing on the
+# wire may borrow it.
+CLIENT_ACTORS = ("user", "session", "worker")
 EVENT_KINDS = (
     "submitted", "state", "chat", "question", "answer", "progress",
     "evidence", "verdict", "agent_silent", "stuck", "note", "error",
 )
+
+# Headers page JavaScript is FORBIDDEN to set or remove on `fetch` (the fetch
+# spec's forbidden-header-name list). Any request carrying one of these came
+# from a browser, and a browser is the user's own hands -- it may never claim
+# to be the session or a worker, whatever it puts in the body. This is the
+# enforcement seam for actor attribution, and it is not fingerprinting: the
+# board's own SPA cannot strip these even if it wanted to.
+BROWSER_HEADERS = ("Cookie", "Origin", "Sec-Fetch-Site", "Sec-Fetch-Mode",
+                   "Sec-Fetch-Dest")
+
+# Bulk create/act cap. The live incident this exists for was 14 cards created
+# against intent followed by 14 hand-written cancels; the cap is here so a
+# runaway import fails loudly at the door instead of flooding the board.
+BULK_MAX = 50
+
+# Non-code work proves itself differently. A mailbox reprocess has no diff, no
+# branch and no preview -- what it has is a readback: the log line or command
+# output that shows the thing actually happened.
+WORK_KINDS = ("code", "ops")
 
 # --------------------------------------------------------------------------
 # Staleness sweep
@@ -215,6 +238,8 @@ CREATE TABLE IF NOT EXISTS cards (
   pinned INTEGER NOT NULL DEFAULT 0,
   dup_of INTEGER,
   long_running INTEGER NOT NULL DEFAULT 0,
+  external_agent INTEGER NOT NULL DEFAULT 0,
+  work_kind TEXT NOT NULL DEFAULT 'code',
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL
 );
@@ -638,6 +663,7 @@ class App:
         self.conn.row_factory = sqlite3.Row
         with self.lock:
             self.conn.executescript(SCHEMA)
+            self._add_missing_columns()
         self._silence_thread = None
         self._sweep_thread = None
         # Waiter proof-of-life. In memory for the hot path (every poll), flushed
@@ -660,6 +686,27 @@ class App:
         self._siblings_snap = None
 
     # -- infra ------------------------------------------------------------
+
+    # `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists,
+    # so a board that has been running since before a column landed would 500 on
+    # every read of it. One idempotent ALTER pass at open, driven off the live
+    # column list -- no version counter to keep in step with anything.
+    ADDED_COLUMNS = (
+        ("cards", "external_agent", "INTEGER NOT NULL DEFAULT 0"),
+        ("cards", "work_kind", "TEXT NOT NULL DEFAULT 'code'"),
+    )
+
+    def _add_missing_columns(self):
+        """MUST be called with self.lock held."""
+        seen = {}
+        for table, column, decl in self.ADDED_COLUMNS:
+            if table not in seen:
+                seen[table] = {r["name"] for r in
+                               self.conn.execute("PRAGMA table_info(%s)" % table)}
+            if column in seen[table]:
+                continue
+            self.conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, decl))
+            seen[table].add(column)
 
     def log(self, msg: str):
         line = "%s sprintd %s" % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg)
@@ -881,6 +928,11 @@ class App:
             "pinned": bool(row["pinned"]),
             "dup_of": row["dup_of"],
             "long_running": bool(row["long_running"]),
+            # An assignee that emits no worker telemetry (an ordinary background
+            # agent, a human, a cron). The silence timer cannot watch it, so it
+            # doesn't -- the session owns checking on it.
+            "external_agent": bool(row["external_agent"]),
+            "work_kind": row["work_kind"] or "code",
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -1005,6 +1057,132 @@ class App:
                 raise
         self.notify()
         return self.card_json(self.card_row(num))
+
+    def create_cards_bulk(self, items, hold=None, actor: str = "user") -> dict:
+        """Import many cards in ONE transaction, held by default.
+
+        User's live incident: importing a list of issues meant N POSTs, which
+        meant a flooded board and 14 cards created against intent before there
+        was any chance to say stop -- then 14 hand-written cancels to undo it.
+
+        So a bulk import lands **held** unless the caller explicitly says
+        otherwise: the cards exist, the board shows them as a pile waiting on a
+        decision, and NOTHING is dispatched until the user releases them. Hold
+        is the preview. And it is all-or-nothing: a half-landed import is the
+        same flood-then-clean-up problem in a smaller size.
+        """
+        if not isinstance(items, list) or not items:
+            raise ApiError(400, "missing_field",
+                           "items must be a non-empty array of {text, images?}",
+                           field="items")
+        if len(items) > BULK_MAX:
+            raise ApiError(413, "too_many",
+                           "%d items is over the bulk cap of %d — split the import"
+                           % (len(items), BULK_MAX),
+                           count=len(items), max=BULK_MAX)
+
+        sprint = self.open_sprint(create=True)
+        hold_mode = bool(sprint["hold_mode"]) if sprint else False
+        # The default is the whole point: silence means hold.
+        held = hold_mode if hold is None else bool(hold)
+        state = "held" if held else "queued"
+
+        # Validate and store attachments for EVERY item before writing a single
+        # row -- an ApiError from item 9 must not leave items 1-8 on the board.
+        prepared = []
+        for i, item in enumerate(items):
+            if isinstance(item, str):
+                item = {"text": item}
+            if not isinstance(item, dict):
+                raise ApiError(400, "bad_item",
+                               "items[%d] must be an object or a string" % i,
+                               index=i)
+            text = (item.get("text") or "").strip()
+            images = item.get("images") or []
+            if not text and not images:
+                raise ApiError(400, "empty_submission",
+                               "items[%d] needs text or images" % i, index=i)
+            prepared.append((text, self.store_images(images, "items[%d].images" % i)))
+
+        nums = []
+        ts = now()
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                for text, attachments in prepared:
+                    cur = self.conn.execute(
+                        "INSERT INTO cards(sprint_id, state, title, body, created_at, updated_at) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (sprint["id"] if sprint else None, state,
+                         first_line_title(text) or "(image only)", text, ts, ts))
+                    num = int(cur.lastrowid)
+                    self._append_event(num, actor, "submitted", {
+                        "text": text or image_line(len(attachments)),
+                        "attachments": attachments,
+                        "images_only": not text,
+                        "hold": held,
+                        "bulk": len(prepared)})
+                    self._append_event(num, "server", "state", {
+                        "from": None, "to": state,
+                        "reason": ("bulk import — held until you release it"
+                                   if held else "bulk import"),
+                        "text": "new → %s" % state})
+                    nums.append(num)
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.notify()
+        return {"ok": True, "count": len(nums), "hold": held, "state": state,
+                "card_nums": nums,
+                "cards": [self.card_json(self.card_row(n), brief=True) for n in nums]}
+
+    # The verbs a pile of cards can be moved with in one call. Deliberately the
+    # flood-control set and nothing else: undo an import (cancel), let it run
+    # (release), or park it again (hold).
+    BULK_ACTIONS = ("cancel", "release", "hold")
+
+    def bulk_action(self, card_nums, action: str, body: dict,
+                    actor: str = "user") -> dict:
+        if action not in self.BULK_ACTIONS:
+            raise ApiError(400, "bad_action",
+                           "bulk action must be one of %s"
+                           % ", ".join(self.BULK_ACTIONS))
+        if not isinstance(card_nums, list) or not card_nums:
+            raise ApiError(400, "missing_field",
+                           "card_nums must be a non-empty array",
+                           field="card_nums")
+        if len(card_nums) > BULK_MAX:
+            raise ApiError(413, "too_many",
+                           "%d cards is over the bulk cap of %d"
+                           % (len(card_nums), BULK_MAX),
+                           count=len(card_nums), max=BULK_MAX)
+        nums = []
+        for n in card_nums:
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                raise ApiError(400, "bad_card_num",
+                               "card_nums must be integers, got %r" % (n,))
+            if n not in nums:
+                nums.append(n)
+        # Every card has to EXIST before anything moves; a typo in the list is a
+        # 404 for the whole call, not eleven cards canceled and one mystery.
+        for n in nums:
+            self.card_row(n)
+        # Applying is per card and NOT all-or-nothing: a card already canceled
+        # is not a reason to leave the other twelve running. Each outcome is
+        # reported by number.
+        applied, failed = [], []
+        for n in nums:
+            try:
+                self.action(n, action, body, actor=actor)
+                applied.append(n)
+            except ApiError as e:
+                failed.append({"card_num": n, "error": e.code, "message": e.message})
+        return {"ok": not failed, "action": action,
+                "applied": applied, "failed": failed,
+                "count": len(applied)}
 
     @staticmethod
     def attach_url(sha: str, ext: str) -> str:
@@ -1267,6 +1445,12 @@ class App:
         carries a card_num and the user reads it on the card), but only once the
         agent itself has actually gone quiet. A card with no agent keeps the
         plain per-card clock.
+
+        The SESSION counts too. When it posts on a card it has just looked at
+        that work -- which is precisely what `agent_silent` asks it to do -- and
+        re-ambering the card five minutes later would nag it about a check it
+        already performed. (Server events never count: the sweep's own reminders
+        must not reset the clock they are complaining about.)
         """
         row = row if row is not None else self.q1("SELECT * FROM cards WHERE num=?", (num,))
         agent = row["agent_name"] if row is not None else None
@@ -1274,11 +1458,12 @@ class App:
             hit = self.q1(
                 "SELECT e.seq AS seq, e.ts AS ts FROM events e "
                 "JOIN cards c ON c.num = e.card_num "
-                "WHERE c.agent_name=? AND e.actor='worker' "
+                "WHERE c.agent_name=? AND e.actor IN ('worker','session') "
                 "ORDER BY e.seq DESC LIMIT 1", (agent,))
         else:
             hit = self.q1(
-                "SELECT seq, ts FROM events WHERE card_num=? AND actor='worker' "
+                "SELECT seq, ts FROM events WHERE card_num=? "
+                "AND actor IN ('worker','session') "
                 "ORDER BY seq DESC LIMIT 1", (num,))
         if hit is not None:
             return hit["ts"], hit["seq"]
@@ -1298,7 +1483,8 @@ class App:
 
     def card_is_silent(self, num: int, row=None) -> bool:
         row = row or self.q1("SELECT * FROM cards WHERE num=?", (num,))
-        if row is None or row["state"] != "in_progress" or row["long_running"]:
+        if row is None or row["state"] != "in_progress" or row["long_running"] \
+                or row["external_agent"]:
             return False
         ts, _seq = self.card_baseline(num)
         if (now() - ts) < self.silence_seconds:
@@ -1313,7 +1499,11 @@ class App:
                 self.log("silence sweep failed: %s" % traceback.format_exc())
 
     def sweep_silence(self) -> int:
-        rows = self.q("SELECT num FROM cards WHERE state='in_progress' AND long_running=0")
+        # `external_agent` is a permanent version of `long_running`: an assignee
+        # that emits no worker telemetry can never satisfy this clock, so the
+        # clock does not run. The session owns checking on it instead.
+        rows = self.q("SELECT num FROM cards WHERE state='in_progress' "
+                      "AND long_running=0 AND external_agent=0")
         fired = 0
         for row in rows:
             num = row["num"]
@@ -1580,6 +1770,33 @@ class App:
         return [r["num"] for r in
                 self.q("SELECT num FROM cards WHERE batch_id=? ORDER BY num", (batch_id,))]
 
+    @staticmethod
+    def packet_work_kind(card_row, packet) -> str:
+        """`ops` or `code` — the packet's own word wins, else the card's."""
+        claimed = packet.get("work_kind") if isinstance(packet, dict) else None
+        if isinstance(claimed, str) and claimed.strip().lower() in WORK_KINDS:
+            return claimed.strip().lower()
+        on_card = None
+        try:
+            on_card = card_row["work_kind"] if card_row is not None else None
+        except (IndexError, KeyError):
+            on_card = None
+        return on_card if on_card in WORK_KINDS else "code"
+
+    @staticmethod
+    def readback_text(packet) -> str:
+        """The observed evidence, as one blob. A list is joined; anything else
+        is not a readback."""
+        val = packet.get("readback") if isinstance(packet, dict) else None
+        if isinstance(val, str):
+            return val.strip()
+        if isinstance(val, list):
+            lines = [s for s in val if isinstance(s, str)]
+            if len(lines) != len(val):
+                return ""
+            return "\n".join(lines).strip()
+        return ""
+
     def validate_packet(self, card_row, packet) -> list:
         missing = []
         if not isinstance(packet, dict):
@@ -1589,9 +1806,21 @@ class App:
             val = packet.get(key)
             return not (isinstance(val, str) and val.strip())
 
-        for field in ("claim", "diffstat", "branch", "test_cmd", "test_result"):
-            if blank(field):
-                missing.append(field)
+        # Non-code work proves itself differently. A mailbox reprocess has no
+        # diff, no branch, no preview and often no test suite -- demanding them
+        # made ops cards liars or second-class. What it DOES have is a readback:
+        # the log excerpt or command output showing the thing actually
+        # happened. So `ops` swaps the required set rather than relaxing it.
+        kind = self.packet_work_kind(card_row, packet)
+        if kind == "ops":
+            if blank("claim"):
+                missing.append("claim")
+            if not self.readback_text(packet):
+                missing.append("readback")
+        else:
+            for field in ("claim", "diffstat", "branch", "test_cmd", "test_result"):
+                if blank(field):
+                    missing.append(field)
 
         tr = packet.get("test_result")
         if isinstance(tr, str) and tr.strip() and "test_result" not in missing:
@@ -1612,12 +1841,16 @@ class App:
             missing.append("validate")
 
         ui = packet.get("ui_change")
+        # An ops card has no UI to have changed, so it need not answer the
+        # question -- but if it volunteers `ui_change: true` it owes the same
+        # screenshots anyone else would.
         if not isinstance(ui, bool):
-            missing.append("ui_change")
+            if kind != "ops":
+                missing.append("ui_change")
         elif ui and not (packet.get("screenshots") or []):
             missing.append("screenshots")
 
-        if not isinstance(ui, bool):
+        if not isinstance(ui, bool) and kind != "ops":
             diff = packet.get("diffstat")
             if isinstance(diff, str) and FRONTEND_HINT_RE.search(diff) and \
                     not (packet.get("screenshots") or []):
@@ -1679,6 +1912,19 @@ class App:
         # Screenshots arrive as absolute worktree paths; store them so the board
         # can actually show them (the whole point of the gate).
         packet = self.ingest_packet(packet)
+        # A packet that declared itself ops says so about the CARD, not just
+        # about this one submission -- a bounce and a second packet must be
+        # judged by the same rules as the first.
+        kind = self.packet_work_kind(row, packet)
+        packet["work_kind"] = kind
+        readback = self.readback_text(packet)
+        if readback:
+            packet["readback"] = readback
+        if kind != (row["work_kind"] or "code"):
+            with self.lock:
+                self.conn.execute("UPDATE cards SET work_kind=?, updated_at=? WHERE num=?",
+                                  (kind, now(), num))
+            row = self.card_row(num)
 
         members = self.batch_members(row["batch_id"]) or [num]
         if num not in members:
@@ -2102,20 +2348,39 @@ class App:
         return title
 
     def assign(self, num: int, agent_name, worktree, branch,
-               title=None, actor: str = "session") -> dict:
+               title=None, actor: str = "session", work_kind=None,
+               external_agent=None) -> dict:
         self.card_row(num)
         title = clean_title(title) if title is not None else None
+        # Ops work has no worktree and no branch to give -- assigning it means
+        # naming who is doing it and saying what shape of evidence to expect.
+        if work_kind is not None:
+            if not (isinstance(work_kind, str)
+                    and work_kind.strip().lower() in WORK_KINDS):
+                raise ApiError(400, "bad_work_kind",
+                               "work_kind must be one of %s" % ", ".join(WORK_KINDS),
+                               field="work_kind")
+            work_kind = work_kind.strip().lower()
+        if external_agent is not None and not isinstance(external_agent, bool):
+            raise ApiError(400, "bad_external_agent",
+                           "external_agent must be true or false",
+                           field="external_agent")
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 self.conn.execute(
                     "UPDATE cards SET agent_name=COALESCE(?,agent_name), "
                     "worktree=COALESCE(?,worktree), branch=COALESCE(?,branch), "
+                    "work_kind=COALESCE(?,work_kind), "
+                    "external_agent=COALESCE(?,external_agent), "
                     "updated_at=? WHERE num=?",
-                    (agent_name, worktree, branch, now(), num))
+                    (agent_name, worktree, branch, work_kind,
+                     None if external_agent is None else (1 if external_agent else 0),
+                     now(), num))
                 self._append_event(num, actor, "note", {
                     "text": "assigned to %s" % (agent_name or "(unchanged)"),
-                    "agent_name": agent_name, "worktree": worktree, "branch": branch})
+                    "agent_name": agent_name, "worktree": worktree, "branch": branch,
+                    "work_kind": work_kind, "external_agent": external_agent})
                 if title is not None:
                     self._write_title(num, title, actor)
                 # Handing a card to an agent IS the start of work, so a queued
@@ -2135,9 +2400,54 @@ class App:
         self.notify()
         return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
 
-    def action(self, num: int, action: str, body: dict, actor: str = "user") -> dict:
+    def action(self, num: int, action: str, body: dict, actor: str = "user",
+               from_browser: bool = False) -> dict:
         row = self.card_row(num)
-        if action in ("pin", "unpin"):
+        if action in ("long_running", "external_agent"):
+            # Both of these turn the silence timer OFF for a card, so they are
+            # the session's to set, not a click in a browser: the user has no
+            # way to know whether an agent is legitimately quiet. `long_running`
+            # was worker-only, which is exactly the gap the user hit -- external
+            # agents emit no worker telemetry, so nobody could set it at all.
+            if from_browser:
+                raise ApiError(403, "session_only",
+                               "%s is set by the session over the API, not from "
+                               "the board" % action)
+            value = body.get("value")
+            if value is None:
+                value = True
+            if not isinstance(value, bool):
+                raise ApiError(400, "bad_value",
+                               "%s takes value: true or false" % action,
+                               field="value")
+            note = body.get("note")
+            if note is not None and not isinstance(note, str):
+                raise ApiError(400, "bad_note", "note must be a string", field="note")
+            note = (note or "").strip()
+            if action == "long_running":
+                text = ("long-running: %s" % note) if note else \
+                    "marked long-running — the silence timer is off for this stretch"
+            else:
+                text = ("external agent: %s" % note) if note else \
+                    ("marked as an external agent — it emits no worker telemetry, "
+                     "so the session owns checking on it")
+            if not value:
+                text = "%s cleared" % action.replace("_", " ")
+            with self.lock:
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self.conn.execute(
+                        "UPDATE cards SET %s=?, updated_at=? WHERE num=?" % action,
+                        (1 if value else 0, now(), num))
+                    self._append_event(num, actor, "note", {
+                        "text": text, action: bool(value),
+                        "note": note or None})
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+            self.notify()
+        elif action in ("pin", "unpin"):
             value = body.get("value")
             if not isinstance(value, bool):
                 value = body.get("pinned")
@@ -2196,7 +2506,7 @@ class App:
                     # Drop the dead agent so nobody SendMessages a pruned worktree.
                     self.conn.execute(
                         "UPDATE cards SET agent_name=NULL, worktree=NULL, long_running=0, "
-                        "updated_at=? WHERE num=?", (now(), num))
+                        "external_agent=0, updated_at=? WHERE num=?", (now(), num))
                     self.conn.execute("COMMIT")
                 except Exception:
                     self.conn.execute("ROLLBACK")
@@ -2217,7 +2527,8 @@ class App:
         else:
             raise ApiError(400, "bad_action",
                            "action must be pin, unpin, cancel, hold, release, "
-                           "duplicate_of, retry or reopen")
+                           "duplicate_of, retry, reopen, long_running or "
+                           "external_agent")
         return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
 
     def set_cursor(self, name: str, seq: int) -> dict:
@@ -2555,6 +2866,42 @@ def make_handler(app: App):
                  "the old link stops working on purpose &mdash; use the new one."],
                 title="sprint — sign in"), "text/html; charset=utf-8")
 
+        def from_browser(self) -> bool:
+            """Did a BROWSER send this, rather than a script holding the token?
+
+            Answered off headers page JavaScript is forbidden to set or remove
+            on `fetch` -- Cookie, Origin, Sec-Fetch-*. The board's own SPA
+            carries them on every call it makes and cannot strip them, so this
+            is an enforcement seam and not a guess. (The Authorization header
+            alone cannot answer it: the SPA reads `?t=` and sends a bearer token
+            exactly like a worker does.)
+            """
+            for name in BROWSER_HEADERS:
+                if (self.headers.get(name) or "").strip():
+                    return True
+            return False
+
+        def actor_or(self, body, default: str) -> str:
+            """Who this request is allowed to SAY it is.
+
+            The user's report: cards created by the session over the API showed
+            their `submitted` events as the user's -- so `reply_to` said "a
+            human is waiting" about the session's own writing. An actor claim is
+            therefore honoured only when it is explicit, in the client-settable
+            set, and coming from something that is not a browser.
+
+            Fails CLOSED in both directions: no claim means the route's own
+            default (never an upgrade), and a browser's claim is dropped
+            silently in favour of `user` -- the person at the keyboard is the
+            user whatever their tab puts in the body.
+            """
+            claimed = body.get("actor") if isinstance(body, dict) else None
+            if not isinstance(claimed, str) or claimed not in CLIENT_ACTORS:
+                return default
+            if self.from_browser():
+                return "user"
+            return claimed
+
         def is_waiter(self, query) -> bool:
             """Is this authenticated request the session's own waiter/drain?
 
@@ -2829,18 +3176,33 @@ def make_handler(app: App):
 
         def _dispatch_post(self, path, query):
             body = self.json_body()
-            actor_hint = body.get("actor")
 
             if path == "/api/cards":
                 card = app.create_card(body.get("text"), body.get("images") or [],
                                        bool(body.get("hold")),
-                                       actor=actor_hint if actor_hint in ACTORS else "user")
+                                       actor=self.actor_or(body, "user"))
                 return 201, card
 
+            if path == "/api/cards/bulk":
+                # `hold` defaults to TRUE here and only here: an import that
+                # dispatches before the user has looked at it is the bug.
+                hold = body.get("hold")
+                return 201, app.create_cards_bulk(
+                    body.get("items"),
+                    hold=True if hold is None else bool(hold),
+                    actor=self.actor_or(body, "user"))
+
+            if path == "/api/cards/bulk-action":
+                return 200, app.bulk_action(body.get("card_nums"),
+                                            body.get("action"), body,
+                                            actor=self.actor_or(body, "user"))
+
             if path == "/api/sidebar":
+                # The sidebar is the user and the session talking; a worker has
+                # no voice here (that is what card telemetry is for).
+                side = self.actor_or(body, "user")
                 return 201, app.sidebar_post(body.get("text"),
-                                             actor_hint if actor_hint in ("user", "session")
-                                             else "user",
+                                             side if side == "session" else "user",
                                              detail=body.get("detail"),
                                              images=body.get("images"))
 
@@ -2871,7 +3233,7 @@ def make_handler(app: App):
                 return 201, app.card_chat(num, body.get("text"),
                                           images=body.get("images"),
                                           detail=body.get("detail"),
-                                          actor=actor_hint if actor_hint in ACTORS else "user")
+                                          actor=self.actor_or(body, "user"))
             if verb == "answer":
                 qid = body.get("question_id")
                 if qid is None:
@@ -2887,14 +3249,15 @@ def make_handler(app: App):
                     raise ApiError(400, "missing_field",
                                    "question_id must be an integer", field="question_id")
                 return 200, app.answer(num, qid, body.get("text"),
-                                       actor=actor_hint if actor_hint in ACTORS else "user")
+                                       actor=self.actor_or(body, "user"))
             if verb == "action":
                 return 200, app.action(num, body.get("action"), body,
-                                       actor=actor_hint if actor_hint in ACTORS else "user")
+                                       actor=self.actor_or(body, "user"),
+                                       from_browser=self.from_browser())
             if verb == "verdict":
                 return 200, app.verdict(num, body.get("verdict"), body.get("notes") or "",
                                         body.get("scope") or "card",
-                                        actor=actor_hint if actor_hint in ACTORS else "user")
+                                        actor=self.actor_or(body, "user"))
             if verb == "events":
                 kind = body.get("kind")
                 payload = body.get("payload")
@@ -2902,18 +3265,18 @@ def make_handler(app: App):
                     payload = {k: v for k, v in body.items()
                                if k not in ("kind", "actor")}
                 return 201, app.card_event(num, kind, payload,
-                                           actor=actor_hint if actor_hint in ACTORS else "worker",
+                                           actor=self.actor_or(body, "worker"),
                                            long_running=body.get("long_running"))
             if verb == "question":
                 return 201, app.ask(num, body.get("text"), body.get("options"),
-                                    actor=actor_hint if actor_hint in ACTORS else "worker")
+                                    actor=self.actor_or(body, "worker"))
             if verb == "ready":
                 packet = body.get("packet", body)
                 return 200, app.card_ready(num, packet,
-                                           actor=actor_hint if actor_hint in ACTORS else "worker")
+                                           actor=self.actor_or(body, "worker"))
             if verb == "state":
                 state = body.get("state")
-                actor = actor_hint if actor_hint in ACTORS else "worker"
+                actor = self.actor_or(body, "worker")
                 if state == "ready":
                     raise ApiError(422, "evidence_required",
                                    "ready is only reachable via POST /api/cards/%d/ready"
@@ -2949,10 +3312,13 @@ def make_handler(app: App):
                 return 200, app.integrated(
                     num, body.get("ok"), body.get("reason") or "",
                     body.get("card_nums"),
-                    actor=actor_hint if actor_hint in ACTORS else "session")
+                    actor=self.actor_or(body, "session"))
             if verb == "assign":
+                # worktree/branch are optional on purpose: ops work has neither.
                 return 200, app.assign(num, body.get("agent_name"), body.get("worktree"),
-                                       body.get("branch"), title=body.get("title"))
+                                       body.get("branch"), title=body.get("title"),
+                                       work_kind=body.get("work_kind"),
+                                       external_agent=body.get("external_agent"))
             raise ApiError(404, "no_such_route", "no route for %s" % path)
 
     return Handler
@@ -3702,6 +4068,11 @@ def cmd_tail(args) -> int:
     p = paths_for(project_root, args.data_dir)
     after = max(0, int(args.after or 0))
     user_only = bool(args.user_only)
+    # The session's own posts come back down its own ingress and wake it for
+    # nothing -- it is being told what it just said. Dropped by DEFAULT for the
+    # same reason heartbeats and cursor frames are: a wakeup should mean
+    # somebody else moved. `--include-self` is the way back to the raw log.
+    include_self = bool(getattr(args, "include_self", False))
     unreachable_after = float(args.unreachable_after)
     read_timeout = float(args.read_timeout)
 
@@ -3766,6 +4137,8 @@ def cmd_tail(args) -> int:
                 after = seq
                 if user_only and obj.get("actor") != "user":
                     continue
+                if not include_self and obj.get("actor") == "session":
+                    continue          # the session's own echo; it already knows
                 emit(tail_line(obj))
         except (OSError, http.client.HTTPException, ValueError):
             pass
@@ -4838,6 +5211,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--user-only", action="store_true",
                    help="print only actor=user events -- the ones a session must "
                         "answer promptly")
+    s.add_argument("--include-self", action="store_true",
+                   help="also print actor=session events; by default the "
+                        "session's own posts are suppressed so its standing "
+                        "tail never wakes it on its own writing")
     s.add_argument("--port", type=int, default=None)
     s.add_argument("--token", default=None)
     s.add_argument("--read-timeout", type=float, default=TAIL_READ_TIMEOUT,
