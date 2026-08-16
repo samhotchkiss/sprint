@@ -4386,5 +4386,406 @@ class TestSprintPostPhaseHelper(Base):
         self.assertIn("5m", out)
 
 
+# --------------------------------------------------------------------------
+# Killed-agent detection (#42)
+#
+# The incident: three workers were killed mid-flight by a provider usage limit
+# and their cards sat in In motion for hours. `agent_silent` had already said
+# "quiet" and had nothing further to say. These tests are about the ending.
+# --------------------------------------------------------------------------
+
+
+class WorkerGoneBase(Base):
+    """Thresholds in seconds so a twenty-minute rule is actually testable, and
+    the sweep driven by hand so nothing here depends on a timer racing."""
+
+    GONE = 1.0
+    DEAD = 2.0
+    LONGRUN_FACTOR = 6.0
+
+    def setUp(self):
+        super().setUp()
+        self.app.worker_gone_seconds = self.GONE
+        self.app.worker_dead_seconds = self.DEAD
+        self.app.worker_longrun_factor = self.LONGRUN_FACTOR
+
+    # -- fixtures ---------------------------------------------------------
+
+    def working_card(self, text="an agent is on this", agent=None, state="in_progress"):
+        """A card with an agent, a worktree and a branch, mid-flight."""
+        num = self.new_card(text)["num"]
+        agent = agent or "sprint-card-%d" % num
+        status, _ = self.post("/api/cards/%d/assign" % num,
+                              {"agent_name": agent,
+                               "worktree": "/tmp/wt/%s" % agent,
+                               "branch": "sprint/card-%d" % num})
+        self.assertEqual(status, 200)
+        if state == "in_progress":
+            status, _ = self.post("/api/cards/%d/state" % num, {"state": "in_progress"})
+            self.assertEqual(status, 200)
+        return num
+
+    def say_something(self, num, text="still here"):
+        status, _ = self.post("/api/cards/%d/events" % num,
+                              {"kind": "progress", "payload": {"text": text}})
+        self.assertEqual(status, 201)
+
+    def go_quiet(self, num, seconds):
+        """Backdate every event on this card so its agent has been quiet that
+        long. Cheaper and far more deterministic than sleeping."""
+        with self.app.lock:
+            self.app.conn.execute(
+                "UPDATE events SET ts=ts-? WHERE card_num=?", (seconds, num))
+            self.app.conn.execute(
+                "UPDATE cards SET updated_at=updated_at-? WHERE num=?", (seconds, num))
+
+    def stuck_events(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return [e for e in detail["timeline"] if e["kind"] == "stuck"]
+
+    def gone_notices(self, num):
+        return [e for e in self.stuck_events(num)
+                if e["payload"].get("rule") == "worker_gone"]
+
+    def card(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return detail["card"]
+
+
+class TestWorkerGoneTiming(WorkerGoneBase):
+    def test_the_notice_lands_at_the_first_interval_and_failed_at_the_second(self):
+        num = self.working_card()
+        self.say_something(num, "reading the card")
+
+        # Inside the first interval: nothing at all. A quiet agent is a working
+        # agent until proven otherwise.
+        self.go_quiet(num, 0.5)
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.gone_notices(num), [])
+        self.assertEqual(self.state_of(num), "in_progress")
+
+        # Past the first interval: the board says out loud that the worker may
+        # be dead, and names it. The card does NOT move yet.
+        self.go_quiet(num, 1.0)          # 1.5s quiet, threshold 1.0
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        notices = self.gone_notices(num)
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]["actor"], "server")
+        self.assertEqual(notices[0]["payload"]["stage"], "notice")
+        self.assertEqual(notices[0]["payload"]["agent_name"], "sprint-card-%d" % num)
+        self.assertIn("sprint-card-%d" % num, notices[0]["payload"]["text"])
+        self.assertEqual(self.state_of(num), "in_progress",
+                         "the first interval is a warning, not a verdict")
+
+        # Past the second: it stops guessing.
+        self.go_quiet(num, 1.0)          # 2.5s quiet, threshold 2.0
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        card = self.card(num)
+        self.assertEqual(card["state"], "failed")
+        self.assertRegex(card["reason"], r"^worker gone: no events for ")
+        self.assertRegex(card["error"], r"^worker gone: no events for ")
+
+    def test_a_worker_that_comes_back_resets_the_clock(self):
+        num = self.working_card()
+        self.go_quiet(num, 5.0)
+        self.say_something(num, "sorry — long build")
+        self.assertEqual(self.app.sweep_worker_gone(), 0,
+                         "a live worker is never declared dead")
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_one_agents_activity_covers_every_card_it_holds(self):
+        """The clock is the AGENT's. While it is posting on card A it is
+        demonstrably not dead on card B."""
+        a = self.working_card("card A", agent="sprint-batch-9")
+        b = self.working_card("card B", agent="sprint-batch-9")
+        self.go_quiet(a, 5.0)
+        self.go_quiet(b, 5.0)
+        self.say_something(a, "working through the batch")
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(b), "in_progress")
+
+    def test_the_notice_fires_once_per_episode(self):
+        num = self.working_card()
+        self.go_quiet(num, 1.5)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        self.assertEqual(self.app.sweep_worker_gone(), 0, "no second notice")
+        self.assertEqual(len(self.gone_notices(num)), 1)
+
+    def test_an_agent_that_never_said_a_word_still_gets_caught(self):
+        """Killed at dispatch: assigned, never posted. The clock falls back to
+        the card's last transition, which is exactly the incident shape."""
+        num = self.working_card("never spoke")
+        self.go_quiet(num, 2.5)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        self.assertEqual(self.state_of(num), "failed")
+
+    def test_a_triaging_card_counts_too(self):
+        num = self.working_card("died while triaging", state="triaging")
+        self.assertEqual(self.state_of(num), "triaging")
+        self.go_quiet(num, 2.5)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        self.assertEqual(self.state_of(num), "failed")
+
+
+class TestWorkerGoneGuards(WorkerGoneBase):
+    """Declaring a working agent dead is worse than waiting, so every one of
+    these is a bias toward leaving the card alone."""
+
+    def test_a_card_with_no_agent_is_never_declared_dead(self):
+        num = self.new_card("nobody on it")["num"]
+        self.post("/api/cards/%d/state" % num, {"state": "triaging"})
+        self.post("/api/cards/%d/state" % num, {"state": "in_progress"})
+        self.go_quiet(num, 60.0)
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "in_progress")
+        self.assertEqual(self.gone_notices(num), [])
+
+    def test_an_external_agent_card_is_never_declared_dead(self):
+        """Somebody else's process on somebody else's clock. The column may not
+        exist in this database at all — absence must degrade, not crash."""
+        num = self.working_card("run by something else")
+        self.assertEqual(self.app.worker_gone_exempt(
+            self.app.card_row(num)), None, "no such column yet: not exempt")
+        with self.app.lock:
+            self.app.conn.execute("ALTER TABLE cards ADD COLUMN external_agent INTEGER")
+            self.app.conn.execute("UPDATE cards SET external_agent=1 WHERE num=?", (num,))
+            self.app._columns = {}
+        self.go_quiet(num, 60.0)
+        self.assertEqual(self.app.worker_gone_exempt(self.app.card_row(num)),
+                         "external_agent")
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_a_long_running_card_is_safe_inside_its_window_and_not_outside_it(self):
+        num = self.working_card("full suite, ~30 min")
+        status, body = self.post("/api/cards/%d/events" % num,
+                                 {"kind": "note", "long_running": True,
+                                  "payload": {"text": "running the full suite"}})
+        self.assertEqual(status, 201, body)
+        self.assertTrue(body["card"]["long_running"])
+
+        # Well past the ordinary window, comfortably inside the stretched one.
+        self.go_quiet(num, 5.0)          # ordinary fail is 2.0s; stretched is 12.0s
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "in_progress")
+
+        # ...but the window ENDS. A flag is not a permanent exemption; an agent
+        # killed mid-suite is the exact shape this rule exists for.
+        self.go_quiet(num, 10.0)         # 15s quiet vs a 12s stretched threshold
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        self.assertEqual(self.state_of(num), "failed")
+
+    def test_a_live_phase_claim_holds_the_rule_off(self):
+        num = self.working_card("declared a long phase")
+        status, _ = self.post("/api/cards/%d/events" % num,
+                              {"kind": "progress",
+                               "payload": {"text": "phase: testing", "phase": "testing",
+                                           "expected_seconds": 600}})
+        self.assertEqual(status, 201)
+        self.go_quiet(num, 5.0)
+        self.assertEqual(self.app.worker_gone_exempt(self.app.card_row(num)), "phase")
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        # ...and once the claim runs out, the rule applies as usual.
+        self.go_quiet(num, 700.0)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        self.assertEqual(self.state_of(num), "failed")
+
+    def test_a_needs_you_card_with_an_open_question_is_not_a_dead_worker(self):
+        """A worker parked on a question is SUPPOSED to be silent — it ended its
+        turn and the user has the ball. The needs_you sweep rule already nags
+        the right person about that."""
+        num = self.working_card("asked something")
+        status, _ = self.post("/api/cards/%d/question" % num,
+                              {"text": "which of these did you mean?"})
+        self.assertEqual(status, 201)
+        self.assertEqual(self.state_of(num), "needs_you")
+        self.go_quiet(num, 60.0)
+        self.assertEqual(self.app.worker_gone_exempt(self.app.card_row(num)),
+                         "open_question")
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "needs_you")
+
+    def test_a_ready_card_is_not_the_workers_problem(self):
+        num = self.working_card("finished and waiting on a verdict")
+        status, body = self.post("/api/cards/%d/ready" % num,
+                                 {"packet": dict(GOOD_PACKET,
+                                                 branch="sprint/card-%d" % num)})
+        self.assertEqual(status, 200, body)
+        self.go_quiet(num, 60.0)
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "ready",
+                         "a ready card is waiting on the USER, not on its agent")
+
+
+class TestWorkerGoneFailedPreservesEverything(WorkerGoneBase):
+    def failed_card_with_history(self):
+        num = self.working_card("has a real history")
+        self.say_something(num, "read the CSS, found the misaligned flex item")
+        status, body = self.post("/api/cards/%d/ready" % num,
+                                 {"packet": dict(GOOD_PACKET,
+                                                 branch="sprint/card-%d" % num)})
+        self.assertEqual(status, 200, body)
+        status, _ = self.post("/api/cards/%d/verdict" % num,
+                              {"verdict": "bounce", "notes": "still overlaps at 980px"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "in_progress")
+        self.go_quiet(num, 30.0)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        return num
+
+    def test_failed_keeps_the_timeline_evidence_branch_and_worktree(self):
+        num = self.failed_card_with_history()
+        _, detail = self.get("/api/cards/%d" % num)
+        card = detail["card"]
+        self.assertEqual(card["state"], "failed")
+        self.assertEqual(card["branch"], "sprint/card-%d" % num)
+        self.assertEqual(card["worktree"], "/tmp/wt/sprint-card-%d" % num)
+        self.assertEqual(card["agent_name"], "sprint-card-%d" % num)
+        self.assertEqual(card["evidence"]["packet"]["claim"], GOOD_PACKET["claim"],
+                         "the evidence a Retry needs as its brief is still there")
+        texts = [str((e.get("payload") or {}).get("text", "")) for e in detail["timeline"]]
+        self.assertTrue(any("misaligned flex item" in t for t in texts),
+                        "the whole timeline survives — it IS the retry brief")
+        self.assertTrue(any(e["kind"] == "evidence" for e in detail["timeline"]))
+        self.assertTrue(any(e["kind"] == "verdict" for e in detail["timeline"]))
+
+    def test_retry_from_a_worker_gone_failure_requeues_with_the_timeline_intact(self):
+        num = self.failed_card_with_history()
+        before = len(self.get("/api/cards/%d" % num)[1]["timeline"])
+        status, body = self.post("/api/cards/%d/action" % num, {"action": "retry"})
+        self.assertEqual(status, 200, body)
+        _, detail = self.get("/api/cards/%d" % num)
+        card = detail["card"]
+        self.assertEqual(card["state"], "queued")
+        self.assertIsNone(card["agent_name"], "nobody SendMessages a dead agent")
+        self.assertIsNone(card["worktree"])
+        self.assertEqual(card["branch"], "sprint/card-%d" % num,
+                         "the branch is where the dead agent's commits are")
+        self.assertEqual(card["evidence"]["packet"]["claim"], GOOD_PACKET["claim"])
+        self.assertGreater(len(detail["timeline"]), before)
+        retry = [e for e in detail["timeline"] if (e["payload"] or {}).get("retry")]
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(retry[0]["payload"]["previous_agent"], "sprint-card-%d" % num)
+
+    def test_the_failed_card_shows_the_machine_reason_and_a_retry(self):
+        """What the user actually sees: the face carries the reason, and the
+        card is in the one state whose menu offers Retry."""
+        num = self.failed_card_with_history()
+        _, board = self.get("/api/board")
+        card = {c["num"]: c for c in board["cards"]}[num]
+        self.assertEqual(card["state"], "failed")
+        self.assertIn("worker gone", card["error"])
+        self.assertIn("no events for", card["error"])
+
+
+class TestWorkerGoneIsWired(WorkerGoneBase):
+    """The rule is only worth anything if the timer thread actually runs it."""
+
+    START_BACKGROUND = True
+
+    def setUp(self):
+        super().setUp()
+
+    def test_the_background_sweep_escalates_without_anyone_calling_it(self):
+        # the sweep thread is already running with the real (long) thresholds
+        # baked in at construction; re-point them and let the tick do the work
+        self.app.sweep_tick = 0.2
+        num = self.working_card("nobody is going to call the sweep by hand")
+        self.go_quiet(num, 30.0)
+        deadline = time.time() + 20
+        while time.time() < deadline and self.state_of(num) != "failed":
+            time.sleep(0.2)
+        self.assertEqual(self.state_of(num), "failed",
+                         "the sweep loop must run this rule, not just define it")
+
+    def test_the_board_ambers_a_card_whose_worker_may_be_gone(self):
+        num = self.working_card("about to go quiet")
+        self.go_quiet(num, 1.5)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        _, board = self.get("/api/board")
+        self.assertTrue({c["num"]: c for c in board["cards"]}[num]["stuck"],
+                        "the age text is the one thing on a face already about "
+                        "time passing — that is where the amber goes")
+
+
+# --------------------------------------------------------------------------
+# Model at dispatch (#41)
+# --------------------------------------------------------------------------
+
+
+class TestDispatchModel(Base):
+    def assign(self, num, **extra):
+        body = {"agent_name": "sprint-card-%d" % num, "worktree": "/tmp/wt",
+                "branch": "sprint/card-%d" % num}
+        body.update(extra)
+        status, out = self.post("/api/cards/%d/assign" % num, body)
+        self.assertEqual(status, 200, out)
+        return out
+
+    def test_assign_records_the_model_and_the_board_says_what_the_default_is(self):
+        num = self.new_card("dispatched after a fallback")["num"]
+        self.assign(num, model="opus")
+        card = self.get("/api/cards/%d" % num)[1]["card"]
+        self.assertEqual(card["model"], "opus")
+        self.assertEqual(card["default_model"], sprintd.DEFAULT_MODEL)
+        _, board = self.get("/api/board")
+        self.assertEqual(board["default_model"], sprintd.DEFAULT_MODEL)
+        self.assertEqual({c["num"]: c for c in board["cards"]}[num]["model"], "opus")
+
+    def test_a_card_dispatched_on_the_default_carries_nothing_to_shout_about(self):
+        num = self.new_card("ordinary dispatch")["num"]
+        self.assign(num, model=sprintd.DEFAULT_MODEL)
+        card = self.get("/api/cards/%d" % num)[1]["card"]
+        self.assertEqual(card["model"], card["default_model"],
+                         "the face shows the model only when it is the exception")
+
+    def test_assign_without_a_model_leaves_it_unset_and_never_clears_it(self):
+        num = self.new_card("model set once, then a plain re-assign")["num"]
+        self.assign(num)
+        self.assertIsNone(self.get("/api/cards/%d" % num)[1]["card"]["model"])
+        self.assign(num, model="sonnet")
+        self.assign(num, agent_name="sprint-card-%d" % num)
+        self.assertEqual(self.get("/api/cards/%d" % num)[1]["card"]["model"], "sonnet")
+
+    def test_the_fallback_is_readable_in_the_timeline(self):
+        num = self.new_card("fable ran out")["num"]
+        self.assign(num, model="opus")
+        _, detail = self.get("/api/cards/%d" % num)
+        notes = [e for e in detail["timeline"]
+                 if e["kind"] == "note" and (e["payload"] or {}).get("model")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("on opus", notes[0]["payload"]["text"])
+
+    def test_a_junk_model_is_a_named_400(self):
+        num = self.new_card("junk")["num"]
+        status, body = self.post("/api/cards/%d/assign" % num,
+                                 {"agent_name": "a", "worktree": "/tmp", "branch": "b",
+                                  "model": 7})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "model")
+
+    def test_a_board_that_predates_the_column_gets_it_on_open(self):
+        """CREATE TABLE IF NOT EXISTS never migrates a live database. A board
+        that has been up since before this shipped must not 500 on every read."""
+        old = os.path.join(self.tmp, "old-project")
+        os.makedirs(os.path.join(old, ".sprint"))
+        db = os.path.join(old, ".sprint", "sprint.db")
+        import sqlite3 as _sq
+        conn = _sq.connect(db)
+        conn.executescript(sprintd.SCHEMA)
+        conn.execute("INSERT INTO sprints(opened_at) VALUES(1.0)")
+        conn.execute("INSERT INTO cards(sprint_id, state, title, body, created_at, "
+                     "updated_at) VALUES(1,'queued','old card','body',1.0,1.0)")
+        conn.commit()
+        conn.close()
+        before = {r[1] for r in _sq.connect(db).execute("PRAGMA table_info(cards)")}
+        self.assertNotIn("model", before)
+
+        app = sprintd.App(old, token="t", log=self.logfh)
+        self.addCleanup(app.close)
+        self.assertIn("model", app.columns("cards"))
+        self.assertIsNone(app.card_json(app.card_row(1), brief=True)["model"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
