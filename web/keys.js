@@ -22,7 +22,7 @@
 //    List (which has no columns) the same number walks the same cards where they
 //    sit, in reading order. So the shortcut map does not change under you when
 //    you flip the layout toggle.
-import { store, cardState, BOARD_COLUMNS } from './state.js';
+import { store, cardState, isConversation, BOARD_COLUMNS } from './state.js';
 import { siblingMenuOpen, openSiblingMenu, closeSiblingMenu, siblingCount, gotoSibling } from './siblings.js';
 
 /**
@@ -46,6 +46,24 @@ for (const c of BOARD_COLUMNS) COLUMN_LABEL[c.key] = c.board;
 const COL_OF_STATE = {};
 for (const c of BOARD_COLUMNS) {
   for (const s of c.sections) for (const st of s.states) COL_OF_STATE[st] = c.key;
+}
+
+/**
+ * Which column a card is DRAWN in — which is the question the cursor is asking,
+ * and it is not always the same as which bucket its state falls in.
+ *
+ * A conversation (card #48) is the one card that is rendered somewhere its
+ * state does not appear: `boardColumns()` deliberately keeps live threads out
+ * of every bucket and the Needs-you column draws them as its own lower section
+ * instead. So `COL_OF_STATE` has no entry for `conversation`, the fallback
+ * filed every thread under Waiting, and the cursor could only reach a thread by
+ * arrowing down a column it is not in — and then jumped across the board to get
+ * to it. Ask the renderer's question, not the bucket's.
+ */
+function columnDrawnIn(card) {
+  if (!card) return 'waiting';
+  if (isConversation(card)) return 'needs_you';
+  return COL_OF_STATE[cardState(card)] || 'waiting';
 }
 
 // Where the cursor is. `col` is one of COLUMN_KEYS, `num` the card it is on.
@@ -117,7 +135,7 @@ function navNodes(col) {
     const num = Number(node.dataset.num);
     if (!Number.isFinite(num) || seen.has(num)) continue;
     const card = store.cards.get(num);
-    const key = card ? (COL_OF_STATE[cardState(card)] || 'waiting') : 'waiting';
+    const key = columnDrawnIn(card);
     if (col && key !== col) continue;
     seen.add(num);
     out.push({ node, num, col: key });
