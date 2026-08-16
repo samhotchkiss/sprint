@@ -196,6 +196,57 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 - Either way the **cursor drain is the truth**: a wakeup is transport, and every wakeup re-drains
   `GET /api/events?after=<cursor>` at-least-once, deduped by seq.
 
+## Reports — documents as first-class attachments (SHIPPED)
+
+User verbatim: **"Some way built into sprint to embed reports."** His chosen shape, verbatim:
+**"Yes, 1& 2, but not a rail.  A link in the header"**, refined to **"link should only appear once
+there's a report within the sprint"**. An agent's real output is often a DOCUMENT — a findings
+write-up, a comparison table, an audit — and flattening one into a one-liner destroys the document,
+while pasting it into `--detail` destroys the timeline.
+
+- **A report IS an attachment.** Markdown (`.md`) and standalone `.html` ride the same
+  content-addressed store a PNG does (`<sha256>.md` / `.html` in `attachments/`), arrive in the same
+  `payload.attachments` list, and are told apart by one server-set field, `doc ∈ {md, html}`. So
+  every surface that already showed attachments shows reports: card chat, sidebar, submission, and
+  evidence packets. There is no second pipeline.
+- **The sniff is the honest one for text.** No magic bytes exist, so a report is: a known extension,
+  strict UTF-8, and no NUL/control bytes (that is what a binary wearing a `.md` looks like). Cap
+  **2 MB** — an order of magnitude under the request cap, because a report is prose, not a payload.
+  `images:` stays png/jpeg only: nothing that ever worked starts accepting text.
+- **Markdown renders SERVER-SIDE, in-house, with no dependency ever** — headings, lists (nested,
+  with lazy continuation), fenced code, tables, blockquotes, rules, links, images, emphasis. The
+  safety story is not a sanitizer: every character the author wrote is escaped **before a single tag
+  exists**, so raw HTML inside a `.md` renders as its own characters. A `.md` containing `<script>`
+  renders the characters `<script>`, inert. `javascript:`/`data:`/`vbscript:` link targets drop to
+  plain text (the words survive; the link does not).
+- **Author `.html` is never rendered, rewritten, or inlined.** It is served under
+  `Content-Security-Policy: sandbox` (unique opaque origin, no scripts, no same-origin) AND displayed
+  only inside an iframe whose `sandbox` attribute is **empty** — every restriction at once. Two
+  independent walls, so one mistake is not a hole.
+- **In a thread**: the existing skim/expand pattern. The document's own title (its first heading, or
+  `<title>`) is the line you skim; the whole rendered page is behind the expand. A stable
+  "Open full page →" link is on the row, not behind the expand.
+- **The header link, NOT a rail.** A quiet `Reports` link beside Calm/Chaos and List/Board, drawn
+  **only when the OPEN sprint has at least one report** — `/api/board` carries `reports` (a count
+  scoped to the open sprint, never a lifetime total). It opens a library page listing this sprint's
+  reports: title, source card `#N` (linked), author, date. Each row opens the report at a stable URL,
+  `#/report/<sha256>.<ext>`, under the board's own auth. Both skins, Fold-friendly.
+- API: `GET /api/reports[?scope=all]` (default = open sprint), `GET /api/reports/<sha>.<ext>`
+  (rendered; `html` for markdown, `raw_url` + `sandboxed` for author HTML),
+  `GET /api/attachments/<sha>.<ext>` (raw bytes). `reports` is accepted alongside `images` on
+  `/api/cards`, `/api/cards/:num/chat`, `/api/sidebar`, worker events, and in an evidence packet.
+- **Markdown is the recommended format; HTML is the fallback.** User verbatim, on the bounce:
+  **"let's also advise agents that md reports are preferable to html. our html rendering isn't
+  great"**. `.md` renders with the board's own typography in both skins; author `.html` is
+  deliberately sandboxed and therefore unstyled, which is exactly why it looks worse. HTML support
+  stays — a document that arrives already-HTML still has a home — but every place an agent reads
+  (`agents/sprint-worker.md`, `sprint-post --help`, `sprint-ready --help`, this spec, the README)
+  says write `.md`, and both helpers print a one-line stderr notice when an `.html` report is passed.
+  A notice, never an error: the report still posts.
+- Workers: `sprint-post <num> chat "summary" --report path.md` (repeatable, validated client-side)
+  and a `reports` field in the packet. A `phase` refuses a report — a phase is about the present, a
+  document is not. Documented in `agents/sprint-worker.md`.
+
 ## Hub — every sprint on this machine (SHIPPED)
 
 User verbatim: "a landing page I can use if there are multiple sprints running on the same computer

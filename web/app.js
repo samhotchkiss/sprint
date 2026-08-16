@@ -1,10 +1,12 @@
 // Wiring: boot, live transport, optimistic actions, render loop.
 import { h, clear, $, debounce, tickTimes, uid, firstLine } from './util.js';
-import { api, ApiError, NetworkError, initAuth, onServerGeneration } from './api.js';
+import {
+  api, ApiError, NetworkError, initAuth, onServerGeneration, onServerStale, serverIsStale,
+} from './api.js';
 import { Live } from './live.js';
 import {
   store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
-  sections, headline, loadView, setView, setChatOpen,
+  sections, headline, loadView, setView, setChatOpen, bounceComposing,
 } from './state.js';
 import { renderList } from './list.js';
 import { renderBoard, renderFold } from './board.js';
@@ -14,6 +16,7 @@ import { initCompose, toBase64List, imageFiles } from './compose.js';
 import { installNotifications, attention, armNotifications, clearBadge } from './notify.js';
 import { loadSkin, installSkinToggle, installBlip } from './skin.js';
 import { startSiblings, renderTitle, closeSiblingMenu } from './siblings.js';
+import { renderReportsPage, renderReportPage } from './reports.js';
 
 const el = {};
 let compose = null;
@@ -22,11 +25,20 @@ const app = {
   transport: 'idle',
   eventText,
   render,
-  openCard, closeCard,
+  openCard, closeCard, composeBounce,
+  goBoard, goReports,
   answer, chat, sessionChat, verdict, cardAction, markDuplicate, retryCard, retrySubmit,
   lightbox: (urls, i, caps) => openLightbox(el.lightbox, urls, i, caps),
   toast: (msg) => toast(msg),
 };
+
+// ---- pages -----------------------------------------------------------------
+//
+// The board is the app. A "page" is the one exception: a report library and a
+// single rendered report, reached from the header link and from stable URLs
+// (#/reports, #/report/<sha>.<ext>). It takes over `main` — never the rail,
+// never a third column. The user ruled a rail out by name.
+let page = null;      // null | {kind: 'reports'|'report', sha, ext, data, error}
 
 // Which shell we are in. The Fold is the spec's real mobile target (980×740),
 // and the phone below it is an explicit fallback, not an optimisation.
@@ -79,6 +91,14 @@ function paint() {
   document.body.classList.toggle('hold-on', !!(store.sprint && store.sprint.hold_mode));
 
   for (const btn of el.viewBtns) btn.classList.toggle('is-on', btn.dataset.view === store.view);
+  // Quiet, and conditional: the link exists only once this sprint has a report
+  // in it. A link to an empty library is a promise the board cannot keep.
+  if (el.reportsLink) {
+    el.reportsLink.hidden = !(store.loaded && store.reports > 0);
+    el.reportsLink.classList.toggle('is-on', !!page);
+    el.reportsLink.title = store.reports === 1 ? '1 report in this sprint'
+      : `${store.reports} reports in this sprint`;
+  }
   // "Unseen" means exactly that: the moment the session chat is the thing in the
   // rail, you have seen it. Closing a card back onto an already-open chat counts
   // just as much as clicking the button does.
@@ -86,10 +106,13 @@ function paint() {
   paintChatButton();
 
   clear(el.main);
-  if (phoneQuery.matches) renderPhone(el.main, app);
+  if (page && page.kind === 'reports') renderReportsPage(el.main, app, page);
+  else if (page && page.kind === 'report') renderReportPage(el.main, app, page);
+  else if (phoneQuery.matches) renderPhone(el.main, app);
   else if (foldQuery.matches) renderFold(el.main, app);
   else if (store.view === 'board') renderBoard(el.main, app);
   else renderList(el.main, app);
+  document.body.classList.toggle('page-open', !!page);
 
   const railOpen = !!store.detail || store.chatOpen;
   document.body.classList.toggle('rail-open', railOpen);
@@ -123,10 +146,19 @@ function paintChatButton() {
 function renderSessionBanner() {
   const offline = store.loaded && store.session.online === false;
   const transportDown = app.transport === 'error';
-  if (!offline && !transportDown) { el.bannerSlot.hidden = true; return; }
+  // The board's server process is older than the page it is serving: features
+  // this page expects simply are not there. Quieter than "offline" (nothing is
+  // broken, and nothing you type is lost) but it must be SAID — the whole bug
+  // was that it was not. Lowest priority of the three: a board nobody is home
+  // at is more urgent news than a board that is merely behind.
+  const stale = serverIsStale();
+  if (!offline && !transportDown && !stale) { el.bannerSlot.hidden = true; return; }
   el.bannerSlot.hidden = false;
   const cls = offline ? 'banner warn' : 'banner dim';
-  const text = offline ? 'session offline — items will queue' : 'lost the board connection — retrying';
+  const text = offline ? 'session offline — items will queue'
+    : transportDown ? 'lost the board connection — retrying'
+      : 'this board needs a restart to pick up new features — '
+        + 'run `sprintd stop` then `sprintd start` in its project';
   // Same words, same banner: rewriting it on every paint is one more thing
   // flickering on a page that should be still.
   if (el.banner.className !== cls) el.banner.className = cls;
@@ -485,7 +517,7 @@ async function verdict(card, kind, notes, key, opts) {
   const word = kind === 'approve' ? 'Approve' : kind === 'bounce' ? 'Bounce' : 'Reject';
   // Approve does not mean Done: the card sits in Ready as "merging" until the branch lands.
   patch(card.num, kind === 'approve' ? 'integrating' : kind === 'bounce' ? 'in_progress' : 'rejected');
-  if (store.bounceOpen === card.num) store.bounceOpen = null;
+  bounceComposing(card.num, false);
   clearVerdictError(card.num);
   render();
   try {
@@ -632,6 +664,72 @@ function failPending(line, retry) {
 
 // ---- the rail ------------------------------------------------------------
 
+// ---- pages: the report library and one rendered report ---------------------
+
+/** Back to the board from a page. Leaves the rail exactly as it was. */
+function goBoard() {
+  if (!page) return;
+  page = null;
+  if (location.hash.startsWith('#/report')) {
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+  render();
+}
+
+/** The library: every report in THIS sprint. */
+function goReports(replace) {
+  page = { kind: 'reports', data: null, error: null };
+  if (location.hash !== '#/reports') {
+    if (replace) history.replaceState(null, '', '#/reports');
+    else location.hash = '#/reports';
+  }
+  render();
+  loadPage(page, () => api.reports());
+}
+
+/** One report on its own page — a stable, linkable URL. */
+function goReport(sha, ext, replace) {
+  page = { kind: 'report', sha, ext, data: null, error: null };
+  const want = `#/report/${sha}.${ext}`;
+  if (location.hash !== want) {
+    if (replace) history.replaceState(null, '', want);
+    else location.hash = want;
+  }
+  render();
+  loadPage(page, () => api.report(sha, ext));
+}
+
+/** Fetch for the page that is open NOW; a later navigation wins. */
+async function loadPage(target, fetcher) {
+  try {
+    const data = await fetcher();
+    if (page !== target) return;
+    target.data = data;
+  } catch (err) {
+    if (page !== target) return;
+    target.error = err;
+    handleError(err, null);
+  }
+  render();
+}
+
+/** Read the hash and put the app in the state it names. */
+function routeFromHash(replace) {
+  const hash = location.hash;
+  const one = hash.match(/^#\/report\/([0-9a-f]{64})\.(md|html)$/);
+  if (one) { closeRailForPage(); goReport(one[1], one[2], replace); return true; }
+  if (hash === '#/reports') { closeRailForPage(); goReports(replace); return true; }
+  const card = hash.match(/^#\/c\/(\d+)/);
+  if (card) { page = null; openCard(Number(card[1])); return true; }
+  if (page) { page = null; render(); }
+  return false;
+}
+
+/** A page owns the whole main area; a card open behind it is just confusing. */
+function closeRailForPage() {
+  if (store.detail) store.detail = null;
+}
+
 /**
  * Open a card in the rail. `opts.focus` says which box wants the caret —
  * 'composer' (the default: the reply box, every entry point) or 'bounce' (you
@@ -645,6 +743,7 @@ function openCard(num, opts) {
   if (num == null) return;
   const n = Number(num);
   const kind = (opts && opts.focus) || 'composer';
+  page = null;
   const card = store.cards.get(n) || null;
   if (!store.detail || store.detail.num !== n) {
     store.detail = {
@@ -652,16 +751,34 @@ function openCard(num, opts) {
       pendingLines: [], justAnswered: false, error: null,
     };
   }
-  store.bounceOpen = kind === 'bounce' ? n : null;
+  // Bouncing is a composing state (card #44) and it is typed in the RAIL (card
+  // #46): opening the card is what puts you in it, and `askFocus` is what puts
+  // the caret in the box once the rail has painted it.
+  if (kind === 'bounce') bounceComposing(n, true);
   askFocus(n, kind);
   if (location.hash !== `#/c/${n}`) history.replaceState(null, '', `#/c/${n}`);
   render();
   refreshDetail();
 }
 
+/**
+ * Start writing a bounce for this card — the one entry point, wherever the
+ * Bounce button lives (the packet in the rail, the walkthrough bar, a review
+ * row). It does #44's half (the composing state: Submit bounce and Cancel, no
+ * Approve) and #46's half (ask for the caret, once) in the same motion, so
+ * there is exactly one implementation of "focus the notes box".
+ */
+function composeBounce(num) {
+  const n = Number(num);
+  bounceComposing(n, true);
+  askFocus(n, 'bounce');
+  render();
+}
+
 function closeCard() {
   store.detail = null;
-  store.bounceOpen = null;
+  // A half-written bounce (and the fact that you were writing one) outlives the
+  // rail closing, exactly like a draft does — only the caret request is dropped.
   pendingFocus = null;
   if (location.hash.startsWith('#/c/')) history.replaceState(null, '', location.pathname + location.search);
   render();
@@ -793,8 +910,11 @@ async function boot() {
   el.bannerSlot = $('#banner-slot');
   el.banner = $('#banner');
   el.composeWrap = $('#compose-wrap');
+  el.reportsLink = $('#reports-link');
   // scoped to the layout control — the skin control is a second .seg beside it
   el.viewBtns = Array.from(document.querySelectorAll('#view-seg .seg-btn'));
+
+  el.reportsLink.addEventListener('click', (e) => { e.preventDefault(); goReports(); });
 
   compose = initCompose({
     form: $('#compose'),
@@ -859,6 +979,7 @@ async function boot() {
       if (!el.lightbox.hidden) { closeLightbox(el.lightbox); return; }
       if (!el.composeWrap.hidden) { closeCompose(); return; }
       if (store.detail) { closeCard(); return; }
+      if (page) { goBoard(); return; }
       if (store.chatOpen) toggleChat(false);
       return;
     }
@@ -875,9 +996,8 @@ async function boot() {
 
   window.addEventListener('focus', () => { clearBadge(); refreshBoard(); });
   window.addEventListener('hashchange', () => {
-    const m = location.hash.match(/^#\/c\/(\d+)/);
-    if (m) openCard(Number(m[1]));
-    else if (store.detail) closeCard();
+    if (routeFromHash()) return;
+    if (store.detail) closeCard();
   });
   for (const q of [foldQuery, phoneQuery]) {
     if (q.addEventListener) q.addEventListener('change', render);
@@ -908,11 +1028,11 @@ async function firstLoad() {
     render();
     return;
   }
-  // A deep link opens its card BEFORE the first paint, never after. Painting the
-  // session chat into the rail and then replacing it with the card one frame
-  // later is a blink you cannot un-see, and it costs nothing to get right.
-  const deep = location.hash.match(/^#\/c\/(\d+)/);
-  if (deep) openCard(Number(deep[1]));
+  // A deep link opens its card (or its report) BEFORE the first paint, never
+  // after. Painting the session chat into the rail and then replacing it with
+  // the card one frame later is a blink you cannot un-see, and it costs nothing
+  // to get right.
+  routeFromHash(true);
 
   // The sidebar thread ships with the board (`board.sidebar`) — no event-log scan.
   render();
@@ -944,6 +1064,10 @@ async function firstLoad() {
   // The first /api/board already recorded this server's generation, so it is
   // the baseline: anything different from here on is a NEW backend.
   onServerGeneration(() => onServerRestart(live));
+  // "This board is behind its own UI" can become true (or stop being true, once
+  // it is actually restarted) at any point; the banner is the only thing that
+  // reads it, so nothing else has to repaint.
+  onServerStale(() => renderSessionBanner());
   live.start(store.seq);
 
   setTimeout(armNotifications, 1500);

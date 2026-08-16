@@ -1075,6 +1075,19 @@ body.rail-open .rail { display: flex; }
 .btn.bounce:hover { border-color: var(--accent); color: var(--accent-hi); }
 .btn.reject { flex: 0 0 84px; color: var(--faint); font-weight: 400; }
 .btn.reject:hover { color: #d99a9a; border-color: #4a3236; }
+/* Mid-bounce (card #44): two buttons, and the one that sends is the filled one.
+   Approve and Reject are not here to be dimmed — they are not rendered at all
+   while you are writing, because the slip being prevented is clicking Approve
+   with a half-finished bounce in the box above it. */
+.verdicts.is-bouncing .btn.bounce {
+  background: var(--accent);
+  color: var(--send-fg);
+  border-color: transparent;
+  font-weight: 500;
+}
+.verdicts.is-bouncing .btn.bounce:hover { background: var(--accent-hi); color: var(--send-fg); }
+.verdicts.is-bouncing .btn.ghost { flex: 0 0 96px; color: var(--faint); font-weight: 400; }
+.verdicts.is-bouncing .btn.ghost:hover { color: var(--ink); }
 .bounce-notes {
   width: 100%;
   background: var(--input);
@@ -2254,6 +2267,338 @@ html.skin-chaos .review-acts .btn.review-approve-unit {
 }
 html.skin-chaos .review-item .review-title { line-height: 1.5; }
 html.skin-chaos .review-unit-error, html.skin-chaos .review-bar-unit { line-height: 1.7; }
+
+/* ===========================================================================
+   Reports — documents as first-class attachments (card #33)
+
+   Three surfaces, no rail (the user ruled a rail out by name):
+     .reports-link   the quiet header link, drawn only when this sprint has one
+     .report         a thread row: a skim line that expands into the document
+     .page           the library and one report on its own URL
+
+   Everything below is tokens-only, so both skins get it for free; the handful
+   of things that need a different SHAPE in Chaos are at the very bottom.
+   =========================================================================== */
+
+/* ---- the header link ----------------------------------------------------- */
+
+.reports-link {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--faint);
+  text-decoration: none;
+  padding: 8px 10px;
+  border-radius: var(--radius-ctl);
+  border: 1px solid transparent;
+  flex: none;
+  white-space: nowrap;
+}
+.reports-link:hover { color: var(--ink); border-color: var(--border-chip); }
+.reports-link.is-on { color: var(--ink); border-color: var(--border-chip); background: var(--chip); }
+
+/* ---- a report in a thread ------------------------------------------------ */
+
+.report {
+  border: 1px solid var(--border-chip);
+  border-radius: var(--radius);
+  background: var(--panel-thread);
+  overflow: hidden;
+  max-width: 100%;
+}
+.item.mine .report { margin-left: auto; }
+.report + .report { margin-top: 8px; }
+
+.report-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 13px;
+  border: none;
+  background: none;
+  color: var(--body-ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.report-head:hover { background: var(--hover); }
+
+.report-kind {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: .07em;
+  color: var(--accent);
+  border: 1px solid var(--border-chip);
+  border-radius: var(--radius-pill);
+  padding: 2px 7px;
+  flex: none;
+}
+.report-title {
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.report-size { font-size: 11.5px; color: var(--faint); flex: none; }
+.report-chev { color: var(--faint); font-size: 12px; flex: none; }
+
+.report-open {
+  display: block;
+  padding: 0 13px 10px 13px;
+  font-size: 12.5px;
+  color: var(--faint);
+  text-decoration: none;
+}
+.report-open:hover { color: var(--accent-hi); text-decoration: underline; }
+
+.report-body { border-top: 1px solid var(--rule); padding: 4px 13px 13px 13px; }
+.report-loading, .report-err { font-size: 13px; color: var(--faint); padding: 10px 0; }
+.report-err { color: var(--bad); }
+
+/* ---- the rendered document ----------------------------------------------- */
+
+.report-doc {
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--body-ink);
+  max-width: 74ch;
+  overflow-wrap: anywhere;
+}
+.report-doc h1, .report-doc h2, .report-doc h3,
+.report-doc h4, .report-doc h5, .report-doc h6 {
+  font-family: var(--font-display);
+  font-weight: var(--display-weight);
+  text-transform: var(--display-case);
+  color: var(--ink);
+  line-height: 1.25;
+  margin: 22px 0 8px 0;
+}
+.report-doc h1 { font-size: var(--size-h1); }
+.report-doc h2 { font-size: var(--size-h2); }
+.report-doc h3 { font-size: 17px; }
+.report-doc h4, .report-doc h5, .report-doc h6 { font-size: 15px; }
+.report-doc > :first-child { margin-top: 4px; }
+.report-doc p { margin: 0 0 12px 0; }
+.report-doc ul, .report-doc ol { margin: 0 0 12px 0; padding-left: 22px; }
+.report-doc li { margin: 3px 0; }
+.report-doc li > ul, .report-doc li > ol { margin: 3px 0; }
+.report-doc a { color: var(--accent-hi); }
+.report-doc strong { color: var(--ink); font-weight: 600; }
+.report-doc code {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  background: var(--chip);
+  border: 1px solid var(--border-chip);
+  border-radius: 5px;
+  padding: 1px 5px;
+}
+.report-doc pre {
+  background: var(--input);
+  border: 1px solid var(--border-chip);
+  border-radius: var(--radius-ctl);
+  padding: 12px 14px;
+  margin: 0 0 14px 0;
+  overflow-x: auto;         /* long code scrolls itself, never the page */
+  max-width: 100%;
+}
+.report-doc pre code {
+  background: none; border: none; padding: 0;
+  font-size: 12.5px; line-height: 1.6; white-space: pre;
+}
+.report-doc blockquote {
+  margin: 0 0 14px 0;
+  padding: 2px 0 2px 14px;
+  border-left: 2px solid var(--accent);
+  color: var(--dim);
+}
+.report-doc hr { border: none; border-top: 1px solid var(--rule); margin: 20px 0; }
+.report-doc img { max-width: 100%; height: auto; border-radius: var(--radius-ctl); }
+/* a wide table scrolls in its own box — the page body never scrolls sideways */
+.report-doc table {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 14px 0;
+  font-size: 13px;
+}
+.report-doc th, .report-doc td {
+  border: 1px solid var(--border-chip);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.report-doc th { color: var(--ink); background: var(--chip); font-weight: 600; }
+
+.report-note {
+  font-size: 12px;
+  color: var(--faint);
+  margin: 0 0 8px 0;
+  line-height: 1.5;
+}
+.report-frame {
+  width: 100%;
+  min-height: 420px;
+  border: 1px solid var(--border-chip);
+  border-radius: var(--radius-ctl);
+  background: #fff;         /* author HTML expects a page, not our canvas */
+}
+
+/* ---- the pages: library, and one report ---------------------------------- */
+
+.page { padding: 26px 0 40px 0; max-width: 78ch; }
+.page-head { margin-bottom: 22px; }
+.page-back {
+  display: inline-block;
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--faint);
+  text-decoration: none;
+  min-height: 30px;
+  padding: 6px 0;
+}
+.page-back:hover { color: var(--accent-hi); }
+.page-title {
+  font-family: var(--font-display);
+  font-size: var(--size-h1);
+  font-weight: var(--display-weight);
+  text-transform: var(--display-case);
+  color: var(--ink);
+  margin: 2px 0 6px 0;
+  line-height: 1.2;
+  text-wrap: pretty;
+}
+.page-sub {
+  font-size: 13px;
+  color: var(--faint);
+  line-height: 1.6;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.page-empty { font-size: 13.5px; color: var(--faint); line-height: 1.7; max-width: 62ch; }
+
+.report-list { list-style: none; margin: 0; padding: 0; }
+.report-row {
+  border-top: 1px solid var(--rule-row);
+  padding: 12px 0;
+}
+.report-row:last-child { border-bottom: 1px solid var(--rule-row); }
+.report-row-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  text-decoration: none;
+}
+.report-row-main:hover .report-row-title { color: var(--accent-hi); }
+.report-row-title {
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--ink);
+  text-wrap: pretty;
+}
+.report-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--faint);
+}
+.report-card-link {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+.report-card-link:hover { text-decoration: underline; }
+.report-card-link.is-none { color: var(--faint); font-family: var(--font-body); }
+.report-card-title { color: var(--dim); }
+.report-dot { color: var(--border-chip); }
+.report-raw { color: var(--faint); text-decoration: none; }
+.report-raw:hover { color: var(--accent-hi); text-decoration: underline; }
+
+/* The Fold (980×740) and below: touch targets, and the frame gets its own
+   height rather than a fixed one that eats the whole screen. */
+@media (max-width: 1199px) {
+  .reports-link { padding: 10px 10px; min-height: 44px; display: flex; align-items: center; }
+  /* `.main` drops its own padding here (the Fold columns carry theirs), so a
+     page has to bring its gutters or it sits flush against the screen edge. */
+  .page { padding: 18px 22px 40px 22px; overflow-y: auto; }
+  .report-head { min-height: 46px; }
+  .report-row-main { min-height: 44px; }
+  .report-frame { min-height: 60vh; }
+  .report-doc { max-width: 100%; }
+}
+
+/* ---- Chaos: same words, hard edges --------------------------------------- */
+
+html.skin-chaos .reports-link { color: var(--dim); }
+html.skin-chaos .reports-link:hover,
+html.skin-chaos .reports-link.is-on { color: var(--ink); border: 2px solid var(--border-chip); }
+html.skin-chaos .report { border: 2px solid var(--border); border-radius: 0; }
+html.skin-chaos .report-body { border-top: 2px solid var(--border); }
+html.skin-chaos .report-kind { border: 2px solid var(--border-chip); border-radius: 0; }
+html.skin-chaos .report-doc { line-height: 1.75; }
+html.skin-chaos .report-doc pre,
+html.skin-chaos .report-doc code,
+html.skin-chaos .report-doc th,
+html.skin-chaos .report-doc td,
+html.skin-chaos .report-frame { border: 2px solid var(--border-chip); border-radius: 0; }
+html.skin-chaos .report-row { border-top: 2px solid var(--rule-row); }
+html.skin-chaos .report-row:last-child { border-bottom: 2px solid var(--rule-row); }
+html.skin-chaos .page-sub, html.skin-chaos .page-empty { line-height: 1.8; }
+
+/* The phone fallback zeroes .main's padding too — same gutters, tighter. */
+@media (max-width: 600px) {
+  .page { padding: 16px 16px 40px 16px; }
+  .report-doc { font-size: 14.5px; }
+}
+
+/* ==========================================================================
+   APPENDED — model tag (card #41)
+   Which model an agent is running on, shown ONLY when it isn't the sprint
+   default. The user reads it after a provider limit killed an agent and the
+   card was re-dispatched a model down; on an ordinary dispatch it is not
+   drawn at all, so this must stay quiet enough to be invisible when it IS
+   drawn on one card out of twelve.
+   ========================================================================== */
+
+.model-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 15px;
+  letter-spacing: .02em;
+  color: var(--dim);
+  background: transparent;
+  white-space: nowrap;
+  vertical-align: baseline;
+}
+.row-agent .model-tag { margin-left: 5px; }
+
+/* Chaos: no radius anywhere, and the same ink outline everything else wears. */
+html.skin-chaos .model-tag {
+  border: 2px solid var(--border);
+  border-radius: 0;
+  font-size: 8px;
+  line-height: 14px;
+  padding: 0 4px;
+}
 
 /* ==========================================================================
    Appended: ops evidence readback (card #38)

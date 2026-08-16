@@ -8,6 +8,7 @@ import { h, timeEl, firstLine } from './util.js';
 import {
   sections, meterSegments, cardState, needsKind, motionState, blockedReason,
   waitingMark, isStuck, BLOCKED_NOTE,
+  modelTag, MODEL_HINT,
 } from './state.js';
 import { phaseChip } from './phase.js';
 import { renderMeter } from './meter.js';
@@ -156,7 +157,13 @@ export function motionRow(card, app) {
   row.appendChild(h('span.row-prog', { title: st.title },
     h('span.prog-track', h('span.prog-fill', { style: { width: st.pct + '%', background: st.color } })),
     chip || h('span.prog-label', { style: { color: st.color } }, st.label)));
-  row.appendChild(h('span.row-agent', shortAgent(card.agent_name)));
+  // ...and, only when it isn't the sprint default, what it is running on. A
+  // card re-dispatched on a fallback model after its agent was killed should
+  // say so where the agent's name already is.
+  const model = modelTag(card);
+  row.appendChild(h('span.row-agent',
+    shortAgent(card.agent_name),
+    model ? h('span.model-tag', { title: MODEL_HINT }, model) : null));
   return row;
 }
 

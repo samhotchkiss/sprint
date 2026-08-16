@@ -37,7 +37,7 @@
 // one thing IS seeing all of them.
 import { h, timeEl, firstLine, plural } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
-import { store, cardState, draft } from './state.js';
+import { store, cardState, draft, bounceComposing } from './state.js';
 import { shortAgent, openable } from './list.js';
 
 // ---- the model -----------------------------------------------------------
@@ -333,7 +333,9 @@ export function flowBarSig(card) {
   const s = step();
   const p = unitProgress(s.key);
   return [card.num, flow.i, flow.steps.length, card.bounce_count,
-    store.bounceOpen === card.num ? 'b' : '',
+    // mid-bounce is part of what the bar looks like: Submit bounce + Cancel
+    // instead of Approve / Bounce / Skip.
+    bounceComposing(card.num) ? 'b' : '',
     p ? `${p.done}/${p.total}${p.error ? 'e' + p.error : ''}` : ''].join('|');
 }
 
@@ -430,40 +432,38 @@ export function reviewBar(card, app) {
   const many = unit && members.length > 1;
   const prog = s ? unitProgress(s.key) : null;
 
-  // The one bounce-notes box on screen, and it is in the rail — never on a card
-  // face (card #46). It carries the card's id so focus and caret can be put back
-  // on it after any re-render, and it opens by itself when you arrived here by
-  // pressing Bounce on a review row.
-  const wantOpen = !!draft(key) || store.bounceOpen === card.num;
+  // Card #44: once you have pressed Bounce, the bar offers Submit bounce and
+  // Cancel and nothing else. Approve — and in the walkthrough, Skip — are gone
+  // while you are writing, so a stray click cannot approve what you were in the
+  // middle of sending back.
+  const composing = bounceComposing(card.num) || !!draft(key);
+
   const notes = h('textarea.bounce-notes', {
     id: 'bounce-' + card.num,
     rows: '2',
     placeholder: 'What has to change? (goes straight to the agent)',
     oninput: (e) => draft(key, e.target.value),
-    onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } },
+    onkeydown: (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+      if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+    },
   });
   notes.value = draft(key);
-  const notesWrap = h('div.review-notes', { hidden: !wantOpen }, notes);
+  const notesWrap = h('div.review-notes', { hidden: !composing }, notes);
 
   function send() {
     const text = notes.value.trim();
     if (!text) { notes.focus(); return; }
     draft(key, null);
+    bounceComposing(card.num, false);
     flowVerdict(app, card, 'bounce', text);
   }
 
-  const bounceBtn = h('button.btn.bounce', {
-    type: 'button',
-    onclick: () => {
-      if (notesWrap.hidden) {
-        notesWrap.hidden = false;
-        bounceBtn.textContent = 'Send bounce';
-        notes.focus();
-        return;
-      }
-      send();
-    },
-  }, wantOpen ? 'Send bounce' : (many ? `Bounce #${card.num}` : 'Bounce'));
+  function cancel() {
+    draft(key, null);
+    bounceComposing(card.num, false);
+    app.render();
+  }
 
   bar.appendChild(h('div.review-bar-head',
     h('span.review-count', `${flow.i + 1} of ${flow.steps.length}`),
@@ -478,6 +478,19 @@ export function reviewBar(card, app) {
       + 'Approve takes the whole branch; Bounce sends back only the card you are reading.'));
   }
   bar.appendChild(notesWrap);
+  if (composing) {
+    bar.appendChild(h('div.verdicts.is-bouncing',
+      h('button.btn.bounce', { type: 'button', onclick: () => send() },
+        many ? `Submit bounce for #${card.num}` : 'Submit bounce'),
+      h('button.btn.ghost', { type: 'button', onclick: () => cancel() }, 'Cancel')));
+    // Focus is asked for once, by app.composeBounce, and restored by id after
+    // that (card #46) — never re-grabbed on every rebuild of this bar.
+    if (prog && prog.error) {
+      bar.appendChild(h('p.review-unit-error',
+        `Stopped at #${prog.error} — ${prog.done} of ${prog.total} approved, nothing after it was sent.`));
+    }
+    return bar;
+  }
   const approve = h('button.btn.approve', {
     type: 'button',
     disabled: !!(prog && !prog.error),
@@ -487,7 +500,10 @@ export function reviewBar(card, app) {
     : (many ? `Approve all ${members.length}` : 'Approve'));
   bar.appendChild(h('div.verdicts',
     approve,
-    bounceBtn,
+    h('button.btn.bounce', {
+      type: 'button',
+      onclick: () => app.composeBounce(card.num),
+    }, many ? `Bounce #${card.num}` : 'Bounce'),
     h('button.btn.ghost.skip', {
       type: 'button',
       title: 'leave it in Awaiting review and come back to it',
@@ -745,6 +761,7 @@ function thumbFor(p, app) {
 }
 
 function actionsRow(card, p, app, merging, shared) {
+  const key = `bounce:${card.num}`;
   const row = h('div.review-acts');
 
   if (merging) {
@@ -753,6 +770,36 @@ function actionsRow(card, p, app, merging, shared) {
     row.appendChild(h('span.review-meta', shortAgent(card.agent_name), ' · ',
       timeEl(card.state_since || card.last_activity_at, { suffix: false })));
     return row;
+  }
+
+  // Cards #44 and #46 together. #44: once you have pressed Bounce, Approve is
+  // gone — a stray click must not merge the thing you were sending back. #46:
+  // the words are typed in the RAIL, so the row carries the composing STATE and
+  // none of the typing. While a bounce is being written the row says where it
+  // is being written and offers the way out; the notes box itself is in the
+  // panel, under the packet, with the caret already in it.
+  const composing = bounceComposing(card.num) || !!draft(key);
+
+  function cancel() {
+    draft(key, null);
+    bounceComposing(card.num, false);
+    app.render();
+  }
+
+  if (composing) {
+    row.appendChild(h('button.btn.bounce.tiny', {
+      type: 'button',
+      title: 'back to the notes box in the panel',
+      onclick: (e) => { e.stopPropagation(); app.openCard(card.num, { focus: 'bounce' }); },
+    }, 'Writing the bounce →'));
+    row.appendChild(h('button.btn.tiny.ghost', {
+      type: 'button',
+      onclick: (e) => { e.stopPropagation(); cancel(); },
+    }, 'Cancel'));
+    row.appendChild(h('span.grow'));
+    row.appendChild(h('span.review-meta', metaLine(card, p, shared), ' · ',
+      timeEl(card.last_activity_at, { suffix: false })));
+    return h('div.review-actwrap', row);
   }
 
   row.appendChild(h('button.btn.approve.tiny', {
@@ -769,6 +816,8 @@ function actionsRow(card, p, app, merging, shared) {
   row.appendChild(h('button.btn.bounce.tiny', {
     type: 'button',
     title: 'open it and send it back with notes',
+    // `openCard` sets the composing state AND asks for the caret, so one click
+    // gets you a notes box you are already typing into.
     onclick: (e) => { e.stopPropagation(); app.openCard(card.num, { focus: 'bounce' }); },
   }, 'Bounce'));
   if (p.live_url && !shared) {

@@ -67,6 +67,7 @@ async function req(method, path, body, opts = {}) {
   const text = await res.text();
   if (text) { try { payload = JSON.parse(text); } catch { payload = { raw: text }; } }
   noteGeneration(payload);
+  noteApiVersion(payload, path);
   if (!res.ok) throw new ApiError(res.status, payload, path);
   return payload;
 }
@@ -99,6 +100,74 @@ function noteGeneration(payload) {
   if (payload && typeof payload === 'object' && payload.generation) {
     rememberGeneration(payload.generation);
   }
+}
+
+// ---- is this server as new as this page? ---------------------------------
+//
+// A board is a long-running process and web/ is read off disk per request, so a
+// tab can be running today's JS against a server that started weeks ago. Before
+// this, that just meant features quietly missing: the title switcher fetched
+// /api/siblings, got a 404 from a server that had never heard of it, swallowed
+// the error and rendered a plain title — and the user reported it as a bug in
+// the switcher. The server publishes `api_version` (what it knows how to
+// serve); the page carries its own; if the server is behind, the page says so
+// in one sentence instead of degrading in silence.
+//
+// Bump BOTH numbers in the same commit whenever web/ starts requiring an
+// endpoint or field a running server might not have.
+export const UI_API_VERSION = 2;
+
+let serverApi = null;                // null = nothing has answered yet
+const staleListeners = new Set();
+
+// Only two endpoints promise to carry the number, so only those two are read.
+// Inferring "no api_version, therefore old" from any response at all was wrong
+// in exactly one place and it mattered: /api/events carries `generation` and
+// never carried a version, so a perfectly current board accused itself of being
+// out of date on its first poll.
+const VERSIONED_PATHS = new Set(['/healthz', '/api/board']);
+
+function noteApiVersion(payload, path) {
+  if (!payload || typeof payload !== 'object') return;
+  if (!VERSIONED_PATHS.has(String(path).split('?')[0])) return;
+  // A server old enough to lack the field on THESE paths is, by definition,
+  // older than the version that introduced it.
+  setServerApi(Number.isFinite(payload.api_version) ? payload.api_version : 0);
+}
+
+function setServerApi(v) {
+  if (serverApi === v) return;
+  const was = serverIsStale();
+  serverApi = v;
+  if (serverIsStale() !== was) {
+    for (const fn of staleListeners) { try { fn(serverIsStale()); } catch {} }
+  }
+}
+
+/** The board's server is older than the page it is serving. */
+export function serverIsStale() {
+  return serverApi != null && serverApi < UI_API_VERSION;
+}
+
+export function serverApiVersion() { return serverApi; }
+
+/** Notified when "this board needs a restart" starts or stops being true. */
+export function onServerStale(fn) {
+  staleListeners.add(fn);
+  return () => staleListeners.delete(fn);
+}
+
+/**
+ * A 404 on an endpoint this page knows exists is the same news as a low
+ * api_version, from a server too old to carry the number at all. Callers that
+ * tolerate a missing endpoint (siblings.js) report it here rather than
+ * swallowing it.
+ */
+export function noteMissingEndpoint(path) {
+  if (serverApi == null || serverApi >= UI_API_VERSION) {
+    setServerApi(UI_API_VERSION - 1);
+  }
+  return path;
 }
 
 /** Record a generation seen anywhere. Returns true if it is a NEW server. */
@@ -151,7 +220,40 @@ export const api = {
     images && images.length ? { text, images, actor: 'user' } : { text, actor: 'user' },
     { idempotencyKey: key }),
   holdMode: (on) => req('POST', '/api/sprint', { action: 'set_hold_mode', hold_mode: !!on }),
+
+  // The report library. `scope` defaults to the OPEN sprint server-side — the
+  // header link exists only when THIS sprint has a report, so the default is
+  // the number that decides it. `scope: 'all'` is history, never the condition.
+  reports: (scope) => req('GET', `/api/reports${scope === 'all' ? '?scope=all' : ''}`),
+  // One report, rendered: `.html` for markdown (rendered by the server out of
+  // escaped text), `raw_url` + `sandboxed` for author HTML.
+  report: (sha, ext) => req('GET', `/api/reports/${sha}.${ext}`),
 };
+
+// ---- reports -------------------------------------------------------------
+//
+// A report is an attachment like a screenshot is, so it arrives in the same
+// `payload.attachments` list. It is told apart by ONE field the server sets and
+// a worker cannot forge into existence: `doc` ∈ {md, html}.
+
+/** Is this attachment ref a report document rather than a picture? */
+export function isReportRef(ref) {
+  return !!(ref && typeof ref === 'object'
+    && (ref.doc === 'md' || ref.doc === 'html')
+    && /^[0-9a-f]{64}$/.test(String(ref.sha256 || '')));
+}
+
+/** The stable in-app URL for one report — the thing a link can point at. */
+export function reportHash(ref) {
+  if (!isReportRef(ref)) return null;
+  return `#/report/${ref.sha256}.${ref.doc === 'html' ? 'html' : 'md'}`;
+}
+
+/** What this document calls itself, falling back to its filename. */
+export function reportTitle(ref) {
+  if (!ref || typeof ref !== 'object') return 'report';
+  return ref.title || ref.name || 'report';
+}
 
 /**
  * Attachment refs. The server hands every ref a ready-to-use `url`

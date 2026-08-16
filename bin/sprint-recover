@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""sprint-recover — print a ready-to-paste recovery brief for one or more cards.
+
+Usage:
+  sprint-recover <num> [<num> ...] [--server URL] [--token TOKEN]
+
+For when an agent died mid-flight — a provider usage limit, a crash, a
+power cut — and you are about to re-dispatch the same card on a fresh
+agent. The one thing that new agent must not do is start over blindly:
+the dead one may have left commits on the branch and uncommitted edits
+in the worktree, and redoing work on top of that is how you get a
+conflicted mess out of a recoverable one.
+
+So this answers, in one command, the five things you would otherwise go
+and find by hand:
+
+  1. where the card is now (state, agent, model, phase)
+  2. the last 10 lines of its timeline — the brief for the new agent
+  3. its worktree path, and whether that worktree still exists
+  4. its branch, and how many commits it is ahead of main
+  5. whether the worktree is dirty, and what is dirty in it
+
+Output is plain text meant to be pasted straight into the new agent's
+brief. Nothing here writes: it is safe to run on a live board, it never
+touches the worktree, and it never runs a git command that changes
+anything.
+
+Reads --server/--token or SPRINT_SERVER/SPRINT_TOKEN, exactly like the
+other three helpers. Stdlib only.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+TIMELINE_LINES = 10
+# What "ahead of main" is measured against, most-specific first. A sprint
+# worktree is branched from origin/main; a repo with neither is not an error,
+# it just means the count is unknown and we say so.
+BASES = ("origin/main", "main", "origin/master", "master")
+
+
+def die(msg, code=2):
+    print("sprint-recover: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="sprint-recover",
+        description="Print a recovery brief for cards whose agent died.")
+    p.add_argument("nums", nargs="*", help="card number(s)")
+    p.add_argument("--server", default=os.environ.get("SPRINT_SERVER"),
+                   help="server base URL (or SPRINT_SERVER env)")
+    p.add_argument("--token", default=os.environ.get("SPRINT_TOKEN"),
+                   help="bearer token (or SPRINT_TOKEN env)")
+    p.add_argument("--lines", type=int, default=TIMELINE_LINES,
+                   help="how many timeline lines to show (default %d)" % TIMELINE_LINES)
+    return p.parse_args(argv)
+
+
+def fetch(server, token, num):
+    url = "%s/api/cards/%d" % (server.rstrip("/"), num)
+    req = urllib.request.Request(
+        url, headers={"Authorization": "Bearer " + token})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:200]
+        die("#%d: server said %s %s" % (num, exc.code, detail))
+    except urllib.error.URLError as exc:
+        die("cannot reach %s (%s)" % (server, exc.reason))
+
+
+def git(worktree, *args):
+    """Read-only git, or None if it cannot answer. Never raises: a missing
+    worktree is a FINDING, not a crash — it is exactly what you came to learn."""
+    try:
+        out = subprocess.run(("git", "-C", worktree) + args,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.decode("utf-8", "replace").rstrip("\n")
+
+
+def one_line(text, limit=110):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def event_line(ev):
+    payload = ev.get("payload") or {}
+    text = payload.get("text") or ""
+    if not text and payload.get("phase"):
+        text = "phase: %s" % payload["phase"]
+    return "  %-6s %-9s %s" % (ev.get("actor", "?"), ev.get("kind", "?"),
+                               one_line(text))
+
+
+def worktree_report(worktree, branch, out):
+    if not worktree:
+        out.append("  worktree: (none recorded on the card)")
+        return
+    out.append("  worktree: %s" % worktree)
+    if not os.path.isdir(worktree):
+        out.append("            GONE — the directory is not there. Nothing to "
+                   "inspect; the new agent starts from a fresh worktree.")
+        return
+    head = git(worktree, "rev-parse", "--abbrev-ref", "HEAD")
+    if head is None:
+        out.append("            not a git worktree (or git could not read it)")
+        return
+    out.append("            on branch %s%s"
+               % (head, "" if head == (branch or head)
+                  else "  (card says %s — they disagree)" % branch))
+
+    ahead = None
+    for base in BASES:
+        if git(worktree, "rev-parse", "--verify", "--quiet", base) is None:
+            continue
+        count = git(worktree, "rev-list", "--count", "%s..HEAD" % base)
+        if count is not None:
+            ahead = (base, int(count))
+            break
+    if ahead is None:
+        out.append("            commits ahead: unknown (no main/master to compare)")
+    elif ahead[1] == 0:
+        out.append("            commits ahead of %s: 0 — the dead agent "
+                   "committed NOTHING" % ahead[0])
+    else:
+        out.append("            commits ahead of %s: %d — READ THESE BEFORE "
+                   "REDOING ANYTHING" % (ahead[0], ahead[1]))
+        log = git(worktree, "log", "--oneline", "-%d" % min(ahead[1], 10),
+                  "%s..HEAD" % ahead[0])
+        for line in (log or "").splitlines():
+            out.append("              %s" % line)
+
+    dirty = git(worktree, "status", "--porcelain")
+    if dirty is None:
+        out.append("            dirty: unknown")
+    elif not dirty.strip():
+        out.append("            dirty: no — the working tree is clean")
+    else:
+        lines = dirty.splitlines()
+        out.append("            dirty: YES, %d path(s) — uncommitted work the "
+                   "dead agent left behind" % len(lines))
+        for line in lines[:15]:
+            out.append("              %s" % line)
+        if len(lines) > 15:
+            out.append("              … and %d more" % (len(lines) - 15))
+
+
+def card_report(detail, lines):
+    card = detail.get("card") or {}
+    num = card.get("num")
+    out = []
+    out.append("#%s — %s" % (num, card.get("title") or "(no title)"))
+    out.append("  state: %s   agent: %s   model: %s"
+               % (card.get("state"),
+                  card.get("agent_name") or "(none)",
+                  card.get("model") or (card.get("default_model") or "default")))
+    if card.get("phase"):
+        out.append("  last declared phase: %s" % card["phase"])
+    if card.get("error"):
+        out.append("  last error: %s" % one_line(card["error"]))
+    out.append("  branch:   %s" % (card.get("branch") or "(none recorded)"))
+    worktree_report(card.get("worktree"), card.get("branch"), out)
+
+    timeline = detail.get("timeline") or []
+    out.append("  last %d timeline lines (this is the brief — paste it):"
+               % min(lines, len(timeline)))
+    if not timeline:
+        out.append("    (nothing on the timeline at all)")
+    for ev in timeline[-lines:]:
+        out.append("  " + event_line(ev))
+    return "\n".join(out)
+
+
+HEADER = """\
+=== sprint-recover: %s ===
+A previous agent on %s died. Re-dispatch on the next model down and tell
+the new agent, in these words, that it is a NEW agent picking up after a
+killed one — and that it must inspect the branch and the worktree below
+BEFORE it redoes any work.
+"""
+
+
+def main(argv):
+    args = parse_args(argv)
+    if not args.nums:
+        die("give me at least one card number, e.g. sprint-recover 41 42")
+    try:
+        nums = [int(n) for n in args.nums]
+    except ValueError:
+        die("card numbers must be integers, got %r" % (args.nums,))
+    if not args.server:
+        die("pass --server or set SPRINT_SERVER")
+    if not args.token:
+        die("pass --token or set SPRINT_TOKEN")
+
+    label = ", ".join("#%d" % n for n in nums)
+    print(HEADER % (label, "this card" if len(nums) == 1 else "these cards"))
+    for num in nums:
+        print(card_report(fetch(args.server, args.token, num), args.lines))
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

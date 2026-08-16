@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import html.parser as html_parser
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -4435,6 +4436,1357 @@ class TestSprintPostPhaseHelper(Base):
         self.assertIn("5m", out)
 
 
+# ===========================================================================
+# Reports — markdown / HTML documents as first-class attachments (card #33)
+# ===========================================================================
+
+REPORT_MD = """# Findings: the drawer scrim
+
+The scrim reads **too dark** at 980px. Three things are true:
+
+- the token is `--scrim`
+- it is used in exactly one place
+- nothing else reads it
+
+## Numbers
+
+| width | opacity | verdict |
+|---|---|---|
+| 1440 | .62 | fine |
+| 980  | .62 | too dark |
+
+> The Fold is the case that matters.
+
+```css
+.scrim { background: var(--scrim); }
+```
+
+See [the spec](https://example.com/spec) for the rest.
+"""
+
+# The whole safety story in one fixture: every way an author could try to get
+# markup out of a .md file. None of it may reach the browser as markup.
+HOSTILE_MD = """# Hostile report
+
+<script>window.__pwned = 1;</script>
+
+<img src=x onerror="window.__pwned = 2">
+
+<iframe src="javascript:alert(1)"></iframe>
+
+An [innocent link](https://example.com) beside a [bad one](javascript:alert(1))
+and an ![image](javascript:alert(2)).
+
+<div onclick="alert(3)">a div</div>
+
+`<script>inline</script>`
+"""
+
+HOSTILE_HTML = ("<!doctype html><html><head><title>Author page</title></head>"
+                "<body><h1>Author page</h1><script>window.__pwned=3;</script>"
+                "</body></html>")
+
+
+class ReportBase(Base):
+    """Reports ride the same content-addressed store an image does. What is
+    different is the sniff (text has no magic bytes) and the render (markdown is
+    turned into HTML by us; author HTML never is)."""
+
+    def write_doc(self, name, text):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def working_card(self, text="a card that gets a report"):
+        num = self.new_card(text)["num"]
+        self.to_in_progress(num)
+        return num
+
+    def post_report(self, num, path, text="here are the findings", kind="chat"):
+        status, body = self.post("/api/cards/%d/events" % num,
+                                 {"kind": kind,
+                                  "payload": {"text": text, "reports": [path]}})
+        self.assertEqual(status, 201, body)
+        return body
+
+    def last_payload(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return detail["timeline"][-1]["payload"]
+
+    def only_report(self, num):
+        docs = [a for a in (self.last_payload(num).get("attachments") or [])
+                if a.get("doc")]
+        self.assertEqual(len(docs), 1, docs)
+        return docs[0]
+
+    def raw(self, path, token="test-token"):
+        """A raw fetch that keeps the headers — the CSP on author HTML is the
+        point of the test, and `req` throws headers away."""
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        try:
+            conn.request("GET", path, headers={"Authorization": "Bearer " + token})
+            resp = conn.getresponse()
+            return resp.status, resp.read(), dict(resp.getheaders())
+        finally:
+            conn.close()
+
+
+class TestReportAccept(ReportBase):
+    """What counts as a report, and what does not."""
+
+    def test_markdown_attaches_and_carries_a_title(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("findings.md", REPORT_MD))
+        ref = self.only_report(num)
+        self.assertEqual(ref["doc"], "md")
+        self.assertEqual(ref["name"], "findings.md")
+        self.assertEqual(ref["mime"], "text/markdown; charset=utf-8")
+        # the skim line is what the document calls itself, not its filename
+        self.assertEqual(ref["title"], "Findings: the drawer scrim")
+        self.assertRegex(ref["sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(ref["url"].endswith(".md"), ref["url"])
+        self.assertTrue(os.path.isfile(ref["path"]))
+
+    def test_html_attaches_and_titles_from_its_title_tag(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("page.html", HOSTILE_HTML))
+        ref = self.only_report(num)
+        self.assertEqual(ref["doc"], "html")
+        self.assertEqual(ref["title"], "Author page")
+        self.assertEqual(ref["mime"], "text/html; charset=utf-8")
+
+    def test_the_title_keeps_a_card_number_in_it(self):
+        """Markers that WRAP the line get stripped; a `#` inside the words does
+        not. "how card #33 shipped" is a title about card #33."""
+        num = self.working_card()
+        self.post_report(num, self.write_doc(
+            "t.md", "# Reports — how card #33 shipped\n\nbody"))
+        self.assertEqual(self.only_report(num)["title"],
+                         "Reports — how card #33 shipped")
+
+    def test_the_title_drops_a_trailing_closing_hash(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("t.md", "## Findings ##\n\nbody"))
+        self.assertEqual(self.only_report(num)["title"], "Findings")
+
+    def test_a_report_with_no_heading_falls_back_to_its_first_line(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("plain.md", "just a sentence\n\nand more"))
+        self.assertEqual(self.only_report(num)["title"], "just a sentence")
+
+    def test_same_bytes_are_stored_once(self):
+        num = self.working_card()
+        a = self.write_doc("one.md", REPORT_MD)
+        b = self.write_doc("two.md", REPORT_MD)
+        self.post_report(num, a)
+        first = self.only_report(num)
+        self.post_report(num, b)
+        second = self.only_report(num)
+        self.assertEqual(first["sha256"], second["sha256"])
+        self.assertEqual(first["path"], second["path"])
+
+    def test_images_door_still_refuses_text(self):
+        """`images:` stays png/jpeg only — nothing that ever worked starts
+        accepting documents because reports arrived."""
+        status, body = self.post("/api/cards", {
+            "images": [base64.b64encode(REPORT_MD.encode()).decode()]})
+        self.assertEqual(status, 400, body)
+
+    def test_a_wrong_extension_is_not_a_report(self):
+        num = self.working_card()
+        path = self.write_doc("notes.txt", "# not a report")
+        status, body = self.post("/api/cards/%d/events" % num,
+                                 {"kind": "chat",
+                                  "payload": {"text": "x", "reports": [path]}})
+        # an unusable path degrades to a name, never to a stored document
+        self.assertEqual(status, 201, body)
+        docs = [a for a in (self.last_payload(num).get("attachments") or [])
+                if a.get("doc")]
+        self.assertEqual(docs, [])
+
+    def test_extension_is_the_whole_sniff_on_the_direct_door(self):
+        status, body = self.post("/api/cards",
+                                 {"text": "x", "reports": [{"name": "notes.txt",
+                                                            "text": "# hi"}]})
+        self.assertEqual(status, 400, body)
+        self.assertIn("md", json.dumps(body))
+
+    def test_a_binary_wearing_a_md_name_is_refused(self):
+        status, body = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "sneaky.md",
+             "data": base64.b64encode(b"MZ\x00\x00\x90binary").decode()}]})
+        self.assertEqual(status, 400, body)
+        self.assertIn("NUL", json.dumps(body))
+
+    def test_invalid_utf8_is_refused(self):
+        status, body = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "bad.md", "data": base64.b64encode(b"\xff\xfe\xfd\xfc").decode()}]})
+        self.assertEqual(status, 400, body)
+        self.assertIn("UTF-8", json.dumps(body))
+
+    def test_an_empty_report_is_refused(self):
+        status, body = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "empty.md", "text": ""}]})
+        self.assertEqual(status, 400, body)
+
+    def test_size_cap_is_enforced_with_a_413(self):
+        big = "x" * (sprintd.REPORT_MAX_BYTES + 1)
+        status, body = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "huge.md", "text": big}]})
+        self.assertEqual(status, 413, body)
+        self.assertIn("exceed", json.dumps(body))
+
+    def test_just_under_the_cap_is_accepted(self):
+        ok = "x" * (sprintd.REPORT_MAX_BYTES - 16)
+        status, body = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "big.md", "text": ok}]})
+        self.assertEqual(status, 201, body)
+
+    def test_a_report_alone_is_a_submission(self):
+        """A document with no words is still work dropped on the board — the
+        card's title becomes the document's."""
+        status, card = self.post("/api/cards", {"reports": [
+            {"name": "findings.md", "text": REPORT_MD}]})
+        self.assertEqual(status, 201, card)
+        self.assertEqual(card["title"], "Findings: the drawer scrim")
+
+    def test_a_report_lands_on_the_sidebar_too(self):
+        status, body = self.post("/api/sidebar", {
+            "text": "wrote this up", "actor": "session",
+            "reports": [{"name": "notes.md", "text": "# Notes\n\nbody"}]})
+        self.assertEqual(status, 201, body)
+        _, board = self.get("/api/board")
+        docs = []
+        for ev in board["sidebar"]:
+            docs += [a for a in (ev["payload"].get("attachments") or []) if a.get("doc")]
+        self.assertEqual(len(docs), 1, docs)
+
+
+class TestReportRenderIsInert(ReportBase):
+    """FALSIFICATION TARGET.
+
+    The claim under test is not "we sanitize markdown" — it is that no author
+    markup is ever TREATED as markup. Markdown is rendered out of text that was
+    escaped before a single tag existed, so a `<script>` in a .md comes back as
+    the characters `<script>`. Break `esc` and every assertion below fails."""
+
+    def rendered(self, text, name="hostile.md"):
+        status, card = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": name, "text": text}]})
+        self.assertEqual(status, 201, card)
+        ref = [a for a in card["attachments"] if a.get("doc")][0]
+        status, detail = self.get("/api/reports/%s.md" % ref["sha256"])
+        self.assertEqual(status, 200, detail)
+        return detail["html"]
+
+    def test_a_script_tag_in_a_md_renders_as_characters_not_a_script(self):
+        html = self.rendered(HOSTILE_MD)
+        # the words survive — the report is still readable
+        self.assertIn("window.__pwned", html)
+        # ...but no browser will ever run them
+        self.assertNotIn("<script", html.lower())
+        self.assertNotIn("</script", html.lower())
+        self.assertIn("&lt;script&gt;", html)
+
+    def parse(self, html):
+        """Every tag and attribute the browser would actually SEE.
+
+        Substring assertions are not enough here: `onerror=` legitimately
+        appears inside `&lt;img src=x onerror=&quot;…&quot;&gt;`, which is inert
+        text. The honest question is structural — what markup does a parser find
+        — so this is the assertion that cannot be satisfied by accident."""
+        seen = []
+
+        class P(html_parser.HTMLParser):
+            def handle_starttag(_self, tag, attrs):
+                seen.append((tag, dict(attrs)))
+            handle_startendtag = handle_starttag
+
+        P(convert_charrefs=True).feed(html)
+        return seen
+
+    # Everything the renderer is allowed to emit. Author markup is not on it,
+    # and cannot get on it: the text is escaped before a tag exists.
+    ALLOWED_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6", "p", "br", "hr",
+                    "ul", "ol", "li", "pre", "code", "blockquote",
+                    "table", "thead", "tbody", "tr", "th", "td",
+                    "a", "img", "strong", "em", "del"}
+
+    def test_a_script_tag_never_becomes_a_tag(self):
+        tags = [t for t, _ in self.parse(self.rendered(HOSTILE_MD))]
+        self.assertNotIn("script", tags)
+        self.assertNotIn("iframe", tags)
+        self.assertNotIn("div", tags)
+
+    def test_only_our_own_tags_are_ever_emitted(self):
+        for tag, _ in self.parse(self.rendered(HOSTILE_MD)):
+            self.assertIn(tag, self.ALLOWED_TAGS, "renderer emitted <%s>" % tag)
+
+    def test_no_event_handler_attribute_survives_as_an_attribute(self):
+        for tag, attrs in self.parse(self.rendered(HOSTILE_MD)):
+            for name in attrs:
+                self.assertFalse(name.startswith("on"),
+                                 "<%s> carries %s" % (tag, name))
+
+    def test_no_attribute_value_is_ever_a_script_url(self):
+        for tag, attrs in self.parse(self.rendered(HOSTILE_MD)):
+            for name, value in attrs.items():
+                v = (value or "").strip().lower().replace("\\t", "").replace("\\n", "")
+                self.assertFalse(v.startswith("javascript:"), "<%s %s>" % (tag, name))
+                self.assertFalse(v.startswith("vbscript:"), "<%s %s>" % (tag, name))
+                self.assertFalse(v.startswith("data:text/html"), "<%s %s>" % (tag, name))
+
+    def test_the_hostile_markup_is_still_READABLE_as_text(self):
+        """Escaping is not deletion. A report about XSS has to be able to say
+        the word `<script>` and have you see it."""
+        html = self.rendered(HOSTILE_MD)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertIn("&lt;iframe", html)
+        self.assertIn("window.__pwned", html)
+
+    def test_a_javascript_link_is_dropped_but_its_words_are_kept(self):
+        html = self.rendered(HOSTILE_MD)
+        hrefs = [a.get("href") for t, a in self.parse(html) if t == "a"]
+        self.assertEqual(hrefs, ["https://example.com"])
+        # the bad link's WORDS survive, without the stray bracket
+        self.assertIn("beside a bad one", html)
+        self.assertNotIn("bad one)", html)
+        srcs = [a.get("src") for t, a in self.parse(html) if t == "img"]
+        self.assertEqual(srcs, [])
+        self.assertIn("and an image.", html)
+
+    def test_a_code_span_containing_a_tag_is_still_inert(self):
+        html = self.rendered(HOSTILE_MD)
+        self.assertIn("<code>&lt;script&gt;inline&lt;/script&gt;</code>", html)
+
+    def test_an_ampersand_is_escaped_exactly_once(self):
+        html = self.rendered("a & b, and &lt; too")
+        self.assertIn("a &amp; b", html)
+        self.assertIn("&amp;lt;", html)
+
+    def test_every_link_we_do_emit_is_defanged(self):
+        html = self.rendered("[x](https://example.com)")
+        self.assertIn('rel="noreferrer noopener nofollow"', html)
+        self.assertIn('target="_blank"', html)
+
+
+class TestReportRenderShape(ReportBase):
+    """The renderer is small on purpose, but it has to actually render a report:
+    a document that comes back as one paragraph is not readable."""
+
+    def html_of(self, text):
+        status, card = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "doc.md", "text": text}]})
+        self.assertEqual(status, 201, card)
+        ref = [a for a in card["attachments"] if a.get("doc")][0]
+        _, detail = self.get("/api/reports/%s.md" % ref["sha256"])
+        return detail["html"]
+
+    def test_the_whole_subset_renders(self):
+        html = self.html_of(REPORT_MD)
+        self.assertIn("<h1>Findings: the drawer scrim</h1>", html)
+        self.assertIn("<h2>Numbers</h2>", html)
+        self.assertIn("<strong>too dark</strong>", html)
+        self.assertIn("<code>--scrim</code>", html)
+        self.assertIn("<ul>", html)
+        self.assertIn("<li>the token is <code>--scrim</code></li>", html)
+        self.assertIn("<table>", html)
+        self.assertIn("<th>width</th>", html)
+        self.assertIn("<td>too dark</td>", html)
+        self.assertIn("<blockquote>", html)
+        self.assertIn('<pre><code class="lang-css">', html)
+        self.assertIn('<a href="https://example.com/spec"', html)
+
+    def test_nested_lists_nest(self):
+        html = self.html_of("- outer\n    - inner\n- back")
+        self.assertIn("<ul>", html)
+        self.assertGreaterEqual(html.count("<ul>"), 2)
+        self.assertIn("inner", html)
+
+    def test_an_ordered_list_is_ordered(self):
+        html = self.html_of("1. first\n2. second")
+        self.assertIn("<ol>", html)
+        self.assertIn("<li>first</li>", html)
+
+    def test_a_fenced_block_is_never_re_scanned_for_markup(self):
+        html = self.html_of("```\n**not bold** and <b>not bold</b>\n```")
+        self.assertNotIn("<strong>", html)
+        self.assertIn("&lt;b&gt;", html)
+
+    def test_a_wrapped_list_item_stays_ONE_item(self):
+        """A real report wraps its prose. Before this, a wrapped item closed the
+        list and the next number restarted at 1."""
+        html = self.html_of(
+            "1. **First.** a line that keeps going\n"
+            "   onto a second source line\n"
+            "2. **Second.** and this one\n"
+            "   also wraps\n")
+        self.assertEqual(html.count("<ol>"), 1, html)
+        self.assertEqual(html.count("<li>"), 2, html)
+        self.assertIn("onto a second source line</li>", html)
+
+    def test_a_wrapped_paragraph_is_one_paragraph_not_a_stack_of_breaks(self):
+        """The author's 80-column wrap is not a design decision about the rail,
+        which is 480px wide."""
+        html = self.html_of("one line\nand its continuation\nand a third")
+        self.assertIn("<p>one line and its continuation and a third</p>", html)
+        self.assertNotIn("<br>", html)
+
+    def test_two_trailing_spaces_still_mean_a_hard_break(self):
+        html = self.html_of("first line  \nsecond line")
+        self.assertIn("first line<br>second line", html)
+
+    def test_a_trailing_backslash_is_a_hard_break_too(self):
+        html = self.html_of("first line\\\nsecond line")
+        self.assertIn("first line<br>second line", html)
+
+    def test_a_paragraph_still_stops_at_the_next_block(self):
+        html = self.html_of("some prose\n## A heading\nmore prose")
+        self.assertIn("<p>some prose</p>", html)
+        self.assertIn("<h2>A heading</h2>", html)
+
+    def test_control_bytes_are_refused(self):
+        """\x00 and \x01 are the renderer's own placeholders — a document must
+        never be able to carry them."""
+        for bad in (b"# ok\x00", b"# ok\x01"):
+            status, body = self.post("/api/cards", {"text": "x", "reports": [
+                {"name": "c.md", "data": base64.b64encode(bad).decode()}]})
+            self.assertEqual(status, 400, body)
+
+    def test_tabs_and_newlines_are_still_fine(self):
+        status, body = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": "t.md", "text": "# ok\n\n\tindented\r\n"}]})
+        self.assertEqual(status, 201, body)
+
+    def test_a_horizontal_rule(self):
+        self.assertIn("<hr>", self.html_of("above\n\n---\n\nbelow"))
+
+
+class TestReportServing(ReportBase):
+    """How the bytes come back — and why author HTML can never touch the board."""
+
+    def stored(self, name, text):
+        status, card = self.post("/api/cards", {"text": "x", "reports": [
+            {"name": name, "text": text}]})
+        self.assertEqual(status, 201, card)
+        return [a for a in card["attachments"] if a.get("doc")][0]
+
+    def test_markdown_comes_back_as_markdown(self):
+        ref = self.stored("doc.md", REPORT_MD)
+        status, blob, headers = self.raw(ref["url"])
+        self.assertEqual(status, 200)
+        self.assertIn("text/markdown", headers.get("Content-Type", ""))
+        self.assertIn(b"# Findings", blob)
+
+    def test_author_html_is_served_under_a_sandbox_csp(self):
+        ref = self.stored("page.html", HOSTILE_HTML)
+        status, blob, headers = self.raw(ref["url"])
+        self.assertEqual(status, 200)
+        csp = headers.get("Content-Security-Policy", "")
+        # `sandbox` with no allow-list: unique opaque origin, scripts off. Even a
+        # direct navigation to this URL cannot read a cookie or reach the API.
+        self.assertIn("sandbox", csp)
+        self.assertNotIn("allow-scripts", csp)
+        self.assertNotIn("allow-same-origin", csp)
+        self.assertIn("default-src 'none'", csp)
+        self.assertEqual(headers.get("Referrer-Policy"), "no-referrer")
+
+    def test_markdown_gets_no_needless_csp_but_is_not_html(self):
+        ref = self.stored("doc.md", REPORT_MD)
+        _, _, headers = self.raw(ref["url"])
+        self.assertNotIn("text/html", headers.get("Content-Type", ""))
+
+    def test_author_html_is_never_inlined_into_the_boards_dom(self):
+        ref = self.stored("page.html", HOSTILE_HTML)
+        status, detail = self.get("/api/reports/%s.html" % ref["sha256"])
+        self.assertEqual(status, 200, detail)
+        self.assertTrue(detail["sandboxed"])
+        self.assertIn("raw_url", detail)
+        # the ONE thing that must not be there: pre-rendered markup to innerHTML
+        self.assertNotIn("html", detail)
+
+    def test_serving_needs_the_token(self):
+        ref = self.stored("doc.md", REPORT_MD)
+        status, _, _ = self.raw(ref["url"], token="wrong")
+        self.assertEqual(status, 401)
+
+    def test_an_unknown_report_is_a_404(self):
+        status, _ = self.get("/api/reports/%s.md" % ("a" * 64))
+        self.assertEqual(status, 404)
+
+
+class TestReportsIndex(ReportBase):
+    """The library, and the ONE number the header link reads.
+
+    User ruling, verbatim: "link should only appear once there's a report
+    within the sprint" — so the default scope is the OPEN sprint and nothing
+    else."""
+
+    def test_an_empty_sprint_has_no_reports_and_says_so_on_the_board(self):
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 0)
+        _, index = self.get("/api/reports")
+        self.assertEqual(index["count"], 0)
+        self.assertEqual(index["reports"], [])
+
+    def test_the_index_names_the_source_card_author_and_date(self):
+        num = self.working_card("the card that owns the report")
+        self.post("/api/cards/%d/state" % num, {"state": "in_progress",
+                                                "title": "Drawer scrim too dark"})
+        self.post_report(num, self.write_doc("findings.md", REPORT_MD))
+        _, index = self.get("/api/reports")
+        self.assertEqual(index["count"], 1)
+        row = index["reports"][0]
+        self.assertEqual(row["title"], "Findings: the drawer scrim")
+        self.assertEqual(row["card_num"], num)
+        self.assertEqual(row["card_title"], "Drawer scrim too dark")
+        self.assertEqual(row["actor"], "worker")
+        self.assertTrue(row["ts"])
+        self.assertTrue(row["view_url"].startswith("#/report/"))
+
+    def test_the_board_count_matches_the_index(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("a.md", "# A\n\nbody"))
+        self.post_report(num, self.write_doc("b.md", "# B\n\nbody"))
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 2)
+
+    def test_one_document_counts_once_however_often_it_is_posted(self):
+        num = self.working_card()
+        path = self.write_doc("same.md", "# Same\n\nbody")
+        self.post_report(num, path)
+        self.post_report(num, path, text="posting it again")
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 1)
+
+    def test_the_index_is_scoped_to_the_OPEN_sprint(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("old.md", "# Last sprint\n\nbody"))
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 1)
+
+        status, _ = self.post("/api/sprint", {"action": "close"})
+        self.assertEqual(status, 200)
+        status, _ = self.post("/api/sprint", {"action": "open", "title": "round two"})
+        self.assertEqual(status, 200)
+
+        # a fresh sprint: the link must NOT be there, and the library is empty
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 0)
+        _, index = self.get("/api/reports")
+        self.assertEqual(index["count"], 0)
+
+        # history is still reachable — it is just never what decides the link
+        _, allof = self.get("/api/reports?scope=all")
+        self.assertEqual(allof["count"], 1)
+        self.assertEqual(allof["reports"][0]["title"], "Last sprint")
+
+    def test_a_report_in_the_new_sprint_brings_the_link_back(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("old.md", "# Last sprint\n\nbody"))
+        self.post("/api/sprint", {"action": "close"})
+        self.post("/api/sprint", {"action": "open", "title": "round two"})
+        fresh = self.working_card("a new card in the new sprint")
+        self.post_report(fresh, self.write_doc("new.md", "# This sprint\n\nbody"))
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 1)
+        _, index = self.get("/api/reports")
+        self.assertEqual([r["title"] for r in index["reports"]], ["This sprint"])
+
+    def test_newest_first(self):
+        num = self.working_card()
+        self.post_report(num, self.write_doc("a.md", "# First\n\nbody"))
+        time.sleep(0.01)
+        self.post_report(num, self.write_doc("b.md", "# Second\n\nbody"))
+        _, index = self.get("/api/reports")
+        self.assertEqual([r["title"] for r in index["reports"]], ["Second", "First"])
+
+    def test_the_index_needs_the_token(self):
+        status, _ = self.get("/api/reports", token=None)
+        self.assertEqual(status, 401)
+
+
+class TestReportsInAnEvidencePacket(ReportBase):
+    """A packet is a document envelope as much as a screenshot one."""
+
+    def test_a_packet_reports_field_is_ingested_and_indexed(self):
+        num = self.working_card()
+        path = self.write_doc("findings.md", REPORT_MD)
+        packet = dict(GOOD_PACKET)
+        packet["reports"] = [path]
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": packet})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "ready")
+
+        _, detail = self.get("/api/cards/%d" % num)
+        refs = detail["evidence"]["packet"]["reports"]
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["doc"], "md")
+        self.assertEqual(refs[0]["title"], "Findings: the drawer scrim")
+
+        _, index = self.get("/api/reports")
+        self.assertEqual(index["count"], 1)
+        self.assertEqual(index["reports"][0]["card_num"], num)
+
+    def test_a_packet_without_reports_still_works(self):
+        num = self.working_card()
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200, body)
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 0)
+
+
+class TestSprintPostReportFlag(ReportBase):
+    """`sprint-post <num> chat "summary" --report path.md` — the worker's door."""
+
+    SPRINT_POST = os.path.join(os.path.dirname(HERE), "bin", "sprint-post")
+    SPRINT_READY = os.path.join(os.path.dirname(HERE), "bin", "sprint-ready")
+
+    def run_post(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_POST] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def run_ready(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_READY] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def test_the_flag_attaches_the_document(self):
+        num = self.working_card()
+        path = self.write_doc("findings.md", REPORT_MD)
+        r = self.run_post(num, "chat", "findings are in the report", "--report", path)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("1 report", r.stdout.decode())
+        ref = self.only_report(num)
+        self.assertEqual(ref["title"], "Findings: the drawer scrim")
+        _, board = self.get("/api/board")
+        self.assertEqual(board["reports"], 1)
+
+    def test_the_flag_repeats(self):
+        num = self.working_card()
+        a = self.write_doc("a.md", "# A\n\nbody")
+        b = self.write_doc("b.html", "<title>B</title><p>body</p>")
+        r = self.run_post(num, "chat", "two of them", "--report", a, "--report", b)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        docs = [x for x in self.last_payload(num)["attachments"] if x.get("doc")]
+        self.assertEqual(sorted(d["doc"] for d in docs), ["html", "md"])
+
+    def test_a_missing_file_fails_before_the_network(self):
+        num = self.working_card()
+        r = self.run_post(num, "chat", "x", "--report", os.path.join(self.tmp, "nope.md"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("report", r.stderr.decode())
+        self.assertIn("no such file", r.stderr.decode())
+
+    def test_a_wrong_extension_fails_by_name(self):
+        num = self.working_card()
+        r = self.run_post(num, "chat", "x", "--report", self.write_doc("n.txt", "hi"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(".md", r.stderr.decode())
+
+    def test_an_oversized_report_fails_before_the_network(self):
+        num = self.working_card()
+        path = self.write_doc("huge.md", "x" * (2 * 1024 * 1024 + 4))
+        r = self.run_post(num, "chat", "x", "--report", path)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("ceiling", r.stderr.decode())
+
+    def test_a_phase_refuses_a_report(self):
+        """A phase says what you are doing right now. A document is not that."""
+        num = self.working_card()
+        r = self.run_post(num, "phase", "testing", "--report",
+                          self.write_doc("a.md", "# A"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("report", r.stderr.decode())
+
+    def test_sprint_ready_carries_reports_through(self):
+        num = self.working_card()
+        packet = dict(GOOD_PACKET)
+        packet["reports"] = [self.write_doc("findings.md", REPORT_MD)]
+        pfile = os.path.join(self.tmp, "packet.json")
+        with open(pfile, "w", encoding="utf-8") as fh:
+            json.dump(packet, fh)
+        r = self.run_ready(num, pfile)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        _, index = self.get("/api/reports")
+        self.assertEqual(index["count"], 1)
+
+    def test_sprint_ready_names_a_bad_report_entry(self):
+        num = self.working_card()
+        packet = dict(GOOD_PACKET)
+        packet["reports"] = ["/tmp/notes.txt"]
+        pfile = os.path.join(self.tmp, "packet.json")
+        with open(pfile, "w", encoding="utf-8") as fh:
+            json.dump(packet, fh)
+        r = self.run_ready(num, pfile)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("reports", r.stderr.decode())
+
+
+class TestMarkdownIsTheRecommendedFormat(ReportBase):
+    """User verbatim on the bounce: "let's also advise agents that md reports
+    are preferable to html. our html rendering isn't great."
+
+    HTML support does NOT go away — a document that arrives already-HTML still
+    has a home. What changes is what an agent is told: every surface an agent
+    reads says write .md, and both helpers say it out loud when an .html report
+    goes by. A notice on stderr, never an error: the report still posts."""
+
+    SPRINT_POST = os.path.join(os.path.dirname(HERE), "bin", "sprint-post")
+    SPRINT_READY = os.path.join(os.path.dirname(HERE), "bin", "sprint-ready")
+    ROOT = os.path.dirname(HERE)
+
+    def run_post(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_POST] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def run_ready(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_READY] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def read_repo_file(self, *parts):
+        with open(os.path.join(self.ROOT, *parts), encoding="utf-8") as fh:
+            return fh.read()
+
+    # --- the nudge is a notice, not a gate -------------------------------
+
+    def test_an_html_report_still_posts(self):
+        num = self.working_card()
+        path = self.write_doc("legacy.html", "<title>Legacy</title><p>body</p>")
+        r = self.run_post(num, "chat", "an already-HTML document", "--report", path)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(self.only_report(num)["doc"], "html")
+
+    def test_an_html_report_prints_a_notice_naming_md(self):
+        num = self.working_card()
+        path = self.write_doc("legacy.html", "<title>Legacy</title><p>body</p>")
+        err = self.run_post(num, "chat", "x", "--report", path).stderr.decode()
+        self.assertIn("legacy.html", err)
+        self.assertIn(".md", err)
+        self.assertNotIn("missing required field", err)
+
+    def test_a_markdown_report_is_not_nagged(self):
+        num = self.working_card()
+        r = self.run_post(num, "chat", "x", "--report",
+                          self.write_doc("findings.md", REPORT_MD))
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertNotIn("Prefer .md", r.stderr.decode())
+
+    def test_sprint_ready_notices_an_html_report_but_accepts_it(self):
+        num = self.working_card()
+        packet = dict(GOOD_PACKET)
+        packet["reports"] = [self.write_doc("legacy.html",
+                                            "<title>Legacy</title><p>body</p>")]
+        pfile = os.path.join(self.tmp, "packet.json")
+        with open(pfile, "w", encoding="utf-8") as fh:
+            json.dump(packet, fh)
+        r = self.run_ready(num, pfile)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn(".md", r.stderr.decode())
+        _, index = self.get("/api/reports")
+        self.assertEqual(index["count"], 1)
+
+    # --- every surface an agent reads says it ----------------------------
+
+    def test_the_helpers_own_help_recommends_md(self):
+        for helper in ("sprint-post", "sprint-ready"):
+            with open(os.path.join(self.ROOT, "bin", helper), encoding="utf-8") as fh:
+                doc = fh.read()
+            self.assertIn("refer .md", doc,
+                          "%s should tell an agent to prefer .md" % helper)
+
+    def test_the_worker_definition_recommends_md(self):
+        doc = self.read_repo_file("agents", "sprint-worker.md")
+        self.assertIn("sandboxed", doc)
+        self.assertIn("Write `.md`", doc)
+
+    def test_the_spec_and_readme_record_the_preference(self):
+        spec = self.read_repo_file("SPEC.md")
+        self.assertIn("md reports are preferable to html", spec)
+        readme = self.read_repo_file("README.md")
+        self.assertIn("sandboxed", readme)
+# --------------------------------------------------------------------------
+# Killed-agent detection (#42)
+#
+# The incident: three workers were killed mid-flight by a provider usage limit
+# and their cards sat in In motion for hours. `agent_silent` had already said
+# "quiet" and had nothing further to say. These tests are about the ending.
+# --------------------------------------------------------------------------
+
+
+class WorkerGoneBase(Base):
+    """Thresholds in seconds so a twenty-minute rule is actually testable, and
+    the sweep driven by hand so nothing here depends on a timer racing."""
+
+    GONE = 1.0
+    DEAD = 2.0
+    LONGRUN_FACTOR = 6.0
+
+    def setUp(self):
+        super().setUp()
+        self.app.worker_gone_seconds = self.GONE
+        self.app.worker_dead_seconds = self.DEAD
+        self.app.worker_longrun_factor = self.LONGRUN_FACTOR
+
+    # -- fixtures ---------------------------------------------------------
+
+    def working_card(self, text="an agent is on this", agent=None, state="in_progress"):
+        """A card with an agent, a worktree and a branch, mid-flight."""
+        num = self.new_card(text)["num"]
+        agent = agent or "sprint-card-%d" % num
+        status, _ = self.post("/api/cards/%d/assign" % num,
+                              {"agent_name": agent,
+                               "worktree": "/tmp/wt/%s" % agent,
+                               "branch": "sprint/card-%d" % num})
+        self.assertEqual(status, 200)
+        if state == "in_progress":
+            status, _ = self.post("/api/cards/%d/state" % num, {"state": "in_progress"})
+            self.assertEqual(status, 200)
+        return num
+
+    def say_something(self, num, text="still here"):
+        status, _ = self.post("/api/cards/%d/events" % num,
+                              {"kind": "progress", "payload": {"text": text}})
+        self.assertEqual(status, 201)
+
+    def go_quiet(self, num, seconds):
+        """Backdate every event on this card so its agent has been quiet that
+        long. Cheaper and far more deterministic than sleeping."""
+        with self.app.lock:
+            self.app.conn.execute(
+                "UPDATE events SET ts=ts-? WHERE card_num=?", (seconds, num))
+            self.app.conn.execute(
+                "UPDATE cards SET updated_at=updated_at-? WHERE num=?", (seconds, num))
+
+    def stuck_events(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return [e for e in detail["timeline"] if e["kind"] == "stuck"]
+
+    def gone_notices(self, num):
+        return [e for e in self.stuck_events(num)
+                if e["payload"].get("rule") == "worker_gone"]
+
+    def card(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return detail["card"]
+
+
+class TestWorkerGoneTiming(WorkerGoneBase):
+    def test_the_notice_lands_at_the_first_interval_and_failed_at_the_second(self):
+        num = self.working_card()
+        self.say_something(num, "reading the card")
+
+        # Inside the first interval: nothing at all. A quiet agent is a working
+        # agent until proven otherwise.
+        self.go_quiet(num, 0.5)
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.gone_notices(num), [])
+        self.assertEqual(self.state_of(num), "in_progress")
+
+        # Past the first interval: the board says out loud that the worker may
+        # be dead, and names it. The card does NOT move yet.
+        self.go_quiet(num, 1.0)          # 1.5s quiet, threshold 1.0
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        notices = self.gone_notices(num)
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]["actor"], "server")
+        self.assertEqual(notices[0]["payload"]["stage"], "notice")
+        self.assertEqual(notices[0]["payload"]["agent_name"], "sprint-card-%d" % num)
+        self.assertIn("sprint-card-%d" % num, notices[0]["payload"]["text"])
+        self.assertEqual(self.state_of(num), "in_progress",
+                         "the first interval is a warning, not a verdict")
+
+        # Past the second: it stops guessing.
+        self.go_quiet(num, 1.0)          # 2.5s quiet, threshold 2.0
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        card = self.card(num)
+        self.assertEqual(card["state"], "failed")
+        self.assertRegex(card["reason"], r"^worker gone: no events for ")
+        self.assertRegex(card["error"], r"^worker gone: no events for ")
+
+    def test_a_worker_that_comes_back_resets_the_clock(self):
+        num = self.working_card()
+        self.go_quiet(num, 5.0)
+        self.say_something(num, "sorry — long build")
+        self.assertEqual(self.app.sweep_worker_gone(), 0,
+                         "a live worker is never declared dead")
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_one_agents_activity_covers_every_card_it_holds(self):
+        """The clock is the AGENT's. While it is posting on card A it is
+        demonstrably not dead on card B."""
+        a = self.working_card("card A", agent="sprint-batch-9")
+        b = self.working_card("card B", agent="sprint-batch-9")
+        self.go_quiet(a, 5.0)
+        self.go_quiet(b, 5.0)
+        self.say_something(a, "working through the batch")
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(b), "in_progress")
+
+    def test_the_notice_fires_once_per_episode(self):
+        num = self.working_card()
+        self.go_quiet(num, 1.5)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        self.assertEqual(self.app.sweep_worker_gone(), 0, "no second notice")
+        self.assertEqual(len(self.gone_notices(num)), 1)
+
+    def test_an_agent_that_never_said_a_word_still_gets_caught(self):
+        """Killed at dispatch: assigned, never posted. The clock falls back to
+        the card's last transition, which is exactly the incident shape."""
+        num = self.working_card("never spoke")
+        self.go_quiet(num, 2.5)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        self.assertEqual(self.state_of(num), "failed")
+
+    def test_a_triaging_card_counts_too(self):
+        num = self.working_card("died while triaging", state="triaging")
+        self.assertEqual(self.state_of(num), "triaging")
+        self.go_quiet(num, 2.5)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        self.assertEqual(self.state_of(num), "failed")
+
+
+class TestWorkerGoneGuards(WorkerGoneBase):
+    """Declaring a working agent dead is worse than waiting, so every one of
+    these is a bias toward leaving the card alone."""
+
+    def test_a_card_with_no_agent_is_never_declared_dead(self):
+        num = self.new_card("nobody on it")["num"]
+        self.post("/api/cards/%d/state" % num, {"state": "triaging"})
+        self.post("/api/cards/%d/state" % num, {"state": "in_progress"})
+        self.go_quiet(num, 60.0)
+        # Both halves: the predicate says why, and the sweep's own query agrees.
+        # They are separate guards and either one alone would let this through.
+        self.assertEqual(self.app.worker_gone_exempt(self.app.card_row(num)),
+                         "no_agent")
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "in_progress")
+        self.assertEqual(self.gone_notices(num), [])
+
+    def test_an_external_agent_card_is_never_declared_dead(self):
+        """Somebody else's process on somebody else's clock. The board has no
+        standing to call it dead and no way to restart it."""
+        num = self.working_card("run by something else")
+        self.go_quiet(num, 60.0)
+        # Before the flag, this card WOULD be escalated — which is what makes
+        # the flag the thing under test rather than an accident of the fixture.
+        self.assertIsNone(self.app.worker_gone_exempt(self.app.card_row(num)))
+        status, body = self.post("/api/cards/%d/action" % num,
+                                 {"action": "external_agent",
+                                  "note": "a cron job owns this one"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["card"]["external_agent"])
+        self.go_quiet(num, 60.0)
+        self.assertEqual(self.app.worker_gone_exempt(self.app.card_row(num)),
+                         "external_agent")
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_a_flag_this_database_has_never_heard_of_degrades_to_false(self):
+        """`card_flag` is how a guard survives a column that landed in another
+        change and has not reached this database yet — absence must read as
+        "no such flag", never as a crash on every sweep tick."""
+        num = self.working_card("nothing exotic about this one")
+        row = self.app.card_row(num)
+        self.assertFalse(self.app.card_flag(row, "no_such_column_anywhere"))
+        self.assertNotIn("no_such_column_anywhere", self.app.columns("cards"))
+        self.assertIn("external_agent", self.app.columns("cards"))
+
+    def test_a_long_running_card_is_safe_inside_its_window_and_not_outside_it(self):
+        num = self.working_card("full suite, ~30 min")
+        status, body = self.post("/api/cards/%d/events" % num,
+                                 {"kind": "note", "long_running": True,
+                                  "payload": {"text": "running the full suite"}})
+        self.assertEqual(status, 201, body)
+        self.assertTrue(body["card"]["long_running"])
+
+        # Well past the ordinary window, comfortably inside the stretched one.
+        self.go_quiet(num, 5.0)          # ordinary fail is 2.0s; stretched is 12.0s
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "in_progress")
+
+        # ...but the window ENDS. A flag is not a permanent exemption; an agent
+        # killed mid-suite is the exact shape this rule exists for.
+        self.go_quiet(num, 10.0)         # 15s quiet vs a 12s stretched threshold
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        self.assertEqual(self.state_of(num), "failed")
+
+    def test_a_live_phase_claim_holds_the_rule_off(self):
+        num = self.working_card("declared a long phase")
+        status, _ = self.post("/api/cards/%d/events" % num,
+                              {"kind": "progress",
+                               "payload": {"text": "phase: testing", "phase": "testing",
+                                           "expected_seconds": 600}})
+        self.assertEqual(status, 201)
+        self.go_quiet(num, 5.0)
+        self.assertEqual(self.app.worker_gone_exempt(self.app.card_row(num)), "phase")
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        # ...and once the claim runs out, the rule applies as usual.
+        self.go_quiet(num, 700.0)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        self.assertEqual(self.state_of(num), "failed")
+
+    def test_a_needs_you_card_with_an_open_question_is_not_a_dead_worker(self):
+        """A worker parked on a question is SUPPOSED to be silent — it ended its
+        turn and the user has the ball. The needs_you sweep rule already nags
+        the right person about that."""
+        num = self.working_card("asked something")
+        status, _ = self.post("/api/cards/%d/question" % num,
+                              {"text": "which of these did you mean?"})
+        self.assertEqual(status, 201)
+        self.assertEqual(self.state_of(num), "needs_you")
+        self.go_quiet(num, 60.0)
+        self.assertEqual(self.app.worker_gone_exempt(self.app.card_row(num)),
+                         "open_question")
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "needs_you")
+
+    def test_a_ready_card_is_not_the_workers_problem(self):
+        num = self.working_card("finished and waiting on a verdict")
+        status, body = self.post("/api/cards/%d/ready" % num,
+                                 {"packet": dict(GOOD_PACKET,
+                                                 branch="sprint/card-%d" % num)})
+        self.assertEqual(status, 200, body)
+        self.go_quiet(num, 60.0)
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "ready",
+                         "a ready card is waiting on the USER, not on its agent")
+
+
+class TestWorkerGoneFailedPreservesEverything(WorkerGoneBase):
+    def failed_card_with_history(self):
+        num = self.working_card("has a real history")
+        self.say_something(num, "read the CSS, found the misaligned flex item")
+        status, body = self.post("/api/cards/%d/ready" % num,
+                                 {"packet": dict(GOOD_PACKET,
+                                                 branch="sprint/card-%d" % num)})
+        self.assertEqual(status, 200, body)
+        status, _ = self.post("/api/cards/%d/verdict" % num,
+                              {"verdict": "bounce", "notes": "still overlaps at 980px"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "in_progress")
+        self.go_quiet(num, 30.0)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        return num
+
+    def test_failed_keeps_the_timeline_evidence_branch_and_worktree(self):
+        num = self.failed_card_with_history()
+        _, detail = self.get("/api/cards/%d" % num)
+        card = detail["card"]
+        self.assertEqual(card["state"], "failed")
+        self.assertEqual(card["branch"], "sprint/card-%d" % num)
+        self.assertEqual(card["worktree"], "/tmp/wt/sprint-card-%d" % num)
+        self.assertEqual(card["agent_name"], "sprint-card-%d" % num)
+        self.assertEqual(card["evidence"]["packet"]["claim"], GOOD_PACKET["claim"],
+                         "the evidence a Retry needs as its brief is still there")
+        texts = [str((e.get("payload") or {}).get("text", "")) for e in detail["timeline"]]
+        self.assertTrue(any("misaligned flex item" in t for t in texts),
+                        "the whole timeline survives — it IS the retry brief")
+        self.assertTrue(any(e["kind"] == "evidence" for e in detail["timeline"]))
+        self.assertTrue(any(e["kind"] == "verdict" for e in detail["timeline"]))
+
+    def test_retry_from_a_worker_gone_failure_requeues_with_the_timeline_intact(self):
+        num = self.failed_card_with_history()
+        before = len(self.get("/api/cards/%d" % num)[1]["timeline"])
+        status, body = self.post("/api/cards/%d/action" % num, {"action": "retry"})
+        self.assertEqual(status, 200, body)
+        _, detail = self.get("/api/cards/%d" % num)
+        card = detail["card"]
+        self.assertEqual(card["state"], "queued")
+        self.assertIsNone(card["agent_name"], "nobody SendMessages a dead agent")
+        self.assertIsNone(card["worktree"])
+        self.assertEqual(card["branch"], "sprint/card-%d" % num,
+                         "the branch is where the dead agent's commits are")
+        self.assertEqual(card["evidence"]["packet"]["claim"], GOOD_PACKET["claim"])
+        self.assertGreater(len(detail["timeline"]), before)
+        retry = [e for e in detail["timeline"] if (e["payload"] or {}).get("retry")]
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(retry[0]["payload"]["previous_agent"], "sprint-card-%d" % num)
+
+    def test_the_failed_card_shows_the_machine_reason_and_a_retry(self):
+        """What the user actually sees: the face carries the reason, and the
+        card is in the one state whose menu offers Retry."""
+        num = self.failed_card_with_history()
+        _, board = self.get("/api/board")
+        card = {c["num"]: c for c in board["cards"]}[num]
+        self.assertEqual(card["state"], "failed")
+        self.assertIn("worker gone", card["error"])
+        self.assertIn("no events for", card["error"])
+
+
+class TestWorkerGoneIsWired(WorkerGoneBase):
+    """The rule is only worth anything if the timer thread actually runs it."""
+
+    START_BACKGROUND = True
+
+    def setUp(self):
+        super().setUp()
+
+    def test_the_background_sweep_escalates_without_anyone_calling_it(self):
+        # the sweep thread is already running with the real (long) thresholds
+        # baked in at construction; re-point them and let the tick do the work
+        self.app.sweep_tick = 0.2
+        num = self.working_card("nobody is going to call the sweep by hand")
+        self.go_quiet(num, 30.0)
+        deadline = time.time() + 20
+        while time.time() < deadline and self.state_of(num) != "failed":
+            time.sleep(0.2)
+        self.assertEqual(self.state_of(num), "failed",
+                         "the sweep loop must run this rule, not just define it")
+
+    def test_the_board_ambers_a_card_whose_worker_may_be_gone(self):
+        num = self.working_card("about to go quiet")
+        self.go_quiet(num, 1.5)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        _, board = self.get("/api/board")
+        self.assertTrue({c["num"]: c for c in board["cards"]}[num]["stuck"],
+                        "the age text is the one thing on a face already about "
+                        "time passing — that is where the amber goes")
+
+
+# --------------------------------------------------------------------------
+# Model at dispatch (#41)
+# --------------------------------------------------------------------------
+
+
+class TestDispatchModel(Base):
+    def assign(self, num, **extra):
+        body = {"agent_name": "sprint-card-%d" % num, "worktree": "/tmp/wt",
+                "branch": "sprint/card-%d" % num}
+        body.update(extra)
+        status, out = self.post("/api/cards/%d/assign" % num, body)
+        self.assertEqual(status, 200, out)
+        return out
+
+    def test_assign_records_the_model_and_the_board_says_what_the_default_is(self):
+        num = self.new_card("dispatched after a fallback")["num"]
+        self.assign(num, model="opus")
+        card = self.get("/api/cards/%d" % num)[1]["card"]
+        self.assertEqual(card["model"], "opus")
+        self.assertEqual(card["default_model"], sprintd.DEFAULT_MODEL)
+        _, board = self.get("/api/board")
+        self.assertEqual(board["default_model"], sprintd.DEFAULT_MODEL)
+        self.assertEqual({c["num"]: c for c in board["cards"]}[num]["model"], "opus")
+
+    def test_a_card_dispatched_on_the_default_carries_nothing_to_shout_about(self):
+        num = self.new_card("ordinary dispatch")["num"]
+        self.assign(num, model=sprintd.DEFAULT_MODEL)
+        card = self.get("/api/cards/%d" % num)[1]["card"]
+        self.assertEqual(card["model"], card["default_model"],
+                         "the face shows the model only when it is the exception")
+
+    def test_assign_without_a_model_leaves_it_unset_and_never_clears_it(self):
+        num = self.new_card("model set once, then a plain re-assign")["num"]
+        self.assign(num)
+        self.assertIsNone(self.get("/api/cards/%d" % num)[1]["card"]["model"])
+        self.assign(num, model="sonnet")
+        self.assign(num, agent_name="sprint-card-%d" % num)
+        self.assertEqual(self.get("/api/cards/%d" % num)[1]["card"]["model"], "sonnet")
+
+    def test_the_fallback_is_readable_in_the_timeline(self):
+        num = self.new_card("fable ran out")["num"]
+        self.assign(num, model="opus")
+        _, detail = self.get("/api/cards/%d" % num)
+        notes = [e for e in detail["timeline"]
+                 if e["kind"] == "note" and (e["payload"] or {}).get("model")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("on opus", notes[0]["payload"]["text"])
+
+    def test_a_junk_model_is_a_named_400(self):
+        num = self.new_card("junk")["num"]
+        status, body = self.post("/api/cards/%d/assign" % num,
+                                 {"agent_name": "a", "worktree": "/tmp", "branch": "b",
+                                  "model": 7})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "model")
+
+    def test_a_board_that_predates_the_column_gets_it_on_open(self):
+        """CREATE TABLE IF NOT EXISTS never migrates a live database. A board
+        that has been up since before this shipped must not 500 on every read."""
+        old = os.path.join(self.tmp, "old-project")
+        os.makedirs(os.path.join(old, ".sprint"))
+        db = os.path.join(old, ".sprint", "sprint.db")
+        import sqlite3 as _sq
+        conn = _sq.connect(db)
+        # The schema as it was before `model` existed — the real shape of a
+        # board that has been up since before this shipped.
+        old_schema = sprintd.SCHEMA.replace("  model TEXT,\n", "")
+        self.assertNotIn("model TEXT", old_schema)
+        conn.executescript(old_schema)
+        conn.execute("INSERT INTO sprints(opened_at) VALUES(1.0)")
+        conn.execute("INSERT INTO cards(sprint_id, state, title, body, created_at, "
+                     "updated_at) VALUES(1,'queued','old card','body',1.0,1.0)")
+        conn.commit()
+        conn.close()
+        before = {r[1] for r in _sq.connect(db).execute("PRAGMA table_info(cards)")}
+        self.assertNotIn("model", before)
+
+        app = sprintd.App(old, token="t", log=self.logfh)
+        self.addCleanup(app.close)
+        self.assertIn("model", app.columns("cards"))
+        self.assertIsNone(app.card_json(app.card_row(1), brief=True)["model"])
+
+
+class TestSprintRecover(Base):
+    """`sprint-recover 41 42` — the "inspect before you redo anything" step,
+    as one command instead of five. Seeded against a real git repo, because
+    the whole value of the thing is that it reports what git actually says."""
+
+    SPRINT_RECOVER = os.path.join(os.path.dirname(HERE), "bin", "sprint-recover")
+
+    def run_recover(self, *argv, token="test-token"):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN=token)
+        return subprocess.run([sys.executable, self.SPRINT_RECOVER]
+                              + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=90)
+
+    def git(self, cwd, *args):
+        import subprocess
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        r = subprocess.run(("git", "-C", cwd) + args, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        return r.stdout.decode()
+
+    def seeded_worktree(self, name, commits=1, dirty=True):
+        """A real repo with a `main`, a branch off it, N commits on the branch
+        and (optionally) an uncommitted edit — the exact state a killed agent
+        leaves behind."""
+        path = os.path.join(self.tmp, name)
+        os.makedirs(path)
+        self.git(path, "init", "-q", "-b", "main")
+        with open(os.path.join(path, "README"), "w") as fh:
+            fh.write("base\n")
+        self.git(path, "add", "-A")
+        self.git(path, "commit", "-qm", "base")
+        self.git(path, "checkout", "-qb", name)
+        for i in range(commits):
+            with open(os.path.join(path, "work-%d.txt" % i), "w") as fh:
+                fh.write("committed work %d\n" % i)
+            self.git(path, "add", "-A")
+            self.git(path, "commit", "-qm", "half-finished thing %d" % i)
+        if dirty:
+            with open(os.path.join(path, "scratch.txt"), "w") as fh:
+                fh.write("uncommitted work the dead agent left\n")
+        return path
+
+    def dead_card(self, worktree, branch, text="the agent on this died"):
+        num = self.new_card(text)["num"]
+        status, _ = self.post("/api/cards/%d/assign" % num,
+                              {"agent_name": "sprint-card-%d" % num,
+                               "worktree": worktree, "branch": branch,
+                               "model": "opus"})
+        self.assertEqual(status, 200)
+        self.post("/api/cards/%d/state" % num, {"state": "in_progress"})
+        self.post("/api/cards/%d/events" % num,
+                  {"kind": "progress",
+                   "payload": {"text": "read the sweep, found the missing guard"}})
+        return num
+
+    def test_it_reports_state_branch_worktree_commits_and_dirtiness(self):
+        wt = self.seeded_worktree("sprint-card-1", commits=2, dirty=True)
+        num = self.dead_card(wt, "sprint-card-1")
+        r = self.run_recover(num)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        out = r.stdout.decode()
+        self.assertIn("#%d" % num, out)
+        self.assertIn("state: in_progress", out)
+        self.assertIn("agent: sprint-card-%d" % num, out)
+        self.assertIn("model: opus", out)
+        self.assertIn("branch:   sprint-card-1", out)
+        self.assertIn(wt, out)
+        self.assertIn("commits ahead of main: 2", out)
+        self.assertIn("half-finished thing 1", out)
+        self.assertIn("dirty: YES", out)
+        self.assertIn("scratch.txt", out)
+        self.assertIn("read the sweep, found the missing guard", out,
+                      "the timeline IS the brief")
+        self.assertIn("inspect the branch and the worktree", out,
+                      "the point of the header is the instruction, not the data")
+
+    def test_a_clean_branch_with_nothing_on_it_says_so_plainly(self):
+        wt = self.seeded_worktree("sprint-card-2", commits=0, dirty=False)
+        num = self.dead_card(wt, "sprint-card-2")
+        out = self.run_recover(num).stdout.decode()
+        self.assertIn("committed NOTHING", out)
+        self.assertIn("dirty: no", out)
+
+    def test_a_worktree_that_is_gone_is_a_finding_not_a_crash(self):
+        num = self.dead_card(os.path.join(self.tmp, "pruned-already"),
+                             "sprint-card-3")
+        r = self.run_recover(num)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("GONE", r.stdout.decode())
+
+    def test_several_cards_in_one_go(self):
+        a = self.dead_card(self.seeded_worktree("wt-a"), "wt-a", "card A")
+        b = self.dead_card(self.seeded_worktree("wt-b"), "wt-b", "card B")
+        out = self.run_recover(a, b).stdout.decode()
+        self.assertIn("#%d, #%d" % (a, b), out)
+        self.assertIn("#%d —" % a, out)
+        self.assertIn("#%d —" % b, out)
+
+    def test_the_last_ten_lines_are_the_last_ten(self):
+        num = self.dead_card(self.seeded_worktree("wt-c"), "wt-c")
+        for i in range(15):
+            self.post("/api/cards/%d/events" % num,
+                      {"kind": "progress", "payload": {"text": "step number %d" % i}})
+        out = self.run_recover(num).stdout.decode()
+        self.assertIn("step number 14", out)
+        self.assertNotIn("step number 3", out, "only the last ten")
+
+    def test_it_never_writes_anything_to_the_card(self):
+        num = self.dead_card(self.seeded_worktree("wt-d"), "wt-d")
+        before = self.get("/api/cards/%d" % num)[1]["timeline"]
+        self.run_recover(num)
+        after = self.get("/api/cards/%d" % num)[1]["timeline"]
+        self.assertEqual(len(before), len(after),
+                         "safe to run on a live board")
+
+    def test_it_fails_named_without_a_card_number(self):
+        r = self.run_recover()
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("card number", r.stderr.decode())
+
+    def test_a_bad_token_is_a_clear_failure_not_a_traceback(self):
+        num = self.dead_card(self.seeded_worktree("wt-e"), "wt-e")
+        r = self.run_recover(num, token="wrong")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("401", r.stderr.decode())
+        self.assertNotIn("Traceback", r.stderr.decode())
+
+
+# --------------------------------------------------------------------------
+# Ops batch (#36-#40): bulk import, actor attribution, ops cards, external
+# agents, and the additive-column migration.
+# --------------------------------------------------------------------------
+
+
 class TestBulkCreate(Base):
     """Importing N issues must never flood the board against intent.
 
@@ -5021,6 +6373,208 @@ class TestMigratedColumns(unittest.TestCase):
         card = app2.card_json(app2.card_row(1))
         self.assertFalse(card["external_agent"])
         self.assertEqual(card["work_kind"], "code")
+class TestSprintIsNamedAfterTheProject(Base):
+    """A board's title defaults to the PROJECT, never the literal "sprint".
+
+    User report: the russ board's header read "sprint" — which says nothing at
+    all when three boards are open in three tmux windows, and is the one string
+    every auto-opened sprint shared.
+    """
+
+    def test_auto_opened_sprint_takes_the_project_basename(self):
+        self.app.open_sprint(create=True)
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        self.assertEqual(board["sprint"]["title"], "project")   # basename of project_root
+
+    def test_open_without_a_title_takes_the_project_basename(self):
+        status, res = self.post("/api/sprint", {"action": "open"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["sprint"]["title"], "project")
+
+    def test_an_explicit_title_still_wins(self):
+        status, res = self.post("/api/sprint", {"action": "open", "title": "Billing week"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["sprint"]["title"], "Billing week")
+
+    def test_a_board_still_carrying_the_old_literal_default_is_renamed_once(self):
+        """Every board opened before this change is sitting under "sprint"."""
+        self.app.open_sprint(create=True)
+        with self.app.lock:
+            self.app.conn.execute("UPDATE sprints SET title='sprint'")
+        self.assertEqual(self.get("/api/board")[1]["sprint"]["title"], "sprint")
+        self.app.name_untitled_sprint()
+        self.assertEqual(self.get("/api/board")[1]["sprint"]["title"], "project")
+
+    def test_a_title_somebody_chose_is_never_touched(self):
+        self.post("/api/sprint", {"action": "open", "title": "Billing week"})
+        self.app.name_untitled_sprint()
+        self.assertEqual(self.get("/api/board")[1]["sprint"]["title"], "Billing week")
+
+    def test_the_registry_name_is_unchanged_by_any_of_this(self):
+        """The switcher labels boards from the registry; this only names sprints."""
+        entry = sprintd.registry_entry(self.project_root, 8399, "127.0.0.1")
+        self.assertEqual(entry["name"], "project")
+
+
+class TestApiVersionIsPublished(Base):
+    """A page can tell it is talking to a server older than itself."""
+
+    def test_healthz_and_board_both_carry_the_api_version(self):
+        status, health = self.get("/healthz", token=None)
+        self.assertEqual(status, 200, health)
+        self.assertEqual(health["api_version"], sprintd.API_VERSION)
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        self.assertEqual(board["api_version"], sprintd.API_VERSION)
+
+    def test_the_version_is_an_integer_that_only_goes_up(self):
+        self.assertIsInstance(sprintd.API_VERSION, int)
+        self.assertGreaterEqual(sprintd.API_VERSION, 2)
+
+
+class TestPortChoice(unittest.TestCase):
+    """`sprintd start` must never need --port: not on a restart, and not when
+    somebody else's board is already sitting on the default."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-port-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "project")
+        os.makedirs(self.root)
+
+    def hold(self, port=0):
+        """Occupy a port for the length of the test and return it."""
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        s.listen(1)
+        self.addCleanup(s.close)
+        return s.getsockname()[1]
+
+    def test_port_file_round_trips(self):
+        p = os.path.join(self.tmp, "port")
+        sprintd.write_port_file(p, 8378)
+        self.assertEqual(sprintd.read_port_file(p), 8378)
+
+    def test_a_junk_or_missing_port_file_reads_as_nothing(self):
+        p = os.path.join(self.tmp, "port")
+        self.assertIsNone(sprintd.read_port_file(p))
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("not a port\n")
+        self.assertIsNone(sprintd.read_port_file(p))
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("99999\n")
+        self.assertIsNone(sprintd.read_port_file(p))
+
+    def test_a_free_port_is_simply_taken(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        free = s.getsockname()[1]
+        s.close()
+        self.assertEqual(sprintd.choose_port(free, self.root), free)
+
+    def test_a_held_port_moves_up_to_the_next_free_one(self):
+        held = self.hold()
+        got = sprintd.choose_port(held, self.root)
+        self.assertNotEqual(got, held)
+        self.assertGreater(got, held)
+        self.assertTrue(sprintd.port_is_free(got))
+
+    def test_an_explicit_port_is_obeyed_even_when_it_is_taken(self):
+        """--port means that port. Silently moving would be the worse bug."""
+        held = self.hold()
+        self.assertEqual(sprintd.choose_port(held, self.root, explicit=True), held)
+
+    def test_it_says_which_port_it_moved_to_and_why(self):
+        held = self.hold()
+        said = []
+        got = sprintd.choose_port(held, self.root, say=said.append)
+        self.assertEqual(len(said), 1)
+        self.assertIn(str(held), said[0])
+        self.assertIn(str(got), said[0])
+
+
+class TestPortSurvivesStopAndStart(unittest.TestCase):
+    """The live failure this fixes: the russ board had been serving on 8378 for
+    weeks; a restart tried the compiled default 8377, found ANOTHER project's
+    board there, and died with "cannot bind 127.0.0.1:8377"."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-portcli-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "project")
+        os.makedirs(self.root)
+        self.server_json = os.path.join(self.root, ".sprint", sprintd.SERVER_JSON)
+        self.port_file = os.path.join(self.root, ".sprint", sprintd.PORT_FILENAME)
+        self.registry = os.path.join(self.tmp, "registry.json")
+        self.addCleanup(self._kill_leftovers)
+
+    def _kill_leftovers(self):
+        info = sprintd.read_server_json(self.server_json)
+        if info and isinstance(info.get("pid"), int):
+            try:
+                os.kill(info["pid"], 15)
+            except OSError:
+                pass
+
+    def _run(self, *argv, timeout=60):
+        import subprocess
+        return subprocess.run(
+            [sys.executable, SPRINTD_PATH, "--project-root", self.root,
+             "--registry", self.registry] + list(argv),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
+    def _free_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def test_restart_reuses_the_port_without_being_told(self):
+        port = self._free_port()
+        r = self._run("start", "--port", str(port), "--token", "keeps-its-port",
+                      "--no-tailscale")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(sprintd.read_port_file(self.port_file), port)
+
+        self.assertEqual(self._run("stop").returncode, 0)
+        self.assertFalse(os.path.exists(self.server_json))
+        self.assertTrue(os.path.exists(self.port_file),
+                        "stop must not take the port with it")
+
+        # no --port this time: the board must come back where it was
+        r2 = self._run("start", "--no-tailscale")
+        self.assertEqual(r2.returncode, 0, r2.stderr.decode())
+        self.assertIn("http://127.0.0.1:%d/?t=keeps-its-port" % port, r2.stdout.decode())
+        self.assertEqual(sprintd.read_server_json(self.server_json)["port"], port)
+        self.assertEqual(self._run("stop").returncode, 0)
+
+    def test_a_default_port_held_by_another_project_does_not_stop_the_start(self):
+        """No recorded port, and something else on the one we would have used:
+        take the next free port and say so, instead of refusing to start."""
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        held = s.getsockname()[1]
+        self.addCleanup(s.close)
+
+        self.assertIsNone(sprintd.read_port_file(self.port_file))
+        # --port is deliberately NOT passed; the preferred port is seeded the
+        # way a fresh board seeds it, through the port file.
+        os.makedirs(os.path.dirname(self.port_file), exist_ok=True)
+        sprintd.write_port_file(self.port_file, held)
+        r = self._run("start", "--no-tailscale", "--token", "moves-over")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        landed = sprintd.read_server_json(self.server_json)["port"]
+        self.assertNotEqual(landed, held)
+        self.assertEqual(sprintd.read_port_file(self.port_file), landed)
+        self.assertIn("is held by", r.stderr.decode())
+        self.assertEqual(sprintd.http_get("127.0.0.1", landed, "/healthz")[0], 200)
+        self.assertEqual(self._run("stop").returncode, 0)
 
 
 if __name__ == "__main__":

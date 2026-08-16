@@ -107,20 +107,21 @@ export const store = {
   seq: 0,
   detail: null,           // {num, card, timeline, evidence, attachments, pendingLines}
   drafts: new Map(),      // freeform text kept across re-renders
+  bouncing: new Set(),    // card nums whose verdict row is mid-BOUNCE (see below)
   attached: new Map(),    // composer key -> images pasted but not sent yet
   expanded: new Set(),    // event keys whose long version you opened (see detail.js)
   doneOpen: false,
   loaded: false,
+  // How many report documents THIS sprint has. The header's Reports link exists
+  // only when this is > 0 — user, verbatim: "link should only appear once
+  // there's a report within the sprint".
+  reports: 0,
 
   // ---- rail + layout (client only) ----------------------------------------
   // Only one thing owns the rail at a time: a card, or the session chat.
   view: 'list',           // 'list' | 'board' — persisted
   chatOpen: false,        // session chat wants the rail
   unseen: false,          // a session line arrived while the rail was closed
-  // Bounce is typed in the RAIL, never on a card face (card #46). This is the
-  // card whose bounce-notes box is open and waiting for words; it survives the
-  // re-render because it lives here rather than in a DOM node's `hidden`.
-  bounceOpen: null,
 };
 
 const VIEW_KEY = 'sprint.view';
@@ -192,6 +193,12 @@ export function normCard(c) {
     pinned: !!c.pinned,
     dup_of: c.dup_of != null ? num(c.dup_of) : null,
     long_running: !!c.long_running,
+    // Which model the agent was dispatched on, and what the sprint's default
+    // is, so `modelTag` can decide whether it is worth drawing. This
+    // normalizer builds an explicit shape — a field it doesn't name does not
+    // exist in the tab, which is exactly how the tag silently didn't render.
+    model: c.model || null,
+    default_model: c.default_model || null,
     created_at: c.created_at || null,
     updated_at: c.updated_at || null,
     queue_position: c.queue_position != null ? num(c.queue_position)
@@ -330,6 +337,11 @@ export function applyBoard(board) {
     const echoes = store.sidebar.filter((e) => e.localEcho && !texts.has(e.payload && e.payload.text));
     store.sidebar = lines.concat(echoes);
   }
+
+  // Scoped to the open sprint by the server — never a lifetime total, because
+  // the header link is a statement about THIS sprint.
+  const reports = num(board.reports);
+  store.reports = reports != null && reports > 0 ? reports : 0;
 
   const seq = num(board.seq != null ? board.seq : board.last_seq);
   if (seq != null) store.seq = Math.max(store.seq, seq);
@@ -710,6 +722,27 @@ export function draft(key, value) {
 }
 
 /**
+ * Are you in the middle of bouncing this card?
+ *
+ * User, verbatim: "once I hit 'Bounce' we should get rid of the 'Approve'
+ * button — should just be a 'Submit bounce' button." Deciding to send something
+ * back is a decision you have already made; leaving Approve sitting next to the
+ * notes box you are typing into means one slip turns a bounce into a merge.
+ * So Bounce opens a composing state — notes plus Submit bounce and Cancel, with
+ * Approve and Reject gone until you send or back out.
+ *
+ * It lives here, beside the drafts, for the same reason drafts do: the row is
+ * rebuilt whenever anything on the card moves, and a half-written bounce (and
+ * the fact that you are writing one at all) has to survive that.
+ */
+export function bounceComposing(num, value) {
+  if (value === undefined) return store.bouncing.has(num);
+  if (value) store.bouncing.add(num);
+  else store.bouncing.delete(num);
+  return value;
+}
+
+/**
  * Images pasted into a composer but not sent yet. Same reasoning as `draft`:
  * the rail is rebuilt whenever the card it is showing moves, and a screenshot
  * you just pasted must survive that — it is part of the message you are still
@@ -767,6 +800,22 @@ export function isStuck(card) {
 }
 
 export const STUCK_HINT = 'parked here longer than it should be — the board said so on the card';
+
+/**
+ * Which model this card's agent is running on, but ONLY when that is worth
+ * saying: a badge that is on every card is decoration, and the thing the user
+ * actually needs to see is the exception — "this one is on opus because fable
+ * hit its usage limit and the first agent was killed."
+ *
+ * The server tells the tab what the default is (`default_model`, on the card
+ * and on the board), so the tab never has to hold a copy of that list.
+ */
+export function modelTag(card) {
+  if (!card || !card.model) return null;
+  return card.model === card.default_model ? null : card.model;
+}
+
+export const MODEL_HINT = 'not the sprint default — this card was dispatched on a fallback model';
 
 // ---- what happened to the message I just sent ---------------------------
 //
