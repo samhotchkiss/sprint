@@ -280,10 +280,25 @@ your assigned worktree; one branch; never push to main; never touch other cards'
   columns. No narrow-phone layout work (a basic usable fallback is fine, not optimized).
 - **Two layouts, one toggle** (persisted in `localStorage`). **List** is the default and the daily
   driver: a 4px proportional meter + legend, then Needs you (the only generously spaced section) /
-  In motion / Blocked / Queued & held, each quieter than the last, then Done. **Board** is the
-  kanban: four columns — Needs you / In progress / Blocked / Queued & held. Needs you deliberately
-  holds both shapes of asking (an open question, and a packet waiting on a verdict); they are told
-  apart by rail colour and an ASKS/SIGNOFF tag. Done is a count that opens into a plain list.
+  In motion / Blocked / Queued & held, each quieter than the last, then Done. In the List, Needs you
+  deliberately holds both shapes of asking (an open question, and a packet waiting on a verdict);
+  they are told apart by rail colour and an ASKS/SIGNOFF tag, and Done is a count that opens into a
+  plain list.
+  **Board** is the kanban, and it is ordered as the life of a card rather than as a reading order —
+  user ruling, verbatim: *"column 1 should have 3 sections (when needed) queued, then held, then
+  blocked … then column 2 is in progress, then column 3 is 'needs you', then column 4 is two
+  sections: awaiting review and complete (they start in awaiting review, then move to complete once
+  I've approved)"*. So: **Waiting** (Queued → Held → Blocked, each section drawn only when it has
+  something in it) · **In progress** · **Needs you** (open questions only) · **Review** (Awaiting
+  review = ready + integrating, then Complete = the closed states, dimmed). The two things that are
+  on the user are deliberately apart: answering a question and signing off a finished branch are
+  different jobs. The Blocked section carries the answer to "what even is blocked?" in place —
+  *"an external wall (red CI, waiting on another branch). Nothing you type fixes these; the session
+  re-checks and unblocks them itself"* — and the List's Blocked intro is the same sentence.
+  The meter stays in **urgency** order (need you → in motion → blocked → queued), not column order:
+  it says what shape the sprint is in, and the columns say where everything is.
+  On the Fold the three live columns (In progress / Needs you / Review) keep the grid and the whole
+  Waiting pile — queued, held **and blocked** — drops into the Elsewhere strip as pills.
   Card face: `#num`, title, tag, last-activity one-liner, agent, state age, amber-on-silence.
   The title on the face is the **condensed** title (≤8 words, set by the session at assign time and
   refined by the worker at triage); the user's original submission is never rewritten and shows in

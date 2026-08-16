@@ -11,6 +11,17 @@ export const SILENT_MS = 5 * 60 * 1000;   // spec: 5 minutes with no worker even
  * the same thing to a human ("this one is on me"), so they share a section and
  * are told apart by their rail colour and tag.
  */
+/**
+ * What "blocked" means, in the user's words back to him: he asked "what even is
+ * blocked? how can it be blocked but not need me?" — so the answer lives on the
+ * section itself, in both layouts, rather than in anyone's head.
+ */
+export const BLOCKED_NOTE = 'Blocked = an external wall (red CI, waiting on another branch). '
+  + 'Nothing you type fixes these; the session re-checks and unblocks them itself.';
+
+/** Which sorter a Board section borrows from the List's four. */
+const SORT_AS = { queued: 'waiting', held: 'waiting', complete: 'done', awaiting: 'needs_you' };
+
 export const COLUMNS = [
   {
     key: 'needs_you',
@@ -425,6 +436,93 @@ function sorterFor(key, now) {
   if (key === 'in_motion') return wrap((a, b) => (isSilent(b, now) ? 1 : 0) - (isSilent(a, now) ? 1 : 0) || oldestFirst(a, b));
   if (key === 'done') return wrap(newestFirst);
   return wrap(oldestFirst);
+}
+
+/**
+ * The Board's columns — a different grouping from the List's reading order, on
+ * the user's ruling: "column 1 should have 3 sections (when needed) queued,
+ * then held, then blocked … then column 2 is in progress, then column 3 is
+ * needs you, then column 4 is two sections: awaiting review and complete".
+ *
+ * So the Board is left-to-right the life of a card, and the two things that are
+ * on YOU are separated: a question (Needs you) is not the same as a finished
+ * branch waiting for your ack (Awaiting review). The List keeps its own
+ * grouping — it is a reading order, not a pipeline.
+ */
+export const BOARD_COLUMNS = [
+  {
+    key: 'waiting',
+    board: 'Waiting',
+    dot: 'var(--faint)',
+    empty: 'Nothing waiting.',
+    sections: [
+      { key: 'queued', label: 'Queued', states: ['queued'], empty: 'Nothing queued.' },
+      { key: 'held', label: 'Held', states: ['held'] },
+      {
+        key: 'blocked',
+        label: 'Blocked',
+        states: ['blocked', 'failed', 'stale'],
+        note: BLOCKED_NOTE,
+      },
+    ],
+  },
+  {
+    key: 'in_motion',
+    board: 'In progress',
+    dot: 'var(--good)',
+    empty: 'No agent is running.',
+    sections: [{ key: 'in_motion', label: null, states: ['triaging', 'in_progress'] }],
+  },
+  {
+    key: 'needs_you',
+    board: 'Needs you',
+    dot: 'var(--accent)',
+    empty: 'Nothing needs you.',
+    sections: [{ key: 'needs_you', label: null, states: ['needs_you'] }],
+  },
+  {
+    key: 'review',
+    board: 'Review',
+    dot: 'var(--good)',
+    empty: 'Nothing to review.',
+    sections: [
+      { key: 'awaiting', label: 'Awaiting review', states: ['ready', 'integrating'] },
+      {
+        key: 'complete',
+        label: 'Complete',
+        states: ['completed', 'rejected', 'duplicate', 'canceled'],
+        quiet: true,
+      },
+    ],
+  },
+];
+
+const BOARD_COL_OF = {};
+for (const c of BOARD_COLUMNS) {
+  for (const s of c.sections) for (const st of s.states) BOARD_COL_OF[st] = [c.key, s.key];
+}
+
+/** The Board's columns, each with its (non-empty) sections filled in. */
+export function boardColumns() {
+  const buckets = new Map();
+  for (const c of BOARD_COLUMNS) for (const s of c.sections) buckets.set(c.key + '/' + s.key, []);
+  const put = (card, state) => {
+    const at = BOARD_COL_OF[state] || ['waiting', 'queued'];
+    buckets.get(at[0] + '/' + at[1]).push(card);
+  };
+  for (const card of store.cards.values()) put(card, cardState(card));
+  // A card you just dropped is on the board before the server has confirmed it.
+  for (const p of store.pending) buckets.get('waiting/queued').unshift(p);
+
+  const now = Date.now();
+  return BOARD_COLUMNS.map((c) => {
+    const secs = c.sections.map((s) => {
+      const cards = buckets.get(c.key + '/' + s.key);
+      cards.sort(sorterFor(SORT_AS[s.key] || s.key, now));
+      return { ...s, cards };
+    });
+    return { ...c, sections: secs, count: secs.reduce((n, s) => n + s.cards.length, 0) };
+  });
 }
 
 /** Sections keyed for the callers that want one by name. */

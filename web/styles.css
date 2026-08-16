@@ -580,6 +580,8 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
 .pill-mark { font-family: var(--font-mono); font-size: 11px; color: var(--faint); }
 /* held reads "untouched" at a glance: outline only */
 .pill.is-held { background: none; border-color: #1c1f24; }
+.pill.is-blocked { border-color: #3a2a2a; }
+.pill.is-blocked .pill-mark { color: var(--bad); }
 .pill.is-held .pill-title { color: var(--faint); }
 
 /* pending submission */
@@ -664,7 +666,30 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
 .col-in_motion .col-head { background: #12161a; border-color: #232a2c; }
 .col-in_motion .col-name, .col-in_motion .col-count { color: var(--good); }
 .col-blocked .col-head { background: #141317; border-color: #2a2529; }
-.col-queued .col-head { background: #121316; border-color: #25272c; }
+.col-waiting .col-head { background: #121316; border-color: #25272c; }
+.col-review .col-head { background: #12161a; border-color: #262b2b; }
+.col-review .col-name, .col-review .col-count { color: var(--good); }
+
+/* a column that holds more than one kind of waiting says which is which */
+.col-sec {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 2px 0 2px;
+}
+.col-sec-name {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.col-sec-count { font-family: var(--font-mono); font-size: 11px; color: var(--faint); }
+.col-note { font-size: 12px; line-height: 1.5; color: var(--faint); padding: 0 2px 2px 2px; }
+.col-group { display: flex; flex-direction: column; gap: 10px; }
+/* closed work is history: present, never competing with live work */
+.col-group.is-quiet .card { opacity: 0.62; }
+.col-group.is-quiet .card:hover { opacity: 1; }
 
 .card {
   display: flex;
@@ -1217,6 +1242,7 @@ body.rail-open .rail { display: flex; }
   .fold-cols {
     flex: 1;
     min-height: 0;
+    overflow: hidden;
     display: grid;
     grid-template-columns: 1fr 1fr 1fr;
     gap: 1px;
@@ -1224,6 +1250,9 @@ body.rail-open .rail { display: flex; }
   }
   .fold-cols .col {
     min-width: 0;
+    /* without this a tall column stretches the grid row and spills over the
+       Elsewhere strip instead of scrolling inside itself */
+    min-height: 0;
     background: var(--canvas);
     display: flex;
     flex-direction: column;
@@ -1525,8 +1554,11 @@ html.skin-chaos .col-needs_you .col-dot { background: #1f1500 !important; }
 html.skin-chaos .col-in_motion .col-head { background: linear-gradient(180deg, #1f5c3a, #123d26); border-color: var(--border); }
 html.skin-chaos .col-blocked .col-head { background: linear-gradient(180deg, #2e2a55, #1e1b3c); border-color: var(--border); }
 html.skin-chaos .col-blocked .col-name, html.skin-chaos .col-blocked .col-count,
-html.skin-chaos .col-queued .col-name, html.skin-chaos .col-queued .col-count { color: var(--dim); }
-html.skin-chaos .col-queued .col-head { background: linear-gradient(180deg, #2b2470, #1a1450); border-color: var(--border); }
+html.skin-chaos .col-waiting .col-name, html.skin-chaos .col-waiting .col-count { color: var(--dim); }
+html.skin-chaos .col-waiting .col-head { background: linear-gradient(180deg, #2b2470, #1a1450); border-color: var(--border); }
+html.skin-chaos .col-review .col-head { background: linear-gradient(180deg, #1f5c3a, #123d26); border-color: var(--border); }
+html.skin-chaos .col-sec-name, html.skin-chaos .col-sec-count { color: var(--dim); }
+html.skin-chaos .col-note { color: var(--dim); }
 
 html.skin-chaos .card { border: 2px solid var(--border); }
 html.skin-chaos .card.is-needs { border-color: var(--accent); }

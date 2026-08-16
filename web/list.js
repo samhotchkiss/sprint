@@ -7,7 +7,7 @@
 import { h, timeEl, firstLine } from './util.js';
 import {
   sections, meterSegments, cardState, needsKind, motionState, blockedReason,
-  waitingMark,
+  waitingMark, BLOCKED_NOTE,
 } from './state.js';
 import { renderMeter } from './meter.js';
 import { renderDone } from './done.js';
@@ -151,7 +151,9 @@ function lastAction(card, app) {
 function blockedSection(col, app) {
   const sec = h('section.section');
   sec.appendChild(head('Blocked', col.cards.length, { quiet: true, tight: true }));
-  sec.appendChild(h('p.section-intro', 'Nothing you type moves these. The session re-checks them on its own.'));
+  // The same sentence the Board's Blocked section uses — the user asked what
+  // blocked even means, and the answer should not depend on which layout he is in.
+  sec.appendChild(h('p.section-intro', BLOCKED_NOTE));
   const rows = h('div.rows');
   for (const card of col.cards) rows.appendChild(blockedRow(card, app));
   sec.appendChild(col.cards.length ? rows : h('p.section-empty', 'Nothing is stuck.'));
