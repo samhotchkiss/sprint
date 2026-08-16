@@ -3071,7 +3071,7 @@ html.skin-chaos .banner.account {
   font-size: 11.5px;
   letter-spacing: .01em;
 }
-.card-foot .blockedby-mark { margin-left: 8px; }
+.card > .blockedby-mark { max-width: 100%; margin-top: 3px; }
 .pill .blockedby-mark { margin-left: 8px; }
 .blocked-row .blockedby-mark { margin-left: auto; padding-left: 10px; }
 
@@ -3173,7 +3173,6 @@ html.skin-chaos .banner.account {
 .exec-confirm-q { font-size: 12.5px; color: var(--body-ink); }
 .btn.tiny.danger { color: var(--bad); }
 
-.exec-add { align-self: flex-start; }
 
 .exec-editor {
   display: flex;
@@ -3258,7 +3257,7 @@ html.skin-chaos .banner.account {
   .settings-text { min-height: 44px; }
   .exec-editor-foot .btn, .exec-confirm .btn { min-height: 44px; }
   .exec-row { flex-wrap: wrap; }
-  .blockedby-mark { max-width: 10ch; }
+  .pill .blockedby-mark { max-width: 10ch; }
 }
 
 /* Chaos: same words, hard edges — no radius, ink outlines, the skin's own

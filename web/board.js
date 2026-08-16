@@ -124,6 +124,12 @@ export function renderCardFace(card, app) {
   const sub = faceSub(card, state, col, app);
   if (sub.text) face.appendChild(h('span.card-sub', { style: sub.color ? { color: sub.color } : null }, sub.text));
 
+  // "waiting on #58" gets its own line rather than a slot in the foot: the
+  // foot already carries the agent and the age, and a card number that got
+  // ellipsised away is the one word this marker exists to say (#61).
+  const waitingOn = blockedByMark(card);
+  if (waitingOn) face.appendChild(waitingOn);
+
   if (col === 'in_motion') {
     const st = motionState(card);
     face.appendChild(h('span.prog-track', { title: st.title },
@@ -139,9 +145,6 @@ export function renderCardFace(card, app) {
   face.appendChild(h('div.card-foot',
     h('span', shortAgent(card.agent_name)),
     executorTag(card, { compact: true }),
-    // "waiting on #58" — the one thing that stops a card looking abandoned
-    // when it is merely queued behind another card (#61).
-    blockedByMark(card),
     h('span.grow'),
     h('span', { class: isStuck(card) ? 'is-stuck-age' : null,
       title: isStuck(card) ? STUCK_HINT : null },

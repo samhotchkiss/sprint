@@ -185,6 +185,9 @@ function build() {
 function paint() {
   if (!draft) return;
   const w = draft.worker;
+  // The body scrolls, and a repaint that threw its scroll position away would
+  // yank you back to the top of the sheet every time you touched a preset.
+  const wasAt = els.body ? els.body.scrollTop : 0;
   clear(els.body);
 
   // 1. model policy
@@ -228,6 +231,7 @@ function paint() {
 
   // 4. the executors themselves
   els.body.appendChild(executorsField(w));
+  els.body.scrollTop = wasAt;
 }
 
 // ---- executors -----------------------------------------------------------
@@ -243,6 +247,13 @@ function executorsField(w) {
   box.appendChild(h('div.settings-label-row',
     h('span.settings-label', 'Executors'),
     h('span.grow'),
+    // Add sits WITH the label, not under the list: the sheet's body scrolls,
+    // and a list of six executors would push the one button this whole panel
+    // exists for below the fold.
+    (jsonMode || editing) ? null : h('button.linkish.exec-add', {
+      type: 'button',
+      onclick: () => { removing = null; startAdd(); },
+    }, 'Add executor'),
     h('button.linkish', {
       type: 'button',
       onclick: () => {
@@ -283,10 +294,6 @@ function executorsField(w) {
 
   if (editing) box.appendChild(execEditor(w));
   else {
-    box.appendChild(h('button.btn.tiny.exec-add', {
-      type: 'button',
-      onclick: () => { removing = null; startAdd(); },
-    }, 'Add executor'));
     box.appendChild(h('p.settings-hint',
       'An executor is a way to run a worker. Add one and you can send any card '
       + 'to it — the rest keep running as Claude subagents.'));
@@ -348,6 +355,17 @@ function startAdd() {
     err: null, errField: null,
   };
   paint();
+  showEditor();
+}
+
+/**
+ * The sheet's body scrolls, so a form that opened under a long list would open
+ * off-screen. Bring it into view, and put the caret where the work starts.
+ */
+function showEditor() {
+  const box = els.body && els.body.querySelector('.exec-editor');
+  if (!box) return;
+  box.scrollIntoView({ block: 'nearest' });
 }
 
 function startEdit(name, spec) {
@@ -362,6 +380,7 @@ function startEdit(name, spec) {
     err: null, errField: null,
   };
   paint();
+  showEditor();
 }
 
 function applyPreset(key) {
