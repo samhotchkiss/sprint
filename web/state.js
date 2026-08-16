@@ -764,6 +764,22 @@ export function isStuck(card) {
 
 export const STUCK_HINT = 'parked here longer than it should be — the board said so on the card';
 
+/**
+ * Which model this card's agent is running on, but ONLY when that is worth
+ * saying: a badge that is on every card is decoration, and the thing the user
+ * actually needs to see is the exception — "this one is on opus because fable
+ * hit its usage limit and the first agent was killed."
+ *
+ * The server tells the tab what the default is (`default_model`, on the card
+ * and on the board), so the tab never has to hold a copy of that list.
+ */
+export function modelTag(card) {
+  if (!card || !card.model) return null;
+  return card.model === card.default_model ? null : card.model;
+}
+
+export const MODEL_HINT = 'not the sprint default — this card was dispatched on a fallback model';
+
 // ---- what happened to the message I just sent ---------------------------
 //
 // Three honest states, each standing on something the server actually told us:
