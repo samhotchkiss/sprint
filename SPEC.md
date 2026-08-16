@@ -24,6 +24,7 @@ recovery must be easy. The user always runs claude inside tmux.
 | `agents/sprint-worker.md` | Worker subagent definition + reporting contract. |
 | `bin/sprint-post`, `bin/sprint-ask`, `bin/sprint-ready` | Thin curl wrappers workers call (python3, no deps). Client-side validate before POST; fail with one named missing field. |
 | `bin/sprint-recover`, `bin/sprint-limit` | The SESSION's two helpers, not the workers'. `sprint-recover <num…>` prints the recovery brief for a card whose agent died; `sprint-limit declare/list/clear` records a provider limit window from the kill message. |
+| `bin/sprint-serve-setup` | One-time, run by hand: publishes the hub on the tailnet under a NAME via a Tailscale Service. Read-only preflight + printed plan by default; `--apply` runs it, `--verify` re-checks. |
 | `.claude-plugin/plugin.json` | Plugin manifest (name: `sprint`). |
 
 ## Data dir & server lifecycle
@@ -307,6 +308,37 @@ root; several run at once in different tmux windows.
   link carrying that board's token. `needs_you > 0` sorts to the top with an amber left rail and the
   oldest open question's age ("stuck 22m"); longest wait first. 10s polling of `GET /api/hub`; no SSE.
 - Started once per machine by hand; boards register themselves. No launchd parity yet.
+- **Reach it by name (SHIPPED).** User verbatim: "figure out how to set things up so I can just
+  navigate any browser to 'sprint' from any device on my tailnet and get to the project picker."
+  The mechanism is a **Tailscale Service** — `tailscale serve --service=svc:sprint --https=443
+  --yes http://127.0.0.1:8300` (plus `--http=80`), which gives the hub its own virtual IP, its own
+  MagicDNS name `sprint.<tailnet>.ts.net`, and its own auto-provisioned certificate. Not plain
+  `tailscale serve 8300`: that publishes under the *machine's* name and evicts whatever already
+  holds that machine's `/` on :443. Not a hostname rename: the machine hosts other things.
+  - **`bin/sprint-serve-setup`** reads the hub's port and token off `~/.sprint/hub.json`, preflights
+    read-only (tailscale ≥1.86, MagicDNS suffix, the hub actually answering `/healthz` with
+    `hub:true`, node tags, whether `svc:<name>` is already defined), prints the admin-console and
+    policy-file steps it cannot perform itself, prints the serve commands, and stops. `--apply`
+    runs them and then verifies by fetching the published name; `--verify` re-checks any time.
+    Idempotent — it reads `tailscale serve status --json` and says "nothing to change" when the
+    mounts already point at the hub.
+  - **The hub knows its own name.** `~/.sprint/hub-canonical` (written by the setup script, or
+    `sprintd hub --canonical-host`, or `$SPRINT_HUB_CANONICAL_HOST`) records the published origin.
+    Re-read on a 5s TTL, so publishing does not mean restarting the hub under an open browser.
+    A request whose `Host:` is a **single label** (`sprint`, i.e. someone followed the tailnet
+    search domain) 302s to that origin, query string and all, **before** auth and never for
+    `/healthz`. Reason: `sprint` and `sprint.<tailnet>.ts.net` are two cookie origins to a browser
+    and only the second one has a certificate, so signing in on one leaves you signed out on the
+    other. Hosts with a dot or a colon in them (every IP:port) are never touched, so the hub is
+    unchanged with no proxy in front of it. Unset -> the whole behaviour is off.
+  - **Boards are NOT proxied, deliberately.** `hub_summarize` hands out `board_url(hosts[0], port,
+    token)` — the board's own absolute `http://<tailnet-ip>:<port>/?t=…`, which already works from
+    every tailnet device and is unaffected by how the hub was reached. Path-mounting them would
+    break their root-relative `/api/…` fetches, and per-port serve mounts would have to be
+    re-applied every time a board started or stopped.
+  - **Honest limits**: the bare name works only where the device honours the tailnet search domain,
+    and only over plain HTTP — `https://sprint/` cannot be made to work, because the certificate is
+    for the FQDN. The FQDN is the deliverable; the bare name is a bonus that redirects onto it.
 - **From inside a board — the title switcher.** User verbatim: "When there are multiple sprints going
   on my box, the title should turn into a dropdown. Also, it should show a dot when another sprint has
   something waiting on me, and when I invoke the dropdown, it should show the dot next to the sprint
