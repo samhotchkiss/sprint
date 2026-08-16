@@ -168,10 +168,19 @@ class TestAuthAndHealth(Base):
             resp.read()
             self.assertEqual(resp.status, 302)
             cookie = resp.getheader("Set-Cookie") or ""
-            self.assertIn(sprintd.COOKIE_NAME + "=test-token", cookie)
+            # per-PORT name: cookies ignore the port, so two boards on one host
+            # sharing a name would sign each other out
+            self.assertIn(sprintd.board_cookie_name(self.port) + "=test-token",
+                          cookie)
         finally:
             conn.close()
         # the cookie alone authenticates
+        status, _ = self.get("/api/board", token=None,
+                             headers={"Cookie": "%s=test-token"
+                                                % sprintd.board_cookie_name(self.port)})
+        self.assertEqual(status, 200)
+        # ...and so does the legacy name, so an already-signed-in browser is
+        # not logged out by the upgrade
         status, _ = self.get("/api/board", token=None,
                              headers={"Cookie": "%s=test-token" % sprintd.COOKIE_NAME})
         self.assertEqual(status, 200)
@@ -2500,6 +2509,121 @@ class TestRegistry(RegistryBase):
                          sprintd.read_registry()[a["project_root"]])
 
 
+class TestClickThroughFromTheHub(Base):
+    """The bounce, verbatim: "I clicked your live link. then I tried to click
+    into the russ board and it said {"error":"unauthorized"...}".
+
+    Cookies are scoped by HOST and ignore the PORT, so every board on one
+    machine shares a cookie jar -- which is the whole situation the hub exists
+    for. The board used to prefer that ambient cookie over the `?t=` in the
+    link it was just handed, so a valid hub link 401'd as soon as you were
+    signed into any OTHER board on the same machine.
+    """
+
+    HTML_ACCEPT = ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                   "image/avif,image/webp,*/*;q=0.8")
+
+    def raw(self, path, headers=None, method="GET"):
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        try:
+            conn.request(method, path, headers=headers or {})
+            resp = conn.getresponse()
+            body = resp.read()
+            return resp.status, body, dict(resp.getheaders())
+        finally:
+            conn.close()
+
+    def test_a_valid_link_signs_you_in_even_holding_another_boards_cookie(self):
+        status, _, headers = self.raw(
+            "/?t=test-token",
+            {"Cookie": "%s=a-different-boards-token" % sprintd.COOKIE_NAME,
+             "Accept": self.HTML_ACCEPT})
+        self.assertEqual(status, 302, "this is the exact bounce: it used to 401")
+        self.assertIn(sprintd.board_cookie_name(self.port) + "=test-token",
+                      headers.get("Set-Cookie") or "")
+        self.assertEqual(headers.get("Location"), "/")
+
+    def test_the_query_token_outranks_a_stale_cookie_on_the_api_too(self):
+        status, _, _ = self.raw(
+            "/api/board?t=test-token",
+            {"Cookie": "%s=stale" % sprintd.board_cookie_name(self.port)})
+        self.assertEqual(status, 200)
+
+    def test_a_wrong_query_token_still_fails_even_with_a_good_cookie_present(self):
+        """Precedence is 'any credential may match', not 'the last one wins' --
+        a bad ?t= must not lock out a browser that IS signed in."""
+        status, _, _ = self.raw(
+            "/api/board?t=nope",
+            {"Cookie": "%s=test-token" % sprintd.board_cookie_name(self.port)})
+        self.assertEqual(status, 200)
+
+    def test_two_boards_on_one_host_do_not_sign_each_other_out(self):
+        """The premise of the whole hub: several sprints, one machine."""
+        other_root = os.path.join(self.tmp, "other")
+        os.makedirs(other_root, exist_ok=True)
+        other = sprintd.App(other_root, log=self.logfh, token="other-token")
+        httpd = sprintd.make_server(other, "127.0.0.1", 0)
+        other_port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever,
+                         kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+        def shutdown():
+            httpd.shutdown()
+            httpd.server_close()
+            other.close()
+
+        self.addCleanup(shutdown)
+        self.assertNotEqual(sprintd.board_cookie_name(self.port),
+                            sprintd.board_cookie_name(other_port),
+                            "each board needs its own slot in the browser jar")
+        # signed into BOTH at once: one jar, two cookies, neither clobbers
+        jar = "%s=test-token; %s=other-token" % (
+            sprintd.board_cookie_name(self.port),
+            sprintd.board_cookie_name(other_port))
+        status, _, _ = self.raw("/api/board", {"Cookie": jar})
+        self.assertEqual(status, 200)
+        conn = http.client.HTTPConnection("127.0.0.1", other_port, timeout=10)
+        try:
+            conn.request("GET", "/api/board", headers={"Cookie": jar})
+            self.assertEqual(conn.getresponse().status, 200)
+        finally:
+            conn.close()
+
+    def test_a_person_who_lands_unauthorized_gets_words_not_json(self):
+        status, body, headers = self.raw("/", {"Accept": self.HTML_ACCEPT})
+        self.assertEqual(status, 401)
+        self.assertIn("text/html", headers.get("Content-Type", ""))
+        page = body.decode()
+        self.assertIn("This board needs its link", page)
+        self.assertNotIn('{"error"', page)
+        self.assertNotIn("test-token", page, "a 401 page must never echo a token")
+
+    def test_a_rotated_token_explains_itself_instead_of_stranding_you(self):
+        status, body, _ = self.raw(
+            "/?t=the-old-rotated-one", {"Accept": self.HTML_ACCEPT})
+        self.assertEqual(status, 401)
+        self.assertIn("new-token", body.decode())
+        self.assertIn("sprintd hub", body.decode(),
+                      "point a stuck user at the page that has every live link")
+
+    def test_the_api_still_gets_json_not_a_web_page(self):
+        for path in ("/api/board", "/api/cards/1"):
+            status, body, headers = self.raw(path, {"Accept": self.HTML_ACCEPT})
+            self.assertEqual(status, 401, path)
+            self.assertIn("application/json", headers.get("Content-Type", ""), path)
+            self.assertEqual(json.loads(body.decode())["error"], "unauthorized")
+
+    def test_a_scripted_client_still_gets_json(self):
+        status, _, headers = self.raw("/", {"Accept": "application/json"})
+        self.assertEqual(status, 401)
+        self.assertIn("application/json", headers.get("Content-Type", ""))
+
+    def test_healthz_is_still_open_and_unchanged(self):
+        status, body, _ = self.raw("/healthz")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body.decode())["ok"])
+
+
 class HubBase(RegistryBase):
     """Spins real boards (real HTTP server, real sqlite, temp data dir) and
     points a real HubApp at them through a temp registry."""
@@ -2872,6 +2996,61 @@ class TestHubServer(HubBase):
     def test_unknown_paths_404(self):
         status, _, _ = self.hget("/nope")
         self.assertEqual(status, 404)
+
+    def test_the_link_the_page_renders_actually_signs_you_in(self):
+        """End to end on the reported path: read the href out of the hub's own
+        API, follow it exactly as a browser would -- carrying the cookie of a
+        DIFFERENT board on the same host -- and land on the board, not on
+        `{"error":"unauthorized"}`."""
+        a = self.board("alpha", token="alpha-secret")
+        self.board("beta", token="beta-secret")
+        status, raw, _ = self.hget("/api/hub?fresh=1")
+        self.assertEqual(status, 200)
+        rows = {r["name"]: r for r in json.loads(raw.decode())["sprints"]}
+        url = rows["alpha"]["url"]
+        self.assertIn("?t=alpha-secret", url)
+
+        # the browser already holds beta's cookie for this host
+        jar = "%s=beta-secret" % sprintd.board_cookie_name(rows["beta"]["port"])
+        conn = http.client.HTTPConnection("127.0.0.1", a["port"], timeout=10)
+        try:
+            conn.request("GET", "/?t=alpha-secret",
+                         headers={"Cookie": jar,
+                                  "Accept": "text/html,*/*;q=0.8"})
+            resp = conn.getresponse()
+            resp.read()
+            self.assertEqual(resp.status, 302, "the bounce: this used to 401")
+            set_cookie = resp.getheader("Set-Cookie") or ""
+        finally:
+            conn.close()
+        self.assertIn(sprintd.board_cookie_name(a["port"]) + "=alpha-secret",
+                      set_cookie)
+        # ...and the follow-up request with both cookies is signed in
+        jar2 = jar + "; " + set_cookie.split(";")[0]
+        conn = http.client.HTTPConnection("127.0.0.1", a["port"], timeout=10)
+        try:
+            conn.request("GET", "/api/board", headers={"Cookie": jar2})
+            self.assertEqual(conn.getresponse().status, 200)
+        finally:
+            conn.close()
+
+    def test_a_stale_hub_cookie_cannot_lock_you_out_of_a_good_hub_link(self):
+        status, _, headers = self.hget(
+            "/?t=hub-secret", token=None,
+            headers={"Cookie": "%s=rotated-away" % sprintd.HUB_COOKIE_NAME,
+                     "Accept": "text/html,*/*;q=0.8"})
+        self.assertEqual(status, 302)
+        self.assertIn(sprintd.HUB_COOKIE_NAME + "=hub-secret",
+                      headers.get("Set-Cookie") or "")
+
+    def test_the_hub_also_answers_a_person_in_words(self):
+        status, raw, headers = self.hget(
+            "/", token=None, headers={"Accept": "text/html,*/*;q=0.8"})
+        self.assertEqual(status, 401)
+        self.assertIn("text/html", headers.get("Content-Type", ""))
+        page = raw.decode()
+        self.assertIn("This page needs its link", page)
+        self.assertNotIn("hub-secret", page)
 
 
 class TestHubCli(unittest.TestCase):
