@@ -2827,6 +2827,7 @@ html.skin-chaos .composer textarea:focus,
 html.skin-chaos .bounce-notes:focus {
   box-shadow: 0 0 0 3px var(--accent);
   border-radius: 0;
+}
 
 /* ==========================================================================
    APPENDED — provider limit line (card #47)
