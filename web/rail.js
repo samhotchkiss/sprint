@@ -15,7 +15,10 @@
 // be mid-sentence with a screenshot attached) is never thrown away unless what
 // it is for actually changed.
 import { h, clear, reconcile, autolink } from './util.js';
-import { store, cardState, isSilent, draft, attachedImages, sessionLabel } from './state.js';
+import {
+  store, cardState, isSilent, draft, attachedImages,
+  isConversation, sessionLabel,
+} from './state.js';
 import { phaseOf, phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
 import { renderThread, renderChat } from './thread.js';
@@ -215,6 +218,9 @@ function cardHead(detail, card, app) {
   // one line that says what its agent is doing right now.
   const chip = card ? phaseChip(card) : null;
   if (chip) head.appendChild(chip);
+  // A conversation has no phase to show, so the head says what it is instead —
+  // otherwise a thread and a work card are indistinguishable once open.
+  else if (card && isConversation(card)) head.appendChild(h('span.rail-note', 'conversation'));
   // ...and, when this card is not running on the board's defaults, what it was
   // dispatched as: "grok · tmux".
   const exec = card ? executorTag(card) : null;
@@ -231,7 +237,16 @@ function cardMenu(card, state, app) {
   // A closed card is closed, not buried: the only thing on offer is getting it
   // back. Closing is the user's verb, and so is undoing it.
   const closed = ['completed', 'rejected', 'duplicate', 'canceled'].includes(state);
-  const actions = closed ? [
+  // A conversation has no queue, no agent and no branch, so none of the verbs
+  // that push work around mean anything on one. What is left is keeping it at
+  // the top and ending it — and ending it is the user's word for "this
+  // discussion is done", never a work state.
+  const actions = isConversation(card) ? [
+    { label: card.pinned ? 'Unpin' : 'Pin to the top', run: () => app.cardAction(card, card.pinned ? 'unpin' : 'pin') },
+    closed
+      ? { label: 'Reopen this conversation', run: () => app.cardAction(card, 'reopen') }
+      : { label: 'Close this conversation', run: () => app.cardAction(card, 'cancel'), danger: true },
+  ] : closed ? [
     { label: 'Reopen — back to the queue', run: () => app.cardAction(card, 'reopen') },
     { label: card.pinned ? 'Unpin' : 'Pin to the top', run: () => app.cardAction(card, card.pinned ? 'unpin' : 'pin') },
   ] : [
@@ -243,6 +258,10 @@ function cardMenu(card, state, app) {
       ? { label: 'Retry with a fresh agent', run: () => app.retryCard(card) }
       : null,
     { label: 'Mark duplicate of…', run: () => app.markDuplicate(card) },
+    // Not every thing you drop on the board turns out to be work. This turns
+    // one into an ongoing thread instead — same number, same body, same
+    // timeline; only what the board expects of it changes.
+    { label: 'Make this a conversation', run: () => app.cardAction(card, 'make_conversation') },
     { label: 'Cancel this card', run: () => app.cardAction(card, 'cancel'), danger: true },
   ].filter(Boolean);
 
@@ -288,13 +307,22 @@ function composer(card, app) {
     if (!c) return;
     const state = cardState(c);
     const answering = state === 'needs_you' && !!c.question;
-    setText(box, 'textarea', 'placeholder', answering
-      ? 'Answer in your own words… (paste a screenshot too)'
-      : (state === 'ready' ? 'Reply, or bounce with notes…'
-        : 'Reply to this card — paste a screenshot if it is easier'));
-    setText(box, '.composer-hint', 'textContent', isSilent(c)
-      ? 'Quiet for five minutes — the session is already checking on the agent.'
-      : 'Everything here appends — nothing is rewritten.');
+    // A conversation is a thread, not a job: nothing here is waiting on an
+    // agent, and replying is the whole point rather than an interruption. The
+    // wording is set on the LIVE node, never by rebuilding it — rebuilding is
+    // what used to move your caret when the highlight changed under you.
+    const convo = isConversation(c);
+    setText(box, 'textarea', 'placeholder', convo
+      ? 'Say something in this thread…'
+      : answering
+        ? 'Answer in your own words… (paste a screenshot too)'
+        : (state === 'ready' ? 'Reply, or bounce with notes…'
+          : 'Reply to this card — paste a screenshot if it is easier'));
+    setText(box, '.composer-hint', 'textContent', convo
+      ? 'An ongoing thread — replying is what clears its highlight.'
+      : isSilent(c)
+        ? 'Quiet for five minutes — the session is already checking on the agent.'
+        : 'Everything here appends — nothing is rewritten.');
     box.classList.toggle('is-answering', answering);
     live.send = (text, images) => {
       // An answer is a question's answer, not an attachment carrier — so a

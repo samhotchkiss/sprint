@@ -8,6 +8,7 @@ import { h, timeEl, firstLine } from './util.js';
 import {
   sections, meterSegments, cardState, needsKind, needsYouCount, motionState,
   blockedReason, waitingMark, isStuck, BLOCKED_NOTE, blockedByMark,
+  conversations, conversationState, CONVERSATION_HINT,
 } from './state.js';
 import { phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
@@ -81,7 +82,65 @@ function needsSection(col, app) {
   if (review) sec.appendChild(review);
 
   if (!col.cards.length) sec.appendChild(h('p.section-empty', 'Nothing needs you.'));
+
+  // …and below all of it, the ongoing threads. They are in this section because
+  // they are the third shape of "this one is on me", and they are BELOW it
+  // because none of them is blocking anything: a conversation waits as long as
+  // you need it to.
+  const convo = conversationBlock(app);
+  if (convo) sec.appendChild(convo);
   return sec;
+}
+
+// ---- 1b. conversations ---------------------------------------------------
+
+/**
+ * User, verbatim: "a lower section in the 'needs you' column where the card
+ * gets highlighted if there's an unread and unseen message. once I see the
+ * message, the highlighting dims, and once I respond the highlight goes away
+ * completely."
+ *
+ * Three weights, one row shape. The rail colour and the mark say which; nothing
+ * counts anything, and a thread you are up to date on is as quiet as the queue.
+ */
+export function conversationBlock(app, { compact = false } = {}) {
+  const cards = conversations();
+  if (!cards.length) return null;
+  const block = h('div', { class: compact ? 'convo-block is-compact' : 'convo-block' });
+  block.appendChild(h('div.convo-head',
+    h('span.convo-label', 'Conversations'),
+    h('span.grow'),
+    h('span.convo-note', 'ongoing threads — nothing here is blocking work')));
+  const rows = h('div.rows');
+  for (const card of cards) rows.appendChild(conversationRow(card, app));
+  block.appendChild(rows);
+  return block;
+}
+
+const CONVO_MARK = { unseen: 'New message', seen: 'Your turn', clear: 'Up to date' };
+
+export function conversationRow(card, app) {
+  const st = conversationState(card);
+  const row = openable(`row convo-row is-${st}`, card, app);
+  row.appendChild(h('span.row-num', '#' + card.num));
+  row.appendChild(h('span.row-main',
+    h('span.row-title', card.title),
+    h('span.row-sub', lastWord(card, app))));
+  row.appendChild(h('span.row-right',
+    h('span.row-tag', { class: `row-tag convo-tag is-${st}`, title: CONVERSATION_HINT[st] },
+      CONVO_MARK[st]),
+    h('span.row-meta', timeEl(card.last_activity_at, { suffix: false }))));
+  return row;
+}
+
+/** The latest thing said in the thread, whoever said it. */
+function lastWord(card, app) {
+  const ev = card.last_event;
+  if (!ev) return firstLine(card.body || '', 160);
+  const who = ev.actor === 'user' ? 'you' : ev.actor === 'session' ? 'session' : null;
+  const text = firstLine(app.eventText(ev), 150);
+  if (!text) return firstLine(card.body || '', 160);
+  return who ? `${who}: ${text}` : text;
 }
 
 export function needsRow(card, app) {

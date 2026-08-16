@@ -23,6 +23,7 @@ import {
   closeKeysSheet, keysSheetOpen,
 } from './keys.js';
 import { renderReportsPage, renderReportPage } from './reports.js';
+import { installRailResize } from './railsize.js';
 
 const el = {};
 let compose = null;
@@ -123,6 +124,11 @@ function paint() {
   // rail, you have seen it. Closing a card back onto an already-open chat counts
   // just as much as clicking the button does.
   if (store.unseen && store.chatOpen && !store.detail && !store.unit) store.unseen = false;
+  // …and the same fact, written down where the OTHER boards' switchers can
+  // read it. `store.unseen` is this tab's gold Chat button; the receipt is what
+  // makes a second board's square go out. Same condition as the line above —
+  // a unit review in the rail is not the session chat being read.
+  if (store.chatOpen && !store.detail && !store.unit) markSidebarSeen();
   paintChatButton();
 
   clear(el.main);
@@ -413,6 +419,10 @@ const refreshDetail = debounce(async () => {
     // and then blinks" the user saw: the board is redrawn by its own refresh,
     // driven by events, not by one card's timeline arriving.
     paintRail();
+    // Opening a conversation IS seeing it. The receipt is written against the
+    // seq this tab actually rendered, never against "now" — you have seen what
+    // was on the screen, not whatever landed while the POST was in flight.
+    markConversationSeen(num, d.timeline);
   } catch (err) {
     if (store.detail && store.detail.num === num && !store.detail.card) store.detail.error = 'Could not load this card.';
     handleError(err, null);
@@ -443,6 +453,63 @@ function normDetail(res, num) {
   const evRaw = res && res.evidence;
   const evidence = evRaw ? (evRaw.packet || evRaw) : (card && card.evidence) || null;
   return { num, card: store.cards.get(num) || card, timeline, evidence, error: null };
+}
+
+/**
+ * Tell the board you have read this conversation, so its highlight dims from
+ * "new message" to "your turn". Cheap and idempotent: the receipt is monotonic
+ * server-side, and we skip the POST entirely when nothing has happened since
+ * the last one. The three highlight states themselves are never computed here —
+ * the server derives them from the log, and this only moves the one number they
+ * are derived against.
+ */
+async function markConversationSeen(num, timeline) {
+  const card = store.cards.get(num);
+  if (!card || card.kind !== 'conversation') return;
+  const seq = (timeline || []).reduce((n, e) => Math.max(n, e.seq || 0), 0);
+  if (!seq) return;
+  const conv = card.conversation;
+  if (conv && Number(conv.last_seen_seq) >= seq) return;
+  try {
+    const res = await api.seen(num, seq);
+    const fresh = normCard(res && res.card);
+    if (!fresh) return;
+    store.cards.set(fresh.num, { ...(store.cards.get(fresh.num) || {}), ...fresh });
+    if (store.detail && store.detail.num === num) syncDetailCard();
+    render();
+  } catch (err) {
+    // A receipt that didn't land is not worth a word to the user: the card
+    // stays highlighted, which is the honest state, and the next open retries.
+    handleError(err, null);
+  }
+}
+
+/**
+ * "I have read the manager channel up to here."
+ *
+ * The switcher square on every OTHER board is derived against this, and the tab
+ * that would otherwise hold the fact is not open over there — so it is written
+ * down. Only ever forward, and only when there is something new to record: this
+ * runs on a paint, and a POST per frame would be absurd.
+ */
+let sidebarSeenAt = 0;
+let sidebarSeenInFlight = false;
+async function markSidebarSeen() {
+  if (!store.loaded || sidebarSeenInFlight) return;
+  const seq = store.seq;
+  if (!seq || seq <= sidebarSeenAt) return;
+  sidebarSeenInFlight = true;
+  const want = seq;
+  try {
+    await api.sidebarSeen(want);
+    sidebarSeenAt = Math.max(sidebarSeenAt, want);
+  } catch (err) {
+    // Nothing to say: the square stays lit, which is the honest state, and the
+    // next paint with the chat open tries again.
+    handleError(err, null);
+  } finally {
+    sidebarSeenInFlight = false;
+  }
 }
 
 function syncDetailCard() {
@@ -1209,6 +1276,9 @@ async function boot() {
   // Before the first paint, so the page never flashes Calm on its way to Chaos.
   loadSkin();
   loadView();
+  // Before the first paint too: a rail that lands at 480 and jumps to your
+  // saved 700 one frame later is the same flash the skin head start avoids.
+  installRailResize($('#rail-grip'));
 
   el.main = $('#main');
   el.rail = $('#rail');

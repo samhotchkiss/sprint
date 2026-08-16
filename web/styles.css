@@ -3448,3 +3448,306 @@ html.skin-chaos .keys-list kbd { border: 2px solid var(--border-chip); border-ra
 .keys-ladder { display: block; margin-top: 4px; }
 .keys-ladder span { display: block; color: var(--faint); font-size: 12.5px; line-height: 1.6; }
 .unit-change, .unit-bounce, .unit-outline .bounce-notes { scroll-margin-bottom: 150px; }
+
+/* ===========================================================================
+   Cards #48, #49, #51 — conversations, a resizable rail, a compact Complete.
+   Appended as one marked block on purpose: this branch landed alongside a
+   larger rework of the rail's paint path, and keeping every line of it in one
+   place is what made the two safe to merge.
+   =========================================================================== */
+
+/* --------------------------------------------------------------------------
+   #49 — the rail is resizable
+
+   One custom property does the whole job. The `1fr 480px` above is left where
+   it is and overridden here rather than edited in place, so the default is
+   still readable in the shell block it belongs to.
+   -------------------------------------------------------------------------- */
+
+:root { --rail-w: 480px; }
+body.rail-open #app { grid-template-columns: 1fr var(--rail-w); }
+
+/* The handle sits astride the rail's left border. It is positioned against the
+   VIEWPORT rather than placed in the grid, deliberately: the shell's rows are
+   auto-placed and shift when the banner appears, so "the rail's cell" is not a
+   fixed grid address — but "this far in from the right edge" always is, and it
+   is exactly `--rail-w`, the same number the column is drawn from.
+   The topbar and the banner are lifted above it below, so the strip can never
+   eat a click in the header it passes behind. */
+.rail-grip {
+  display: none;
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  right: calc(var(--rail-w) - 5px);
+  width: 11px;
+  z-index: 30;
+  cursor: col-resize;
+  /* the visible part is a 1px seam that brightens; the hit area is the 11px */
+  background: linear-gradient(90deg, transparent 4px, var(--rule) 4px,
+                                     var(--rule) 5px, transparent 5px);
+  touch-action: none;
+}
+body.rail-open .rail-grip { display: block; }
+.rail-grip:hover,
+.rail-grip:focus-visible,
+body.rail-resizing .rail-grip {
+  background: linear-gradient(90deg, transparent 3px, var(--accent) 3px,
+                                     var(--accent) 6px, transparent 6px);
+  outline: none;
+}
+/* While dragging, nothing else on the page should be selecting text or
+   swallowing the pointer. */
+body.rail-resizing { cursor: col-resize; user-select: none; }
+body.rail-resizing .main, body.rail-resizing .rail { pointer-events: none; }
+
+html.skin-chaos .rail-grip {
+  background: linear-gradient(90deg, transparent 3px, var(--rule) 3px,
+                                     var(--rule) 6px, transparent 6px);
+}
+html.skin-chaos .rail-grip:hover,
+html.skin-chaos .rail-grip:focus-visible,
+html.skin-chaos body.rail-resizing .rail-grip {
+  background: linear-gradient(90deg, transparent 2px, var(--accent) 2px,
+                                     var(--accent) 7px, transparent 7px);
+}
+
+/* --------------------------------------------------------------------------
+   #48 — conversations, at the bottom of Needs you
+
+   Three weights on one row shape. User, verbatim: "the card gets highlighted
+   if there's an unread and unseen message. once I see the message, the
+   highlighting dims, and once I respond the highlight goes away completely."
+   -------------------------------------------------------------------------- */
+
+.convo-block { margin-top: 26px; padding-top: 4px; border-top: 1px solid var(--rule); }
+.convo-head { display: flex; align-items: baseline; gap: 10px; padding: 14px 0 8px 0; }
+.convo-label {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.convo-note { font-size: 12.5px; color: var(--faint); }
+
+/* `minmax(0, 1fr)`, not `1fr`: a bare 1fr floors at the widest unbreakable word
+   in the title, and Chaos's pixel display face makes that wide enough to push
+   the row out of a 220px board column. */
+.convo-row {
+  grid-template-columns: 52px minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: start;
+  padding: 15px 16px 15px 12px;
+  max-width: 100%;
+}
+.convo-row .row-num { padding-top: 2px; }
+/* A thread's first line can be a paragraph. Two lines is enough to know which
+   conversation it is; the whole of it is one click away. */
+.convo-row .row-title {
+  font-size: 14.5px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.convo-row .row-sub { color: var(--faint); }
+.convo-row .row-right { padding-top: 1px; }
+.convo-tag { color: var(--faint); }
+
+/* clear — you spoke last. As quiet as the queue: nothing is owed. */
+.convo-row.is-clear { border-left-color: transparent; }
+.convo-row.is-clear .row-title { color: var(--dim); font-weight: 400; }
+
+/* seen — you have read it and not replied. The highlight is dimmed, not gone. */
+.convo-row.is-seen { border-left-color: var(--convo-seen-line); background: var(--convo-seen-bg); }
+.convo-row.is-seen .convo-tag { color: var(--convo-seen-ink); }
+
+/* unseen — they spoke after you last looked. The loud one. */
+.convo-row.is-unseen { border-left-color: var(--accent); background: var(--convo-unseen-bg); }
+.convo-row.is-unseen .row-title { color: var(--ink); font-weight: 500; }
+.convo-row.is-unseen .convo-tag { color: var(--accent); }
+.convo-row.is-unseen .row-sub { color: var(--dim); }
+
+/* The Board's Needs-you column carries the same block, tighter. */
+.convo-block.is-compact { margin-top: 14px; padding: 0 4px 8px 4px; }
+.convo-block.is-compact .convo-head { padding: 10px 4px 6px 4px; }
+.convo-block.is-compact .convo-note { display: none; }
+.convo-block.is-compact .convo-row {
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 10px;
+  padding: 11px 10px 11px 9px;
+}
+.convo-block.is-compact .convo-row .row-sub { margin-top: 4px; font-size: 12px; }
+/* The mark and the age go on their own line under the title in a column this
+   narrow. It wraps, and its floor is 0 — Chaos sets the mark in a pixel face
+   whose min-content is wider than the whole column, and an unwrappable child
+   is what pushes a grid track past its container. */
+.convo-block.is-compact .convo-row .row-right {
+  grid-column: 1 / -1;
+  min-width: 0;
+  text-align: left;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding-top: 7px;
+}
+/* …and its children need the same floor: a flex item's default `min-width:
+   auto` is min-content, which is the pixel-font word that started all this. */
+.convo-block.is-compact .convo-row .row-right > * { min-width: 0; }
+.convo-block.is-compact .convo-tag { overflow-wrap: anywhere; }
+.convo-block.is-compact .convo-row .row-meta { margin-top: 0; }
+.convo-block.is-compact .row-title { font-size: 13.5px; }
+
+/* Chaos paints EVERY `.row` with its own gradient, border and bevel, at a
+   specificity the plain `.convo-row.is-*` rules above cannot reach. Left to
+   itself that swallowed two of the three weights: `seen` and `clear` came out
+   pixel-identical, so the middle step — "once I see the message, the
+   highlighting dims" — simply did not exist on this skin. The three weights are
+   restated here in Chaos's own idiom rather than fought for with !important. */
+html.skin-chaos .convo-row.is-unseen {
+  border-left-color: var(--accent);
+  background: linear-gradient(180deg, #2e2309, #1f1705);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+html.skin-chaos .convo-row.is-seen {
+  border-left-color: var(--convo-seen-line);
+  background: linear-gradient(180deg, #241d34, #18132c);
+}
+html.skin-chaos .convo-row.is-clear {
+  border-left-color: var(--border);
+  background: linear-gradient(180deg, #1b1540, #14102e);
+}
+html.skin-chaos .convo-label { line-height: 1.7; }
+/* Chaos tiles `.rows` at a 268px minimum, which is wider than a board column —
+   in the Needs-you column the block is one stack, not a tile grid. */
+html.skin-chaos .convo-block.is-compact .rows { grid-template-columns: minmax(0, 1fr); }
+
+/* --------------------------------------------------------------------------
+   #51 — Complete / Done is a compact list with an expander
+
+   User, verbatim: "we need completed to just be a compact list. you can click
+   each item to open the card. and, beyond 20 completed, they're hidden and you
+   can expand that list."
+   -------------------------------------------------------------------------- */
+
+.done-more {
+  align-self: flex-start;
+  margin-top: 8px;
+  padding: 9px 2px;
+  min-height: 34px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--faint);
+  text-align: left;
+}
+.done-more:hover { color: var(--dim); }
+.done-more:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+
+/* In the Board's Review column the list lives inside a scrolling column body,
+   so it gets the padding the card group used to supply. */
+.col-body .done-list { padding: 2px 4px 10px 4px; }
+.col-body .done-row { grid-template-columns: 16px 40px 1fr auto; gap: 9px; padding: 9px 5px; }
+.col-body .done-title { font-size: 12.5px; }
+.col-body .done-more { min-height: 44px; padding-left: 5px; }
+
+html.skin-chaos .done-more { line-height: 1.7; }
+
+/* --------------------------------------------------------------------------
+   Fold (≤1199px) — the rail is a slide-over, so there is nothing to drag
+   -------------------------------------------------------------------------- */
+
+@media (max-width: 1199px) {
+  .rail-grip, body.rail-open .rail-grip { display: none; }
+  /* 44px targets, per the Fold's touch rules. */
+  .convo-row { padding: 16px 14px 16px 11px; min-height: 44px; }
+  .convo-block.is-compact .convo-row { min-height: 44px; }
+  .done-row { min-height: 44px; }
+  .done-more { min-height: 44px; }
+}
+
+/* --------------------------------------------------------------------------
+   Tokens for the block above. Both skins, and both checked against the
+   readability floor: no 11–13px text below 4.5:1 on the surface it sits on.
+   -------------------------------------------------------------------------- */
+
+:root {
+  /* #48 — the two highlighted conversation states. `clear` has no tokens
+     because `clear` is the absence of a highlight, not a quieter one. */
+  --convo-unseen-bg: #191510;
+  --convo-seen-bg: #131316;
+  --convo-seen-line: #4a3c28;
+  --convo-seen-ink: #a08a67;    /* 5.6:1 on --convo-seen-bg */
+}
+
+html.skin-chaos {
+  --convo-unseen-bg: #1c1608;
+  --convo-seen-bg: #14141a;
+  --convo-seen-line: #6b5620;
+  --convo-seen-ink: #c9a85e;    /* 8.1:1 on --convo-seen-bg */
+}
+
+/* The handle spans the whole viewport height (it has no grid row of its own to
+   stop at), so the two things it would otherwise pass in front of are lifted
+   above it. Nothing about how they look changes. */
+.topbar, .banner-slot { position: relative; }
+.banner-slot { z-index: 40; }
+/* …and the header sits above the banner, not merely above the handle. Giving
+   both the SAME z-index made the banner (later in the DOM) win, and the first
+   two rows of the open switcher menu — including the board you are on —
+   disappeared behind "session offline". */
+.topbar { z-index: 50; }
+
+/* --------------------------------------------------------------------------
+   #56 — the switcher's square: gold, green, or split
+
+   User's ruling, verbatim: "gold for needs you or a new message from the
+   session chat, green for needs review", and "half and half if both — split
+   the square diagonally". A square, because you cannot honestly split a circle
+   along a diagonal.
+
+   The bug: the indicator only ever read `needs_you`, so a board at
+   needs_you 0 / ready 8 — eight branches waiting on a verdict — said nothing.
+   -------------------------------------------------------------------------- */
+
+.si-slot { width: 10px; flex: none; display: flex; }
+.si-mark {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  border-radius: 2px;
+  display: block;
+}
+.si-mark.is-gold { background: var(--accent); }
+.si-mark.is-green { background: var(--good); }
+/* One square, one diagonal, two halves — never two dots. */
+.si-mark.is-split {
+  background: linear-gradient(135deg,
+    var(--accent) 0 calc(50% - .5px),
+    var(--rule) calc(50% - .5px) calc(50% + .5px),
+    var(--good) calc(50% + .5px) 100%);
+}
+/* The title carries the same square, summarising every OTHER board. */
+.title-btn .si-mark { width: 9px; height: 9px; }
+
+/* Chaos has no soft corners anywhere; the square is already a square. */
+html.skin-chaos .si-mark { border-radius: 0; box-shadow: 0 0 0 1px var(--border); }
+html.skin-chaos .si-mark.is-split {
+  background: linear-gradient(135deg,
+    var(--accent) 0 calc(50% - 1px),
+    var(--border) calc(50% - 1px) calc(50% + 1px),
+    var(--good) calc(50% + 1px) 100%);
+}
+
+/* On the Fold the menu rows are 44px targets already; the square just needs to
+   stay legible next to a 12px name. */
+@media (max-width: 1199px) {
+  .si-slot, .si-mark { width: 11px; }
+  .si-mark { height: 11px; }
+}
