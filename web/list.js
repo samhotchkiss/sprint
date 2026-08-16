@@ -7,7 +7,7 @@
 import { h, timeEl, firstLine } from './util.js';
 import {
   sections, meterSegments, cardState, needsKind, motionState, blockedReason,
-  waitingMark, BLOCKED_NOTE,
+  waitingMark, isStuck, BLOCKED_NOTE,
 } from './state.js';
 import { renderMeter } from './meter.js';
 import { renderDone } from './done.js';
@@ -229,8 +229,10 @@ function pendingPill(card, app) {
 
 /** A row you can click or tab to. Chips inside stop the click themselves. */
 export function openable(cls, card, app) {
+  // Every List row is built here, so this is the one place the sweep's amber
+  // has to be applied: `is-stuck` ambers whatever age text that row carries.
   const el = h('div', {
-    class: cls,
+    class: isStuck(card) ? cls + ' is-stuck' : cls,
     'data-num': card.num,
     role: 'button',
     tabindex: '0',

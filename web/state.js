@@ -195,6 +195,10 @@ export function normCard(c) {
     evidence: c.evidence ? (c.evidence.packet || c.evidence) : null,
     attachments: Array.isArray(c.attachments) ? c.attachments : [],
     silent: c.silent != null ? !!c.silent : null,
+    // The staleness sweep's verdict, straight from the server (this normalizer
+    // builds an explicit shape, so a field it doesn't name simply doesn't exist
+    // in the tab).
+    stuck: !!c.stuck,
     state_since: c.state_since || c.updated_at || null,
   };
 }
@@ -363,6 +367,7 @@ export function applyEvents(events) {
         card.state_since = ev.ts || card.state_since;
         if (to !== 'needs_you') card.question = null;
         if (ev.payload.reason) card.reason = ev.payload.reason;
+        if (before !== to) card.stuck = false;   // it moved: the sweep re-arms
         store.patches.delete(card.num);
         if (before !== to && (to === 'needs_you' || to === 'ready')) out.attention.push(card.num);
       }
@@ -379,6 +384,11 @@ export function applyEvents(events) {
       card.error = ev.payload.text || card.error;
     } else if (ev.kind === 'agent_silent') {
       card.silent = true;
+    } else if (ev.kind === 'stuck') {
+      // The server's staleness sweep. Sticks until the card actually moves —
+      // the transition above is what clears it, because moving the card is the
+      // only thing that proves somebody dealt with it.
+      card.stuck = true;
     }
     if (ev.actor === 'worker' || ev.actor === 'session' || ev.actor === 'user') {
       card.last_activity_at = ev.ts || card.last_activity_at;
@@ -668,6 +678,8 @@ export function eventText(ev) {
     case 'question': return direct || 'Asked a question';
     case 'answer': return direct || 'Answered';
     case 'agent_silent': return direct || 'No word from the agent — checking on it';
+    // The sweep's own words, prefixed so the line says what kind of line it is.
+    case 'stuck': return `stuck: ${direct || 'parked with nobody acting on it'}`;
     case 'evidence': return direct || 'Posted an evidence packet';
     case 'verdict': {
       const v = p.verdict;
@@ -679,7 +691,21 @@ export function eventText(ev) {
   }
 }
 
-export const SYSTEM_KINDS = new Set(['state', 'agent_silent', 'verdict', 'evidence', 'error', 'submitted']);
+export const SYSTEM_KINDS = new Set(['state', 'agent_silent', 'stuck', 'verdict', 'evidence', 'error', 'submitted']);
+
+/**
+ * The server's staleness sweep has flagged this card and it hasn't moved since.
+ *
+ * Deliberately NOT a second silence rule computed in the browser: the server
+ * owns the clock (five states, five thresholds, a backoff ladder), and the tab
+ * just reports what it was told. A card that moves clears the flag on its own
+ * `state` event, so this can never be stale in the other direction.
+ */
+export function isStuck(card) {
+  return !!(card && card.stuck);
+}
+
+export const STUCK_HINT = 'parked here longer than it should be — the board said so on the card';
 
 // ---- what happened to the message I just sent ---------------------------
 //
