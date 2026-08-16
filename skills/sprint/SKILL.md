@@ -88,9 +88,10 @@ went green, the overlapping card landed, the dependency shipped).
    boot for this project there is none yet; treat that as cursor `0`).
 6. Reap orphaned worktrees (see step 3's reap procedure) — cheap
    insurance even on a clean boot.
-7. Launch the waiter and enter the drain loop (step 2). This is where
-   boot and resume converge into the same loop — from here on there is
-   no difference between "just started" and "been running for days."
+7. Arm your ingress (step 2's `sprintd tail` under Monitor) and enter the
+   drain loop (step 2). This is where boot and resume converge into the
+   same loop — from here on there is no difference between "just
+   started" and "been running for days."
 
 ## 2. The drain loop — the one invariant that must never break
 
@@ -120,19 +121,15 @@ let me sit waiting for a response. send a message saying something like
 'okay, I'm looking into it, i'll get back to you with a proposed
 plan'."
 
-**On every wakeup — waiter exit, session resume, boot, anything —
-do these in this exact order:**
+**On every wakeup — a tail line, a waiter exit, session resume, boot,
+anything — do these in this exact order:**
 
-1. **Relaunch the waiter FIRST**, before you do anything else, using
-   your current persisted cursor:
-   `bin/sprintd wait --after $CURSOR --timeout 60`, run in background.
-   Exit 0 = events are waiting → wake immediately once launched if
-   already true. Exit 2 = timeout, nothing happened → relaunch again
-   with the same cursor. Any other exit = server unreachable → run
-   `bin/sprintd start` again (idempotent) and retry the waiter; if it
-   keeps failing, post what's happening to the sidebar so it's not
-   silent, and keep retrying — never give up unattended (see the
-   project's own recover-and-continue norm: restore, log, move on).
+1. **Make sure your ingress is armed FIRST**, before you do anything
+   else, using your current persisted cursor. See "Ingress" just below
+   for the two modes: with `sprintd tail` under Monitor this is normally
+   already true (it survives drops on its own and runs the whole
+   sprint), so it's a check, not a relaunch. With the `wait` fallback it
+   IS a relaunch, and it goes before the drain every single time.
 2. **Then drain**: `GET /api/events?after=$CURSOR&limit=50` in a loop
    until the response is empty. Send the waiter marker on these drains —
    `-H "X-Sprint-Waiter: session"` (or `&waiter=1`) — so the board counts
@@ -144,19 +141,85 @@ do these in this exact order:**
    end of a big backlog — a moving cursor is how the user's messages flip
    from "landed" to "session is on it", and a long silent catch-up shows
    the board as **catching up** rather than caught up.
-3. **Only once the page is empty** does step 1 repeat (you already
-   relaunched the waiter before draining, so there's no gap where a new
-   event could land and go unnoticed — that's the whole point of the
-   ordering).
+3. **Only once the page is empty** does step 1 repeat (you armed your
+   ingress before draining, so there's no gap where a new event could
+   land and go unnoticed — that's the whole point of the ordering).
 
-The waiter's background exit is a **latency optimization** — it just
-tells you sooner than a dumb poll would. The cursor and the event log
-are the actual truth. Treat every drain as at-least-once delivery:
-dedupe by `seq` (you already are, by only ever acting on events strictly
-after your persisted cursor), and never assume an event you're about to
-act on hasn't already been acted on in a previous, interrupted drain —
-your actions themselves should be idempotent where possible (e.g. don't
-re-dispatch a card that already has a live `agent_name`).
+Ingress is **transport**. Whatever wakes you — a tail line, a waiter
+exit — it tells you sooner than a dumb poll would and nothing more. The
+cursor and the event log are the actual truth: **always drain from the
+cursor on every wakeup**, and never act on the contents of a wakeup
+notification instead of draining (the line you were handed is a summary,
+clipped to 120 characters, with no attachments and no detail). Treat
+every drain as at-least-once delivery: dedupe by `seq` (you already are,
+by only ever acting on events strictly after your persisted cursor), and
+never assume an event you're about to act on hasn't already been acted
+on in a previous, interrupted drain — your actions themselves should be
+idempotent where possible (e.g. don't re-dispatch a card that already
+has a live `agent_name`).
+
+### Ingress: how you find out something happened
+
+**Primary — `sprintd tail` under the Monitor tool.** One held-open
+connection, one notification per real event, and nothing at all while
+the board is quiet:
+
+```
+Monitor(
+  command: "bin/sprintd tail --after $CURSOR",
+  description: "sprint board events",
+  persistent: true)
+```
+
+Each line it prints is one event, pre-summarised:
+
+```
+{"seq":48,"card":5,"actor":"user","kind":"chat","reply_to":"card:5","text":"can you also…"}
+```
+
+- Heartbeats and cursor moves are consumed and never printed, so an idle
+  board costs you **zero** wakeups (the old 60s long-poll cost you one a
+  minute, forever, whether or not anything happened).
+- It **never exits on its own.** It reconnects through drops by itself,
+  resuming from the last seq — so one Monitor call lasts the sprint.
+  Re-arm only if the monitor itself reports that the process exited.
+- Two lines are not events, and both mean act now:
+  `{"error":"unreachable"}` — the board has been gone a full minute; run
+  `bin/sprintd start` (idempotent) and say so in the sidebar once it's
+  back. `{"restart":true,…}` — a different sprintd process is answering
+  on that port; re-read `.sprint/server.json` (the token may have
+  rotated) and drain from your cursor. Neither is a reason to re-arm:
+  the tail is still running and will pick the stream back up.
+- `--after $CURSOR` catches you up from the cursor before it streams, so
+  arming it after a gap replays exactly what you missed and nothing else.
+- The tail holds the stream open with the waiter marker, so **sitting on
+  it is your proof of life** — the board shows the session as live for
+  exactly as long as your tail is attached, the same way the waiter's
+  polling used to.
+- `--user-only` narrows it to `actor: "user"` events. That is the subset
+  you must answer *promptly*, but it also means `agent_silent`,
+  `evidence` and worker `error` events stop waking you — so use it only
+  while you are genuinely parked on a human (hold mode, or every card is
+  in `ready` waiting on a verdict), and go back to the unfiltered tail
+  the moment agents are running.
+
+**Fallback — the `wait` long-poll.** `bin/sprintd wait --after $CURSOR
+--timeout 60`, run as a background Bash task; its exit is your wakeup.
+Exit 0 = events are waiting. Exit 2 = timeout, nothing happened →
+relaunch with the same cursor. Any other exit = server unreachable → run
+`bin/sprintd start` again (idempotent) and retry; if it keeps failing,
+post what's happening to the sidebar so it isn't silent, and keep
+retrying — never give up unattended (restore, log, move on). Reach for
+it when:
+
+- the Monitor tool isn't available to you, or a monitor was
+  auto-stopped for volume; or
+- you want a **crash detector** alongside the tail. A tail that is
+  wedged rather than dead looks identical to a quiet board. One
+  `wait --after $CURSOR --timeout 900` in the background, re-armed each
+  time it exits, is a cheap 15-minute "am I still attached" check that
+  costs four wakeups an hour and catches the case the tail can't
+  report on: itself.
 
 ### Where the reply goes: `payload.reply_to` is the routing key
 

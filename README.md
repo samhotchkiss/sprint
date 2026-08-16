@@ -75,9 +75,30 @@ Top-right of the board, next to "session":
 
 Only the red state raises a banner. "Catching up" is a working session,
 so it stays on the dot where you can ignore it. The board knows the
-difference because the session's waiter polls `/api/events` continuously
-while it's attached — that polling is the proof of life, not the drain
-cursor, which legitimately falls minutes behind during a busy dispatch.
+difference because the session's ingress stays attached the whole time
+it's alive — being attached is the proof of life, not the drain cursor,
+which legitimately falls minutes behind during a busy dispatch.
+
+## How the session hears about you
+
+Two modes, and both end in the same place: the session drains
+`/api/events` from its saved cursor, which is the only source of truth
+either way. **`sprintd tail`** is the primary one — it holds a single
+streaming connection to the board open and prints exactly one compact
+JSON line per real event, so the session runs it under its streaming
+monitor and gets woken once per thing that actually happened and never
+in between (heartbeats and cursor moves never reach it; a quiet board
+costs zero wakeups). It never exits on its own: it reconnects through
+dropped connections by itself and resumes from the last event it saw,
+tells the session in one line if the board has been unreachable for a
+minute or if it restarted underneath, and counts as session liveness for
+as long as it's attached. **`sprintd wait`** is the fallback — a 60s
+long-poll the session relaunches each time it returns, which is the
+older, noisier arrangement (a wakeup a minute whether or not anything
+happened) and still the right tool where the streaming monitor isn't
+available, or as a slow heartbeat that would notice a wedged tail. You
+can watch either one yourself: `bin/sprintd tail --user-only` in a
+terminal prints a line the moment you post anything on the board.
 
 ## Multiple sprints on one machine
 
@@ -209,8 +230,9 @@ a live Claude Code conversation, not a daemon.
  |   .sprint/sprint.db  .sprint/attachments/  .sprint/server.json  server.log |
  +----------------------------------------------------------------------------+
                                      ^
-                                     | GET /api/events?after=SEQ  (drain loop)
-                                     | sprintd wait --after SEQ   (latency optimization only)
+                                     | GET /api/events?after=SEQ  (drain loop — the truth)
+                                     | sprintd tail --after SEQ   (SSE, one line per event)
+                                     | sprintd wait --after SEQ   (long-poll fallback)
                                      |
                     +----------------------------------+
                     |   Claude Code session (you)       |

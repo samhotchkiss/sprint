@@ -18,7 +18,7 @@ recovery must be easy. The user always runs claude inside tmux.
 
 | Piece | What |
 |---|---|
-| `bin/sprintd` | Single-file executable Python 3.9+ **stdlib only** (http.server + sqlite3). Subcommands: `start`, `stop`, `status`, `wait`, `doctor`, `hub`. Owns all state. |
+| `bin/sprintd` | Single-file executable Python 3.9+ **stdlib only** (http.server + sqlite3). Subcommands: `start`, `stop`, `status`, `tail`, `wait`, `doctor`, `hub`. Owns all state. |
 | `web/` | Vanilla JS/CSS/HTML SPA served by sprintd from disk. No build step, no CDN, no external requests. |
 | `skills/sprint/SKILL.md` | The orchestrator brain: boot, resume, event-drain loop, dispatch, batching, liveness response, evidence gate, verdicts, end-sprint. |
 | `agents/sprint-worker.md` | Worker subagent definition + reporting contract. |
@@ -141,9 +141,21 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
   `generation` too; neither carries an `id:` (they are not events and must never become
   Last-Event-ID). `/api/board` and `/api/events` carry `generation` as well, so the polling fallback
   sees a restart on the same terms as SSE.
-- `sprintd wait --after SEQ [--timeout 60]` — CLI: blocks until events exist past SEQ or timeout;
-  exit 0 = events waiting, exit 2 = timeout (relaunch me), nonzero-other = server unreachable.
-  This is the session's ingress primitive (background task; its exit re-invokes the session).
+- `sprintd tail --after SEQ [--user-only]` — CLI: the session's PRIMARY ingress. Holds one
+  `/api/stream` connection open (carrying the waiter marker, so being attached is liveness) and
+  prints exactly ONE compact JSON line per event to stdout —
+  `{seq, card, actor, kind, reply_to, text (120 chars)}` — for a streaming monitor to wake on.
+  `--after` catches up from the cursor first; `--user-only` narrows to `actor: "user"`.
+  Heartbeats and cursor frames are consumed, never printed (they would wake the monitor for
+  nothing); a generation change prints `{"restart": true, …}`. Reconnects with backoff and
+  resumes from the last seq on a drop, printing nothing extra; after 60s unreachable prints ONE
+  `{"error": "unreachable"}` line and keeps retrying. **Never exits on its own.**
+- `sprintd wait --after SEQ [--timeout 60]` — CLI: the long-poll FALLBACK (Monitor unavailable, or
+  a long-timeout crash-detection heartbeat beside the tail); blocks until events exist past SEQ or
+  timeout; exit 0 = events waiting, exit 2 = timeout (relaunch me), nonzero-other = server
+  unreachable (background task; its exit re-invokes the session).
+- Either way the **cursor drain is the truth**: a wakeup is transport, and every wakeup re-drains
+  `GET /api/events?after=<cursor>` at-least-once, deduped by seq.
 
 ## Hub — every sprint on this machine (SHIPPED)
 
@@ -254,8 +266,9 @@ of all the underlying work... 'hey, why have #123, #127 and #128 been blocked fo
 ## Orchestration contract (SKILL.md must encode)
 
 1. **Boot** ("start a sprint"): run doctor → `sprintd start` → print URL (`http://<tailnet-ip>:8377/?t=…`)
-   → open sprint via API → start the waiter (background Bash: `sprintd wait --after <cursor>`).
-2. **Drain loop invariant**: on EVERY wakeup (waiter exit, resume, boot): relaunch the waiter FIRST,
+   → open sprint via API → arm ingress (`sprintd tail --after <cursor>` under the streaming Monitor
+   tool; `sprintd wait` in background Bash as the fallback).
+2. **Drain loop invariant**: on EVERY wakeup (tail line, waiter exit, resume, boot): arm ingress FIRST,
    then `GET /api/events?after=<cursor>` until empty, act on each event, then persist cursor. The
    transport is a latency optimization; the cursor drain is the truth (at-least-once, dedupe by seq).
 3. **Dispatch**: respect concurrency cap (default 3 agents incl. batches). Fetch-first
@@ -401,5 +414,5 @@ python3 ≥3.9 + git; tailscale optional (loopback-only degrade); everything els
 ## Non-goals (v1)
 
 Multi-user, public exposure, auto-dup-detection, priority pickers/drag-reorder, batch blind-approve,
-session summaries beyond the end-sprint card, phone-portrait optimization, Monitor-based ingress
-(waiter first; Monitor is a later upgrade), agent-list integration (possible later mirror).
+session summaries beyond the end-sprint card, phone-portrait optimization, agent-list integration
+(possible later mirror).
