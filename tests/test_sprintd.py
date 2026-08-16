@@ -4705,6 +4705,150 @@ class TestHubServer(HubBase):
         self.assertNotIn("hub-secret", page)
 
 
+class TestCanonicalOrigin(unittest.TestCase):
+    """Normalising "the name this hub is published under"."""
+
+    def test_a_bare_hostname_is_assumed_to_be_https(self):
+        self.assertEqual(
+            sprintd.parse_canonical_origin("sprint.taild21804.ts.net"),
+            "https://sprint.taild21804.ts.net")
+
+    def test_a_full_url_keeps_its_scheme_and_port_and_loses_its_slash(self):
+        self.assertEqual(sprintd.parse_canonical_origin("http://sprint.x.ts.net:8300/"),
+                         "http://sprint.x.ts.net:8300")
+
+    def test_a_single_label_canonical_host_is_refused(self):
+        """The bare name is what we redirect AWAY from; accepting one as the
+        destination would build a redirect loop."""
+        self.assertIsNone(sprintd.parse_canonical_origin("sprint"))
+
+    def test_junk_turns_the_feature_off_rather_than_breaking_the_hub(self):
+        for junk in ("", "   ", None, "ftp://sprint.x.ts.net", "https://", "://x"):
+            self.assertIsNone(sprintd.parse_canonical_origin(junk), junk)
+
+    def test_only_a_single_label_host_is_moved(self):
+        c = "https://sprint.taild21804.ts.net"
+        self.assertEqual(sprintd.canonical_redirect(c, "sprint", "/?t=abc"),
+                         "https://sprint.taild21804.ts.net/?t=abc")
+        self.assertEqual(sprintd.canonical_redirect(c, "sprint:80", "/"),
+                         "https://sprint.taild21804.ts.net/")
+        for untouched in ("sprint.taild21804.ts.net", "100.67.2.108:8300",
+                          "127.0.0.1:8300", "[::1]:8300", "", None):
+            self.assertIsNone(sprintd.canonical_redirect(c, untouched, "/"),
+                              untouched)
+
+    def test_no_canonical_configured_means_no_redirect_at_all(self):
+        self.assertIsNone(sprintd.canonical_redirect(None, "sprint", "/"))
+
+
+class TestHubBehindAServeProxy(TestHubServer):
+    """The hub with `tailscale serve` in front of it publishing it as
+    `sprint.<tailnet>.ts.net`.
+
+    Inherits every TestHubServer case on purpose: with a canonical host
+    configured, all of the ordinary paths (reached on an IP, which always has
+    dots in it) must behave exactly as they did before.
+    """
+
+    CANONICAL = "https://sprint.taild21804.ts.net"
+
+    def setUp(self):
+        super().setUp()
+        self.hub.canonical_host = self.CANONICAL
+
+    def hget_host(self, path, host, token="hub-secret", headers=None):
+        hdrs = dict(headers or {})
+        hdrs["Host"] = host
+        return self.hget(path, token=token, headers=hdrs)
+
+    def test_the_bare_magicdns_name_is_sent_to_the_fqdn(self):
+        """`sprint/` and `sprint.tailnet.ts.net/` are two cookie origins to a
+        browser and only one of them has a certificate. One origin wins."""
+        status, _, headers = self.hget_host("/", "sprint")
+        self.assertEqual(status, 302)
+        self.assertEqual(headers.get("Location"), self.CANONICAL + "/")
+
+    def test_the_sign_in_token_rides_along_and_no_cookie_is_spent_early(self):
+        status, _, headers = self.hget_host("/?t=hub-secret", "sprint",
+                                            token=None)
+        self.assertEqual(status, 302)
+        self.assertEqual(headers.get("Location"),
+                         self.CANONICAL + "/?t=hub-secret")
+        self.assertIsNone(headers.get("Set-Cookie"),
+                          "the cookie belongs on the canonical origin, not on "
+                          "the one we are bouncing off")
+
+    def test_healthz_is_never_redirected(self):
+        """It is what the proxy and `sprintd doctor` probe; a health check must
+        not have to follow a Location."""
+        status, raw, _ = self.hget_host("/healthz", "sprint", token=None)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(raw.decode())["hub"])
+
+    def test_the_fqdn_itself_is_served_not_bounced(self):
+        status, _, _ = self.hget_host("/api/hub", "sprint.taild21804.ts.net")
+        self.assertEqual(status, 200, "a redirect loop would show up here")
+
+    def test_reaching_it_on_the_raw_address_still_works(self):
+        for host in ("100.67.2.108:8300", "127.0.0.1:%d" % self.hub_port):
+            status, _, _ = self.hget_host("/api/hub", host)
+            self.assertEqual(status, 200, host)
+
+    def test_an_unauthenticated_bare_hit_is_bounced_before_the_sign_in_page(self):
+        """Otherwise the sign-in page renders on the origin we are trying to
+        get people off, and the link they click from it re-lands there."""
+        status, _, headers = self.hget_host(
+            "/", "sprint", token=None,
+            headers={"Accept": "text/html,*/*;q=0.8"})
+        self.assertEqual(status, 302)
+        self.assertEqual(headers.get("Location"), self.CANONICAL + "/")
+
+    def test_board_links_stay_absolute_so_the_proxy_cannot_break_them(self):
+        """The whole reason the boards are not proxied: the hub hands out each
+        board's own address, which works from any device on the tailnet no
+        matter which name the hub itself was reached by."""
+        a = self.board("alpha", token="alpha-secret")
+        status, raw, _ = self.hget_host("/api/hub?fresh=1",
+                                        "sprint.taild21804.ts.net")
+        self.assertEqual(status, 200)
+        url = json.loads(raw.decode())["sprints"][0]["url"]
+        self.assertEqual(url, "http://127.0.0.1:%d/?t=alpha-secret" % a["port"])
+        self.assertNotIn("sprint.taild21804.ts.net", url)
+
+    def test_the_feature_is_off_when_nothing_is_configured(self):
+        self.hub.canonical_host = ""
+        status, _, _ = self.hget_host("/api/hub", "sprint")
+        self.assertEqual(status, 200)
+
+    def test_the_env_var_and_the_file_both_configure_it(self):
+        """`sprint-serve-setup` writes the file; the hub re-reads it on a short
+        TTL, so publishing the service does not mean restarting the hub."""
+        self.hub.canonical_host = None
+        self.hub._canonical_cache = (0.0, None)
+        path = sprintd.hub_canonical_path()
+        self.assertTrue(path.startswith(os.path.dirname(self.registry)))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        sprintd.write_token_file(path, "sprint.taild21804.ts.net")
+        self.assertEqual(self.hub.canonical(), self.CANONICAL)
+
+        old = os.environ.get("SPRINT_HUB_CANONICAL_HOST")
+        os.environ["SPRINT_HUB_CANONICAL_HOST"] = "https://other.taild21804.ts.net"
+        try:
+            self.hub._canonical_cache = (0.0, None)
+            self.assertEqual(self.hub.canonical(),
+                             "https://other.taild21804.ts.net")
+        finally:
+            if old is None:
+                os.environ.pop("SPRINT_HUB_CANONICAL_HOST", None)
+            else:
+                os.environ["SPRINT_HUB_CANONICAL_HOST"] = old
+
+    def test_the_named_url_carries_the_token(self):
+        self.assertEqual(sprintd.hub_named_url(self.CANONICAL, "hub secret/1"),
+                         self.CANONICAL + "/?t=hub%20secret/1")
+        self.assertIsNone(sprintd.hub_named_url(None, "tok"))
+
+
 class TestHubCli(unittest.TestCase):
     """The real CLI, end to end: two daemonized boards register themselves, the
     hub lists them both, and --stop cleans up."""

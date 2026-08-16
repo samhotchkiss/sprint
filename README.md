@@ -181,6 +181,58 @@ Details worth knowing:
   parity for it yet (`sprintd doctor --install-launchd` covers boards
   only).
 
+## Reach it by name
+
+`http://100.67.2.108:8300/` is not a thing anyone types on a phone. If
+the machine running the hub is on a tailnet with MagicDNS, you can
+publish the hub as a **Tailscale Service** and get a real name instead:
+
+```
+bin/sprint-serve-setup            # prints exactly what it would do
+bin/sprint-serve-setup --apply    # does it
+bin/sprint-serve-setup --verify   # checks the name answers
+```
+
+Then, from any device on the tailnet:
+
+| you type | what happens |
+|---|---|
+| `https://sprint.<your-tailnet>.ts.net/?t=…` | first time on a device — signs you in, cookie lasts a year |
+| `https://sprint.<your-tailnet>.ts.net/` | every time after that |
+| `sprint/` | the bare name, where the device honours the tailnet search domain |
+
+The script prints all three filled in with your tailnet and your hub
+token. It never runs a privileged command without `--apply`, and it is
+safe to re-run: `tailscale serve` config is declarative.
+
+A few things worth knowing before you run it:
+
+- **It cannot do the whole job alone.** Defining the service and
+  granting access to it live in the tailnet policy file / admin console.
+  The script prints the exact JSON to paste and the exact page to open,
+  and checks whether it's been done. Three one-time steps: define
+  `sprint` with endpoints `tcp:443` and `tcp:80`, a grant letting members
+  reach `svc:sprint`, and an `autoApprovers` entry so this machine is
+  approved as its host without a click.
+- **Why a service and not `tailscale serve 8300`.** Plain serve
+  publishes under the *machine's* name, and it takes over that machine's
+  `/` on :443 — which usually already has something on it. A service has
+  its own virtual IP, its own name, and its own certificate, so it
+  collides with nothing and stays true if the hub ever moves boxes.
+- **The bare name is a bonus, not the deliverable.** `sprint/` only
+  resolves on devices that accept the tailnet's search domain, and it
+  only works over plain HTTP — the certificate is issued for
+  `sprint.<tailnet>.ts.net`, so `https://sprint/` fails on the name, and
+  no amount of configuration can fix that. The hub bounces a bare-name
+  visit to the full name so you land on one origin and one sign-in
+  either way. **The FQDN is the URL to bookmark.**
+- **The boards are deliberately not proxied.** The hub links to each
+  board at its own `http://<tailnet-ip>:<port>/?t=…`, which already
+  works from every device on the tailnet. Those links are absolute, so
+  they keep working however you reached the hub.
+- **Nothing about this is required**, and nothing changes if you skip
+  it: the hub still answers on its IP and port exactly as before.
+
 ## When a provider limit kills your agents
 
 Agents get killed by usage limits, several at once, and the kill message

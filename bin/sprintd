@@ -75,6 +75,9 @@ REGISTRY_FILENAME = "registry.json"
 HUB_TOKEN_FILENAME = "hub-token"
 HUB_JSON = "hub.json"
 HUB_LOG = "hub.log"
+HUB_CANONICAL_FILENAME = "hub-canonical"  # the name the hub is reachable by, if a
+                                          # reverse proxy (tailscale serve) gives it one
+HUB_CANONICAL_TTL = 5.0                # re-read that file at most this often
 HUB_COOKIE_NAME = "sprint_hub_token"   # NOT COOKIE_NAME: cookies ignore the port,
                                        # so sharing a name would log the boards out
 DEFAULT_HUB_POLL_SECONDS = 10.0        # how often the hub re-reads every board
@@ -7682,6 +7685,70 @@ def hub_json_path(registry: str = None) -> str:
     return os.path.join(hub_dir(registry), HUB_JSON)
 
 
+def hub_canonical_path(registry: str = None) -> str:
+    return os.path.join(hub_dir(registry), HUB_CANONICAL_FILENAME)
+
+
+def parse_canonical_origin(value):
+    """Normalise "the name this hub is reachable by" to a scheme+host origin.
+
+    Accepts `sprint.taild21804.ts.net`, `https://sprint.taild21804.ts.net`,
+    `http://sprint.example:8300`; returns `https://sprint.taild21804.ts.net`
+    (https assumed, since that is what `tailscale serve` terminates). Anything
+    unusable -> None, and the feature simply stays off.
+
+    A SINGLE-LABEL canonical host is rejected on purpose: the bare name is the
+    thing we redirect *away* from, so accepting one would build a loop.
+    """
+    v = (value or "").strip().rstrip("/")
+    if not v:
+        return None
+    if "//" not in v:
+        v = "https://" + v
+    try:
+        parts = urllib.parse.urlsplit(v)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not host or "." not in host:
+        return None
+    netloc = host if port is None else "%s:%d" % (host, port)
+    return "%s://%s" % (parts.scheme, netloc)
+
+
+def host_header_name(raw) -> str:
+    """The hostname out of a `Host:` header, port and IPv6 brackets stripped."""
+    h = (raw or "").strip()
+    if not h:
+        return ""
+    if h.startswith("["):
+        end = h.find("]")
+        return h[1:end] if end > 0 else ""
+    return h.split(":", 1)[0].lower()
+
+
+def canonical_redirect(canonical, host_header, path: str):
+    """Where a request that arrived on the BARE MagicDNS name should go instead.
+
+    `tailscale serve` hands the hub the client's original `Host:`, so a browser
+    that followed the search domain (`sprint/`) arrives as `Host: sprint` while
+    the same page reached properly arrives as `sprint.<tailnet>.ts.net`. Those
+    are two different cookie origins to a browser and only one of them has a
+    TLS certificate, so signing in on one leaves you signed out on the other.
+    Send the single-label one to the FQDN and there is exactly one origin.
+
+    Only a single-label host is moved: an IP:port (how the hub is reached on
+    loopback and over the raw tailnet address) always has dots, so it is never
+    touched and the hub keeps working with no proxy in front of it at all.
+    """
+    if not canonical:
+        return None
+    name = host_header_name(host_header)
+    if not name or "." in name or ":" in name:  # ":" -> a bare IPv6 literal
+        return None
+    return canonical + (path if path.startswith("/") else "/" + path)
+
+
 class _FileLock:
     """Best-effort cross-process lock so two boards starting at once cannot
     lose each other's registry row. Degrades to a no-op where flock is absent."""
@@ -8820,9 +8887,13 @@ def cmd_doctor(args) -> int:
     registered = read_registry(args.registry)
     hinfo = read_server_json(hub_json_path(args.registry))
     if hinfo and probe_hub(hinfo, registry_path(args.registry)) == "healthy":
+        named = hub_named_url(parse_canonical_origin(
+            os.environ.get("SPRINT_HUB_CANONICAL_HOST")
+            or read_token_file(hub_canonical_path(args.registry))), hinfo["token"])
         ok("hub running (%d board%s registered): %s"
            % (len(registered), "" if len(registered) == 1 else "s",
-              hub_url(hinfo.get("host") or "127.0.0.1", hinfo["port"], hinfo["token"])))
+              named or hub_url(hinfo.get("host") or "127.0.0.1",
+                               hinfo["port"], hinfo["token"])))
     else:
         note("hub not running -- `sprintd hub` serves one page listing every "
              "sprint on this machine (%d registered right now)" % len(registered))
@@ -9213,10 +9284,12 @@ class HubApp:
 
     def __init__(self, registry: str = None, token: str = None, log=None,
                  poll_seconds: float = None, prune_seconds: float = None,
-                 timeout: float = 2.5, tmux_send: str = None,
-                 autoheal: bool = None):
+                 timeout: float = 2.5, canonical_host=None,
+                 tmux_send: str = None, autoheal: bool = None):
         self.registry = registry
         self.registry_file = registry_path(registry)
+        self.canonical_host = canonical_host
+        self._canonical_cache = (0.0, None)
         self.token = token or secrets.token_urlsafe(24)
         self.logfh = log
         self.poll_seconds = poll_seconds if poll_seconds is not None else env_float(
@@ -9258,6 +9331,25 @@ class HubApp:
             self.logfh.flush()
         except (OSError, ValueError):
             pass
+
+    def canonical(self):
+        """The origin this hub is published under, or None.
+
+        Resolution order: the constructor/flag, then `$SPRINT_HUB_CANONICAL_HOST`,
+        then `~/.sprint/hub-canonical` (what `sprint-serve-setup` writes). The
+        file is re-read on a short TTL rather than at startup, so publishing the
+        service does not require restarting the hub underneath an open browser.
+        """
+        if self.canonical_host is not None:
+            return parse_canonical_origin(self.canonical_host)
+        stamp, cached = self._canonical_cache
+        if now() - stamp < HUB_CANONICAL_TTL:
+            return cached
+        value = (os.environ.get("SPRINT_HUB_CANONICAL_HOST")
+                 or read_token_file(hub_canonical_path(self.registry)))
+        parsed = parse_canonical_origin(value)
+        self._canonical_cache = (now(), parsed)
+        return parsed
 
     def refresh(self) -> dict:
         entries = read_registry(self.registry)
@@ -9673,10 +9765,21 @@ def make_hub_handler(hub: HubApp):
                 query = urllib.parse.parse_qs(parsed.query)
 
                 if path == "/healthz":
+                    # Never redirected: this is what the proxy and `doctor`
+                    # probe, and a health check must not chase a Location.
                     return self.json_out(200, {
                         "ok": True, "hub": True, "pid": os.getpid(),
                         "registry": hub.registry_file,
                         "started_at": hub.started_at})
+
+                moved = canonical_redirect(hub.canonical(),
+                                           self.headers.get("Host"), self.path)
+                if moved:
+                    # Before auth on purpose: the bare name should land on the
+                    # real origin whether or not the request carried a token,
+                    # and the `?t=` rides along in `self.path`.
+                    return self._send(302, b"", "text/plain",
+                                      [("Location", moved)])
 
                 if not self.authed(query):
                     return self.unauthorized(path, self.command or "GET")
@@ -9721,6 +9824,13 @@ def make_hub_server(hub: HubApp, host: str, port: int) -> HubServer:
 
 def hub_url(host: str, port: int, token: str) -> str:
     return "http://%s:%d/?t=%s" % (host, port, urllib.parse.quote(token))
+
+
+def hub_named_url(canonical, token: str):
+    """The by-name URL, when the hub has been published under one."""
+    if not canonical:
+        return None
+    return "%s/?t=%s" % (canonical, urllib.parse.quote(token))
 
 
 def probe_hub(info: dict, registry_file: str, timeout: float = 3.0) -> str:
@@ -9782,12 +9892,31 @@ def cmd_hub(args) -> int:
             pass
         return 0
 
+    if getattr(args, "canonical_host", None):
+        parsed = parse_canonical_origin(args.canonical_host)
+        if not parsed:
+            print("error: --canonical-host wants a hostname with a dot in it, "
+                  "e.g. sprint.taild21804.ts.net", file=sys.stderr)
+            return 1
+        try:
+            write_token_file(hub_canonical_path(args.registry), parsed)
+        except OSError as exc:
+            print("error: cannot write %s (%s)"
+                  % (hub_canonical_path(args.registry), exc), file=sys.stderr)
+            return 1
+    canonical = parse_canonical_origin(
+        os.environ.get("SPRINT_HUB_CANONICAL_HOST")
+        or read_token_file(hub_canonical_path(args.registry)))
+
     if info:
         state = probe_hub(info, reg_file)
         if state == "healthy":
             print("hub already running (pid %s) -> %s"
                   % (info.get("pid"), hub_url(info.get("host") or "127.0.0.1",
                                               info.get("port"), info["token"])))
+            named = hub_named_url(canonical, info["token"])
+            if named:
+                print(named)
             return 0
         if state == "foreign":
             print("error: port %s is held by something else (not this hub). "
@@ -9870,6 +9999,9 @@ def cmd_hub(args) -> int:
     hub.start_background()
 
     urls = [hub_url(h, actual_port, token) for h in hosts]
+    named = hub_named_url(canonical, token)
+    if named:
+        urls.insert(0, named)
     hub.log("hub listening on %s (registry %s)" % (
         ", ".join("%s:%d" % (h, actual_port) for h in hosts), reg_file))
     report(True, urls=urls, pid=os.getpid(), port=actual_port)
@@ -10024,6 +10156,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--poll-seconds", type=float, default=None,
                    help="how often to re-poll every board (default %d)"
                         % DEFAULT_HUB_POLL_SECONDS)
+    s.add_argument("--canonical-host", default=None, metavar="HOST",
+                   help="the name a reverse proxy publishes this hub under "
+                        "(e.g. sprint.taild21804.ts.net); remembered in "
+                        "~/.sprint/" + HUB_CANONICAL_FILENAME)
     s.set_defaults(func=cmd_hub)
     return ap
 
