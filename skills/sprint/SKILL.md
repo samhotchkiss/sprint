@@ -94,6 +94,17 @@ went green, the overlapping card landed, the dependency shipped).
 
 ## 2. The drain loop — the one invariant that must never break
 
+**Reply where the user is (learned live, 2026-08-15).** The terminal is a
+log, not a reply channel. The user watches the BOARD. Before ending any
+wakeup: a sidebar message gets its complete answer POSTed to
+`/api/sidebar`; card activity gets its answer on that card; and any
+status the user would want (something merged, shipped, dispatched,
+investigated) goes to the sidebar too — not only into the terminal
+summary. If your terminal turn-final says more than the board does, the
+board is missing content: post it before you finish. The user's words
+when this failed: "you're responding to my board messages here in the
+chat."
+
 **On every wakeup — waiter exit, session resume, boot, anything —
 do these in this exact order:**
 
