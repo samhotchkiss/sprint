@@ -7,20 +7,34 @@
 //
 //   1. GROUPED BY WORK UNIT. Cards that share a batch (or, failing that, an
 //      agent) are one branch and one review — so they are one expandable row
-//      that says "Design core · 6 cards", not six rows that say almost the same
-//      thing. A singleton stays exactly what it was. Thirteen rows become four.
+//      that says "Restart-proof tabs + reply routing · 2 cards", not six rows
+//      that say almost the same thing. A singleton stays exactly what it was.
 //   2. THE VERDICT IS ON THE ROW. Every review row leads with the packet's claim
 //      and its first Check-it-yourself step, carries the first screenshot as a
 //      thumbnail and the live link, and puts Approve / Bounce right there. The
 //      drawer is still one click away and still has the whole thread — it is no
 //      longer the price of an easy yes.
-//   3. REVIEW NEXT. One button walks the ready queue oldest-first, one card at a
+//   3. REVIEW NEXT. One button walks the ready queue oldest-first, one STEP at a
 //      time, in the rail: Approve / Bounce / Skip with a running "3 of 13".
-//      Group members flow consecutively, because they are one piece of work.
 //
-// What this is NOT is a bulk approve. Every verdict here is the same per-card
-// POST the drawer makes — the walkthrough only saves you the navigation, and
-// the group row expands to individual cards rather than acting on them together.
+// Two later rulings shaped what you see here.
+//
+// Card #28 — the row was titled "Agent card-23 · 2 cards" and the user could
+// not tell what any of it was: a unit is named after the WORK IN IT (its member
+// cards' own titles, falling back to the branch's claim), never after the agent
+// that carried it, and the Review-next control is a filled button standing
+// apart from the row stack rather than another line of text in it.
+//
+// Card #26 — user, verbatim: "i feel like i just hit approve way too many
+// time", and his GO on the fix: "ONE Approve per work unit when the unit
+// shipped as one branch with one packet (the six design cards = one click);
+// per-card records still written underneath, and you can still expand a group
+// to bounce a single member." So a unit that really did ship as one branch with
+// one packet has ONE Approve — which still issues the same per-card POST for
+// every member, one after another, so the server, the events and the per-card
+// records are exactly what they were. It is not a blind bulk approve: the unit
+// button only exists where one packet covers every member, i.e. where seeing
+// one thing IS seeing all of them.
 import { h, timeEl, firstLine, plural } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
 import { store, cardState, draft } from './state.js';
@@ -59,18 +73,11 @@ export function reviewGroups(cards) {
       kind: members.length > 1 ? 'group' : 'single',
       cards: members,
       card: members[0],
-      title: groupTitle(members),
+      title: unitTitle(members),
       branch: sharedBranch(members),
       agent: members[0].agent_name || null,
     });
   }
-  return out;
-}
-
-/** Flat, in reading order: what the walkthrough steps through. */
-export function reviewQueue(cards) {
-  const out = [];
-  for (const g of reviewGroups(cards)) for (const c of g.cards) out.push(c.num);
   return out;
 }
 
@@ -80,17 +87,86 @@ function sharedBranch(members) {
   return members.every((m) => m.branch === b) ? b : null;
 }
 
+// ---- what to call a work unit --------------------------------------------
+//
+// User, card #28: a row that reads "Agent card-23 · 2 cards" tells you the name
+// of a process. You are being asked about WORK, so the row is named after the
+// work: the member cards' own titles first (they are the condensed ≤8-word
+// titles the workers already wrote), the branch's claim next, the branch name
+// after that. The agent is metadata and lives on the right with the timestamp,
+// where a process name belongs.
+
+/** How long a derived unit title may run before its parts get trimmed. */
+const UNIT_TITLE_MAX = 64;
+
+/** Words not worth the characters when a title has to be cut short. */
+const FILLER = /^(the|a|an|and|or|for|to|of|in|on|at|is|are|was|were|it|its|that|this|so|but|with|when|from|into|by)$/i;
+
+/** A card's own words, or nothing — `normCard` fills a blank title with "Card #N". */
+function ownTitle(card) {
+  const t = firstLine((card && card.title) || '', 90).trim();
+  if (!t || /^card\s*#?\d+$/i.test(t)) return '';
+  return t;
+}
+
 /**
- * What to call a work unit. The branch is the honest name — it is literally the
- * one thing all these cards are — but a branch named after the card that started
- * it ("sprint/card-18") names nothing, so those fall back to the agent.
+ * The human name of a work unit, derived from what is in it. Never the agent.
+ * Two members "Board recovers from backend restarts" + "Every user event
+ * carries reply_to" name the unit together; six members name it by the first
+ * two and the row's own "· 6 cards" says how many more there are.
  */
-function groupTitle(members) {
-  const branch = sharedBranch(members);
+export function unitTitle(members) {
+  const titles = [];
+  for (const m of members || []) {
+    const t = ownTitle(m);
+    if (t && !titles.includes(t)) titles.push(t);
+  }
+  if (titles.length) return joinTitles(titles);
+  const claim = unitClaim(members);
+  if (claim) return firstClause(claim);
+  const branch = sharedBranch(members || []);
   const leaf = branch ? String(branch).split('/').pop() : '';
   if (leaf && !/^(card|batch)[-_]?\d+$/i.test(leaf)) return humanize(leaf);
-  const agent = members[0].agent_name;
-  return agent ? `Agent ${shortAgent(agent)}` : `${members.length} cards`;
+  return `${plural((members || []).length, 'card')} on one branch`;
+}
+
+/** The branch-wide claim, when every member really is showing the same one. */
+function unitClaim(members) {
+  const first = (members && members[0] && members[0].evidence) || null;
+  const claim = (first && first.claim) || '';
+  if (!claim) return '';
+  return members.every((m) => m.evidence && (m.evidence.claim || '') === claim) ? claim : '';
+}
+
+function joinTitles(titles) {
+  if (titles.length === 1) return clipWords(titles[0], UNIT_TITLE_MAX);
+  const two = titles.slice(0, 2);
+  const full = two.join(' + ');
+  if (full.length <= UNIT_TITLE_MAX) return full;
+  const each = Math.max(12, Math.floor((UNIT_TITLE_MAX - 3) / 2));
+  return two.map((t) => clipWords(t, each)).join(' + ');
+}
+
+/** Cut to a length on a word boundary — never mid-word, never on a filler word. */
+function clipWords(text, max) {
+  const s = String(text || '').trim();
+  if (s.length <= max) return s;
+  const kept = [];
+  let len = -1;
+  for (const w of s.split(/\s+/)) {
+    if (len + 1 + w.length > max && kept.length) break;
+    kept.push(w);
+    len += 1 + w.length;
+  }
+  while (kept.length > 1 && FILLER.test(kept[kept.length - 1])) kept.pop();
+  return kept.length ? kept.join(' ') : s.slice(0, max);
+}
+
+/** The first clause of a claim — "X, so Y" and "X — Y" both lead with X. */
+function firstClause(claim) {
+  const s = firstLine(claim, 200).replace(/\.$/, '');
+  const cut = s.split(/\s+—\s+|\s+–\s+|[;:]\s+|,\s+(?=so\b|and\b|which\b|without\b)/)[0];
+  return clipWords(cut || s, UNIT_TITLE_MAX);
 }
 
 function humanize(s) {
@@ -141,38 +217,138 @@ export function groupOpen(key, value) {
   return value;
 }
 
+// ---- one work unit, one click -------------------------------------------
+//
+// Card #26. The Approve here is exactly the Approve the drawer has always made,
+// issued once per member card in order: the server is untouched, every card
+// still gets its own verdict event and its own record, and a member that fails
+// stops the run where it stands rather than leaving you guessing which of the
+// six went through.
+
+/** key → {done, total, at, error} while a unit is being approved, or after it broke. */
+const running = new Map();
+
+export function unitProgress(key) { return running.get(key) || null; }
+
+/**
+ * True when this unit shipped as ONE thing: one branch, and one evidence packet
+ * covering every member. That is the whole licence for a single Approve — you
+ * are not approving six things you have not seen, you are approving the one
+ * packet that is on screen. Anything looser keeps its per-card verdicts.
+ */
+export function shipsAsOne(g) {
+  return !!(g && g.kind === 'group' && g.branch && sharedPacket(g.cards));
+}
+
+/** The members still asking for a verdict, in order. */
+function readyMembers(nums) {
+  const out = [];
+  for (const n of nums || []) {
+    const card = store.cards.get(Number(n));
+    if (card && cardState(card) === 'ready') out.push(card);
+  }
+  return out;
+}
+
+/**
+ * Approve every ready member of a unit, one per-card POST at a time. Stops on
+ * the first failure and leaves the failure on the row: nothing after it was
+ * sent, and the button offers to pick up where it stopped.
+ */
+export async function approveUnit(key, nums, app) {
+  const prev = running.get(key);
+  if (prev && !prev.error) return false;          // already in flight
+  const todo = readyMembers(nums);
+  if (!todo.length) { running.delete(key); return false; }
+  const st = { done: 0, total: todo.length, at: todo[0].num, error: null };
+  running.set(key, st);
+  app.render();
+  for (const card of todo) {
+    st.at = card.num;
+    app.render();
+    // eslint-disable-next-line no-await-in-loop
+    const ok = await app.verdict(card, 'approve');
+    if (!ok) { st.error = card.num; app.render(); return false; }
+    st.done += 1;
+    app.render();
+  }
+  running.delete(key);
+  app.render();
+  app.toast(`${plural(st.total, 'card')} approved as one work unit — merging now.`);
+  return true;
+}
+
 // ---- the walkthrough -----------------------------------------------------
 //
-// A flow is a snapshot of the queue plus a finger on it. It never approves
-// anything itself: it opens a card, waits for a real per-card verdict to land,
+// A flow is a snapshot of the ready queue plus a finger on it. It never
+// approves anything itself: it opens a card, waits for a real verdict to land,
 // and then moves the finger. Nothing here can act on a card you have not seen.
+//
+// A STEP is one decision, not one card: a unit that shipped as one branch with
+// one packet is a single step (approve the unit, bounce one member, or skip),
+// because that is how many things you were actually asked about.
 
 let flow = null;
 
 export function reviewFlow() { return flow; }
-export function flowActive(num) { return !!flow && flow.queue[flow.i] === Number(num); }
 
-export function startFlow(app, nums) {
-  const queue = (nums || []).filter((n) => n != null);
-  if (!queue.length) return;
-  flow = { queue, i: 0, approved: 0, bounced: 0, skipped: 0 };
+/** The steps the walkthrough offers, in reading order. */
+export function reviewSteps(cards) {
+  const steps = [];
+  for (const g of reviewGroups(cards)) {
+    if (shipsAsOne(g)) {
+      steps.push({ key: g.key, nums: g.cards.map((c) => c.num), unit: true, title: g.title });
+    } else {
+      for (const c of g.cards) steps.push({ key: 'card:' + c.num, nums: [c.num], unit: false, title: c.title });
+    }
+  }
+  return steps;
+}
+
+function step() { return flow ? flow.steps[flow.i] : null; }
+
+export function flowActive(num) {
+  const s = step();
+  return !!s && s.nums.includes(Number(num));
+}
+
+/** The signature the rail memoises the verdict bar on. Null = no bar here. */
+export function flowBarSig(card) {
+  if (!card || !flowActive(card.num) || cardState(card) !== 'ready') return null;
+  const s = step();
+  const p = unitProgress(s.key);
+  return [card.num, flow.i, flow.steps.length, card.bounce_count,
+    p ? `${p.done}/${p.total}${p.error ? 'e' + p.error : ''}` : ''].join('|');
+}
+
+export function startFlow(app, steps) {
+  const list = (steps || []).filter((s) => s && s.nums && s.nums.length);
+  if (!list.length) return;
+  flow = { steps: list, i: 0, approved: 0, bounced: 0, skipped: 0 };
   flow.i = nextIndex(0);
-  if (flow.i >= queue.length) { flow = null; return; }
-  app.openCard(queue[flow.i]);
+  if (flow.i >= list.length) { flow = null; return; }
+  openStep(app);
+}
+
+/** Open the first member of the current step that is still asking for a verdict. */
+function openStep(app) {
+  const s = step();
+  if (!s) return;
+  const ready = readyMembers(s.nums);
+  app.openCard((ready[0] || { num: s.nums[0] }).num);
 }
 
 /**
  * The queue is a snapshot, and the board moves underneath it: a card can be
  * approved from the row, bounced from the rail, or merged by the session while
- * you are three cards back. Walk past anything that is no longer asking for a
+ * you are three steps back. Walk past anything that is no longer asking for a
  * verdict rather than parking the walkthrough on a card with nothing to decide.
  */
 function nextIndex(from) {
-  for (let i = from; i < flow.queue.length; i += 1) {
-    const card = store.cards.get(flow.queue[i]);
-    if (card && cardState(card) === 'ready') return i;
+  for (let i = from; i < flow.steps.length; i += 1) {
+    if (readyMembers(flow.steps[i].nums).length) return i;
   }
-  return flow.queue.length;
+  return flow.steps.length;
 }
 
 export function stopFlow(app) {
@@ -180,17 +356,19 @@ export function stopFlow(app) {
   if (app) app.render();
 }
 
-function advance(app) {
+/** Stay on this step while it still has members asking; otherwise move on. */
+function advance(app, { within = false } = {}) {
   if (!flow) return;
+  if (within && readyMembers(step().nums).length) { openStep(app); app.render(); return; }
   flow.i = nextIndex(flow.i + 1);
-  if (flow.i >= flow.queue.length) {
+  if (flow.i >= flow.steps.length) {
     const done = flow;
     flow = null;
     app.render();
     app.toast(finishLine(done));
     return;
   }
-  app.openCard(flow.queue[flow.i]);
+  openStep(app);
 }
 
 function finishLine(f) {
@@ -199,14 +377,26 @@ function finishLine(f) {
   if (f.bounced) bits.push(`${f.bounced} bounced back`);
   if (f.skipped) bits.push(`${f.skipped} skipped`);
   const tail = bits.length ? bits.join(', ') : 'nothing decided';
-  return `That was all ${plural(f.queue.length, 'card')} — ${tail}.`;
+  const cards = f.steps.reduce((n, s) => n + s.nums.length, 0);
+  return `That was all ${plural(cards, 'card')} — ${tail}.`;
 }
 
-/** Approve/bounce inside a flow: the same per-card POST, then the next card. */
+/** Approve/bounce inside a flow: the same per-card POST, then the next step. */
 async function flowVerdict(app, card, kind, notes) {
   const ok = await app.verdict(card, kind, notes);
   if (!ok || !flow) return;
   if (kind === 'approve') flow.approved += 1; else flow.bounced += 1;
+  // A bounced member leaves its siblings on the table — they are still ready
+  // and still yours to decide, so the step is not over until they are gone.
+  advance(app, { within: kind === 'bounce' });
+}
+
+/** Approve a whole unit from the walkthrough, then move to the next step. */
+async function flowApproveUnit(app, s) {
+  const n = readyMembers(s.nums).length;
+  const ok = await approveUnit(s.key, s.nums, app);
+  if (!ok || !flow) return;
+  flow.approved += n;
   advance(app);
 }
 
@@ -218,6 +408,11 @@ async function flowVerdict(app, card, kind, notes) {
 export function reviewBar(card, app) {
   const bar = h('div.review-bar');
   const key = `bounce:${card.num}`;
+  const s = step();
+  const unit = !!s && s.unit;
+  const members = unit ? readyMembers(s.nums) : [];
+  const many = unit && members.length > 1;
+  const prog = s ? unitProgress(s.key) : null;
 
   const notes = h('textarea.bounce-notes', {
     rows: '2',
@@ -246,24 +441,42 @@ export function reviewBar(card, app) {
       }
       send();
     },
-  }, notesWrap.hidden ? 'Bounce' : 'Send bounce');
+  }, notesWrap.hidden
+    ? (many ? `Bounce #${card.num}` : 'Bounce')
+    : 'Send bounce');
 
   bar.appendChild(h('div.review-bar-head',
-    h('span.review-count', `${flow.i + 1} of ${flow.queue.length}`),
-    h('span.review-bar-note', 'walking the ready queue, oldest first'),
+    h('span.review-count', `${flow.i + 1} of ${flow.steps.length}`),
+    h('span.review-bar-note', many
+      ? `one branch, ${plural(members.length, 'card')} — one decision`
+      : 'walking the ready queue, oldest first'),
     h('span.grow'),
     h('button.btn.ghost.tiny', { type: 'button', onclick: () => stopFlow(app) }, 'Stop')));
+  if (many) {
+    bar.appendChild(h('p.review-bar-unit',
+      `${s.title} — ${members.map((c) => '#' + c.num).join(', ')}. `
+      + 'Approve takes the whole branch; Bounce sends back only the card you are reading.'));
+  }
   bar.appendChild(notesWrap);
+  const approve = h('button.btn.approve', {
+    type: 'button',
+    disabled: !!(prog && !prog.error),
+    onclick: () => (many ? flowApproveUnit(app, s) : flowVerdict(app, card, 'approve')),
+  }, prog && !prog.error
+    ? `approving ${Math.min(prog.done + 1, prog.total)} of ${prog.total}…`
+    : (many ? `Approve all ${members.length}` : 'Approve'));
   bar.appendChild(h('div.verdicts',
-    h('button.btn.approve', {
-      type: 'button', onclick: () => flowVerdict(app, card, 'approve'),
-    }, 'Approve'),
+    approve,
     bounceBtn,
     h('button.btn.ghost.skip', {
       type: 'button',
       title: 'leave it in Awaiting review and come back to it',
       onclick: () => { if (flow) flow.skipped += 1; advance(app); },
     }, 'Skip')));
+  if (prog && prog.error) {
+    bar.appendChild(h('p.review-unit-error',
+      `Stopped at #${prog.error} — ${prog.done} of ${prog.total} approved, nothing after it was sent.`));
+  }
   return bar;
 }
 
@@ -289,19 +502,28 @@ export function reviewBlock(cards, app, { compact = false } = {}) {
 function reviewHead(cards, app, compact) {
   const groups = reviewGroups(cards);
   const units = groups.length;
-  const running = !!flow;
+  const walking = !!flow;
   const line = units === cards.length
     ? `${plural(cards.length, 'branch', 'branches')} waiting on a verdict.`
     : `${plural(cards.length, 'card')} in ${plural(units, 'work unit')} — one row per branch.`;
 
+  // Card #28: this used to be a bordered chip sitting in the same stack as the
+  // rows, and it read as another row — a title with no obvious verb. It is a
+  // filled button with a label that says what it does to you, and it sits in
+  // its own bar above the stack with a rule under it, so nothing about it can
+  // be mistaken for one of the things being reviewed.
   const btn = h('button.btn.review-next', {
     type: 'button',
-    title: running ? 'back to the card you are on' : 'step through them one at a time, oldest first',
+    title: walking ? 'back to the card you are on' : 'step through them one at a time, oldest first',
     onclick: () => {
-      if (flow) { app.openCard(flow.queue[flow.i]); return; }
-      startFlow(app, reviewQueue(cards));
+      if (flow) { openStep(app); return; }
+      startFlow(app, reviewSteps(cards));
     },
-  }, running ? `Reviewing ${flow.i + 1} of ${flow.queue.length}` : 'Review next');
+  },
+    h('span.review-next-label', walking
+      ? `Reviewing ${flow.i + 1} of ${flow.steps.length}`
+      : 'Review next'),
+    h('span.review-next-arrow', '→'));
 
   // On the Board the column already has an "Awaiting review" heading over it;
   // saying it twice, two lines apart, is how the first cut of this read.
@@ -369,15 +591,34 @@ function groupRow(g, app, { compact }) {
     body.appendChild(holder);
   }
 
-  // No group-level Approve, ever: approving six cards with one click is the
-  // blind bulk approve the spec rules out. The unit's action is to WALK it —
-  // same per-card verdicts, one after another.
+  // One branch, one packet, one Approve (card #26) — issued as the same
+  // per-card POST for every member, in order, so the records underneath are
+  // unchanged. Units that did NOT ship as one thing keep their per-card
+  // verdicts and only offer the walkthrough.
   const acts = h('div.review-acts');
+  const one = shipsAsOne(g);
+  const waiting = one ? g.cards.filter((c) => cardState(c) === 'ready') : [];
+  const prog = unitProgress(g.key);
+  if (one && waiting.length) {
+    const label = prog && !prog.error
+      ? `approving ${Math.min(prog.done + 1, prog.total)} of ${prog.total}…`
+      : (waiting.length > 1 ? `Approve all ${waiting.length}` : `Approve #${waiting[0].num}`);
+    acts.appendChild(h('button.btn.tiny.approve.review-approve-unit', {
+      type: 'button',
+      disabled: !!(prog && !prog.error),
+      title: waiting.length > 1
+        ? `one branch, one packet — approves each of the ${waiting.length} cards underneath`
+        : `approve #${waiting[0].num}`,
+      onclick: (e) => { e.stopPropagation(); approveUnit(g.key, g.cards.map((c) => c.num), app); },
+    }, label));
+  }
   acts.appendChild(h('button.btn.tiny.review-walk', {
     type: 'button',
-    title: 'step through these one at a time, oldest first',
-    onclick: () => startFlow(app, g.cards.map((c) => c.num)),
-  }, `Review these ${g.cards.length}`));
+    title: one
+      ? 'read them one at a time before you decide'
+      : 'step through these one at a time, oldest first',
+    onclick: () => startFlow(app, reviewSteps(g.cards)),
+  }, one ? 'Read them first' : `Review these ${g.cards.length}`));
   acts.appendChild(h('button.btn.tiny.ghost.review-toggle-cards', {
     type: 'button',
     onclick: () => { groupOpen(g.key, !isOpen); app.render(); },
@@ -390,6 +631,11 @@ function groupRow(g, app, { compact }) {
   acts.appendChild(h('span.grow'));
   if (shared) acts.appendChild(h('span.review-meta', unitMeta(shared)));
   body.appendChild(acts);
+  if (prog && prog.error) {
+    body.appendChild(h('p.review-unit-error',
+      `Stopped at #${prog.error} — ${prog.done} of ${prog.total} approved, nothing after it was sent. `
+      + 'The button picks up where it stopped.'));
+  }
   wrap.appendChild(body);
 
   if (isOpen) {
@@ -409,12 +655,16 @@ function unitMeta(p) {
   return bits.join(' · ');
 }
 
+/**
+ * The line under a unit's name: which cards are in it and what holds them
+ * together. The titles are up in the name now (card #28), so this says the
+ * things the name cannot — the card numbers and the branch.
+ */
 function groupSub(g) {
-  const titles = g.cards.map((c) => c.title).filter(Boolean);
-  const head = titles.slice(0, 2).join(' · ');
-  const rest = titles.length - 2;
-  const branch = g.branch ? `one branch, ${g.branch}` : 'one agent';
-  return `${branch} — ${head}${rest > 0 ? ` +${rest} more` : ''}`;
+  const nums = g.cards.map((c) => '#' + c.num);
+  const shown = nums.length > 6 ? `${nums.slice(0, 6).join(', ')} +${nums.length - 6}` : nums.join(', ');
+  const where = g.branch ? `one branch, ${g.branch}` : 'one agent, one worktree';
+  return `${shown} · ${where}`;
 }
 
 /**
@@ -430,10 +680,13 @@ export function reviewRow(card, app, { compact = false, inGroup = false, shared 
     'data-num': card.num,
   });
 
+  // Card #28: the row leads with the card's OWN title — what you asked for —
+  // and the claim is the second line under it. A review row never leads with a
+  // control's label or an agent's name.
   const lead = openable('review-lead', card, app);
   lead.appendChild(h('span.row-num', '#' + card.num));
   const body = h('span.review-body',
-    h('span.review-title', card.title),
+    h('span.review-title', ownTitle(card) || firstLine(card.body || '', 70) || `Card #${card.num}`),
     h('p.review-claim', p.claim || 'No claim recorded — open it and ask the agent what it thinks it did.'));
   // In a batch the check step and the screenshots belong to the branch, not to
   // this card, and the unit above already showed them once.

@@ -1930,3 +1930,98 @@ html.skin-chaos .review-bar { border-top: 2px solid var(--border); box-shadow: v
 html.skin-chaos .btn.review-next { border: 2px solid var(--border-chip); }
 html.skin-chaos .review-group-title { line-height: 1.5; }
 html.skin-chaos .review-claim { line-height: 1.6; }
+
+/* ===========================================================================
+   REVIEW SURFACE, LABELLED — cards #28 and #26.
+   A second self-contained section appended after card #25's: nothing above this
+   line is edited, so this lands cleanly next to other work in flight.
+
+   #28: the unit row is named after the work in it, so the NAME carries the
+   weight and the sub-line drops back to metadata; and Review next is a filled
+   button in its own bar, never another line in the stack of rows.
+   #26: one Approve per work unit that shipped as one branch with one packet,
+   with its progress and its failure said in words on the row.
+   =========================================================================== */
+
+/* ---- Review next: a button, unmistakably --------------------------------- */
+
+.review-head {
+  padding: 2px 0 12px 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 2px;
+}
+.btn.review-next {
+  min-height: 38px;
+  padding: 0 16px;
+  background: var(--send-bg);
+  color: var(--send-fg);
+  border-color: transparent;
+  border-radius: var(--radius-ctl);
+  font-weight: 600;
+  gap: 8px;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, .35);
+}
+.btn.review-next:hover { background: var(--send-hi); border-color: transparent; }
+.btn.review-next:active { transform: translateY(1px); }
+.btn.review-next .review-next-arrow { font-size: 14px; opacity: .8; }
+.review-block.is-compact .review-head { padding-bottom: 9px; }
+.review-block.is-compact .btn.review-next { min-height: 34px; font-size: 12.5px; padding: 0 12px; }
+
+/* ---- the unit row: the name is the work ---------------------------------- */
+
+.review-group-title { font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
+.review-group-sub { font-family: var(--font-mono); font-size: 11.5px; }
+.review-block.is-compact .review-group-title { font-size: 13.5px; }
+
+/* ---- a singleton row leads with its own title ---------------------------- */
+
+.review-item .review-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.35;
+  letter-spacing: -.01em;
+}
+.review-item .review-claim { margin-top: 5px; font-size: 13.5px; color: var(--dim); }
+.review-block.is-compact .review-item .review-title { font-size: 13.5px; }
+
+/* ---- one Approve per work unit ------------------------------------------- */
+
+.review-acts .btn.review-approve-unit { font-weight: 600; }
+.review-acts .btn.review-approve-unit[disabled] { opacity: .72; }
+.review-unit-error {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--bad);
+  max-width: 70ch;
+}
+.review-bar-unit {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--dim);
+  max-width: 70ch;
+}
+.review-bar .review-unit-error { margin-top: 2px; }
+
+@media (max-width: 1199px) {
+  .btn.review-next { min-height: 44px; }
+  .review-block.is-compact .btn.review-next { min-height: 44px; }
+}
+
+/* ---- Chaos: same words, hard edges --------------------------------------- */
+
+html.skin-chaos .btn.review-next {
+  border: 2px solid var(--border);
+  background: var(--send-bg);
+  color: var(--send-fg);
+  box-shadow: inset 1px 1px 0 #fff3c4, inset -1px -1px 0 #8a6510, 0 3px 0 #0a0618;
+}
+html.skin-chaos .btn.review-next:active { transform: translateY(2px); box-shadow: inset 1px 1px 0 #fff3c4, inset -1px -1px 0 #8a6510, 0 1px 0 #0a0618; }
+html.skin-chaos .review-head { border-bottom: 2px solid var(--border); }
+html.skin-chaos .review-acts .btn.review-approve-unit {
+  background: linear-gradient(180deg, #9df0a8, #3fae5a);
+  color: #06210f;
+  box-shadow: inset 1px 1px 0 #d6ffdd, inset -1px -1px 0 #1c6b31, 0 3px 0 #0a0618;
+}
+html.skin-chaos .review-item .review-title { line-height: 1.5; }
+html.skin-chaos .review-unit-error, html.skin-chaos .review-bar-unit { line-height: 1.7; }
