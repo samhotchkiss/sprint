@@ -55,14 +55,17 @@ export const api = {
   events: (after, limit = 500) => req('GET', `/api/events?after=${after || 0}&limit=${limit}`),
 
   submit: (payload, key) => req('POST', '/api/cards', payload, { idempotencyKey: key }),
-  chat: (num, text) => req('POST', `/api/cards/${num}/chat`, { text }),
+  // text, images, or both — exactly like dropping work on the board
+  chat: (num, text, images) => req('POST', `/api/cards/${num}/chat`,
+    images && images.length ? { text, images } : { text }),
   answer: (num, question_id, text) => req('POST', `/api/cards/${num}/answer`, { question_id, text }),
   action: (num, action, extra) => req('POST', `/api/cards/${num}/action`, { action, ...(extra || {}) }),
   retry: (num) => req('POST', `/api/cards/${num}/action`, { action: 'retry' }),
   verdict: (num, verdict, notes) =>
     req('POST', `/api/cards/${num}/verdict`, notes ? { verdict, notes } : { verdict }),
 
-  sidebar: (text) => req('POST', '/api/sidebar', { text, actor: 'user' }),
+  sidebar: (text, images) => req('POST', '/api/sidebar',
+    images && images.length ? { text, images, actor: 'user' } : { text, actor: 'user' }),
   holdMode: (on) => req('POST', '/api/sprint', { action: 'set_hold_mode', hold_mode: !!on }),
 };
 

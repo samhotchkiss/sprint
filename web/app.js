@@ -10,7 +10,7 @@ import { renderList } from './list.js';
 import { renderBoard, renderFold } from './board.js';
 import { renderPhone } from './phone.js';
 import { renderRail, openLightbox, closeLightbox } from './rail.js';
-import { initCompose, toBase64List } from './compose.js';
+import { initCompose, toBase64List, imageFiles } from './compose.js';
 import { installNotifications, attention, armNotifications, clearBadge } from './notify.js';
 import { loadSkin, installSkinToggle, installBlip } from './skin.js';
 
@@ -38,6 +38,14 @@ function render() {
   if (renderQueued) return;
   renderQueued = true;
   requestAnimationFrame(() => { renderQueued = false; paint(); });
+}
+
+/** The rail alone — for frames that provably touch nothing else (see onCursor). */
+let railQueued = false;
+function paintRail() {
+  if (renderQueued || railQueued) return;
+  railQueued = true;
+  requestAnimationFrame(() => { railQueued = false; renderRail(el.rail, app); });
 }
 
 function paint() {
@@ -106,6 +114,16 @@ function renderSessionBanner() {
   el.banner.className = offline ? 'banner warn' : 'banner dim';
   el.banner.appendChild(h('span',
     offline ? 'session offline — items will queue' : 'lost the board connection — retrying'));
+}
+
+/** Is the caret in something that takes text? Then a keystroke is not a shortcut. */
+function isTyping(node) {
+  if (!node) return false;
+  if (node instanceof HTMLTextAreaElement) return true;
+  if (node instanceof HTMLInputElement) {
+    return !['button', 'checkbox', 'radio', 'submit', 'file', 'reset'].includes(node.type);
+  }
+  return !!(node.isContentEditable);
 }
 
 function captureFocus() {
@@ -221,9 +239,16 @@ async function sendSubmit(pending) {
 
 function retrySubmit(pending) { sendSubmit(pending); }
 
-async function answer(card, question, text) {
+async function answer(card, question, text, images) {
   const before = card.state;
   const q = question || card.question || {};
+  // A screenshot pasted while answering is its own line to the agent: the
+  // answer itself is the thing that unblocks the card, and it goes second so
+  // the image is already in the thread when the agent picks the answer up.
+  if (images && images.length) {
+    await chat(card, text, images);
+    if (!text) text = '(see the image above)';
+  }
   patch(card.num, 'in_progress');
   card.question = null;
   // "Delivered — the agent sees it next turn": the optimistic status line the
@@ -255,11 +280,18 @@ async function answer(card, question, text) {
   }
 }
 
-async function chat(card, text) {
-  const line = pushPending(card.num, { actor: 'user', kind: 'chat', payload: { text } });
+async function chat(card, text, images) {
+  const imgs = images || [];
+  const line = pushPending(card.num, {
+    actor: 'user', kind: 'chat',
+    // The thumbnails you pasted are in the thread before the POST returns — the
+    // data: URLs render as tiles directly, and the stored refs replace them the
+    // moment the card refreshes.
+    payload: { text: text || (imgs.length ? `${imgs.length} image(s)` : ''), attachments: localRefs(imgs) },
+  });
   render();
   try {
-    const res = await api.chat(card.num, text);
+    const res = await api.chat(card.num, text, toBase64List(imgs));
     // Stamp the real seq on our own line so it reads "landed" the instant the
     // POST returns, and flips to "session is on it" when the cursor passes it.
     settlePending(card.num, false, res && res.event, line);
@@ -273,17 +305,27 @@ async function chat(card, text) {
   }
 }
 
+/** Local, immediately-renderable refs for images we have not uploaded yet. */
+function localRefs(images) {
+  return (images || []).map((i) => ({ url: i.dataUrl, name: i.name || 'pasted image' }));
+}
+
 /** A line to the session itself, in the sprint-level chat. */
-async function sessionChat(text) {
-  const line = normEvent({ actor: 'user', kind: 'chat', ts: new Date().toISOString(), payload: { text } });
+async function sessionChat(text, images) {
+  const imgs = images || [];
+  const payload = { text: text || (imgs.length ? `${imgs.length} image(s)` : ''), attachments: localRefs(imgs) };
+  const line = normEvent({ actor: 'user', kind: 'chat', ts: new Date().toISOString(), payload });
   line.local = true;         // "sending…" — no seq yet, so nothing is claimed
   line.localEcho = true;     // replaced when the server's own copy arrives
   line.sortSeq = store.seq + 0.5;   // ordering only, never a delivery claim
   store.sidebar.push(line);
   render();
   try {
-    const res = await api.sidebar(text);
+    const res = await api.sidebar(text, toBase64List(imgs));
     line.local = false;
+    if (res && res.event && res.event.payload && res.event.payload.attachments) {
+      line.payload.attachments = res.event.payload.attachments;
+    }
     const seq = res && res.event && Number(res.event.seq);
     if (seq && !Number.isNaN(seq)) {
       line.seq = seq;
@@ -544,12 +586,7 @@ async function boot() {
     if (!el.composeWrap.hidden) return;
     const a = document.activeElement;
     if (a && (a instanceof HTMLTextAreaElement || a instanceof HTMLInputElement)) return;
-    const items = e.clipboardData && e.clipboardData.items;
-    if (!items) return;
-    const files = [];
-    for (const it of items) {
-      if (it.kind === 'file' && /^image\//.test(it.type)) { const f = it.getAsFile(); if (f) files.push(f); }
-    }
+    const files = imageFiles(e.clipboardData);
     if (!files.length) return;
     e.preventDefault();
     openCompose();
@@ -557,6 +594,14 @@ async function boot() {
   });
 
   document.addEventListener('keydown', (e) => {
+    // "/" is the shortcut to drop work — unless you are already typing, where a
+    // slash is just a slash. Nothing else on this page claims a bare key.
+    if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey
+        && el.composeWrap.hidden && !isTyping(document.activeElement)) {
+      e.preventDefault();
+      openCompose();
+      return;
+    }
     if (e.key === 'Escape') {
       if (!el.lightbox.hidden) { closeLightbox(el.lightbox); return; }
       if (!el.composeWrap.hidden) { closeCompose(); return; }
@@ -620,7 +665,14 @@ async function firstLoad() {
     onStatus: (mode) => { app.transport = mode; render(); },
     // The session drained further: messages it has now read flip to
     // "session is on it" without waiting for the next board fetch.
-    onCursor: (seq) => { if (applyCursor(seq)) render(); },
+    //
+    // This is the most frequent frame on the wire — an active session moves its
+    // cursor every second or so — and the ONLY thing on screen that reads the
+    // cursor is the delivery pill under your own messages in the rail. So it
+    // paints the rail and nothing else; the rail then patches those pills in
+    // place rather than rebuilding the thread. That is what stopped the rail
+    // blinking once a second while an agent was working.
+    onCursor: (seq) => { if (applyCursor(seq)) paintRail(); },
     onAuthError: showAuthWall,
   });
   live.start(store.seq);

@@ -13,7 +13,11 @@
 // The evidence packet is a fifth thing that renders AS a message rather than as
 // a fixed panel — it arrived at a moment in the conversation and it reads in
 // that place, with the claim first and "Check it yourself" as its visual centre.
-import { h, ageSuffix, richText, firstLine } from './util.js';
+//
+// Nothing in here is rebuilt on a whim. Every item carries a key and a version
+// (see `reconcile`), so a frame that changed nothing changes no DOM — which is
+// what keeps the rail still while the session's cursor ticks past underneath.
+import { h, ageSuffix, richText, firstLine, reconcile, timeEl } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
 import { SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, draft } from './state.js';
 import { detailBlock } from './detail.js';
@@ -31,10 +35,17 @@ const ACTOR = {
  * on, so they sit at the bottom where your eye already is.
  */
 export function renderThread(root, detail, app) {
+  reconcile(root, threadItems(detail, app));
+}
+
+/** The whole stream as keyed descriptors — see `reconcile` in util.js. */
+export function threadItems(detail, app) {
   const card = detail.card;
   const state = detail.state;
+  const out = [];
 
-  root.appendChild(h('p.thread-opened', `Card #${detail.num} opened`));
+  out.push({ key: 'opened', ver: detail.num,
+    make: () => h('p.thread-opened', `Card #${detail.num} opened`) });
 
   const items = (detail.timeline || []).slice();
   const known = new Set(items.map((e) => e.seq).filter((s) => s != null));
@@ -46,9 +57,8 @@ export function renderThread(root, detail, app) {
   // The user's own words, verbatim, are the first thing in the thread — the face
   // carries a condensed title, and this is where the untouched submission lives.
   if (card && card.body && !items.some((e) => e.kind === 'submitted')) {
-    root.appendChild(message({
-      actor: 'user', ts: card.created_at, payload: { text: card.body },
-    }, app));
+    const ev = { actor: 'user', ts: card.created_at, payload: { text: card.body } };
+    out.push({ key: 'body', ver: card.body.length, make: () => message(ev, app) });
   }
 
   // The question the card is actually waiting on renders as a panel at the
@@ -56,37 +66,69 @@ export function renderThread(root, detail, app) {
   const liveQuestion = (state === 'needs_you' && card && card.question)
     ? lastIndexOfKind(items, 'question') : -1;
 
+  const shown = new Set();
   items.forEach((ev, i) => {
     if (i === liveQuestion) return;
+    const key = eventKey(ev);
     if (SYSTEM_KINDS.has(ev.kind) && ev.kind !== 'submitted' && ev.kind !== 'evidence') {
-      root.appendChild(statusChange(ev, app));
+      out.push({ key, ver: 1, make: () => statusChange(ev, app) });
       return;
     }
     if (ev.kind === 'evidence') return;        // the packet itself renders below
-    root.appendChild(message(ev, app));
+    out.push({ key, ver: 1, make: () => message(ev, app) });
     const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
     if (Array.isArray(atts) && atts.length) {
-      root.appendChild(shotRow(atts, app, ev.actor === 'user'));
+      for (const a of atts) shown.add(attachmentUrl(a));
+      // the version tracks the refs themselves (by length, not by value: a
+      // pasted data: URL is enormous) so an optimistic local thumbnail is
+      // swapped for the stored attachment exactly once
+      out.push({ key: key + ':shots', ver: refsVer(atts),
+        make: () => shotRow(atts, app, ev.actor === 'user') });
     }
   });
 
-  if (Array.isArray(card && card.attachments) && card.attachments.length) {
-    root.appendChild(shotRow(card.attachments, app, true, 'you attached this'));
+  // Anything attached to the card that no line in the thread already showed —
+  // never a second copy of a screenshot you can already see above.
+  const loose = (Array.isArray(card && card.attachments) ? card.attachments : [])
+    .filter((a) => !shown.has(attachmentUrl(a)));
+  if (loose.length) {
+    out.push({ key: 'card-atts', ver: loose.map((a) => attachmentUrl(a)).join(','),
+      make: () => shotRow(loose, app, true, 'you attached this') });
   }
 
   if (state === 'needs_you' && card && card.question) {
-    root.appendChild(questionPanel(card, card.question, app));
+    out.push({ key: 'question', ver: card.question.id || card.question.text || 1,
+      make: () => questionPanel(card, card.question, app) });
   } else if (detail.justAnswered) {
-    root.appendChild(statusLine('Delivered — the agent sees it next turn', 'now', 'good'));
+    out.push({ key: 'answered', ver: 1,
+      make: () => statusLine('Delivered — the agent sees it next turn', 'now', 'good') });
   }
 
   const packet = detail.evidence || (card && card.evidence);
   if (packet && (state === 'ready' || state === 'integrating')) {
     if (state === 'integrating') {
-      root.appendChild(statusLine('Approved — merging', ageSuffix(card.state_since), 'good'));
+      out.push({ key: 'merging', ver: card.state_since || 1,
+        make: () => statusLine('Approved — merging', ageSuffix(card.state_since), 'good') });
     }
-    root.appendChild(evidencePacket(packet, card, state, app));
+    out.push({
+      key: 'packet',
+      ver: `${state}:${card ? card.bounce_count : 0}:${(packet && packet.claim) || ''}`.length
+        + ':' + state + ':' + (card ? card.bounce_count : 0),
+      make: () => evidencePacket(packet, card, state, app),
+    });
   }
+  return out;
+}
+
+function refsVer(refs) {
+  return refs.length + ':' + refs.map((r) => String(attachmentUrl(r) || '').length).join('.');
+}
+
+/** An event's identity in the log — stable across every re-render. */
+function eventKey(ev) {
+  if (ev.seq != null) return 's' + ev.seq;
+  if (ev.localId) return 'l' + ev.localId;
+  return 'x' + (ev.kind || '') + ':' + (ev.ts || '');
 }
 
 function lastIndexOfKind(items, kind) {
@@ -96,13 +138,29 @@ function lastIndexOfKind(items, kind) {
 
 /** The session chat: same bubbles, no card machinery. */
 export function renderChat(root, lines, app) {
+  reconcile(root, chatItems(lines, app));
+}
+
+export function chatItems(lines, app) {
   if (!lines.length) {
-    root.appendChild(h('div.thread-empty',
+    return [{ key: 'empty', ver: 1, make: () => h('div.thread-empty',
       h('p', 'This is the session itself — same brain as the terminal.'),
-      h('p', 'Ask it anything: “why have #123, #127 and #128 been blocked for so long?”')));
-    return;
+      h('p', 'Ask it anything: “why have #123, #127 and #128 been blocked for so long?”')) }];
   }
-  for (const ev of lines) root.appendChild(message(ev, app));
+  const out = [];
+  lines.forEach((ev, i) => {
+    const key = ev.seq != null ? 's' + ev.seq : 'echo' + i;
+    out.push({ key, ver: 1, make: () => message(ev, app) });
+    const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
+    if (Array.isArray(atts) && atts.length) {
+      // the version tracks the refs themselves (by length, not by value: a
+      // pasted data: URL is enormous) so an optimistic local thumbnail is
+      // swapped for the stored attachment exactly once
+      out.push({ key: key + ':shots', ver: refsVer(atts),
+        make: () => shotRow(atts, app, ev.actor === 'user') });
+    }
+  });
+  return out;
 }
 
 // ---- item types ----------------------------------------------------------
@@ -110,15 +168,11 @@ export function renderChat(root, lines, app) {
 function message(ev, app) {
   const who = ACTOR[ev.actor] || ACTOR.worker;
   const mine = ev.actor === 'user';
-  const st = mine ? messageStatus(ev) : null;
 
-  const item = h('div.item', {
-    class: `item ${who.cls}${mine ? ' mine' : ''}${ev.pending || ev.local ? ' is-pending' : ''}${ev.failed ? ' is-failed' : ''}`,
-  });
-  item.appendChild(h('div.msg-head',
-    h('span.msg-who', who.label),
-    st ? h('span.msg-status', { class: `msg-status is-${st.key}`, title: st.title }, st.label) : null,
-    st && (st.key === 'sending' || st.key === 'failed') ? null : h('span.msg-when', ageSuffix(ev.ts))));
+  const item = h('div.item');
+  const status = h('span.msg-status');
+  const when = h('span.msg-when');
+  item.appendChild(h('div.msg-head', h('span.msg-who', who.label), status, when));
 
   const bubble = h('div.bubble', h('p', richText(eventText(ev), app.openCard)));
   // Only a line with real detail gets an affordance — a chevron over nothing is
@@ -126,6 +180,27 @@ function message(ev, app) {
   const more = detailBlock(ev, app);
   if (more) bubble.appendChild(more);
   item.appendChild(bubble);
+
+  // Delivery state moves under the message ("sending…" → "landed" → "session is
+  // on it") while the message itself never changes. That transition is the most
+  // frequent thing on the wire, so it is patched in place: the bubble, and any
+  // image in it, is never re-created for it.
+  item._sync = () => {
+    const st = mine ? messageStatus(ev) : null;
+    item.className = `item ${who.cls}${mine ? ' mine' : ''}`
+      + `${ev.pending || ev.local ? ' is-pending' : ''}${ev.failed ? ' is-failed' : ''}`;
+    status.hidden = !st;
+    if (st) {
+      status.className = `msg-status is-${st.key}`;
+      status.title = st.title;
+      if (status.textContent !== st.label) status.textContent = st.label;
+    }
+    const hideWhen = st && (st.key === 'sending' || st.key === 'failed');
+    when.hidden = !!hideWhen;
+    const label = ageSuffix(ev.ts);
+    if (!hideWhen && when.textContent !== label) when.textContent = label;
+  };
+  item._sync();
   return item;
 }
 
@@ -134,7 +209,8 @@ function statusChange(ev, app) {
     : (ev.kind === 'state' && (ev.payload.to === 'ready' || ev.payload.to === 'completed')) ? 'good'
       : ev.kind === 'verdict' && ev.payload.verdict === 'approve' ? 'good' : '';
   const label = statusLabel(ev);
-  const item = statusLine(label, ageSuffix(ev.ts), tone);
+  // a live time element, so the ticker keeps it honest without a rebuild
+  const item = statusLine(label, timeEl(ev.ts), tone);
   // an error's stack, a silence note's findings — tucked under, closed
   const more = detailBlock(ev, app, { small: true });
   if (more) item.appendChild(more);
@@ -157,7 +233,7 @@ export function statusLine(label, when, tone) {
     h('div.status-line', { class: `status-line${tone ? ' is-' + tone : ''}` },
       h('span.status-dot'),
       h('span.status-label', label),
-      when ? h('span.status-when', when) : null));
+      when ? h('span.status-when', when) : null));   // `when` may be a live timeEl
 }
 
 function shotRow(refs, app, mine, fallbackCaption) {
