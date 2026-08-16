@@ -289,6 +289,7 @@ and the table is prose.
 | worker | `question` | Server already flipped to `needs_you`. Nothing to do — the card face shows the question; you'll see the `answer` event when the user responds. A question with `payload.artifacts` is a **decision request** (mockups, a live URL, notes for a choice the agent cannot make itself); the rail renders them above the answer box, so still nothing to relay — but if you re-surface it after 30 minutes, say what is attached ("#42 wants you to pick one of three headers — screenshots and a preview are on the card"). |
 | worker | `evidence` (ready) | Card (or whole batch) just entered `ready`. Nothing required from you — it's now waiting on the user's verdict. Optional: a short sidebar note if the user seems to be waiting on it. |
 | server | `note` with `payload.settings` | The user changed the board's dispatch policy in the Settings panel (model, executors, concurrency). Nothing is owed in reply — but your next dispatch reads the new values, including a concurrency cap that may have just gone up (dispatch now) or down (don't start another until you are back under it). |
+| server | `note` with `payload.blocked_by_change` and `payload.blocked_by: null` | A card just stopped waiting on another card — the blocker landed and the server cleared the link ("no longer blocked — #58 landed"). **This is a dispatch trigger**: the card is dispatchable now, so treat it like fresh queued work this drain cycle. |
 | server | `agent_silent` | See step 5 — go investigate. |
 | server | `limit_cleared` | A provider limit window just ended. **This is a work signal, not a notification.** `payload.kind` says which procedure: `"model"` — re-dispatch what you downgraded, back on the model named in `payload.model`; `"account"` — the whole Claude account came back (the user pressed Resume after signing in with another session), so **re-dispatch every card parked or killed during the window, briefing each with its own timeline**. `payload.reason` says whether the clock got there or somebody cleared it early. See step 5b. |
 | server | `limit_declared` | A limit declaration — yours, or (for `kind: "account"`) one another board on this machine made. Nothing to do; the board is now showing the line or the banner. |
@@ -303,8 +304,8 @@ on `state`, not on the wording:
 | `payload.state` | your reaction |
 |---|---|
 | `integrating` (>10 min) | **You owe this one a finish.** The user approved it and the git work either never started or never got reported. Rebase/gate/merge it now and `POST /api/cards/:num/integrated {"ok": true}` — or, if it failed, `{"ok": false, "reason": "<what broke>"}` so it goes back to the agent. Never leave it at "merging". |
-| `queued` (>15 min, no agent) | Dispatch it (step 3) if you have capacity. If you don't, say so where the user can see it: a sidebar line naming the card and what it's waiting behind. "Queued" with no explanation past a quarter hour is the same as lost. |
-| `blocked` (>30 min) | Re-check the wall (the Blocked sweep below, but now with a specific card named). Still blocked → post a `note` saying you re-checked and what's still true. Not blocked anymore → move it back to `queued`/`in_progress` and dispatch. |
+| `queued` (>15 min, no agent) | Dispatch it (step 3) if you have capacity. If you don't, say so where the user can see it: a sidebar line naming the card and what it's waiting behind — and if what it is waiting behind is another card, record that with `blocked_by` (below) rather than in a sentence. "Queued" with no explanation past a quarter hour is the same as lost. |
+| `blocked` (>30 min) | Re-check the wall (the Blocked sweep below, but now with a specific card named). Still blocked → post a `note` saying you re-checked and what's still true. Not blocked anymore → move it back to `queued`/`in_progress` and dispatch. If `payload.blocked_by` is set, the wall is another card and the board is already watching it for you — go look at that card instead. |
 | `needs_you` (>30 min) | Re-surface the question to the user: a sidebar line with the card number and the question in one sentence. The UI chimed once when the card flipped; this is your cue to ask again in words. Do NOT answer it yourself. |
 | `ready` (>24 h) | A gentle reminder, at most **once a day**: mention it in the sidebar alongside anything else waiting on a verdict. One line, no repetition — the sweep's own backoff assumes you aren't adding noise of your own. |
 
@@ -326,14 +327,61 @@ is by design: `--user-only` is "a human is waiting", and the whole point
 of the sweep is that no human is. One more reason to run the unfiltered
 tail whenever anything is in motion.
 
+### When one card is waiting on another: set `blocked_by`
+
+User verbatim: **"when one card is blocked by another, show that in the
+card details."** So when the wall is *another card on this board*, say
+so structurally. Never write it only in prose — a sentence in the
+timeline is invisible to the board, to the sweep and to you an hour
+later.
+
+```bash
+# #61 is waiting on #58
+curl -sS -X POST "$SPRINT_SERVER/api/cards/61/action" \
+  -H "Authorization: Bearer $SPRINT_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"action":"blocked_by","target":58,"reason":"needs the settings form first"}'
+
+# and to take it back off by hand
+  -d '{"action":"blocked_by","target":null}'
+```
+
+- It is a **link, not a state**. A card can be `queued` and blocked at
+  the same time, which is the common case: it is dispatchable in
+  principle and pointless in practice. Move it to the `blocked` state
+  as well only when that is genuinely where it belongs.
+- The server refuses three things by name, and each refusal is telling
+  you something true: `self_block` (a card cannot wait on itself),
+  `blocked_cycle` (A → B → A — nothing in that loop could ever unblock),
+  and `blocker_closed` (the target already finished, so nothing is
+  coming from it).
+- Every card payload carries `blocked_by` and `blocked_reason`, so the
+  rail shows "Blocked by #N — reason" with #N as a link and the face
+  gets a quiet marker. You get the same two fields on `/api/board`.
+
+**The auto-clear is a dispatch trigger.** When the blocker completes or
+is closed, the server clears `blocked_by` on everything waiting on it
+and writes one `note` per freed card:
+
+> no longer blocked — #58 landed
+
+Treat that event exactly like a `queued` card appearing: the card is
+dispatchable **now**, and if you have capacity it should go out this
+drain cycle rather than waiting for the sweep to remind you. The sweep
+will re-amber it if nobody picks it up — and while a card is blocked,
+its nag says *"waiting on #58"* instead of "dispatch it or say why
+not", because nagging you to dispatch something that cannot start is
+noise.
+
 ### Blocked sweep
 
-`blocked` cards don't self-clear. Once per drain cycle (cheap: it's
-already in your `GET /api/board` response), glance at any `blocked`
+Walls that are NOT another card — CI red, a missing credential, an
+upstream outage — still don't self-clear. Once per drain cycle (cheap:
+it's already in your `GET /api/board` response), glance at any `blocked`
 cards and re-check whether their named reason still holds (CI still
-red? the overlapping card still open? the dependency still missing?).
-Clear ones that aren't blocked anymore by moving them back to
-`queued`/`in_progress` as appropriate and note why.
+red? the dependency still missing?). Clear ones that aren't blocked
+anymore by moving them back to `queued`/`in_progress` as appropriate and
+note why. A card waiting on another card needs none of this — that one
+clears itself.
 
 ---
 

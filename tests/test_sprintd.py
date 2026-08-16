@@ -8037,5 +8037,323 @@ class TestSprintLimitCli(Base):
         self.assertIn("SPRINT_SERVER", r.stderr.decode())
 
 
+# --------------------------------------------------------------------------
+# blocked_by (#61)
+#
+# User verbatim: "when one card is blocked by another, show that in the card
+# details." The link used to be a sentence somebody typed; now it is a column,
+# which is what lets the board draw it, the sweep name it, and the server clear
+# it by itself the moment the blocker closes.
+# --------------------------------------------------------------------------
+
+
+class BlockedByBase(Base):
+    def block(self, num, target, reason=None):
+        body = {"action": "blocked_by", "target": target}
+        if reason is not None:
+            body["reason"] = reason
+        return self.post("/api/cards/%d/action" % num, body)
+
+    def card(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return detail["card"]
+
+    def notes(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return [e for e in detail["timeline"] if e["kind"] == "note"]
+
+    def blocked_notes(self, num):
+        return [e for e in self.notes(num)
+                if e["payload"].get("blocked_by_change")]
+
+    def close_completed(self, num):
+        """queued → … → completed, the only honest way in."""
+        self.to_in_progress(num)
+        status, _ = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200)
+        self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+        status, _ = self.post("/api/cards/%d/integrated" % num, {"ok": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "completed")
+
+
+class TestBlockedBySetAndClear(BlockedByBase):
+    def test_set_and_clear_round_trip(self):
+        blocker = self.new_card("ship the API")["num"]
+        waiting = self.new_card("use the new API")["num"]
+
+        status, body = self.block(waiting, blocker, "needs the endpoint first")
+        self.assertEqual(status, 200, body)
+        card = self.card(waiting)
+        self.assertEqual(card["blocked_by"], blocker)
+        self.assertEqual(card["blocked_reason"], "needs the endpoint first")
+
+        # the timeline says it in words, with the card number in it so the
+        # board's #N autolink picks it up
+        ev = self.blocked_notes(waiting)[-1]
+        self.assertIn("#%d" % blocker, ev["payload"]["text"])
+        self.assertIn("needs the endpoint first", ev["payload"]["text"])
+
+        # ...and the board payload carries it too, so a face can mark it
+        status, board = self.get("/api/board")
+        by_num = {c["num"]: c for c in board["cards"]}
+        self.assertEqual(by_num[waiting]["blocked_by"], blocker)
+
+        status, body = self.block(waiting, None)
+        self.assertEqual(status, 200, body)
+        card = self.card(waiting)
+        self.assertIsNone(card["blocked_by"])
+        self.assertIsNone(card["blocked_reason"])
+        self.assertEqual(self.blocked_notes(waiting)[-1]["payload"]["was_blocked_by"],
+                         blocker)
+
+    def test_a_reason_is_optional(self):
+        blocker = self.new_card("first")["num"]
+        waiting = self.new_card("second")["num"]
+        status, _ = self.block(waiting, blocker)
+        self.assertEqual(status, 200)
+        self.assertIsNone(self.card(waiting)["blocked_reason"])
+
+    def test_clearing_a_card_that_is_not_blocked_writes_nothing(self):
+        num = self.new_card("nothing in its way")["num"]
+        status, _ = self.block(num, None)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.blocked_notes(num), [],
+                         "a no-op must not write an event saying something changed")
+
+    def test_re_pointing_at_another_card_replaces_it(self):
+        a = self.new_card("a")["num"]
+        b = self.new_card("b")["num"]
+        waiting = self.new_card("waiting")["num"]
+        self.block(waiting, a)
+        self.block(waiting, b, "actually it is b")
+        card = self.card(waiting)
+        self.assertEqual(card["blocked_by"], b)
+        self.assertEqual(card["blocked_reason"], "actually it is b")
+
+    def test_the_reason_is_one_line_and_capped(self):
+        blocker = self.new_card("blocker")["num"]
+        waiting = self.new_card("waiting")["num"]
+        self.block(waiting, blocker, "two\nlines  and   spaces " + "x" * 400)
+        reason = self.card(waiting)["blocked_reason"]
+        self.assertEqual(len(reason), sprintd.BLOCKED_REASON_MAX)
+        self.assertNotIn("\n", reason)
+        self.assertTrue(reason.startswith("two lines and spaces "))
+
+
+class TestBlockedByRefusals(BlockedByBase):
+    def test_a_card_cannot_block_itself(self):
+        num = self.new_card("me")["num"]
+        status, body = self.block(num, num)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "self_block")
+        self.assertEqual(body["field"], "target")
+        self.assertIsNone(self.card(num)["blocked_by"])
+
+    def test_a_target_that_does_not_exist_is_a_404(self):
+        num = self.new_card("me")["num"]
+        status, body = self.block(num, 9999)
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body["error"], "no_such_card")
+
+    def test_a_target_that_is_not_a_number_is_named(self):
+        num = self.new_card("me")["num"]
+        status, body = self.block(num, "the other one")
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "target")
+
+    def test_target_is_required(self):
+        num = self.new_card("me")["num"]
+        status, body = self.post("/api/cards/%d/action" % num,
+                                 {"action": "blocked_by"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "missing_field")
+        self.assertEqual(body["field"], "target")
+
+    def test_a_direct_cycle_is_refused_by_name(self):
+        a = self.new_card("a")["num"]
+        b = self.new_card("b")["num"]
+        self.block(b, a)                       # b waits on a
+        status, body = self.block(a, b)        # a waits on b -> nobody moves
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "blocked_cycle")
+        self.assertEqual(body["field"], "target")
+        self.assertEqual(body["chain"], [a, b, a])
+        self.assertIn("#%d" % b, body["message"])
+        self.assertIsNone(self.card(a)["blocked_by"],
+                          "a refused link must leave the card untouched")
+
+    def test_a_longer_cycle_is_refused_too(self):
+        a = self.new_card("a")["num"]
+        b = self.new_card("b")["num"]
+        c = self.new_card("c")["num"]
+        self.block(c, b)
+        self.block(b, a)
+        status, body = self.block(a, c)        # a -> c -> b -> a
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "blocked_cycle")
+        self.assertEqual(body["chain"], [a, c, b, a])
+
+    def test_a_chain_that_is_not_a_cycle_is_fine(self):
+        a = self.new_card("a")["num"]
+        b = self.new_card("b")["num"]
+        c = self.new_card("c")["num"]
+        self.assertEqual(self.block(b, a)[0], 200)
+        self.assertEqual(self.block(c, b)[0], 200)
+        self.assertEqual(self.card(c)["blocked_by"], b)
+
+    def test_a_closed_blocker_is_refused(self):
+        """Nothing is coming from a card that already finished, so the link
+        would never clear itself and the card would wait forever."""
+        blocker = self.new_card("already done")["num"]
+        waiting = self.new_card("waiting")["num"]
+        self.post("/api/cards/%d/action" % blocker, {"action": "cancel"})
+        status, body = self.block(waiting, blocker)
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"], "blocker_closed")
+        self.assertEqual(body["blocker_state"], "canceled")
+
+
+class TestBlockedByAutoClear(BlockedByBase):
+    def test_the_blocker_landing_clears_it_once_and_says_so(self):
+        blocker = self.new_card("ship the API")["num"]
+        waiting = self.new_card("use the new API")["num"]
+        self.block(waiting, blocker, "needs the endpoint")
+
+        before = len(self.blocked_notes(waiting))
+        self.close_completed(blocker)
+
+        card = self.card(waiting)
+        self.assertIsNone(card["blocked_by"])
+        self.assertIsNone(card["blocked_reason"])
+        freed = [e for e in self.blocked_notes(waiting)
+                 if e["payload"].get("was_blocked_by") == blocker]
+        self.assertEqual(len(freed), 1, "exactly one unblock event")
+        self.assertEqual(freed[0]["actor"], "server")
+        self.assertEqual(freed[0]["payload"]["text"],
+                         "no longer blocked — #%d landed" % blocker)
+        self.assertEqual(len(self.blocked_notes(waiting)), before + 1)
+
+    def test_it_fires_once_even_if_the_blocker_is_closed_again(self):
+        blocker = self.new_card("ship the API")["num"]
+        waiting = self.new_card("use the new API")["num"]
+        self.block(waiting, blocker)
+        self.close_completed(blocker)
+        # reopened and closed a second way: nobody is pointing at it any more,
+        # so there is nothing left to announce
+        self.post("/api/cards/%d/action" % blocker, {"action": "reopen"})
+        self.post("/api/cards/%d/action" % blocker, {"action": "cancel"})
+        freed = [e for e in self.blocked_notes(waiting)
+                 if e["payload"].get("was_blocked_by") == blocker]
+        self.assertEqual(len(freed), 1)
+
+    def test_a_canceled_blocker_says_what_actually_happened(self):
+        blocker = self.new_card("we are not doing this")["num"]
+        waiting = self.new_card("waiting on it")["num"]
+        self.block(waiting, blocker)
+        self.post("/api/cards/%d/action" % blocker, {"action": "cancel"})
+        card = self.card(waiting)
+        self.assertIsNone(card["blocked_by"])
+        self.assertEqual(self.blocked_notes(waiting)[-1]["payload"]["text"],
+                         "no longer blocked — #%d canceled" % blocker)
+
+    def test_every_card_waiting_on_it_is_freed(self):
+        blocker = self.new_card("the one thing")["num"]
+        waiters = [self.new_card("waiter %d" % i)["num"] for i in range(3)]
+        for w in waiters:
+            self.block(w, blocker)
+        self.close_completed(blocker)
+        for w in waiters:
+            self.assertIsNone(self.card(w)["blocked_by"], "#%d should be free" % w)
+
+    def test_a_blocker_that_merely_moves_changes_nothing(self):
+        blocker = self.new_card("still going")["num"]
+        waiting = self.new_card("waiting")["num"]
+        self.block(waiting, blocker)
+        self.to_in_progress(blocker)
+        self.assertEqual(self.card(waiting)["blocked_by"], blocker)
+
+
+class TestBlockedBySweep(BlockedByBase):
+    """The parked-card sweep says what the card is actually waiting for."""
+
+    def setUp(self):
+        super().setUp()
+        self.app.sweep_thresholds["queued"] = 1.0
+        self.app.sweep_thresholds["blocked"] = 1.0
+
+    def age(self, num, seconds):
+        with self.app.lock:
+            self.app.conn.execute(
+                "UPDATE events SET ts=ts-? WHERE card_num=?", (seconds, num))
+            self.app.conn.execute(
+                "UPDATE cards SET updated_at=updated_at-? WHERE num=?", (seconds, num))
+
+    def stuck_texts(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return [e["payload"]["text"] for e in detail["timeline"] if e["kind"] == "stuck"]
+
+    def test_a_queued_blocked_card_is_nagged_about_the_blocker(self):
+        blocker = self.new_card("the wall")["num"]
+        waiting = self.new_card("behind the wall")["num"]
+        self.block(waiting, blocker, "needs the endpoint")
+        self.age(waiting, 5.0)
+
+        self.assertGreaterEqual(self.app.sweep_stuck(), 1)
+        texts = self.stuck_texts(waiting)
+        self.assertEqual(len(texts), 1)
+        self.assertIn("waiting on #%d" % blocker, texts[0])
+        self.assertNotIn("dispatch it or say why not", texts[0])
+
+    def test_an_unblocked_card_gets_the_ordinary_nag_again(self):
+        blocker = self.new_card("the wall")["num"]
+        waiting = self.new_card("behind the wall")["num"]
+        self.block(waiting, blocker)
+        self.age(waiting, 5.0)
+        self.app.sweep_stuck()
+        self.assertIn("waiting on #%d" % blocker, self.stuck_texts(waiting)[0])
+
+        # the blocker lands: the card is dispatchable again, so the amber drops
+        # and its clock restarts...
+        self.close_completed(blocker)
+        self.assertFalse(self.card(waiting)["stuck"],
+                         "the wall came down — the old reminder is spent")
+        # ...and once nobody picks it up, the sweep re-ambers it in the usual
+        # words, because now there really is nothing stopping anyone.
+        self.age(waiting, 5.0)
+        self.app.sweep_stuck()
+        texts = self.stuck_texts(waiting)
+        self.assertEqual(len(texts), 2, "the unblock re-arms the reminders")
+        self.assertIn("dispatch it or say why not", texts[-1])
+        self.assertNotIn("waiting on #", texts[-1])
+
+    def test_a_card_with_no_blocker_is_nagged_the_old_way(self):
+        num = self.new_card("nobody is on it")["num"]
+        self.age(num, 5.0)
+        self.app.sweep_stuck()
+        self.assertIn("dispatch it or say why not", self.stuck_texts(num)[0])
+
+
+class TestBlockedByDocs(Base):
+    """The orchestrator sets the link instead of writing a sentence about it."""
+
+    def read_repo_file(self, *parts):
+        path = os.path.join(os.path.dirname(HERE), *parts)
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_skill_tells_the_session_to_set_blocked_by(self):
+        doc = self.read_repo_file("skills", "sprint", "SKILL.md")
+        self.assertIn('"action":"blocked_by"', doc)
+        self.assertIn("no longer blocked", doc)
+
+    def test_the_spec_records_the_field(self):
+        spec = self.read_repo_file("SPEC.md")
+        self.assertIn("blocked_by", spec)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
