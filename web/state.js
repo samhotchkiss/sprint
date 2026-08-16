@@ -1,6 +1,6 @@
 // The client-side projection of the board. Tolerant normalizers: the server owns the
 // truth, we only ever *display* it, so unknown/missing fields degrade instead of throwing.
-import { age, firstLine, ms } from './util.js';
+import { age, firstLine, ms, h } from './util.js';
 import { phaseOf } from './phase.js';
 import { reviewUnits } from './units.js';
 
@@ -207,6 +207,11 @@ export function normCard(c) {
     bounce_count: c.bounce_count || 0,
     pinned: !!c.pinned,
     dup_of: c.dup_of != null ? num(c.dup_of) : null,
+    // Which card this one is waiting on, and why (#61). Structural, so the
+    // rail can link it and the face can mark it; null on nearly every card,
+    // which is why the marker is an exception rather than chrome.
+    blocked_by: c.blocked_by != null ? num(c.blocked_by) : null,
+    blocked_reason: c.blocked_reason || null,
     long_running: !!c.long_running,
     // Which model the agent was dispatched on, and what the sprint's default
     // is, so `modelTag` can decide whether it is worth drawing. This
@@ -1041,4 +1046,25 @@ export function messageStatus(ev) {
     label: 'landed',
     title: 'saved on the board; the session has not read it yet',
   };
+}
+
+// ---- blocked by (#61) ----------------------------------------------------
+
+/**
+ * The quiet marker a blocked card's face or row carries: "waiting on #58".
+ *
+ * User verbatim: "when one card is blocked by another, show that in the card
+ * details." The details are the rail's job; this is the two words that stop a
+ * card looking abandoned from across the board. Null on every card with
+ * nothing in its way, which is nearly all of them — a marker on every card
+ * would say nothing.
+ */
+export function blockedByMark(card) {
+  const n = card && card.blocked_by;
+  if (n == null) return null;
+  return h('span.blockedby-mark', {
+    title: card.blocked_reason
+      ? `waiting on #${n} — ${card.blocked_reason}`
+      : `waiting on #${n} to land`,
+  }, `waiting on #${n}`);
 }

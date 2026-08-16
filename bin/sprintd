@@ -243,6 +243,24 @@ STUCK_TEXT = {
     "ready": "ready for review %s — it is waiting on a verdict",
 }
 
+# ...and what it says instead when the board KNOWS what the card is waiting on.
+# "dispatch it or say why not" is the wrong nag for a card whose blocker is
+# named on it: nobody can dispatch it, and the answer to "why not" is already
+# recorded. Naming the blocker turns the reminder into something actionable --
+# go look at #N -- instead of a question the reader has to go and re-derive.
+STUCK_TEXT_BLOCKED = {
+    "queued": "queued %s — waiting on #%s to land, so it is not ready to dispatch",
+    "blocked": "blocked %s — waiting on #%s",
+    "needs_you": "waiting on you for %s — and on #%s",
+}
+# One line of the user's own words for why a card is waiting. Longer than this
+# is a conversation, and a conversation belongs in the thread.
+BLOCKED_REASON_MAX = 140
+# How far the cycle check will walk a chain before it calls the data broken.
+# A real chain is two or three cards deep; anything past this is a loop that
+# predates the check (a hand-edited database) and must not hang the request.
+BLOCKED_CHAIN_MAX = 64
+
 # --------------------------------------------------------------------------
 # Killed-agent detection
 #
@@ -449,6 +467,12 @@ CREATE TABLE IF NOT EXISTS cards (
   executor TEXT,
   model TEXT,
   model_reason TEXT,
+  -- Which OTHER card this one is waiting on, and why, in the user's words.
+  -- NULL means nothing is in its way. This is the card-to-card link itself,
+  -- not prose about one: the board can draw it, the sweep can name it, and the
+  -- server clears it by itself the moment the blocker lands.
+  blocked_by INTEGER,
+  blocked_reason TEXT,
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL
 );
@@ -1776,6 +1800,10 @@ class App:
         # would have to remember across a restart, which is exactly what it
         # failed to do the night this card was written.
         ("cards", "model_reason", "TEXT"),
+        # The card this one is waiting on, and why. NULL on every card a board
+        # created before the link was structural (it used to live in prose).
+        ("cards", "blocked_by", "INTEGER"),
+        ("cards", "blocked_reason", "TEXT"),
         # Account-wide windows landed after the first limits table shipped, so
         # a board that ran the earlier version has a `limits` table without it.
         ("limits", "kind", "TEXT NOT NULL DEFAULT 'model'"),
@@ -2440,6 +2468,12 @@ class App:
             "bounce_count": row["bounce_count"],
             "pinned": bool(row["pinned"]),
             "dup_of": row["dup_of"],
+            # The card-to-card wall, structural rather than prose: which card
+            # this one is waiting on and why. Both NULL on a card with nothing
+            # in its way, which is most of them -- so the face only ever draws
+            # a marker for the exception.
+            "blocked_by": (row["blocked_by"] if "blocked_by" in have else None),
+            "blocked_reason": (row["blocked_reason"] if "blocked_reason" in have else None),
             "long_running": bool(row["long_running"]),
             # Which model this card's agent was dispatched on, and whether that
             # is worth saying out loud. NULL model or the sprint default means
@@ -3175,6 +3209,12 @@ class App:
         self._append_event(num, actor, "state", payload)
         self.conn.execute("UPDATE cards SET state=?, updated_at=? WHERE num=?",
                           (to_state, now(), num))
+        # A card that just closed cannot be blocking anything any more. Clearing
+        # it here -- inside the same transaction as the state change -- is what
+        # makes "no longer blocked" a fact rather than a thing somebody has to
+        # notice and go do. The session treats that event as a dispatch trigger.
+        if to_state in TERMINAL_STATES:
+            self._autoclear_blocked_by(num, to_state, actor)
 
     # -- phases -----------------------------------------------------------
     #
@@ -3356,6 +3396,25 @@ class App:
                       "ORDER BY seq DESC LIMIT 1", (num,))
         return int(row["seq"]) if row is not None else 0
 
+    def _episode_seq(self, num: int) -> int:
+        """Where this card's current stuck episode starts.
+
+        Normally the last transition -- moving a card is what proves somebody
+        dealt with it. Being UNBLOCKED counts too: the card did not move, but
+        the reason nobody could move it just went away, so the reminders that
+        were pointless while it waited are worth having again.
+        """
+        seq = self._last_state_seq(num)
+        # The LIKE is a cheap pre-filter on the JSON text; the payload is then
+        # actually parsed, so a card whose body happens to contain the phrase
+        # cannot fake one.
+        for row in self.q("SELECT seq, payload FROM events WHERE card_num=? AND kind='note' "
+                          "AND seq>? AND payload LIKE '%blocked_by_change%' "
+                          "ORDER BY seq DESC LIMIT 5", (num, seq)):
+            if (jload(row["payload"], {}) or {}).get("blocked_by_change"):
+                return int(row["seq"])
+        return seq
+
     def _stuck_events_since(self, num: int, seq: int) -> list:
         return self.q("SELECT seq, ts FROM events WHERE card_num=? AND kind='stuck' "
                       "AND seq>? ORDER BY seq", (num, seq))
@@ -3381,6 +3440,16 @@ class App:
                 "ORDER BY seq DESC LIMIT 1", (num,))
             if hit is not None and float(hit["ts"]) > since:
                 since = float(hit["ts"])
+        # The wall going up or coming down restarts the clock in every state.
+        # A card unblocked at 3pm has not been "queued with nobody on it" since
+        # this morning -- it has been dispatchable for a few minutes, and the
+        # sweep should give the session those minutes before it ambers it again.
+        ep = self.q1("SELECT ts, payload FROM events WHERE card_num=? AND kind='note' "
+                     "AND payload LIKE '%blocked_by_change%' ORDER BY seq DESC LIMIT 1",
+                     (num,))
+        if ep is not None and (jload(ep["payload"], {}) or {}).get("blocked_by_change") \
+                and float(ep["ts"]) > since:
+            since = float(ep["ts"])
         return since
 
     def stuck_due(self, row):
@@ -3400,7 +3469,7 @@ class App:
         elapsed = now() - since
         if elapsed < threshold:
             return None
-        priors = self._stuck_events_since(num, self._last_state_seq(num))
+        priors = self._stuck_events_since(num, self._episode_seq(num))
         # One opening notice plus at most `sweep_max_reminders` repeats, then
         # this episode goes quiet for good. Nagging a card the user has decided
         # to leave alone is how a signal turns back into noise.
@@ -3410,6 +3479,14 @@ class App:
             gap = self.sweep_backoff[min(len(priors) - 1, len(self.sweep_backoff) - 1)]
             if (now() - float(priors[-1]["ts"])) < gap:
                 return None
+        # What is this card actually waiting for? If the board knows -- because
+        # somebody said so structurally rather than in a sentence -- the
+        # reminder says that instead of asking a question nobody can act on.
+        blocker = row["blocked_by"] if "blocked_by" in self.columns("cards") else None
+        if blocker is not None and state in STUCK_TEXT_BLOCKED:
+            text = STUCK_TEXT_BLOCKED[state] % (human_span(elapsed), blocker)
+        else:
+            text = STUCK_TEXT[state] % human_span(elapsed)
         return {
             "card_num": num,
             "state": state,
@@ -3417,7 +3494,8 @@ class App:
             "threshold_seconds": threshold,
             "reminder": len(priors),      # 0 = the opening notice
             "since": since,
-            "text": STUCK_TEXT[state] % human_span(elapsed),
+            "blocked_by": blocker,
+            "text": text,
         }
 
     def card_is_stuck(self, num: int, row=None) -> bool:
@@ -3432,7 +3510,7 @@ class App:
         # this has been sitting here too long -- so both amber the age.
         if row["state"] not in STUCK_STATES and row["state"] not in WORKER_GONE_STATES:
             return False
-        return bool(self._stuck_events_since(num, self._last_state_seq(num)))
+        return bool(self._stuck_events_since(num, self._episode_seq(num)))
 
     def _sweep_loop(self):
         while not self.stopping.wait(self.sweep_tick):
@@ -4828,6 +4906,153 @@ class App:
         self.notify()
         return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
 
+    # -- blocked by -------------------------------------------------------
+    #
+    # User, verbatim: "when one card is blocked by another, show that in the
+    # card details." It used to be free text -- a card said "blocked" and the
+    # card it was waiting on lived in somebody's sentence. Nothing could read
+    # that: not the board (no link to click), not the sweep (which nagged
+    # "dispatch it or say why not" at a card nobody could dispatch), and not
+    # the session (which had to re-read the thread to find out what landed).
+    #
+    # So the link is a column. Set it, clear it, and the server does the two
+    # things a structural link makes possible: it refuses a loop, and it clears
+    # itself the moment the blocker is closed.
+
+    def blocked_by_of(self, num: int):
+        """The card `num` is waiting on, or None. Copes with a database that
+        predates the column."""
+        if "blocked_by" not in self.columns("cards"):
+            return None
+        row = self.q1("SELECT blocked_by FROM cards WHERE num=?", (num,))
+        if row is None:
+            return None
+        return row["blocked_by"]
+
+    def _blocked_chain(self, start: int) -> list:
+        """`start` and everything it is (transitively) waiting on, in order.
+
+        Stops at `BLOCKED_CHAIN_MAX` so a loop already in the database -- a
+        hand-edited row, a chain written before this check existed -- costs a
+        bounded walk instead of hanging the request that found it.
+        """
+        chain, seen, at = [], set(), start
+        while at is not None and at not in seen and len(chain) < BLOCKED_CHAIN_MAX:
+            chain.append(at)
+            seen.add(at)
+            at = self.blocked_by_of(at)
+        return chain
+
+    def set_blocked_by(self, num: int, target, reason=None,
+                       actor: str = "user") -> dict:
+        """Point a card at the card it is waiting on, or clear it (target None).
+
+        Three refusals, each named, because every one of them is a link that
+        would read as true on the board and never come untrue by itself.
+        """
+        row = self.card_row(num)
+        if "blocked_by" not in self.columns("cards"):
+            raise ApiError(500, "no_blocked_by_column",
+                           "this board's database has no blocked_by column")
+        reason = clean_short_text(reason, "reason", BLOCKED_REASON_MAX)
+        was = row["blocked_by"]
+
+        if target is None:
+            if was is None:
+                # Idempotent: clearing a card that is not blocked is a no-op,
+                # not an error, and it must not write an event that says
+                # something changed.
+                return {"ok": True, "card": self.card_json(row, brief=True)}
+            text = "no longer blocked — the wall on #%s was cleared by hand" % was
+            with self.lock:
+                self._write_blocked_by(num, None, None, actor, text, cleared_from=was)
+            self.notify()
+            return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
+
+        try:
+            target = int(target)
+        except (TypeError, ValueError):
+            raise ApiError(400, "missing_field",
+                           "blocked_by needs target: a card number, or null to clear",
+                           field="target")
+        if target == num:
+            raise ApiError(400, "self_block",
+                           "#%s cannot be blocked by itself" % num, field="target")
+        other = self.card_row(target)        # 404 no_such_card if it isn't real
+        if other["state"] in TERMINAL_STATES:
+            # A closed blocker never lands, so the auto-clear that makes this
+            # link safe would never fire: the card would sit there saying it is
+            # waiting on something that already finished, forever.
+            raise ApiError(409, "blocker_closed",
+                           "#%s is already %s — nothing is coming from it"
+                           % (target, other["state"]),
+                           field="target", blocker_state=other["state"])
+        chain = self._blocked_chain(target)
+        if num in chain:
+            # A -> B -> A is a wall with nothing on the other side of it: both
+            # cards wait for each other and neither can ever be unblocked.
+            loop = " → ".join("#%s" % c for c in ([num] + chain[:chain.index(num) + 1]))
+            raise ApiError(400, "blocked_cycle",
+                           "that would make a loop: %s — nothing in it could ever "
+                           "unblock" % loop,
+                           field="target", chain=[num] + chain[:chain.index(num) + 1])
+
+        text = "blocked by #%s%s" % (target, (" — %s" % reason) if reason else "")
+        with self.lock:
+            self._write_blocked_by(num, target, reason, actor, text)
+        self.notify()
+        return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
+
+    def _write_blocked_by(self, num, target, reason, actor, text,
+                          cleared_from=None, _conn_open: bool = False):
+        """The column and the event, together. `_conn_open` lets the auto-clear
+        ride inside the blocker's own transition transaction."""
+        payload = {"text": text, "blocked_by": target,
+                   "blocked_reason": reason,
+                   # What the sweep reads to know this card's clock restarted:
+                   # being unblocked is the card becoming dispatchable again,
+                   # which re-arms the reminders that were pointless while it
+                   # was waiting.
+                   "blocked_by_change": True}
+        if cleared_from is not None:
+            payload["was_blocked_by"] = cleared_from
+        if not _conn_open:
+            self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "UPDATE cards SET blocked_by=?, blocked_reason=?, updated_at=? "
+                "WHERE num=?", (target, reason, now(), num))
+            self._append_event(num, actor, "note", payload)
+            if not _conn_open:
+                self.conn.execute("COMMIT")
+        except Exception:
+            if not _conn_open:
+                self.conn.execute("ROLLBACK")
+            raise
+
+    def _autoclear_blocked_by(self, blocker: int, to_state: str, actor: str) -> list:
+        """Everything waiting on `blocker` stops waiting. Caller owns the
+        transaction, so the unblock lands with the blocker's own state change or
+        not at all.
+
+        Fires exactly once per blocked card because it is the same write that
+        clears the column: a card closed twice (completed, then reopened and
+        canceled) finds nobody pointing at it the second time.
+        """
+        if "blocked_by" not in self.columns("cards"):
+            return []
+        rows = self.conn.execute(
+            "SELECT num FROM cards WHERE blocked_by=?", (blocker,)).fetchall()
+        landed = "landed" if to_state == "completed" else to_state
+        freed = []
+        for row in rows:
+            self._write_blocked_by(
+                row["num"], None, None, "server",
+                "no longer blocked — #%s %s" % (blocker, landed),
+                cleared_from=blocker, _conn_open=True)
+            freed.append(row["num"])
+        return freed
+
     def action(self, num: int, action: str, body: dict, actor: str = "user",
                from_browser: bool = False) -> dict:
         row = self.card_row(num)
@@ -4915,6 +5140,19 @@ class App:
                                   (target, now(), num))
             self.transition(num, "duplicate", actor, reason="duplicate of #%d" % target,
                             extra={"dup_of": target})
+        elif action == "blocked_by":
+            # `{"action":"blocked_by","target":N,"reason":"..."}` to set it,
+            # `{"action":"blocked_by","target":null}` to clear it. `target` is
+            # required and explicit: a missing key would silently clear the
+            # link, which is exactly the kind of quiet unblock this whole
+            # change exists to stop.
+            if "target" not in body and "blocked_by" not in body:
+                raise ApiError(400, "missing_field",
+                               "blocked_by needs target: a card number, or null "
+                               "to clear", field="target")
+            target = body.get("target", body.get("blocked_by"))
+            return {"ok": True, "card": self.set_blocked_by(
+                num, target, body.get("reason"), actor=actor)["card"]}
         elif action == "retry":
             # A dead agent's card goes back in the queue; the session picks it up
             # and dispatches a FRESH agent with the full timeline as its brief.
@@ -4955,8 +5193,8 @@ class App:
         else:
             raise ApiError(400, "bad_action",
                            "action must be pin, unpin, cancel, hold, release, "
-                           "duplicate_of, retry, reopen, long_running or "
-                           "external_agent")
+                           "duplicate_of, blocked_by, retry, reopen, "
+                           "long_running or external_agent")
         return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
 
     def set_cursor(self, name: str, seq: int) -> dict:

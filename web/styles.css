@@ -2886,6 +2886,226 @@ html.skin-chaos .banner.account {
   background: var(--panel);
 }
 
+/* ==========================================================================
+   APPENDED — cards #58 and #61
+
+   #58  "make it easy to add executors." Adding one used to mean hand-writing
+        a JSON object into a textarea. Now it is a list you can read, four
+        presets, a labelled form, and an inline confirm to remove — with the
+        raw object still one click away for anyone who wants it.
+   #61  "when one card is blocked by another, show that in the card details."
+        A line under the rail head, and a quiet marker on the face and rows.
+   ========================================================================== */
+
+/* ---- #61: the wall, when the wall is another card ----------------------- */
+
+/* The marker. Deliberately the quietest thing on a face: it is the answer to
+   "why has nothing happened here", not an alarm. It never wraps and never
+   pushes the agent name or the age off the line. */
+.blockedby-mark {
+  flex: 0 0 auto;
+  max-width: 12ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: 11.5px;
+  letter-spacing: .01em;
+}
+.card > .blockedby-mark { max-width: 100%; margin-top: 3px; }
+.pill .blockedby-mark { margin-left: 8px; }
+.blocked-row .blockedby-mark { margin-left: auto; padding-left: 10px; }
+
+/* The rail's line. It is a fact about the card, so it reads as prose in the
+   panel's own voice rather than as a control: no button shape, no fill, one
+   hairline rule under the head to say it belongs to the head and not to the
+   first event in the thread. */
+.rail-blocked {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  padding: 9px 16px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--input);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.rail-blocked-label {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.rail-blocked-num .cardlink { font-size: 13px; }
+.rail-blocked-why {
+  color: var(--body-ink);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+/* What happens next, so nobody goes looking for the button that clears it. */
+.rail-blocked-note {
+  flex: 1 0 100%;
+  color: var(--faint);
+  font-size: 12px;
+}
+
+/* ---- #58: the executor list and its form -------------------------------- */
+
+/* A label with something on the other end of it (the JSON escape hatch). */
+.settings-label-row { display: flex; align-items: baseline; gap: 10px; }
+
+/* A text button that is honestly a link: used for Edit / Remove / Edit as
+   JSON, all of which are small and none of which deserve a button's weight. */
+.linkish {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+}
+.linkish:hover { color: var(--accent-hi); }
+.linkish.danger { color: var(--faint); }
+.linkish.danger:hover { color: var(--bad); }
+.linkish:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.settings-execs { gap: 9px; }
+
+.exec-list { display: flex; flex-direction: column; gap: 6px; }
+.exec-empty { font-size: 12.5px; color: var(--faint); }
+
+.exec-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  background: var(--input);
+}
+.exec-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.exec-name {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--ink);
+}
+/* What it IS, in a sentence — the thing the raw JSON never said out loud. */
+.exec-what { font-size: 12.5px; color: var(--dim); overflow-wrap: anywhere; }
+.exec-note { font-size: 12px; color: var(--faint); overflow-wrap: anywhere; }
+.exec-acts { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; }
+.exec-default {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/* Removing asks in the row it is about — never a browser confirm(), which is
+   a different application's dialog appearing on top of yours. */
+.exec-row.is-removing { border-color: var(--bad); align-items: center; flex-wrap: wrap; }
+.exec-confirm { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.exec-confirm-q { font-size: 12.5px; color: var(--body-ink); }
+.btn.tiny.danger { color: var(--bad); }
+
+
+.exec-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  padding: 13px 14px 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-ctl);
+  background: var(--panel);
+}
+.exec-editor-head {
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: var(--display-weight);
+  text-transform: var(--display-case);
+  color: var(--ink);
+  margin: 0;
+}
+.exec-field { display: flex; flex-direction: column; gap: 6px; }
+.exec-label {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/* The presets. Each one says what it is underneath its name, because "codex
+   via tmux" only means something if you already know what tmux is for here. */
+.exec-presets { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.exec-preset {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  background: var(--input);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+.exec-preset:hover { border-color: var(--border-chip); }
+.exec-preset.is-on { border-color: var(--accent); }
+.exec-preset:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.exec-preset-name { font-size: 13px; color: var(--ink); }
+.exec-preset-blurb { font-size: 11.5px; line-height: 1.45; color: var(--faint); }
+
+/* `.settings-text` itself is defined with the other controls further up (the
+   sprint-name field uses it too). All this section adds is the one state the
+   executor form needs: the field an error is about. */
+.settings-text.is-bad { border-color: var(--bad); }
+
+/* Not a field: the window name is derived from the card every time. Saying so
+   stops anyone hunting for the setting that isn't there. */
+.exec-derived { font-size: 12px; line-height: 1.55; color: var(--faint); }
+.exec-derived code { font-family: var(--font-mono); font-size: 11.5px; color: var(--dim); }
+
+.exec-err {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--bad);
+}
+.exec-editor-foot { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* Fold (980×740) and narrower: two preset columns become one, and every
+   control clears the 44px touch target. */
+@media (max-width: 1199px) {
+  .exec-presets { grid-template-columns: 1fr; }
+  .exec-editor-foot .btn, .exec-confirm .btn { min-height: 44px; }
+  .exec-row { flex-wrap: wrap; }
+  .pill .blockedby-mark { max-width: 10ch; }
+}
+
+/* Chaos: same words, hard edges — no radius, ink outlines, the skin's own
+   underline weight. */
+html.skin-chaos .rail-blocked { border-bottom: 2px solid var(--border); }
+html.skin-chaos .exec-row,
+html.skin-chaos .exec-preset { border: 2px solid var(--border); border-radius: 0; }
+html.skin-chaos .exec-editor {
+  border: 2px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 0;
+}
+html.skin-chaos .exec-preset.is-on { border-color: var(--accent); }
+html.skin-chaos .exec-row.is-removing { border-color: var(--bad); }
+html.skin-chaos .linkish { text-decoration-thickness: 2px; }
+html.skin-chaos .exec-what,
+html.skin-chaos .exec-preset-blurb,
+html.skin-chaos .exec-derived { line-height: 1.7; }
 /* ===========================================================================
    ONE CARD PER WORK UNIT — card #55.
    Appended as its own self-contained section: nothing above this line is
@@ -3227,3 +3447,4 @@ html.skin-chaos .keys-list kbd { border: 2px solid var(--border-chip); border-ra
    sentence with four clauses in it. */
 .keys-ladder { display: block; margin-top: 4px; }
 .keys-ladder span { display: block; color: var(--faint); font-size: 12.5px; line-height: 1.6; }
+.unit-change, .unit-bounce, .unit-outline .bounce-notes { scroll-margin-bottom: 150px; }
