@@ -4536,6 +4536,10 @@ class TestWorkerGoneGuards(WorkerGoneBase):
         self.post("/api/cards/%d/state" % num, {"state": "triaging"})
         self.post("/api/cards/%d/state" % num, {"state": "in_progress"})
         self.go_quiet(num, 60.0)
+        # Both halves: the predicate says why, and the sweep's own query agrees.
+        # They are separate guards and either one alone would let this through.
+        self.assertEqual(self.app.worker_gone_exempt(self.app.card_row(num)),
+                         "no_agent")
         self.assertEqual(self.app.sweep_worker_gone(), 0)
         self.assertEqual(self.state_of(num), "in_progress")
         self.assertEqual(self.gone_notices(num), [])
