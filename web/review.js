@@ -138,13 +138,22 @@ function unitClaim(members) {
   return members.every((m) => m.evidence && (m.evidence.claim || '') === claim) ? claim : '';
 }
 
+/**
+ * Two titles, one line. When they do not both fit, the LONGER one gives up its
+ * words first — trimming both halves evenly turns two readable phrases into two
+ * unreadable ones, and one of them usually had room to spare.
+ */
 function joinTitles(titles) {
   if (titles.length === 1) return clipWords(titles[0], UNIT_TITLE_MAX);
-  const two = titles.slice(0, 2);
-  const full = two.join(' + ');
-  if (full.length <= UNIT_TITLE_MAX) return full;
-  const each = Math.max(12, Math.floor((UNIT_TITLE_MAX - 3) / 2));
-  return two.map((t) => clipWords(t, each)).join(' + ');
+  let [a, b] = titles.slice(0, 2);
+  const room = UNIT_TITLE_MAX - 3;                  // the " + " between them
+  const floor = 16;                                 // below this a title says nothing
+  for (let pass = 0; pass < 2 && a.length + b.length > room; pass += 1) {
+    const spare = pass === 0 ? room - Math.min(a.length, b.length) : Math.floor(room / 2);
+    if (a.length >= b.length) a = clipWords(a, Math.max(floor, spare));
+    else b = clipWords(b, Math.max(floor, spare));
+  }
+  return `${a} + ${b}`;
 }
 
 /** Cut to a length on a word boundary — never mid-word, never on a filler word. */
@@ -292,14 +301,20 @@ let flow = null;
 
 export function reviewFlow() { return flow; }
 
-/** The steps the walkthrough offers, in reading order. */
+/**
+ * The steps the walkthrough offers, in reading order. Only cards actually
+ * asking for a verdict count: a unit that is already merging is not a decision,
+ * and counting it would make "1 of 7" a lie on a queue of six.
+ */
 export function reviewSteps(cards) {
   const steps = [];
   for (const g of reviewGroups(cards)) {
+    const waiting = g.cards.filter((c) => cardState(c) === 'ready');
+    if (!waiting.length) continue;
     if (shipsAsOne(g)) {
-      steps.push({ key: g.key, nums: g.cards.map((c) => c.num), unit: true, title: g.title });
+      steps.push({ key: g.key, nums: waiting.map((c) => c.num), unit: true, title: g.title });
     } else {
-      for (const c of g.cards) steps.push({ key: 'card:' + c.num, nums: [c.num], unit: false, title: c.title });
+      for (const c of waiting) steps.push({ key: 'card:' + c.num, nums: [c.num], unit: false, title: c.title });
     }
   }
   return steps;
