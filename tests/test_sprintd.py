@@ -1406,6 +1406,142 @@ class TestBatches(Base):
         self.assertNotIn("per_card", c["evidence"]["packet"])
 
 
+class TestUnitVerdicts(Base):
+    """One Approve on a work unit, per-card records underneath it (card #55).
+
+    User ruling, verbatim: "I just want the single card that lives in review,
+    then when I open it up, it outlines everything that changed, and I can
+    approve them together."
+
+    The board shows ONE card for six, and the single Approve fans out into the
+    same per-card POST it always was. Nothing about that is a new endpoint or a
+    bulk write: every member card must still end up with its own verdict event,
+    its own state transition and its own completion, because that is the audit
+    trail and the per-card timeline the user reads afterwards.
+    """
+
+    def _unit_of_six(self, ready=True):
+        nums = [self.new_card("design nit %d" % i)["num"] for i in range(6)]
+        status, body = self.post("/api/batches",
+                                 {"card_nums": nums, "agent_name": "sprint-batch-1",
+                                  "branch": "sprint/batch-1",
+                                  "worktree": "/tmp/wt-batch-1"})
+        self.assertEqual(status, 201, body)
+        for num in nums:
+            self.to_in_progress(num)
+        if ready:
+            packet = dict(GOOD_PACKET,
+                          per_card=[{"card_num": n, "claim": "fixed #%d" % n} for n in nums])
+            status, body = self.post("/api/cards/%d/ready" % nums[0], {"packet": packet})
+            self.assertEqual(status, 200, body)
+        return nums
+
+    def verdicts_on(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return [e["payload"] for e in detail["timeline"] if e["kind"] == "verdict"]
+
+    def test_one_unit_approve_writes_a_verdict_and_a_completion_per_member(self):
+        nums = self._unit_of_six()
+        # This is exactly what the one Approve button does: the same per-card
+        # POST for every member, in order.
+        for num in nums:
+            status, body = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+            self.assertEqual(status, 200, body)
+
+        for num in nums:
+            self.assertEqual(self.state_of(num), "integrating")
+            got = self.verdicts_on(num)
+            self.assertEqual(len(got), 1, "#%d owes exactly one verdict event" % num)
+            self.assertEqual(got[0]["verdict"], "approve")
+            self.assertEqual(got[0]["scope"], "card",
+                             "a unit approve is six card verdicts, never one batch write")
+
+        # ...and the completion is per card too, one member at a time.
+        for num in nums:
+            status, body = self.post("/api/cards/%d/integrated" % num, {"ok": True})
+            self.assertEqual(status, 200, body)
+        for num in nums:
+            self.assertEqual(self.state_of(num), "completed")
+            self.assertIn("verdict", self.kinds_for(num))
+
+    def test_bouncing_one_section_leaves_its_siblings_ready(self):
+        nums = self._unit_of_six()
+        odd = nums[2]
+        status, body = self.post("/api/cards/%d/verdict" % odd,
+                                 {"verdict": "bounce", "notes": "the third one is still 2px off"})
+        self.assertEqual(status, 200, body)
+
+        self.assertEqual(self.state_of(odd), "in_progress")
+        _, detail = self.get("/api/cards/%d" % odd)
+        self.assertEqual(detail["card"]["bounce_count"], 1)
+        for num in nums:
+            if num == odd:
+                continue
+            self.assertEqual(self.state_of(num), "ready",
+                             "#%d was not the part you sent back" % num)
+            _, sib = self.get("/api/cards/%d" % num)
+            self.assertEqual(sib["card"]["bounce_count"], 0)
+            self.assertEqual(self.verdicts_on(num), [])
+
+        # the five that are left still approve as one unit
+        for num in [n for n in nums if n != odd]:
+            status, body = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(self.state_of(num), "integrating")
+        self.assertEqual(self.state_of(odd), "in_progress",
+                         "the bounced part stays with the agent while the rest merges")
+
+    def test_a_singleton_is_a_unit_of_one_and_behaves_exactly_as_before(self):
+        num = self.new_card("the scrim is too dark")["num"]
+        status, _ = self.post("/api/cards/%d/assign" % num,
+                              {"agent_name": "sprint-card-%d" % num,
+                               "worktree": "/tmp/wt-solo",
+                               "branch": "sprint/card-%d" % num})
+        self.assertEqual(status, 200)
+        self.post("/api/cards/%d/state" % num, {"state": "in_progress"})
+        # no per_card: a unit of one owes nothing a single card did not owe
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "ready")
+
+        status, body = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "integrating")
+        self.assertEqual(len(self.verdicts_on(num)), 1)
+        status, _ = self.post("/api/cards/%d/integrated" % num, {"ok": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "completed")
+
+    def test_a_whole_unit_bounce_sends_every_member_back(self):
+        nums = self._unit_of_six()
+        for num in nums:
+            status, body = self.post("/api/cards/%d/verdict" % num,
+                                     {"verdict": "bounce", "notes": "the whole branch is wrong"})
+            self.assertEqual(status, 200, body)
+        for num in nums:
+            self.assertEqual(self.state_of(num), "in_progress")
+            _, detail = self.get("/api/cards/%d" % num)
+            self.assertEqual(detail["card"]["bounce_count"], 1)
+            self.assertEqual(self.verdicts_on(num)[0]["notes"], "the whole branch is wrong")
+
+    def test_the_board_carries_one_packet_and_every_members_own_claim(self):
+        """What the outline is built from, in one fetch: the branch's packet on
+        every member, and each member's own claim inside its `per_card` entry."""
+        nums = self._unit_of_six()
+        _, board = self.get("/api/board")
+        cards = {c["num"]: c for c in board["cards"] if c["num"] in nums}
+        self.assertEqual(len(cards), 6)
+        claims = set()
+        for num in nums:
+            packet = cards[num]["evidence"]["packet"]
+            self.assertEqual(packet["claim"], GOOD_PACKET["claim"], "one packet for the unit")
+            self.assertEqual(cards[num]["branch"], "sprint/batch-1")
+            mine = [e for e in packet["per_card"] if e["card_num"] == num]
+            self.assertEqual(len(mine), 1)
+            claims.add(mine[0]["claim"])
+        self.assertEqual(len(claims), 6, "every section of the outline says its own thing")
+
+
 class StreamReader:
     """Read an SSE stream line by line. Shared by every test that reads frames."""
 

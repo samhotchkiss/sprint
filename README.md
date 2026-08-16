@@ -49,13 +49,15 @@ running inside the project you want a board for.
    you, and everything under it — In motion, Blocked, Queued & held —
    gets quieter on purpose. **LIST/BOARD** in the header swaps the
    reading order for the kanban columns; it remembers which you picked.
-5. Answer a multiple-choice question straight from its row in the list.
-   Everything else happens in the right rail: click a card and its whole
-   thread opens there, with the evidence packet — claim, "check it
-   yourself" steps, screenshots, Approve / Bounce / Reject — in the
-   stream where it arrived. Click **Chat** for the session itself; it's
-   the same brain as the terminal, so it can act on what you say there,
-   not just answer. The rail holds one or the other, never both.
+5. Everything you do happens in the right rail: click a card and its
+   whole thread opens there, with the evidence packet — claim, "check it
+   yourself" steps, screenshots — and Approve / Bounce / Reject pinned
+   at the bottom where they can't be scrolled off. Work that shipped
+   together is **one card** in Awaiting review: open it and you get an
+   outline of everything that changed, one section per change, with a
+   single Approve under the lot. Click **Chat** for the session itself;
+   it's the same brain as the terminal, so it can act on what you say
+   there, not just answer. The rail holds one thing at a time.
 6. When an agent's output is a **document** rather than a line — an audit, a
    findings write-up, a comparison — it attaches it as a report. It reads in
    the thread as a title you can skim and expand, and a quiet **Reports** link

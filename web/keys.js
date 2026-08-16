@@ -30,10 +30,12 @@ import { siblingMenuOpen, openSiblingMenu, closeSiblingMenu, siblingCount, gotoS
  *
  * Card #53 made the whole review row the click target (`.review-item`), so that
  * is the node that now carries `data-num` there — it is the same row, one
- * wrapper further out than it used to be.
+ * wrapper further out than it used to be. Card #55 then gave a multi-card branch
+ * a single row of its own (`.unit-card`); it is one thing to review, so it is
+ * one stop for the cursor, filed under its lead card's number.
  */
-const NAV_SEL = '.card[data-num], .row[data-num], .review-item[data-num], .pill[data-num],'
-  + ' .done-row[data-num]';
+const NAV_SEL = '.card[data-num], .row[data-num], .review-item[data-num], .unit-card[data-num],'
+  + ' .pill[data-num], .done-row[data-num]';
 
 /** The four numbered columns, in the order the Board draws them. */
 export const COLUMN_KEYS = BOARD_COLUMNS.map((c) => c.key);
@@ -211,7 +213,13 @@ function select(entry, { preview = true } = {}) {
   // nothing else — the page itself never moves.
   if (entry.node.scrollIntoView) entry.node.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   paintNav({ refocus: false });
-  if (preview) app.openCard(entry.num, { focus: 'none' });
+  // A work unit (card #55) previews as its OUTLINE, not as its lead card — the
+  // outline is what clicking it opens, and a shortcut that showed you something
+  // else would be a second, quieter way to open the same row.
+  if (preview) {
+    if (entry.node.classList.contains('unit-card')) app.openUnit(entry.num);
+    else app.openCard(entry.num, { focus: 'none' });
+  }
 }
 
 /** 1–4: take the column and highlight its first card (which previews it). */
@@ -242,6 +250,13 @@ export function moveNav(delta) {
 /** Enter: hand the card to the rail and put the caret in its reply box (#46). */
 function openCursor() {
   if (!nav) return false;
+  const entry = navNodes(nav.col).find((e) => e.num === nav.num);
+  if (entry && entry.node.classList.contains('unit-card')) {
+    // A unit opens its outline; there is no single reply box to aim at, because
+    // the outline is several cards' worth of change with one verdict under it.
+    app.openUnit(nav.num);
+    return true;
+  }
   app.openCard(nav.num, { focus: 'composer' });
   return true;
 }

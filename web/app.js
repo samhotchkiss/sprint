@@ -6,7 +6,7 @@ import {
 import { Live } from './live.js';
 import {
   store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
-  sections, headline, loadView, setView, setChatOpen, bounceComposing,
+  sections, headline, countFor, loadView, setView, setChatOpen, bounceComposing,
   activeLimits, limitLine, accountLimit,
 } from './state.js';
 import { renderList } from './list.js';
@@ -32,6 +32,7 @@ const app = {
   eventText,
   render,
   openCard, closeCard, composeBounce,
+  openUnit, closeUnit,
   goBoard, goReports,
   pageOpen: () => !!page,
   answer, chat, sessionChat, verdict, cardAction, markDuplicate, retryCard, retrySubmit,
@@ -100,7 +101,8 @@ function paint() {
   renderTitle(el.titleWrap, title);
   // On the Fold the header is 54px and the whole headline will not fit; the one
   // number that changes what you do next survives, in the accent colour.
-  const needs = secs.needs_you.cards.length;
+  // Decisions, not cards: a six-card branch is one thing waiting on you.
+  const needs = countFor('needs_you', secs);
   el.headline.classList.toggle('fold-need', foldQuery.matches);
   el.headline.textContent = !store.loaded ? ''
     : foldQuery.matches ? (needs ? `${needs} need you` : 'nothing needs you')
@@ -120,7 +122,7 @@ function paint() {
   // "Unseen" means exactly that: the moment the session chat is the thing in the
   // rail, you have seen it. Closing a card back onto an already-open chat counts
   // just as much as clicking the button does.
-  if (store.unseen && store.chatOpen && !store.detail) store.unseen = false;
+  if (store.unseen && store.chatOpen && !store.detail && !store.unit) store.unseen = false;
   paintChatButton();
 
   clear(el.main);
@@ -133,7 +135,7 @@ function paint() {
   else renderList(el.main, app);
   document.body.classList.toggle('page-open', !!page);
 
-  const railOpen = !!store.detail || store.chatOpen;
+  const railOpen = !!store.detail || !!store.unit || store.chatOpen;
   document.body.classList.toggle('rail-open', railOpen);
   renderRail(el.rail, app);
 
@@ -183,12 +185,13 @@ function restoreFocus(f) {
  */
 function paintChatButton() {
   const b = el.chatBtn;
-  const cardOpen = !!store.detail;
+  // A unit's outline owns the rail exactly the way a card does.
+  const cardOpen = !!store.detail || !!store.unit;
   b.classList.toggle('is-open', store.chatOpen && !cardOpen);
   b.classList.toggle('is-unseen', store.unseen && !cardOpen && !store.chatOpen);
   b.classList.toggle('is-dim', cardOpen);
   b.setAttribute('aria-pressed', store.chatOpen && !cardOpen ? 'true' : 'false');
-  b.title = cardOpen ? 'a card has the rail — click to go back to the session'
+  b.title = cardOpen ? 'the rail is showing work — click to go back to the session'
     : store.unseen ? 'the session said something while you were not looking'
       : store.chatOpen ? 'hide the session chat' : 'chat with the session';
 }
@@ -364,7 +367,10 @@ function applyPendingFocus() {
   // The rail may still be waiting on the card's timeline; try again next paint,
   // but never so long that a slow fetch yanks the cursor out of something else.
   const stale = Date.now() - f.at > 4000;
-  if (!store.detail || store.detail.num !== f.num) { pendingFocus = null; return; }
+  // A unit's outline owns the rail without any card owning it, and every bounce
+  // box in there is typed in place — so the caret request belongs to whatever
+  // the rail is currently showing, not only to an open card.
+  if (!store.unit && (!store.detail || store.detail.num !== f.num)) { pendingFocus = null; return; }
   let node = f.kind === 'bounce' ? document.getElementById('bounce-' + f.num) : null;
   if (!node) node = document.getElementById('composer-' + f.num);
   if (!node) { if (stale) pendingFocus = null; return; }
@@ -873,6 +879,8 @@ function routeFromHash(replace) {
   const one = hash.match(/^#\/report\/([0-9a-f]{64})\.(md|html)$/);
   if (one) { closeRailForPage(); goReport(one[1], one[2], replace); return true; }
   if (hash === '#/reports') { closeRailForPage(); goReports(replace); return true; }
+  const unit = hash.match(/^#\/u\/(\d+)/);
+  if (unit) { page = null; openUnit(Number(unit[1])); return true; }
   const card = hash.match(/^#\/c\/(\d+)/);
   if (card) { page = null; openCard(Number(card[1])); return true; }
   if (page) { page = null; render(); }
@@ -882,6 +890,7 @@ function routeFromHash(replace) {
 /** A page owns the whole main area; a card open behind it is just confusing. */
 function closeRailForPage() {
   if (store.detail) store.detail = null;
+  if (store.unit) store.unit = null;
 }
 
 /**
@@ -911,12 +920,16 @@ function openCard(num, opts) {
   const keepPage = !!(opts && opts.keepPage);
   if (!keepPage) page = null;
   const card = store.cards.get(n) || null;
+  // `fromUnit` is how you got here, and it is the only thing the card's head
+  // needs to offer the way back to the outline you left.
+  const from = opts && opts.fromUnit != null ? Number(opts.fromUnit) : null;
   if (!store.detail || store.detail.num !== n) {
     store.detail = {
       num: n, card, timeline: [], evidence: card && card.evidence,
-      pendingLines: [], justAnswered: false, error: null,
+      pendingLines: [], justAnswered: false, error: null, fromUnit: from,
     };
-  }
+  } else if (from != null) store.detail.fromUnit = from;
+  store.unit = null;
   // Bouncing is a composing state (card #44) and it is typed in the RAIL (card
   // #46): opening the card is what puts you in it, and `askFocus` is what puts
   // the caret in the box once the rail has painted it.
@@ -947,8 +960,36 @@ function composeBounce(num) {
   render();
 }
 
-function closeCard() {
+/**
+ * Open a work unit's outline in the rail (card #55): everything that shipped on
+ * one branch, in one readable page, with one Approve under it. `num` is any
+ * member card — the unit is resolved from the board every paint, so which
+ * member you name only matters for the URL.
+ */
+function openUnit(num) {
+  if (num == null) return;
+  const n = Number(num);
+  page = null;
   store.detail = null;
+  store.unit = { lead: n };
+  if (location.hash !== `#/u/${n}`) history.replaceState(null, '', `#/u/${n}`);
+  render();
+}
+
+function closeUnit() {
+  store.unit = null;
+  pendingFocus = null;
+  if (location.hash.startsWith('#/u/')) history.replaceState(null, '', location.pathname + location.search);
+  render();
+}
+
+function closeCard() {
+  // Closing a card you opened out of an outline puts you back in the outline —
+  // it is the page you were reading, and it has not gone anywhere.
+  const back = store.detail && store.detail.fromUnit;
+  store.detail = null;
+  pendingFocus = null;
+  if (back != null) { openUnit(back); return; }
   // A half-written bounce (and the fact that you were writing one) outlives the
   // rail closing, exactly like a draft does — only the caret request is dropped.
   pendingFocus = null;
@@ -962,7 +1003,10 @@ function toggleChat(force, opts) {
   if (want) {
     store.unseen = false;
     store.detail = null;
-    if (location.hash.startsWith('#/c/')) history.replaceState(null, '', location.pathname + location.search);
+    store.unit = null;
+    if (location.hash.startsWith('#/c/') || location.hash.startsWith('#/u/')) {
+      history.replaceState(null, '', location.pathname + location.search);
+    }
   }
   render();
   // Opening the chat asks for the caret — except on the Escape rung that is
@@ -1030,7 +1074,17 @@ function escape(e) {
     return;
   }
   if (page) { goBoard(); return; }
-  // Rung 2: out of the card, back to the session chat.
+  // Rung 2: out of the card, back to the session chat — except that a card you
+  // opened out of a work unit's outline (card #55) has one more step behind it.
+  // Escape is one step back per press, so that step is the outline, and the
+  // press after it is the one that reaches the session chat.
+  if (store.detail && store.detail.fromUnit) {
+    e.preventDefault();
+    clearNav();
+    if (a && a.blur) a.blur();
+    closeCard();
+    return;
+  }
   if (store.detail) {
     e.preventDefault();
     clearNav();
@@ -1039,6 +1093,16 @@ function escape(e) {
     // No caret grab here on purpose: the rung before this one just took you OUT
     // of a text box, and dropping you into a different one would undo it.
     else toggleChat(true, { focus: false });
+    return;
+  }
+  // A work unit (card #55) holds the rail exactly the way a card does, so it
+  // gets the same rung: out of the unit, back to the session chat.
+  if (store.unit) {
+    e.preventDefault();
+    clearNav();
+    if (a && a.blur) a.blur();
+    if (foldQuery.matches) closeUnit();
+    else toggleChat(true, { focus: false });   // this clears the unit too
     return;
   }
   if (clearNav()) { render(); return; }
@@ -1209,7 +1273,11 @@ async function boot() {
   $('#drop-btn').addEventListener('click', () => openCompose());
   $('#compose-cancel').addEventListener('click', () => closeCompose());
   el.composeWrap.addEventListener('mousedown', (e) => { if (e.target === el.composeWrap) closeCompose(); });
-  el.scrim.addEventListener('click', () => { if (store.detail) closeCard(); else toggleChat(false); });
+  el.scrim.addEventListener('click', () => {
+    if (store.detail) closeCard();
+    else if (store.unit) closeUnit();
+    else toggleChat(false);
+  });
 
   // Paste or drop an image anywhere and the sheet opens with it already attached.
   window.addEventListener('paste', (e) => {
@@ -1258,6 +1326,7 @@ async function boot() {
   window.addEventListener('hashchange', () => {
     if (routeFromHash()) return;
     if (store.detail) closeCard();
+    else if (store.unit) closeUnit();
   });
   for (const q of [foldQuery, phoneQuery]) {
     if (q.addEventListener) q.addEventListener('change', render);
