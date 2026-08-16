@@ -1,9 +1,10 @@
 // Sprint settings — the board's dispatch policy, in a small panel.
 //
-// Four things live here, and all four are the USER's call rather than the
-// orchestrator's: which model a worker gets by default, whether workers run as
-// Claude subagents or as a command driven in its own tmux window, what those
-// executors are called, and how many run at once.
+// Five things live here, and all five are the USER's call rather than the
+// orchestrator's: what this sprint is CALLED, which model a worker gets by
+// default, whether workers run as Claude subagents or as a command driven in
+// its own tmux window, what those executors are called, and how many run at
+// once.
 //
 // The panel is deliberately quiet: a ghost link in the header (the same
 // restraint as the other header links), a sheet the width of the Drop-work
@@ -34,6 +35,10 @@ let els = {};
 let draft = null;     // what the panel is showing right now
 let loaded = null;    // what the server last told us
 let onSaved = null;
+// The sprint's NAME. Not part of the settings document — it is the open
+// sprint's title on the server — but this is where a rename belongs, because
+// it is the user's call and this is the panel of the user's calls.
+let sprintName = { value: '', saved: '', max: 60, fallback: '' };
 
 /** Wire the header link. Called once at boot. */
 export function installSettings(btn, afterSave) {
@@ -60,6 +65,12 @@ export async function openSettings() {
     const res = await api.settings();
     loaded = res.settings;
     draft = clone(res.settings);
+    sprintName = {
+      value: res.name || '',
+      saved: res.name || '',
+      max: res.name_max || 60,
+      fallback: res.name_default || '',
+    };
     setStatus('');
     paint();
   } catch (err) {
@@ -104,6 +115,21 @@ function paint() {
   if (!draft) return;
   const w = draft.worker;
   clear(els.body);
+
+  // 0. the sprint's name — what the header, the switcher and the hub call it.
+  const nameInput = h('input.settings-text', {
+    id: 'settings-name',
+    type: 'text',
+    maxlength: String(sprintName.max),
+    value: sprintName.value,
+    placeholder: sprintName.fallback || 'this sprint',
+    spellcheck: false,
+    oninput: (e) => { sprintName.value = e.target.value; },
+  });
+  els.body.appendChild(field('Sprint name', nameInput,
+    'What this sprint is called, everywhere it appears: the title above, the '
+    + 'switcher, and the hub. Name it after the work, not the folder. Leave it '
+    + `as “${sprintName.fallback || 'the folder name'}” and it stays the folder name.`));
 
   // 1. model policy
   const seg = h('div.seg.settings-seg', { role: 'group', 'aria-label': 'model policy' });
@@ -182,6 +208,7 @@ async function save() {
   if (!executors || typeof executors !== 'object' || Array.isArray(executors)) {
     return setStatus('Executors must be an object of name → definition.', true);
   }
+  const wanted = (sprintName.value || '').trim();
   const patch = {
     worker: {
       model_policy: w.model_policy,
@@ -190,11 +217,16 @@ async function save() {
       executors,
     },
   };
+  // Only send a name when it actually changed: a rename writes an event to the
+  // board, and saving the model policy is not a rename.
+  if (wanted && wanted !== sprintName.saved) patch.name = wanted;
   setStatus('saving…');
   try {
     const res = await api.saveSettings(patch);
     loaded = res.settings;
     draft = clone(res.settings);
+    sprintName.value = res.name || wanted;
+    sprintName.saved = sprintName.value;
     setStatus('');
     closeSettings();
     if (onSaved) onSaved(res.settings);

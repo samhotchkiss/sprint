@@ -67,7 +67,6 @@ async function req(method, path, body, opts = {}) {
   const text = await res.text();
   if (text) { try { payload = JSON.parse(text); } catch { payload = { raw: text }; } }
   noteGeneration(payload);
-  noteApiVersion(payload, path);
   if (!res.ok) throw new ApiError(res.status, payload, path);
   return payload;
 }
@@ -104,71 +103,22 @@ function noteGeneration(payload) {
 
 // ---- is this server as new as this page? ---------------------------------
 //
-// A board is a long-running process and web/ is read off disk per request, so a
-// tab can be running today's JS against a server that started weeks ago. Before
-// this, that just meant features quietly missing: the title switcher fetched
-// /api/siblings, got a 404 from a server that had never heard of it, swallowed
-// the error and rendered a plain title — and the user reported it as a bug in
-// the switcher. The server publishes `api_version` (what it knows how to
-// serve); the page carries its own; if the server is behind, the page says so
-// in one sentence instead of degrading in silence.
+// It is, or it is about to be, and the page no longer has an opinion about it.
 //
-// Bump BOTH numbers in the same commit whenever web/ starts requiring an
-// endpoint or field a running server might not have.
-export const UI_API_VERSION = 3;
-
-let serverApi = null;                // null = nothing has answered yet
-const staleListeners = new Set();
-
-// Only two endpoints promise to carry the number, so only those two are read.
-// Inferring "no api_version, therefore old" from any response at all was wrong
-// in exactly one place and it mattered: /api/events carries `generation` and
-// never carried a version, so a perfectly current board accused itself of being
-// out of date on its first poll.
-const VERSIONED_PATHS = new Set(['/healthz', '/api/board']);
-
-function noteApiVersion(payload, path) {
-  if (!payload || typeof payload !== 'object') return;
-  if (!VERSIONED_PATHS.has(String(path).split('?')[0])) return;
-  // A server old enough to lack the field on THESE paths is, by definition,
-  // older than the version that introduced it.
-  setServerApi(Number.isFinite(payload.api_version) ? payload.api_version : 0);
-}
-
-function setServerApi(v) {
-  if (serverApi === v) return;
-  const was = serverIsStale();
-  serverApi = v;
-  if (serverIsStale() !== was) {
-    for (const fn of staleListeners) { try { fn(serverIsStale()); } catch {} }
-  }
-}
-
-/** The board's server is older than the page it is serving. */
-export function serverIsStale() {
-  return serverApi != null && serverApi < UI_API_VERSION;
-}
-
-export function serverApiVersion() { return serverApi; }
-
-/** Notified when "this board needs a restart" starts or stops being true. */
-export function onServerStale(fn) {
-  staleListeners.add(fn);
-  return () => staleListeners.delete(fn);
-}
-
-/**
- * A 404 on an endpoint this page knows exists is the same news as a low
- * api_version, from a server too old to carry the number at all. Callers that
- * tolerate a missing endpoint (siblings.js) report it here rather than
- * swallowing it.
- */
-export function noteMissingEndpoint(path) {
-  if (serverApi == null || serverApi >= UI_API_VERSION) {
-    setServerApi(UI_API_VERSION - 1);
-  }
-  return path;
-}
+// A board is a long-running process and web/ is read off disk per request, so a
+// tab really can be running today's JS against a server that started weeks ago.
+// This page used to answer that with a banner — "this board needs a restart to
+// pick up new features — run `sprintd stop` then `sprintd start` in its
+// project" — and the user's answer to the banner was "don't show me this
+// notice". He is right: restarting a server is not a job you hand to the person
+// reading the board. The server watches its own source file and re-execs itself
+// when it changes (sprintd's `check_code_update`), so the gap closes by itself,
+// usually within seconds, and the tab re-syncs off `generation` exactly as it
+// does after any other restart.
+//
+// The server still publishes `api_version` — the log and the hub use it to say
+// which build answered — but nothing on this page reads it, and no version
+// number is ever allowed to turn into a chore on screen again.
 
 /** Record a generation seen anywhere. Returns true if it is a NEW server. */
 export function rememberGeneration(g) {

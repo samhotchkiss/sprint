@@ -1,7 +1,7 @@
 // Wiring: boot, live transport, optimistic actions, render loop.
 import { h, clear, $, debounce, tickTimes, uid, firstLine, reconcile } from './util.js';
 import {
-  api, ApiError, NetworkError, initAuth, onServerGeneration, onServerStale, serverIsStale,
+  api, ApiError, NetworkError, initAuth, onServerGeneration,
 } from './api.js';
 import { Live } from './live.js';
 import {
@@ -148,21 +148,19 @@ function paintChatButton() {
 function renderSessionBanner() {
   const offline = store.loaded && store.session.online === false;
   const transportDown = app.transport === 'error';
-  // The board's server process is older than the page it is serving: features
-  // this page expects simply are not there. Quieter than "offline" (nothing is
-  // broken, and nothing you type is lost) but it must be SAID — the whole bug
-  // was that it was not. Lowest priority of the three: a board nobody is home
-  // at is more urgent news than a board that is merely behind.
-  const stale = serverIsStale();
+  // There is deliberately no third banner here. A board serving code older than
+  // this page used to raise one, telling the user to run `sprintd stop` then
+  // `sprintd start`; his answer was "don't show me this notice". Restarting a
+  // server is the server's job — it watches its own source and re-execs itself
+  // — so the only things that reach this slot are the two the user can do
+  // something about: nobody is home, and the connection dropped.
   const limits = renderLimitBanners();
-  el.banner.hidden = !(offline || transportDown || stale);
+  el.banner.hidden = !(offline || transportDown);
   el.bannerSlot.hidden = el.banner.hidden && !limits;
   if (el.banner.hidden) return;
   const cls = offline ? 'banner warn' : 'banner dim';
   const text = offline ? 'session offline — items will queue'
-    : transportDown ? 'lost the board connection — retrying'
-      : 'this board needs a restart to pick up new features — '
-        + 'run `sprintd stop` then `sprintd start` in its project';
+    : 'lost the board connection — retrying';
   // Same words, same banner: rewriting it on every paint is one more thing
   // flickering on a page that should be still.
   if (el.banner.className !== cls) el.banner.className = cls;
@@ -1200,10 +1198,6 @@ async function firstLoad() {
   // The first /api/board already recorded this server's generation, so it is
   // the baseline: anything different from here on is a NEW backend.
   onServerGeneration(() => onServerRestart(live));
-  // "This board is behind its own UI" can become true (or stop being true, once
-  // it is actually restarted) at any point; the banner is the only thing that
-  // reads it, so nothing else has to repaint.
-  onServerStale(() => renderSessionBanner());
   live.start(store.seq);
 
   setTimeout(armNotifications, 1500);

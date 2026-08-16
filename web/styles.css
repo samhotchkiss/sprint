@@ -2696,6 +2696,7 @@ html.skin-chaos .packet-readback {
 .settings-seg { align-self: flex-start; }
 
 .settings-select,
+.settings-text,
 .settings-num {
   font-family: var(--font-body);
   font-size: 14px;
@@ -2709,8 +2710,13 @@ html.skin-chaos .packet-readback {
   align-self: flex-start;
 }
 .settings-select { min-width: 240px; }
+/* The sprint's name is the widest thing anyone types here and the one the whole
+   board is titled after, so it gets the full width of the sheet. */
+.settings-text { width: 100%; align-self: stretch; }
 .settings-num { width: 110px; }
-.settings-select:focus, .settings-num:focus { border-color: var(--accent); }
+.settings-select:focus, .settings-text:focus, .settings-num:focus {
+  border-color: var(--accent);
+}
 
 .settings-json {
   width: 100%;
@@ -2781,6 +2787,7 @@ html.skin-chaos .packet-readback {
 
 html.skin-chaos .settings-sheet { border: 2px solid var(--border); }
 html.skin-chaos .settings-select,
+html.skin-chaos .settings-text,
 html.skin-chaos .settings-num,
 html.skin-chaos .settings-json,
 html.skin-chaos .settings-err { border: 2px solid var(--border); border-radius: 0; }
