@@ -107,6 +107,7 @@ export const store = {
   seq: 0,
   detail: null,           // {num, card, timeline, evidence, attachments, pendingLines}
   drafts: new Map(),      // freeform text kept across re-renders
+  bouncing: new Set(),    // card nums whose verdict row is mid-BOUNCE (see below)
   attached: new Map(),    // composer key -> images pasted but not sent yet
   expanded: new Set(),    // event keys whose long version you opened (see detail.js)
   doneOpen: false,
@@ -702,6 +703,27 @@ export function draft(key, value) {
   if (value === undefined) return store.drafts.get(key) || '';
   if (value === null || value === '') store.drafts.delete(key);
   else store.drafts.set(key, value);
+  return value;
+}
+
+/**
+ * Are you in the middle of bouncing this card?
+ *
+ * User, verbatim: "once I hit 'Bounce' we should get rid of the 'Approve'
+ * button — should just be a 'Submit bounce' button." Deciding to send something
+ * back is a decision you have already made; leaving Approve sitting next to the
+ * notes box you are typing into means one slip turns a bounce into a merge.
+ * So Bounce opens a composing state — notes plus Submit bounce and Cancel, with
+ * Approve and Reject gone until you send or back out.
+ *
+ * It lives here, beside the drafts, for the same reason drafts do: the row is
+ * rebuilt whenever anything on the card moves, and a half-written bounce (and
+ * the fact that you are writing one at all) has to survive that.
+ */
+export function bounceComposing(num, value) {
+  if (value === undefined) return store.bouncing.has(num);
+  if (value) store.bouncing.add(num);
+  else store.bouncing.delete(num);
   return value;
 }
 

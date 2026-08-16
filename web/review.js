@@ -37,7 +37,7 @@
 // one thing IS seeing all of them.
 import { h, timeEl, firstLine, plural } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
-import { store, cardState, draft } from './state.js';
+import { store, cardState, draft, bounceComposing } from './state.js';
 import { shortAgent, openable } from './list.js';
 
 // ---- the model -----------------------------------------------------------
@@ -333,6 +333,9 @@ export function flowBarSig(card) {
   const s = step();
   const p = unitProgress(s.key);
   return [card.num, flow.i, flow.steps.length, card.bounce_count,
+    // mid-bounce is part of what the bar looks like: Submit bounce + Cancel
+    // instead of Approve / Bounce / Skip.
+    bounceComposing(card.num) ? 'b' : '',
     p ? `${p.done}/${p.total}${p.error ? 'e' + p.error : ''}` : ''].join('|');
 }
 
@@ -429,36 +432,37 @@ export function reviewBar(card, app) {
   const many = unit && members.length > 1;
   const prog = s ? unitProgress(s.key) : null;
 
+  // Card #44: once you have pressed Bounce, the bar offers Submit bounce and
+  // Cancel and nothing else. Approve — and in the walkthrough, Skip — are gone
+  // while you are writing, so a stray click cannot approve what you were in the
+  // middle of sending back.
+  const composing = bounceComposing(card.num) || !!draft(key);
+
   const notes = h('textarea.bounce-notes', {
     rows: '2',
     placeholder: 'What has to change? (goes straight to the agent)',
     oninput: (e) => draft(key, e.target.value),
-    onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } },
+    onkeydown: (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+      if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+    },
   });
   notes.value = draft(key);
-  const notesWrap = h('div.review-notes', { hidden: !draft(key) }, notes);
+  const notesWrap = h('div.review-notes', { hidden: !composing }, notes);
 
   function send() {
     const text = notes.value.trim();
     if (!text) { notes.focus(); return; }
     draft(key, null);
+    bounceComposing(card.num, false);
     flowVerdict(app, card, 'bounce', text);
   }
 
-  const bounceBtn = h('button.btn.bounce', {
-    type: 'button',
-    onclick: () => {
-      if (notesWrap.hidden) {
-        notesWrap.hidden = false;
-        bounceBtn.textContent = 'Send bounce';
-        notes.focus();
-        return;
-      }
-      send();
-    },
-  }, notesWrap.hidden
-    ? (many ? `Bounce #${card.num}` : 'Bounce')
-    : 'Send bounce');
+  function cancel() {
+    draft(key, null);
+    bounceComposing(card.num, false);
+    app.render();
+  }
 
   bar.appendChild(h('div.review-bar-head',
     h('span.review-count', `${flow.i + 1} of ${flow.steps.length}`),
@@ -473,6 +477,18 @@ export function reviewBar(card, app) {
       + 'Approve takes the whole branch; Bounce sends back only the card you are reading.'));
   }
   bar.appendChild(notesWrap);
+  if (composing) {
+    bar.appendChild(h('div.verdicts.is-bouncing',
+      h('button.btn.bounce', { type: 'button', onclick: () => send() },
+        many ? `Submit bounce for #${card.num}` : 'Submit bounce'),
+      h('button.btn.ghost', { type: 'button', onclick: () => cancel() }, 'Cancel')));
+    setTimeout(() => notes.focus(), 0);
+    if (prog && prog.error) {
+      bar.appendChild(h('p.review-unit-error',
+        `Stopped at #${prog.error} — ${prog.done} of ${prog.total} approved, nothing after it was sent.`));
+    }
+    return bar;
+  }
   const approve = h('button.btn.approve', {
     type: 'button',
     disabled: !!(prog && !prog.error),
@@ -482,7 +498,10 @@ export function reviewBar(card, app) {
     : (many ? `Approve all ${members.length}` : 'Approve'));
   bar.appendChild(h('div.verdicts',
     approve,
-    bounceBtn,
+    h('button.btn.bounce', {
+      type: 'button',
+      onclick: () => { bounceComposing(card.num, true); app.render(); },
+    }, many ? `Bounce #${card.num}` : 'Bounce'),
     h('button.btn.ghost.skip', {
       type: 'button',
       title: 'leave it in Awaiting review and come back to it',
@@ -751,28 +770,52 @@ function actionsRow(card, p, app, merging, shared) {
     return row;
   }
 
+  // Card #44, on the row as in the rail: Bounce swaps the row's verdicts for
+  // Submit bounce + Cancel. Approve does not sit next to a notes box you are
+  // typing into.
+  const composing = bounceComposing(card.num) || !!draft(key);
+
   const notes = h('textarea.bounce-notes', {
     rows: '2',
     placeholder: 'What has to change? (goes straight to the agent)',
     oninput: (e) => draft(key, e.target.value),
-    onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } },
+    onkeydown: (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+      if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+    },
   });
   notes.value = draft(key);
-  const pop = h('div.bounce-pop', { hidden: !draft(key) },
-    notes,
-    h('div.bounce-pop-acts',
-      h('button.btn.tiny.bounce', { type: 'button', onclick: () => send() }, 'Send bounce'),
-      h('button.btn.tiny.ghost', {
-        type: 'button',
-        onclick: () => { draft(key, null); notes.value = ''; pop.hidden = true; },
-      }, 'Cancel')));
+  const pop = h('div.bounce-pop', { hidden: !composing }, notes);
 
   function send() {
     const text = notes.value.trim();
     if (!text) { notes.focus(); return; }
     draft(key, null);
+    bounceComposing(card.num, false);
     pop.hidden = true;
     app.verdict(card, 'bounce', text);
+  }
+
+  function cancel() {
+    draft(key, null);
+    bounceComposing(card.num, false);
+    app.render();
+  }
+
+  if (composing) {
+    row.appendChild(h('button.btn.bounce.tiny', {
+      type: 'button',
+      onclick: (e) => { e.stopPropagation(); send(); },
+    }, 'Submit bounce'));
+    row.appendChild(h('button.btn.tiny.ghost', {
+      type: 'button',
+      onclick: (e) => { e.stopPropagation(); cancel(); },
+    }, 'Cancel'));
+    row.appendChild(h('span.grow'));
+    row.appendChild(h('span.review-meta', metaLine(card, p, shared), ' · ',
+      timeEl(card.last_activity_at, { suffix: false })));
+    setTimeout(() => notes.focus(), 0);
+    return h('div.review-actwrap', row, pop);
   }
 
   row.appendChild(h('button.btn.approve.tiny', {
@@ -783,7 +826,11 @@ function actionsRow(card, p, app, merging, shared) {
   row.appendChild(h('button.btn.bounce.tiny', {
     type: 'button',
     title: 'send it back with notes',
-    onclick: (e) => { e.stopPropagation(); pop.hidden = !pop.hidden; if (!pop.hidden) notes.focus(); },
+    onclick: (e) => {
+      e.stopPropagation();
+      bounceComposing(card.num, true);
+      app.render();
+    },
   }, 'Bounce'));
   if (p.live_url && !shared) {
     row.appendChild(h('a.btn.tiny.ghost.review-live', {
