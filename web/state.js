@@ -188,6 +188,12 @@ export function normCard(c) {
     pinned: !!c.pinned,
     dup_of: c.dup_of != null ? num(c.dup_of) : null,
     long_running: !!c.long_running,
+    // Which model the agent was dispatched on, and what the sprint's default
+    // is, so `modelTag` can decide whether it is worth drawing. This
+    // normalizer builds an explicit shape — a field it doesn't name does not
+    // exist in the tab, which is exactly how the tag silently didn't render.
+    model: c.model || null,
+    default_model: c.default_model || null,
     created_at: c.created_at || null,
     updated_at: c.updated_at || null,
     queue_position: c.queue_position != null ? num(c.queue_position)
