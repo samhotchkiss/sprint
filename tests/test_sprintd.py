@@ -52,6 +52,12 @@ class Base(unittest.TestCase):
     WAITER_PERSIST = 5.0
     SSE_HEARTBEAT = 15.0
     START_BACKGROUND = False
+    # None == production defaults (the staleness sweep never fires inside a
+    # test that didn't ask for it). TestStaleSweep shrinks them to seconds.
+    SWEEP_TICK = None
+    SWEEP_THRESHOLDS = None
+    SWEEP_BACKOFF = None
+    SWEEP_MAX_REMINDERS = None
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="sprintd-test-")
@@ -71,6 +77,10 @@ class Base(unittest.TestCase):
             waiter_gone_seconds=self.WAITER_GONE,
             waiter_persist_seconds=self.WAITER_PERSIST,
             sse_heartbeat=self.SSE_HEARTBEAT,
+            sweep_tick=self.SWEEP_TICK,
+            sweep_thresholds=self.SWEEP_THRESHOLDS,
+            sweep_backoff=self.SWEEP_BACKOFF,
+            sweep_max_reminders=self.SWEEP_MAX_REMINDERS,
         )
         self.httpd = sprintd.make_server(self.app, "127.0.0.1", 0)
         self.host, self.port = self.httpd.server_address[0], self.httpd.server_address[1]
@@ -1131,6 +1141,300 @@ class TestSilenceTimer(Base):
             time.sleep(0.3)
         self.assertEqual(len(self._wait_for_silent(mine)), 1,
                          "a different agent's chatter must not cover for a quiet one")
+
+
+class SweepBase(Base):
+    """Cards parked in a state somebody owes an action on.
+
+    Ages are faked by rewinding the card's own events rather than by sleeping:
+    a ten-minute rule tested with a ten-minute threshold is the real rule, and
+    a test that sleeps through it isn't a test anyone will run.
+    """
+
+    def backdate(self, num, seconds):
+        with self.app.lock:
+            self.app.conn.execute("UPDATE events SET ts=ts-? WHERE card_num=?",
+                                  (seconds, num))
+            self.app.conn.execute("UPDATE cards SET updated_at=updated_at-? WHERE num=?",
+                                  (seconds, num))
+
+    def stuck_events(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return [e for e in detail["timeline"] if e["kind"] == "stuck"]
+
+    def board_card(self, num):
+        _, board = self.get("/api/board")
+        return {c["num"]: c for c in board["cards"]}[num]
+
+    # -- fixtures, one per parked state ----------------------------------
+
+    def a_queued_card(self):
+        return self.new_card("nobody has picked this up")["num"]
+
+    def a_blocked_card(self):
+        num = self.new_card("walled off")["num"]
+        status, _ = self.post("/api/cards/%d/state" % num,
+                              {"state": "blocked", "reason": "ci_red"})
+        self.assertEqual(status, 200)
+        return num
+
+    def a_needs_you_card(self):
+        num = self.new_card("has a question")["num"]
+        self.to_in_progress(num)
+        status, body = self.post("/api/cards/%d/question" % num,
+                                 {"text": "sqlite or a file lock?"})
+        self.assertEqual(status, 201, body)
+        self.assertEqual(self.state_of(num), "needs_you")
+        return num
+
+    def a_ready_card(self):
+        num = self.new_card("waiting on a verdict")["num"]
+        self.to_in_progress(num)
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200, body)
+        return num
+
+    def an_integrating_card(self):
+        num = self.a_ready_card()
+        status, body = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "integrating")
+        return num
+
+
+class TestStaleSweep(SweepBase):
+    """The five rules, at their real production thresholds."""
+
+    def test_integrating_past_ten_minutes_is_stuck(self):
+        """Today's failure, exactly: approved, then forgotten at 'merging'."""
+        num = self.an_integrating_card()
+        self.backdate(num, 11 * 60)
+        self.assertEqual(self.app.sweep_stuck(), 1)
+
+        events = self.stuck_events(num)
+        self.assertEqual(len(events), 1, "one opening notice")
+        ev = events[0]
+        self.assertEqual(ev["actor"], "server")
+        self.assertEqual(ev["payload"]["state"], "integrating")
+        self.assertEqual(ev["payload"]["threshold_seconds"], 600.0)
+        self.assertGreaterEqual(ev["payload"]["stuck_for_seconds"], 660)
+        self.assertIn("still merging", ev["payload"]["text"])
+        self.assertIn("11m", ev["payload"]["text"])
+        self.assertIsNone(ev["payload"].get("reply_to"),
+                          "a server event has no human waiting behind it")
+
+    def test_queued_with_nobody_on_it_past_fifteen_minutes_is_stuck(self):
+        num = self.a_queued_card()
+        self.backdate(num, 16 * 60)
+        self.assertEqual(self.app.sweep_stuck(), 1)
+        p = self.stuck_events(num)[0]["payload"]
+        self.assertEqual(p["state"], "queued")
+        self.assertEqual(p["threshold_seconds"], 900.0)
+        self.assertIn("dispatch it", p["text"])
+
+    def test_blocked_past_thirty_minutes_is_stuck(self):
+        num = self.a_blocked_card()
+        self.backdate(num, 31 * 60)
+        self.assertEqual(self.app.sweep_stuck(), 1)
+        p = self.stuck_events(num)[0]["payload"]
+        self.assertEqual(p["state"], "blocked")
+        self.assertEqual(p["threshold_seconds"], 1800.0)
+        self.assertIn("re-checking", p["text"])
+
+    def test_needs_you_unanswered_past_thirty_minutes_is_stuck(self):
+        num = self.a_needs_you_card()
+        self.backdate(num, 31 * 60)
+        self.assertEqual(self.app.sweep_stuck(), 1)
+        p = self.stuck_events(num)[0]["payload"]
+        self.assertEqual(p["state"], "needs_you")
+        self.assertEqual(p["threshold_seconds"], 1800.0)
+        self.assertIn("waiting on you", p["text"])
+
+    def test_ready_past_a_day_is_stuck(self):
+        num = self.a_ready_card()
+        self.backdate(num, 25 * 3600)
+        self.assertEqual(self.app.sweep_stuck(), 1)
+        p = self.stuck_events(num)[0]["payload"]
+        self.assertEqual(p["state"], "ready")
+        self.assertEqual(p["threshold_seconds"], 86400.0)
+        self.assertIn("verdict", p["text"])
+        self.assertIn("1d", p["text"])
+
+    def test_ready_under_a_day_is_not_stuck_yet(self):
+        """The thresholds are per-state, not one global clock: 23h of `ready`
+        is fine where 11m of `integrating` is not."""
+        num = self.a_ready_card()
+        self.backdate(num, 23 * 3600)
+        self.assertEqual(self.app.sweep_stuck(), 0)
+        self.assertEqual(self.stuck_events(num), [])
+
+    def test_healthy_cards_are_left_alone(self):
+        """Every card the sweep must NOT touch, in one place."""
+        fresh_queued = self.a_queued_card()          # young
+        fresh_integrating = self.an_integrating_card()
+
+        working = self.new_card("an agent is on it")["num"]
+        self.to_in_progress(working)                 # in_progress is not swept
+        self.backdate(working, 6 * 3600)
+
+        held = self.new_card("not dispatched yet", hold=True)["num"]
+        self.backdate(held, 6 * 3600)                # held is deliberate, not stale
+
+        done = self.an_integrating_card()
+        status, _ = self.post("/api/cards/%d/integrated" % done, {"ok": True})
+        self.assertEqual(status, 200)
+        self.backdate(done, 6 * 3600)                # terminal states are over
+
+        picked_up = self.a_queued_card()             # queued but assigned == mid-pickup
+        status, _ = self.post("/api/cards/%d/assign" % picked_up,
+                              {"agent_name": "sprint-card-x", "worktree": "/tmp/wt",
+                               "branch": "sprint/x"})
+        self.assertEqual(status, 200)
+        with self.app.lock:                          # assign also moves it to triaging
+            self.app.conn.execute("UPDATE cards SET state='queued' WHERE num=?", (picked_up,))
+        self.backdate(picked_up, 6 * 3600)
+
+        self.assertEqual(self.app.sweep_stuck(), 0)
+        for num in (fresh_queued, fresh_integrating, working, held, done, picked_up):
+            self.assertEqual(self.stuck_events(num), [], "#%d should be healthy" % num)
+
+    def test_a_note_on_a_blocked_card_restarts_its_recheck_clock(self):
+        """`blocked` is the one re-check rule: somebody looking at the wall and
+        saying so is exactly the action the reminder was asking for."""
+        num = self.a_blocked_card()
+        self.backdate(num, 31 * 60)
+        status, _ = self.post("/api/cards/%d/events" % num,
+                              {"kind": "note", "payload": {"text": "ci still red"}})
+        self.assertEqual(status, 201)
+        self.assertEqual(self.app.sweep_stuck(), 0)
+        self.assertEqual(self.stuck_events(num), [])
+
+    def test_the_board_ambers_a_stuck_card_until_it_moves(self):
+        num = self.an_integrating_card()
+        self.assertFalse(self.board_card(num)["stuck"])
+        self.backdate(num, 11 * 60)
+        self.app.sweep_stuck()
+        self.assertTrue(self.board_card(num)["stuck"])
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertTrue(detail["card"]["stuck"])
+
+        status, _ = self.post("/api/cards/%d/integrated" % num, {"ok": True})
+        self.assertEqual(status, 200)
+        self.assertFalse(self.board_card(num)["stuck"],
+                         "moving the card clears the flag")
+
+    def test_thresholds_are_env_tunable(self):
+        """The SPRINT_SWEEP_* knobs the tests (and a ten-second demo) rely on."""
+        names = {state: envname for state, envname, _d in sprintd.STUCK_RULES}
+        self.assertEqual(sorted(names.values()), sorted([
+            "SPRINT_SWEEP_BLOCKED_SECONDS", "SPRINT_SWEEP_INTEGRATING_SECONDS",
+            "SPRINT_SWEEP_NEEDS_YOU_SECONDS", "SPRINT_SWEEP_QUEUED_SECONDS",
+            "SPRINT_SWEEP_READY_SECONDS"]))
+        saved = {k: os.environ.get(k) for k in list(names.values()) + ["SPRINT_SWEEP_TICK"]}
+        try:
+            for envname in names.values():
+                os.environ[envname] = "7"
+            os.environ["SPRINT_SWEEP_TICK"] = "0.25"
+            app = sprintd.App(self.project_root, data_dir=os.path.join(self.tmp, "envdir"),
+                              token="t", log=self.logfh)
+            try:
+                self.assertEqual(app.sweep_tick, 0.25)
+                for state in names:
+                    self.assertEqual(app.sweep_thresholds[state], 7.0, state)
+            finally:
+                app.close()
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+class TestStuckBackoff(SweepBase):
+    """One notice, three backing-off reminders, then silence — until it moves."""
+
+    SWEEP_BACKOFF = (600.0, 1800.0, 5400.0)
+    SWEEP_MAX_REMINDERS = 3
+
+    def _age_last_stuck(self, num, seconds):
+        """Pretend the last reminder was `seconds` ago."""
+        rows = self.app.q("SELECT seq FROM events WHERE card_num=? AND kind='stuck' "
+                          "ORDER BY seq DESC LIMIT 1", (num,))
+        self.assertTrue(rows, "no stuck event to age")
+        with self.app.lock:
+            self.app.conn.execute("UPDATE events SET ts=ts-? WHERE seq=?",
+                                  (seconds, rows[0]["seq"]))
+
+    def test_reminders_back_off_then_stop_at_three(self):
+        num = self.an_integrating_card()
+        self.backdate(num, 11 * 60)
+
+        self.assertEqual(self.app.sweep_stuck(), 1)          # the opening notice
+        self.assertEqual(len(self.stuck_events(num)), 1)
+
+        # A second sweep a moment later says nothing: the ladder starts at 10m.
+        self.assertEqual(self.app.sweep_stuck(), 0)
+        self._age_last_stuck(num, 9 * 60)
+        self.assertEqual(self.app.sweep_stuck(), 0, "9m < the 10m first gap")
+
+        for gap, want in ((10 * 60, 2), (30 * 60, 3), (90 * 60, 4)):
+            self._age_last_stuck(num, gap)
+            self.assertEqual(self.app.sweep_stuck(), 1, "gap %ds should fire" % gap)
+            self.assertEqual(len(self.stuck_events(num)), want)
+
+        # Cap reached: one notice + three reminders, and then it shuts up
+        # however long the card sits there.
+        for _ in range(3):
+            self._age_last_stuck(num, 24 * 3600)
+            self.assertEqual(self.app.sweep_stuck(), 0, "capped at 3 reminders")
+        self.assertEqual(len(self.stuck_events(num)), 4)
+        self.assertEqual([e["payload"]["reminder"] for e in self.stuck_events(num)],
+                         [0, 1, 2, 3])
+
+    def test_a_state_change_re_arms_the_episode(self):
+        num = self.an_integrating_card()
+        self.backdate(num, 11 * 60)
+        for _ in range(4):
+            self.app.sweep_stuck()
+            self._age_last_stuck(num, 24 * 3600)
+        self.assertEqual(len(self.stuck_events(num)), 4)
+        self.assertEqual(self.app.sweep_stuck(), 0, "episode is spent")
+
+        # The session finally lands it, the user re-opens it, it stalls again:
+        # a fresh episode, counted from zero.
+        status, _ = self.post("/api/cards/%d/integrated" % num,
+                              {"ok": False, "reason": "rebase conflict"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "in_progress")
+        status, _ = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200)
+        status, _ = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+        self.assertEqual(status, 200)
+        self.backdate(num, 11 * 60)
+
+        self.assertEqual(self.app.sweep_stuck(), 1, "a state change re-arms it")
+        self.assertEqual(self.stuck_events(num)[-1]["payload"]["reminder"], 0)
+
+
+class TestSweepThreadFiresOnItsOwn(SweepBase):
+    """The rule the user actually asked for: nobody has to run anything."""
+
+    SWEEP_TICK = 0.1
+    SWEEP_THRESHOLDS = {"integrating": 0.5, "queued": 0.5, "blocked": 0.5,
+                        "needs_you": 0.5, "ready": 0.5}
+    START_BACKGROUND = True
+
+    def test_a_forgotten_merge_flags_itself(self):
+        num = self.an_integrating_card()
+        deadline = time.time() + 12
+        while time.time() < deadline and not self.stuck_events(num):
+            time.sleep(0.1)
+        events = self.stuck_events(num)
+        self.assertTrue(events, "the sweep thread never fired")
+        self.assertEqual(events[0]["payload"]["state"], "integrating")
+        self.assertEqual(events[0]["payload"]["threshold_seconds"], 0.5)
+        self.assertTrue(self.board_card(num)["stuck"])
 
 
 class TestHoldMode(Base):
@@ -2852,7 +3156,8 @@ class TestTail(unittest.TestCase):
 
     def _sprintd(self, *argv, timeout=60):
         import subprocess
-        env = dict(os.environ, SPRINT_SSE_HEARTBEAT=str(self.HEARTBEAT))
+        env = dict(os.environ, SPRINT_SSE_HEARTBEAT=str(self.HEARTBEAT),
+                   **getattr(self, "extra_env", {}))
         return subprocess.run(
             [sys.executable, SPRINTD_PATH, "--project-root", self.root] + list(argv),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=env)
@@ -2975,6 +3280,31 @@ class TestTail(unittest.TestCase):
         seqs = [ev["seq"] for ev in got]
         self.assertEqual(seqs, sorted(seqs), "events arrive in log order")
         self.assertEqual(len(seqs), len(set(seqs)), "one line per event, exactly")
+
+    def test_default_tail_prints_the_sweep(self):
+        """A `stuck` event is an ordinary event on the ordinary stream: the
+        session's default tail wakes on it with no special casing. `--user-only`
+        does not show it, on purpose — that filter is "a human is waiting", and
+        the whole point of the sweep is that no human is."""
+        self.stop_server()
+        self.extra_env = {"SPRINT_SWEEP_TICK": "0.2",
+                          "SPRINT_SWEEP_QUEUED_SECONDS": "1"}
+        self.start_server()
+        self.assertEqual(self.api("POST", "/api/sprint", {"action": "open"})[0], 200)
+
+        _proc, lines, _noise = self.tail("--after", str(self.head()))
+        _uproc, ulines, _unoise = self.tail("--after", str(self.head()), "--user-only")
+        card = self.new_card("nobody will dispatch this")
+
+        got = self._await(
+            lambda: [ev for ev in self.parsed(lines) if ev.get("kind") == "stuck"],
+            timeout=25.0, what="a stuck line on the default tail")
+        self.assertEqual(got[0]["card"], card["num"])
+        self.assertEqual(got[0]["actor"], "server")
+        self.assertIn("dispatch it", got[0]["text"])
+        self.assertIsNone(got[0]["reply_to"])
+        self.assertEqual([ev for ev in self.parsed(ulines) if ev.get("kind") == "stuck"],
+                         [], "--user-only is a human filter, and this is the server")
 
     def test_user_only_prints_only_what_a_human_wrote(self):
         """The filter the session actually runs: the events it must answer."""
