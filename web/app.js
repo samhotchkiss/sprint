@@ -1,7 +1,7 @@
 // Wiring: boot, live transport, optimistic actions, render loop.
 import { h, clear, $, debounce, tickTimes, uid, firstLine, reconcile } from './util.js';
 import {
-  api, ApiError, NetworkError, initAuth, onServerGeneration, onServerStale, serverIsStale,
+  api, ApiError, NetworkError, initAuth, onServerGeneration,
 } from './api.js';
 import { Live } from './live.js';
 import {
@@ -18,6 +18,10 @@ import { installNotifications, attention, armNotifications, clearBadge } from '.
 import { loadSkin, installSkinToggle, installBlip } from './skin.js';
 import { startSiblings, renderTitle, closeSiblingMenu } from './siblings.js';
 import { installSettings, closeSettings, settingsOpen } from './settings.js';
+import {
+  installKeys, handleKey, paintNav, clearNav, isNavNode, focusNavCursor,
+  closeKeysSheet, keysSheetOpen,
+} from './keys.js';
 import { renderReportsPage, renderReportPage } from './reports.js';
 import { installRailResize } from './railsize.js';
 
@@ -31,6 +35,7 @@ const app = {
   openCard, closeCard, composeBounce,
   openUnit, closeUnit,
   goBoard, goReports,
+  pageOpen: () => !!page,
   answer, chat, sessionChat, verdict, cardAction, markDuplicate, retryCard, retrySubmit,
   lightbox: (urls, i, caps) => openLightbox(el.lightbox, urls, i, caps),
   toast: (msg) => toast(msg),
@@ -76,6 +81,17 @@ function paintRail() {
   });
 }
 
+/**
+ * Card #57. Which layout the shell is in, as a class on <body>, because the
+ * Board's columns scroll independently (card #59) and the List's page scrolls —
+ * two different overflow stories that CSS has to be able to tell apart.
+ */
+function paintShell() {
+  const board = !page && !phoneQuery.matches
+    && (foldQuery.matches || store.view === 'board');
+  document.body.classList.toggle('layout-board', board);
+}
+
 function paint() {
   const focus = captureFocus();
   const secs = sections();
@@ -116,6 +132,7 @@ function paint() {
   paintChatButton();
 
   clear(el.main);
+  paintShell();
   if (page && page.kind === 'reports') renderReportsPage(el.main, app, page);
   else if (page && page.kind === 'report') renderReportPage(el.main, app, page);
   else if (phoneQuery.matches) renderPhone(el.main, app);
@@ -134,6 +151,37 @@ function paint() {
   renderSessionBanner();
   restoreFocus(focus);
   applyPendingFocus();
+}
+
+/**
+ * Where the caret — or the keyboard cursor — was before we touched the DOM.
+ *
+ * Two shapes, one mechanism, because they are the same problem: the board
+ * repaints on every event, and the thing you were pointing at has to survive
+ * being redrawn. A text box survives by its `id` (card #46); a highlighted card
+ * survives by its card NUMBER (card #57), which is the only identity a card face
+ * carries across a rebuild.
+ */
+function captureFocus() {
+  const a = document.activeElement;
+  if (isNavNode(a)) return { kind: 'nav' };
+  if (!a || !a.id || !(a instanceof HTMLTextAreaElement || a instanceof HTMLInputElement)) return null;
+  return { kind: 'text', id: a.id, start: a.selectionStart, end: a.selectionEnd, len: (a.value || '').length };
+}
+
+function restoreFocus(f) {
+  // The highlight is repainted on EVERY frame (so a live update can't lose it);
+  // focus is only taken back if focus is what it had.
+  paintNav({ refocus: !!(f && f.kind === 'nav') });
+  if (!f || f.kind !== 'text') return;
+  const next = document.getElementById(f.id);
+  if (!next || next === document.activeElement) return;
+  next.focus({ preventScroll: true });
+  // The words come back from the draft store, so the text is usually identical —
+  // but clamp anyway rather than throw and leave the caret at 0.
+  const len = (next.value || '').length;
+  const at = (n) => Math.max(0, Math.min(len, n == null ? len : n));
+  try { next.setSelectionRange(at(f.start), at(f.end)); } catch {}
 }
 
 /**
@@ -157,21 +205,19 @@ function paintChatButton() {
 function renderSessionBanner() {
   const offline = store.loaded && store.session.online === false;
   const transportDown = app.transport === 'error';
-  // The board's server process is older than the page it is serving: features
-  // this page expects simply are not there. Quieter than "offline" (nothing is
-  // broken, and nothing you type is lost) but it must be SAID — the whole bug
-  // was that it was not. Lowest priority of the three: a board nobody is home
-  // at is more urgent news than a board that is merely behind.
-  const stale = serverIsStale();
+  // There is deliberately no third banner here. A board serving code older than
+  // this page used to raise one, telling the user to run `sprintd stop` then
+  // `sprintd start`; his answer was "don't show me this notice". Restarting a
+  // server is the server's job — it watches its own source and re-execs itself
+  // — so the only things that reach this slot are the two the user can do
+  // something about: nobody is home, and the connection dropped.
   const limits = renderLimitBanners();
-  el.banner.hidden = !(offline || transportDown || stale);
+  el.banner.hidden = !(offline || transportDown);
   el.bannerSlot.hidden = el.banner.hidden && !limits;
   if (el.banner.hidden) return;
   const cls = offline ? 'banner warn' : 'banner dim';
   const text = offline ? 'session offline — items will queue'
-    : transportDown ? 'lost the board connection — retrying'
-      : 'this board needs a restart to pick up new features — '
-        + 'run `sprintd stop` then `sprintd start` in its project';
+    : 'lost the board connection — retrying';
   // Same words, same banner: rewriting it on every paint is one more thing
   // flickering on a page that should be still.
   if (el.banner.className !== cls) el.banner.className = cls;
@@ -299,29 +345,10 @@ function emptyTextTarget(node) {
   return !String(node.value || '').trim();
 }
 
-/**
- * Where the caret was before we touched the DOM. Every text surface on this page
- * carries a stable id for exactly this reason — the composers (`composer-<num>`,
- * `sidebar-text`, `compose-text`) and the bounce-notes box (`bounce-<num>`) —
- * because an id is the only thing that survives a node being replaced.
- */
-function captureFocus() {
-  const a = document.activeElement;
-  if (!a || !a.id || !(a instanceof HTMLTextAreaElement || a instanceof HTMLInputElement)) return null;
-  return { id: a.id, start: a.selectionStart, end: a.selectionEnd, len: (a.value || '').length };
-}
-
-function restoreFocus(f) {
-  if (!f) return;
-  const next = document.getElementById(f.id);
-  if (!next || next === document.activeElement) return;
-  next.focus({ preventScroll: true });
-  // The words come back from the draft store, so the text is usually identical —
-  // but clamp anyway rather than throw and leave the caret at 0.
-  const len = (next.value || '').length;
-  const at = (n) => Math.max(0, Math.min(len, n == null ? len : n));
-  try { next.setSelectionRange(at(f.start), at(f.end)); } catch {}
-}
+// Every text surface on this page carries a stable id for exactly this reason —
+// the composers (`composer-<num>`, `sidebar-text`, `compose-text`) and the
+// bounce-notes box (`bounce-<num>`) — because an id is the only thing that
+// survives a node being replaced. See captureFocus/restoreFocus above.
 
 // ---- put the caret where you just asked for it ---------------------------
 
@@ -411,6 +438,14 @@ function normDetail(res, num) {
     if (!card.question && boardCard.question) card.question = boardCard.question;
     if (!card.evidence && boardCard.evidence) card.evidence = boardCard.evidence;
     if (!card.last_activity_at) card.last_activity_at = boardCard.last_activity_at;
+    // Where the card sits in the Queued pile is a property of the WHOLE list,
+    // so an older server only ever puts it on `/api/board`. Reading one card
+    // must not be able to erase it: a card with no queue position sorts to the
+    // bottom of Queued, and card #57's arrow-preview reads every card you pass
+    // — which reshuffled the pile under the cursor, one card per keystroke.
+    if (card.queue_position == null && boardCard.queue_position != null) {
+      card.queue_position = boardCard.queue_position;
+    }
   }
   if (card) store.cards.set(card.num, { ...(boardCard || {}), ...card });
   const rawTl = (res && (res.timeline || res.events)) || (raw && raw.timeline) || [];
@@ -925,8 +960,14 @@ function closeRailForPage() {
 
 /**
  * Open a card in the rail. `opts.focus` says which box wants the caret —
- * 'composer' (the default: the reply box, every entry point) or 'bounce' (you
- * pressed Bounce on a review row, so it is the notes box you meant).
+ * 'composer' (the default: the reply box, every entry point), 'bounce' (you
+ * pressed Bounce on a review row, so it is the notes box you meant), or 'none'.
+ *
+ * 'none' is card #57's preview: arrowing down a column shows each card in the
+ * rail as you pass it, and the caret must NOT follow, or the next arrow would
+ * type into a reply box instead of moving the highlight. Same open, same rail,
+ * one thing withheld — which is why it is an argument here rather than a second
+ * "preview" path that could drift out of step with the real one.
  *
  * Re-opening the card that is already open keeps its thread as it stands: the
  * pending and failed lines in it are the user's own words, and throwing them
@@ -960,8 +1001,11 @@ function openCard(num, opts) {
   if (kind === 'bounce') bounceComposing(n, true);
   // ...but never when the card arrived UNDER something you opened to read: you
   // asked for a report, not for a caret. #46's "focus my cursor in the reply
-  // box" is about clicking a card, and this is not that.
-  if (!keepPage) askFocus(n, kind);
+  // box" is about clicking a card, and this is not that. And never on #57's
+  // preview (`focus: 'none'`), where the caret has to stay off the rail so the
+  // next arrow keeps moving the highlight instead of typing into a reply box.
+  if (kind === 'none') pendingFocus = null;
+  else if (!keepPage) askFocus(n, kind);
   if (!keepPage && location.hash !== `#/c/${n}`) history.replaceState(null, '', `#/c/${n}`);
   render();
   refreshDetail();
@@ -1018,7 +1062,7 @@ function closeCard() {
   render();
 }
 
-function toggleChat(force) {
+function toggleChat(force, opts) {
   const want = force != null ? force : !(store.chatOpen && !store.detail);
   setChatOpen(want);
   if (want) {
@@ -1030,7 +1074,106 @@ function toggleChat(force) {
     }
   }
   render();
-  if (want) setTimeout(() => { const t = $('#sidebar-text'); if (t) t.focus(); }, 60);
+  // Opening the chat asks for the caret — except on the Escape rung that is
+  // explicitly about getting you OUT of a text box (see `escape`).
+  const takeCaret = !(opts && opts.focus === false);
+  if (want && takeCaret) setTimeout(() => { const t = $('#sidebar-text'); if (t) t.focus(); }, 60);
+}
+
+/**
+ * The Escape ladder — one rung per press, first match wins.
+ *
+ * Escape already meant four things on this page before card #57 asked it to mean
+ * more, so the ORDER is the whole design. The user's two rulings, verbatim:
+ * "hitting esc takes me back to the session chat", and then "oh, and if I'm
+ * already in the session chat, hitting esc toggles it open/closed". So repeated
+ * Escape walks you out of typing, out of the card, back to the session chat, then
+ * collapses the rail — and one more brings it back. Nothing is a dead end and
+ * nothing traps focus.
+ *
+ * Chrome first (a sheet on top of everything is what Escape obviously means):
+ *   1. the shortcut sheet   → close it
+ *   2. the Settings sheet   → close it
+ *   3. the sprint switcher  → close it
+ *   4. the lightbox         → close it
+ *   5. the Drop-work sheet  → close it
+ *
+ * Then the four rungs of the user's own ladder:
+ *   6. the caret is in the bounce-notes box → the box cancels the bounce itself
+ *      (card #44), and the document keeps its hands off. It used to fall through
+ *      here and close the whole card out from under a half-written bounce.
+ *   7. the caret is in a card's reply box   → leave the box, land back on the
+ *      highlighted card. The rail keeps showing that card.
+ *   8. a card has the rail                  → drop the highlight and put the
+ *      session chat back in the rail. On the Fold the rail is a slide-over ON TOP
+ *      of the work, so there it is dismissed instead of swapped.
+ *   9. the session chat has the rail        → toggle it closed; pressing Escape
+ *      once more opens it again, on the session chat, with the caret in the box.
+ *
+ * A report page and a stray column highlight get their own rungs in between —
+ * both are "put the board back the way it was", which is the same verb.
+ */
+function escape(e) {
+  const a = document.activeElement;
+  // Closing a sheet hands the keyboard back to the card you were standing on.
+  // A sheet takes focus when it opens (its Close button, the switcher's first
+  // row), so without this you come out of it with the highlight still painted
+  // and Return doing nothing — the board looks like it lost the plot.
+  if (closeKeysSheet()) { focusNavCursor(); return; }
+  if (closeSettings()) { focusNavCursor(); return; }
+  if (closeSiblingMenu()) {
+    render();
+    // After the repaint, not before: the menu's row is about to be replaced.
+    requestAnimationFrame(() => focusNavCursor());
+    return;
+  }
+  if (!el.lightbox.hidden) { closeLightbox(el.lightbox); return; }
+  if (!el.composeWrap.hidden) { closeCompose(); return; }
+  // The bounce box owns its own Escape (review.js / thread.js cancel the bounce).
+  if (a && a.classList && a.classList.contains('bounce-notes')) return;
+  // Rung 1: out of the reply box, back onto the card you were reading.
+  if (store.detail && a && a.id === `composer-${store.detail.num}`) {
+    e.preventDefault();
+    a.blur();
+    focusNavCursor();
+    return;
+  }
+  if (page) { goBoard(); return; }
+  // Rung 2: out of the card, back to the session chat — except that a card you
+  // opened out of a work unit's outline (card #55) has one more step behind it.
+  // Escape is one step back per press, so that step is the outline, and the
+  // press after it is the one that reaches the session chat.
+  if (store.detail && store.detail.fromUnit) {
+    e.preventDefault();
+    clearNav();
+    if (a && a.blur) a.blur();
+    closeCard();
+    return;
+  }
+  if (store.detail) {
+    e.preventDefault();
+    clearNav();
+    if (a && a.blur) a.blur();
+    if (foldQuery.matches) closeCard();
+    // No caret grab here on purpose: the rung before this one just took you OUT
+    // of a text box, and dropping you into a different one would undo it.
+    else toggleChat(true, { focus: false });
+    return;
+  }
+  // A work unit (card #55) holds the rail exactly the way a card does, so it
+  // gets the same rung: out of the unit, back to the session chat.
+  if (store.unit) {
+    e.preventDefault();
+    clearNav();
+    if (a && a.blur) a.blur();
+    if (foldQuery.matches) closeUnit();
+    else toggleChat(true, { focus: false });   // this clears the unit too
+    return;
+  }
+  if (clearNav()) { render(); return; }
+  // Rungs 3 and 4: the session chat is a toggle from here on.
+  e.preventDefault();
+  toggleChat(!store.chatOpen);
 }
 
 // ---- compose sheet -------------------------------------------------------
@@ -1191,6 +1334,9 @@ async function boot() {
     toast('Settings saved — in effect for the next dispatch.');
     refreshBoard();
   });
+  // The "?" button and its sheet: the shortcut map, quiet, on the page rather
+  // than in anybody's head.
+  installKeys(app);
   el.chatBtn.addEventListener('click', () => toggleChat());
   $('#drop-btn').addEventListener('click', () => openCompose());
   $('#compose-cancel').addEventListener('click', () => closeCompose());
@@ -1218,7 +1364,7 @@ async function boot() {
     // text box that is still empty. Once there are words in the box a slash is
     // just a slash, and inside the Drop-work sheet itself it always is.
     if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey
-        && el.composeWrap.hidden && !settingsOpen()) {
+        && el.composeWrap.hidden && !settingsOpen() && !keysSheetOpen()) {
       const a = document.activeElement;
       const inSheet = !!(a && el.composeWrap.contains(a));
       if (!inSheet && (!isTyping(a) || emptyTextTarget(a))) {
@@ -1227,21 +1373,16 @@ async function boot() {
         return;
       }
     }
-    if (e.key === 'Escape') {
-      if (closeSettings()) return;
-      if (closeSiblingMenu()) { render(); return; }
-      if (!el.lightbox.hidden) { closeLightbox(el.lightbox); return; }
-      if (!el.composeWrap.hidden) { closeCompose(); return; }
-      if (store.detail) { closeCard(); return; }
-      if (store.unit) { closeUnit(); return; }
-      if (page) { goBoard(); return; }
-      if (store.chatOpen) toggleChat(false);
-      return;
-    }
+    if (e.key === 'Escape') { escape(e); return; }
     if (!el.lightbox.hidden && el.lightbox._nav) {
       if (e.key === 'ArrowRight') el.lightbox._nav(1);
       if (e.key === 'ArrowLeft') el.lightbox._nav(-1);
+      return;
     }
+    // Everything else keyboard-shaped: the switcher, the column numbers, the
+    // arrows, Enter. It owns its own don't-hijack rules and reports whether it
+    // took the key.
+    handleKey(e, { isTyping, emptyTextTarget });
   });
   document.addEventListener('click', (e) => {
     if (!e.target.closest('.menu-wrap')) {
@@ -1320,10 +1461,6 @@ async function firstLoad() {
   // The first /api/board already recorded this server's generation, so it is
   // the baseline: anything different from here on is a NEW backend.
   onServerGeneration(() => onServerRestart(live));
-  // "This board is behind its own UI" can become true (or stop being true, once
-  // it is actually restarted) at any point; the banner is the only thing that
-  // reads it, so nothing else has to repaint.
-  onServerStale(() => renderSessionBanner());
   live.start(store.seq);
 
   setTimeout(armNotifications, 1500);

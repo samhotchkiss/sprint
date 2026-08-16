@@ -169,6 +169,9 @@ function unitCard(unit, app, { compact }) {
   const p = unit.packet;
   const item = h('div.unit-card', {
     'data-unit': unit.key,
+    // The keyboard walks the Review column by card number (card #57), and a
+    // unit's number is its lead card's — the same one the URL uses (#/u/<n>).
+    'data-num': unit.lead.num,
     role: 'button',
     tabindex: '0',
     title: 'open the outline — everything that changed, in one page',

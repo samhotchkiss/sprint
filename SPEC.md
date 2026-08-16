@@ -37,6 +37,21 @@ recovery must be easy. The user always runs claude inside tmux.
 - Bind: `tailscale ip -4` result + `127.0.0.1`, both. If no tailnet IP: bind loopback only and say so
   loudly. **Never 0.0.0.0, never a LAN interface.** Fixed default port **8377** (`--port` overridable);
   same port reused on restart so the URL survives reboots.
+- `.sprint/last-restart.json` — the self-restart stamp (when, which sha, how many lately). The board
+  hashes the source file it is running (`bin/sprintd`) every few seconds and, when that file becomes
+  DIFFERENT code, re-execs itself in place with the same argv (`os.execv`, so the pid, port, token,
+  log fds and launchd job all survive; the browser re-syncs off `generation` exactly as it does after
+  a manual restart). Gates, all of them load-bearing: content not mtime; the same new sha seen twice
+  and not written in the last couple of seconds; it must `compile()`; no in-flight non-streaming
+  request (SSE is excluded by design — it is held open for hours); and the DB write lock is held
+  across the exec. Crash-loop guard: never twice inside 60s, never more than 3 in 10 minutes, stamp
+  written BEFORE the exec so a build that never comes back still counts. When a guard blocks it, the
+  board appends a `note` (`actor: "server"`, `payload.restart_pending: true`) for the SESSION —
+  never a banner telling the user to run `sprintd stop`. That banner is gone from `web/` for good
+  (user, verbatim: "don't show me this notice"). Every threshold is env-tunable
+  (`SPRINT_CODE_WATCH_TICK`, `SPRINT_CODE_SETTLE_SECONDS`, `SPRINT_SELFRESTART_MIN_INTERVAL`,
+  `SPRINT_SELFRESTART_MAX_BURST`, `SPRINT_SELFRESTART_BURST_WINDOW`,
+  `SPRINT_RESTART_DRAIN_SECONDS`).
 - Auth: random bearer token generated at first start, stored in `.sprint/token` (and mirrored into
   `server.json` while running). `start` reuses it across stop/start; `--token` forces a value,
   `--new-token` rotates. Browser: `/?t=TOKEN` sets a cookie. API: `Authorization: Bearer` or cookie.
@@ -62,9 +77,10 @@ recovery must be easy. The user always runs claude inside tmux.
 - `cards(num INTEGER PRIMARY KEY AUTOINCREMENT, sprint_id, state, title, body, batch_id NULL,
   agent_name NULL, worktree NULL, branch NULL, bounce_count DEFAULT 0, pinned DEFAULT 0,
   dup_of NULL, long_running DEFAULT 0, external_agent DEFAULT 0, work_kind DEFAULT 'code',
-  executor NULL, model NULL, created_at, updated_at)` — `executor`/`model` are the per-card
-  dispatch choice (NULL = the board's defaults); **`num` is global across sprints**;
-  the UI renders `#num` and #num means the same card forever.
+  executor NULL, model NULL, blocked_by NULL, blocked_reason NULL, created_at, updated_at)` —
+  `executor`/`model` are the per-card dispatch choice (NULL = the board's defaults);
+  `blocked_by`/`blocked_reason` are the card-to-card wall (see Blocked by);
+  **`num` is global across sprints**; the UI renders `#num` and #num means the same card forever.
 - `batches(id, sprint_id, agent_name, worktree, branch, created_at)`.
 - `events(seq INTEGER PRIMARY KEY AUTOINCREMENT, card_num NULL, ts, actor, kind, payload JSON)` —
   the single append-only truth. `card_num NULL` = sprint-level (sidebar chat, session status).
@@ -799,6 +815,34 @@ python3 stdlib or POSIX sh only), `web/`, `README.md`. Install: `claude --plugin
 `/plugin install sprint@<marketplace>` for distribution; `claude plugin validate` must pass. Deps:
 python3 ≥3.9 + git; tailscale optional (loopback-only degrade); everything else stdlib.
 
+## Blocked by (SHIPPED)
+
+User verbatim: *"when one card is blocked by another, show that in the card details."* The link used
+to live in prose — a card said `blocked` and the card it was waiting on was in somebody's sentence,
+which nothing could read: no link to click, a sweep that nagged "dispatch it or say why not" at a
+card nobody could dispatch, and a session that had to re-read a thread to find out what landed.
+
+- **Store**: `cards.blocked_by` (nullable card number) + `cards.blocked_reason` (nullable one line,
+  140 chars). A link, not a state: a card can be `queued` AND blocked, which is the common case.
+- **API**: the existing card action —
+  `POST /api/cards/:num/action {"action":"blocked_by","target":N,"reason":"…"}`, and `target: null`
+  to clear. `target` is required and explicit (a missing key would quietly unblock). Three named
+  refusals: `self_block`, `blocked_cycle` (400, carries the whole `chain` — A→B→A is a wall with
+  nothing behind it), `blocker_closed` (409 — a closed blocker never lands, so the auto-clear that
+  makes the link safe would never fire). A target that does not exist is the usual 404.
+  Every card payload carries `blocked_by`/`blocked_reason`.
+- **Auto-clear**: when the blocker reaches a terminal state, the server clears `blocked_by` on every
+  card waiting on it and appends one `note` each (`actor: "server"`, `text: "no longer blocked — #N
+  landed"`, `payload.blocked_by_change`). It rides inside the blocker's own transition transaction,
+  and it fires exactly once per waiting card because the same write clears the column.
+- **Sweep**: a blocked card's `stuck` line names the blocker (`"queued 20m — waiting on #58 to land"`)
+  instead of asking someone to dispatch it. An unblock restarts that card's stuck clock and re-arms
+  its reminders, so the board re-ambers it if nobody picks it up.
+- **UI**: the rail shows "Blocked by #N — reason" under the head with #N as the ordinary in-app card
+  link; the card face and the List row carry a small quiet marker; both skins.
+- **Orchestration**: SKILL.md tells the session to set the link rather than describe it, and to treat
+  the auto-clear note as a dispatch trigger.
+
 ## Settings & executors (SHIPPED)
 
 User verbatim: *"we need some sprint settings options here … our standing instructions should be to
@@ -820,6 +864,12 @@ example."* Scope ruling: *"Peer per card — mix grok-via-tmux and claude subage
   the board down, and a change appends a `note` event (`actor: "server"`, carrying the new settings)
   so the session's own tail sees it. Read on demand, cached on mtime: `$EDITOR .sprint/config.json`
   needs no restart.
+- **The sprint's name** rides on the same endpoint (`PUT /api/settings {"name": "..."}`) but is NOT
+  in that file: it is the open sprint's title in the database, one source of truth, echoed back as
+  `name` on `/api/settings`, `/api/board` and `/healthz`. `sprintd start --name "..."` is the launch
+  path (and renames a board that is already up); the registry row follows it, so the title switcher
+  and the hub label a board by what it is about rather than by its directory. One line, ≤60 chars;
+  default is the project directory's name. A rename appends one `note` (`actor: "server"`).
 - **Per card**: `cards.executor`/`cards.model` (both nullable; NULL = the board's defaults), set via
   `POST /api/cards/:num/assign {executor?, model?}`, which refuses an executor that is not declared.
   Every card payload carries `dispatch: {executor, kind, command, session, model, source,

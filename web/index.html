@@ -37,6 +37,10 @@ try {
     <!-- quiet by design: dispatch policy is something you visit twice a month -->
     <button class="btn ghost settings-btn" id="settings-btn" type="button"
             title="model policy, executors, how many agents run at once">Settings</button>
+    <!-- the keyboard map. Quiet on purpose: one character, no label, and the
+         shortcut that opens it is written on it. -->
+    <button class="btn ghost keys-btn" id="keys-btn" type="button"
+            aria-label="keyboard shortcuts" title="keyboard shortcuts (?)">?</button>
     <div class="seg" id="skin-seg" role="group" aria-label="skin">
       <button class="seg-btn" type="button" data-skin="calm" aria-pressed="true">Calm</button>
       <button class="seg-btn" type="button" data-skin="chaos" aria-pressed="false">Chaos</button>
@@ -94,6 +98,37 @@ try {
     </div>
     <p class="compose-hint">Return sends · Shift+Return for a new line</p>
   </form>
+</div>
+
+<!-- the keyboard map (card #57). Static markup: it is a list of facts about the
+     page, and nothing on it depends on the board's state. -->
+<div class="sheet-wrap" id="keys-wrap" hidden>
+  <div class="sheet keys-sheet" role="dialog" aria-modal="true" aria-labelledby="keys-title">
+    <div class="keys-head">
+      <h2 id="keys-title">Keyboard</h2>
+      <span class="grow"></span>
+      <button class="btn ghost" id="keys-close" type="button">Close</button>
+    </div>
+    <dl class="keys-list">
+      <dt><kbd>/</kbd></dt><dd>Drop work — from anywhere, and from an empty box</dd>
+      <dt><kbd>.</kbd></dt><dd>Switch sprint — the menu numbers itself, press a number to go</dd>
+      <dt><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>4</kbd></dt>
+      <dd>Waiting · In progress · Needs you · Review — the same four in either layout</dd>
+      <dt><kbd>↑</kbd><kbd>↓</kbd></dt><dd>Move through that column — each card you land on opens in the rail</dd>
+      <dt><kbd>Return</kbd></dt><dd>Open the highlighted card and put the cursor in its reply box</dd>
+      <dt><kbd>Esc</kbd></dt>
+      <dd>One step back, every time you press it:
+        <span class="keys-ladder">
+          <span>writing a bounce → drop it</span>
+          <span>in a reply box → leave the box, the card stays open</span>
+          <span>a card in the rail → back to the session chat</span>
+          <span>on the session chat → close the rail; press it again to bring it back</span>
+        </span></dd>
+      <dt><kbd>?</kbd></dt><dd>This list</dd>
+    </dl>
+    <p class="keys-note">None of these fire while you are typing. Esc is the exception — it is
+      how you stop typing.</p>
+  </div>
 </div>
 
 <!-- the CRT. Chaos only (styles.css hides it in Calm), never in the way of a click -->

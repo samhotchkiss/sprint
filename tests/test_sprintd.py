@@ -11,6 +11,7 @@ import http.client
 import importlib.util
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -1186,6 +1187,35 @@ class TestHoldMode(Base):
 
         # after the flip, new cards queue again
         self.assertEqual(self.new_card("fresh")["state"], "queued")
+
+    def test_card_detail_carries_the_same_queue_position_as_the_board(self):
+        """One card's own payload has to agree with the board about where it sits.
+
+        The board is the only place that used to say this, so a client that
+        re-read a single card got a card object with no queue position on it,
+        overwrote the one it had, and watched the card drop to the bottom of the
+        Queued pile. Card #57's arrow-preview reads every card you pass, which
+        turned that into the whole pile reshuffling under the cursor.
+        """
+        nums = [self.new_card("queued %d" % i)["num"] for i in range(3)]
+        _, board = self.get("/api/board")
+        on_board = {c["num"]: c["queue_position"] for c in board["cards"]}
+        self.assertEqual([on_board[n] for n in nums], [1, 2, 3])
+        for n in nums:
+            _, detail = self.get("/api/cards/%d" % n)
+            self.assertEqual(detail["card"]["queue_position"], on_board[n],
+                             "card %d disagrees with the board" % n)
+        # A card that is not queued has no position at all, on either endpoint.
+        self.post("/api/cards/%d/action" % nums[0], {"action": "hold"})
+        _, detail = self.get("/api/cards/%d" % nums[0])
+        self.assertIsNone(detail["card"]["queue_position"])
+        # ...and the cards behind it close the gap, in both places at once.
+        _, board = self.get("/api/board")
+        on_board = {c["num"]: c["queue_position"] for c in board["cards"]}
+        self.assertEqual([on_board[n] for n in nums[1:]], [1, 2])
+        for n in nums[1:]:
+            _, detail = self.get("/api/cards/%d" % n)
+            self.assertEqual(detail["card"]["queue_position"], on_board[n])
 
     def test_hold_action_on_queued_card(self):
         num = self.new_card("queued then held")["num"]
@@ -6893,14 +6923,17 @@ class TestSprintIsNamedAfterTheProject(Base):
         self.app.name_untitled_sprint()
         self.assertEqual(self.get("/api/board")[1]["sprint"]["title"], "Billing week")
 
-    def test_the_registry_name_is_unchanged_by_any_of_this(self):
-        """The switcher labels boards from the registry; this only names sprints."""
+    def test_an_unnamed_registry_row_still_falls_back_to_the_directory(self):
+        """The switcher labels boards from the registry. A sprint that named
+        itself puts that name in the row (see TestSprintNames); one that did
+        not still reads as its directory."""
         entry = sprintd.registry_entry(self.project_root, 8399, "127.0.0.1")
         self.assertEqual(entry["name"], "project")
 
 
 class TestApiVersionIsPublished(Base):
-    """A page can tell it is talking to a server older than itself."""
+    """Which build answered, as one number. It is a diagnostic now, not a
+    banner: a board behind its own code restarts itself (TestSelfRestart)."""
 
     def test_healthz_and_board_both_carry_the_api_version(self):
         status, health = self.get("/healthz", token=None)
@@ -8171,6 +8204,1129 @@ class TestSprintLimitCli(Base):
                            timeout=60)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("SPRINT_SERVER", r.stderr.decode())
+
+
+# --------------------------------------------------------------------------
+# Adding an executor is a guided flow (#58)
+#
+# User verbatim: "make it easy to add executors." The panel now offers presets
+# instead of a JSON textarea, which is only an improvement if the shapes those
+# presets write are the exact shapes the server takes and the session reads.
+# So the presets are parsed straight out of the shipped web/settings.js and put
+# through the real round trip: PUT, GET, resolve a dispatch from it.
+# --------------------------------------------------------------------------
+
+
+class TestExecutorPresets(Base):
+    """The four presets the Settings sheet offers, tested as data."""
+
+    def presets(self):
+        path = os.path.join(os.path.dirname(HERE), "web", "settings.js")
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        start = src.index("/* PRESETS_JSON_START */") + len("/* PRESETS_JSON_START */")
+        end = src.index("/* PRESETS_JSON_END */")
+        block = src[start:end].strip()
+        self.assertTrue(block.startswith("const PRESETS ="), block[:40])
+        block = block[len("const PRESETS ="):].strip().rstrip(";")
+        # Strict JSON on purpose: the presets are data the server has to accept,
+        # so they are kept in a form this test can hand to the server verbatim.
+        return json.loads(block)
+
+    def put(self, patch, **kw):
+        return self.req("PUT", "/api/settings", patch, **kw)
+
+    def test_there_are_four_and_they_cover_the_named_cases(self):
+        presets = self.presets()
+        self.assertEqual(sorted(presets), ["claude", "cli", "codex", "grok"])
+        for key, p in presets.items():
+            self.assertTrue(p["label"], key)
+            self.assertTrue(p["blurb"], key)
+
+    def test_every_preset_field_is_one_the_server_knows(self):
+        for key, p in self.presets().items():
+            for field in p["spec"]:
+                self.assertIn(field, sprintd.EXECUTOR_FIELDS,
+                              "preset %s writes an unknown field %r" % (key, field))
+            self.assertIn(p["spec"]["kind"], sprintd.EXECUTOR_KINDS)
+
+    def test_a_preset_round_trips_and_resolves_a_dispatch_label(self):
+        """save → GET → the code that draws "grok · tmux", with no translation
+        anywhere in between."""
+        presets = self.presets()
+        for key, p in presets.items():
+            name = p["name"] or "my-agent"
+            spec = dict(p["spec"])
+            if spec.get("kind") == "tmux" and not spec.get("command"):
+                # the "another CLI" preset ships blank on purpose: the form
+                # makes you fill it in, and the server refuses it empty
+                status, body = self.put({"worker": {"executors": {name: spec}}})
+                self.assertEqual(status, 400, body)
+                self.assertEqual(body["field"], "worker.executors.%s.command" % name)
+                spec["command"] = "aider"
+
+            status, body = self.put({"worker": {"executors": {name: spec}}})
+            self.assertEqual(status, 200, body)
+
+            # read it back: byte-for-byte the same object the preset carries
+            stored = self.settings_worker()["executors"][name]
+            self.assertEqual(stored, spec, "preset %s did not round-trip" % key)
+
+            # ...and the resolution the card face's tag is built from
+            d = sprintd.resolve_dispatch({"worker": self.settings_worker()}, name, None)
+            self.assertEqual(d["executor"], name)
+            self.assertEqual(d["kind"], spec["kind"])
+            self.assertEqual(d["command"], spec.get("command"))
+            self.assertEqual(d["session"], spec.get("session"))
+            if spec.get("model"):
+                self.assertEqual(d["model"], spec["model"],
+                                 "an executor's model is what a card gets")
+
+    def test_the_grok_preset_matches_the_shape_the_skill_dispatches(self):
+        """SKILL.md's tmux block reads command and session off the executor.
+        If the preset drifted from it, a dispatch would be typed into the wrong
+        window with the wrong command — so the two are pinned together here."""
+        grok = self.presets()["grok"]["spec"]
+        self.assertEqual(grok["kind"], "tmux")
+        self.assertEqual(grok["command"], "grok")
+        self.assertEqual(grok["session"], "sprint-workers")
+        path = os.path.join(os.path.dirname(HERE), "skills", "sprint", "SKILL.md")
+        with open(path, encoding="utf-8") as fh:
+            skill = fh.read()
+        self.assertIn('{"kind": "tmux", "command": "grok", "session": "sprint-workers"}',
+                      skill)
+
+    def settings_worker(self):
+        status, body = self.get("/api/settings")
+        self.assertEqual(status, 200, body)
+        return body["settings"]["worker"]
+
+
+class TestExecutorNameValidation(Base):
+    """The names the form refuses, refused again by the server — the form is a
+    faster answer, never the only one."""
+
+    def put(self, patch, **kw):
+        return self.req("PUT", "/api/settings", patch, **kw)
+
+    def test_a_name_with_a_space_is_refused_by_name(self):
+        status, body = self.put({"worker": {
+            "executors": {"my grok": {"kind": "subagent"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors key")
+        self.assertIn("letters, digits", body["message"])
+
+    def test_an_empty_name_is_refused(self):
+        status, body = self.put({"worker": {"executors": {"": {"kind": "subagent"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors key")
+
+    def test_a_name_that_is_too_long_is_refused(self):
+        status, body = self.put({"worker": {
+            "executors": {"g" * 41: {"kind": "subagent"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors key")
+
+    def test_command_and_session_are_refused_on_a_subagent(self):
+        status, body = self.put({"worker": {
+            "executors": {"claude": {"kind": "subagent", "command": "claude"}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors.claude.command")
+
+    def test_a_blank_session_is_refused(self):
+        status, body = self.put({"worker": {
+            "executors": {"grok": {"kind": "tmux", "command": "grok", "session": "  "}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors.grok.session")
+
+    def test_a_model_that_is_not_a_string_is_refused(self):
+        status, body = self.put({"worker": {
+            "executors": {"grok": {"kind": "tmux", "command": "grok", "model": 4}}}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "worker.executors.grok.model")
+
+
+class TestExecutorPanelSource(Base):
+    """The panel itself. Not a screenshot test — these are the promises the
+    card made about the form, checked where they are written."""
+
+    def source(self, *parts):
+        path = os.path.join(os.path.dirname(HERE), *parts)
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_raw_json_is_still_reachable(self):
+        js = self.source("web", "settings.js")
+        self.assertIn("Edit as JSON", js)
+        self.assertIn("settings-executors", js)
+
+    def test_removing_never_uses_a_browser_confirm(self):
+        js = self.source("web", "settings.js")
+        self.assertNotIn("window.confirm", js)
+        self.assertNotIn("confirm(", js)
+        self.assertIn("exec-confirm", js)
+
+    def test_every_field_carries_a_plain_words_hint(self):
+        js = self.source("web", "settings.js")
+        for field in ("name", "kind", "command", "session", "model", "note"):
+            self.assertRegex(js, r"\n  %s: '" % field,
+                             "%s needs a hint in FIELD_HINT" % field)
+
+    def test_the_form_validates_before_it_saves(self):
+        js = self.source("web", "settings.js")
+        self.assertIn("There is already an executor called", js)
+        self.assertIn("A tmux worker needs a command", js)
+        self.assertIn("NAME_RE", js)
+
+
+# --------------------------------------------------------------------------
+# blocked_by (#61)
+#
+# User verbatim: "when one card is blocked by another, show that in the card
+# details." The link used to be a sentence somebody typed; now it is a column,
+# which is what lets the board draw it, the sweep name it, and the server clear
+# it by itself the moment the blocker closes.
+# --------------------------------------------------------------------------
+
+
+class BlockedByBase(Base):
+    def block(self, num, target, reason=None):
+        body = {"action": "blocked_by", "target": target}
+        if reason is not None:
+            body["reason"] = reason
+        return self.post("/api/cards/%d/action" % num, body)
+
+    def card(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return detail["card"]
+
+    def notes(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return [e for e in detail["timeline"] if e["kind"] == "note"]
+
+    def blocked_notes(self, num):
+        return [e for e in self.notes(num)
+                if e["payload"].get("blocked_by_change")]
+
+    def close_completed(self, num):
+        """queued → … → completed, the only honest way in."""
+        self.to_in_progress(num)
+        status, _ = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200)
+        self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+        status, _ = self.post("/api/cards/%d/integrated" % num, {"ok": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "completed")
+
+
+class TestBlockedBySetAndClear(BlockedByBase):
+    def test_set_and_clear_round_trip(self):
+        blocker = self.new_card("ship the API")["num"]
+        waiting = self.new_card("use the new API")["num"]
+
+        status, body = self.block(waiting, blocker, "needs the endpoint first")
+        self.assertEqual(status, 200, body)
+        card = self.card(waiting)
+        self.assertEqual(card["blocked_by"], blocker)
+        self.assertEqual(card["blocked_reason"], "needs the endpoint first")
+
+        # the timeline says it in words, with the card number in it so the
+        # board's #N autolink picks it up
+        ev = self.blocked_notes(waiting)[-1]
+        self.assertIn("#%d" % blocker, ev["payload"]["text"])
+        self.assertIn("needs the endpoint first", ev["payload"]["text"])
+
+        # ...and the board payload carries it too, so a face can mark it
+        status, board = self.get("/api/board")
+        by_num = {c["num"]: c for c in board["cards"]}
+        self.assertEqual(by_num[waiting]["blocked_by"], blocker)
+
+        status, body = self.block(waiting, None)
+        self.assertEqual(status, 200, body)
+        card = self.card(waiting)
+        self.assertIsNone(card["blocked_by"])
+        self.assertIsNone(card["blocked_reason"])
+        self.assertEqual(self.blocked_notes(waiting)[-1]["payload"]["was_blocked_by"],
+                         blocker)
+
+    def test_a_reason_is_optional(self):
+        blocker = self.new_card("first")["num"]
+        waiting = self.new_card("second")["num"]
+        status, _ = self.block(waiting, blocker)
+        self.assertEqual(status, 200)
+        self.assertIsNone(self.card(waiting)["blocked_reason"])
+
+    def test_clearing_a_card_that_is_not_blocked_writes_nothing(self):
+        num = self.new_card("nothing in its way")["num"]
+        status, _ = self.block(num, None)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.blocked_notes(num), [],
+                         "a no-op must not write an event saying something changed")
+
+    def test_re_pointing_at_another_card_replaces_it(self):
+        a = self.new_card("a")["num"]
+        b = self.new_card("b")["num"]
+        waiting = self.new_card("waiting")["num"]
+        self.block(waiting, a)
+        self.block(waiting, b, "actually it is b")
+        card = self.card(waiting)
+        self.assertEqual(card["blocked_by"], b)
+        self.assertEqual(card["blocked_reason"], "actually it is b")
+
+    def test_the_reason_is_one_line_and_capped(self):
+        blocker = self.new_card("blocker")["num"]
+        waiting = self.new_card("waiting")["num"]
+        self.block(waiting, blocker, "two\nlines  and   spaces " + "x" * 400)
+        reason = self.card(waiting)["blocked_reason"]
+        self.assertEqual(len(reason), sprintd.BLOCKED_REASON_MAX)
+        self.assertNotIn("\n", reason)
+        self.assertTrue(reason.startswith("two lines and spaces "))
+
+
+class TestBlockedByRefusals(BlockedByBase):
+    def test_a_card_cannot_block_itself(self):
+        num = self.new_card("me")["num"]
+        status, body = self.block(num, num)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "self_block")
+        self.assertEqual(body["field"], "target")
+        self.assertIsNone(self.card(num)["blocked_by"])
+
+    def test_a_target_that_does_not_exist_is_a_404(self):
+        num = self.new_card("me")["num"]
+        status, body = self.block(num, 9999)
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body["error"], "no_such_card")
+
+    def test_a_target_that_is_not_a_number_is_named(self):
+        num = self.new_card("me")["num"]
+        status, body = self.block(num, "the other one")
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "target")
+
+    def test_target_is_required(self):
+        num = self.new_card("me")["num"]
+        status, body = self.post("/api/cards/%d/action" % num,
+                                 {"action": "blocked_by"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "missing_field")
+        self.assertEqual(body["field"], "target")
+
+    def test_a_direct_cycle_is_refused_by_name(self):
+        a = self.new_card("a")["num"]
+        b = self.new_card("b")["num"]
+        self.block(b, a)                       # b waits on a
+        status, body = self.block(a, b)        # a waits on b -> nobody moves
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "blocked_cycle")
+        self.assertEqual(body["field"], "target")
+        self.assertEqual(body["chain"], [a, b, a])
+        self.assertIn("#%d" % b, body["message"])
+        self.assertIsNone(self.card(a)["blocked_by"],
+                          "a refused link must leave the card untouched")
+
+    def test_a_longer_cycle_is_refused_too(self):
+        a = self.new_card("a")["num"]
+        b = self.new_card("b")["num"]
+        c = self.new_card("c")["num"]
+        self.block(c, b)
+        self.block(b, a)
+        status, body = self.block(a, c)        # a -> c -> b -> a
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "blocked_cycle")
+        self.assertEqual(body["chain"], [a, c, b, a])
+
+    def test_a_chain_that_is_not_a_cycle_is_fine(self):
+        a = self.new_card("a")["num"]
+        b = self.new_card("b")["num"]
+        c = self.new_card("c")["num"]
+        self.assertEqual(self.block(b, a)[0], 200)
+        self.assertEqual(self.block(c, b)[0], 200)
+        self.assertEqual(self.card(c)["blocked_by"], b)
+
+    def test_a_closed_blocker_is_refused(self):
+        """Nothing is coming from a card that already finished, so the link
+        would never clear itself and the card would wait forever."""
+        blocker = self.new_card("already done")["num"]
+        waiting = self.new_card("waiting")["num"]
+        self.post("/api/cards/%d/action" % blocker, {"action": "cancel"})
+        status, body = self.block(waiting, blocker)
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"], "blocker_closed")
+        self.assertEqual(body["blocker_state"], "canceled")
+
+
+class TestBlockedByAutoClear(BlockedByBase):
+    def test_the_blocker_landing_clears_it_once_and_says_so(self):
+        blocker = self.new_card("ship the API")["num"]
+        waiting = self.new_card("use the new API")["num"]
+        self.block(waiting, blocker, "needs the endpoint")
+
+        before = len(self.blocked_notes(waiting))
+        self.close_completed(blocker)
+
+        card = self.card(waiting)
+        self.assertIsNone(card["blocked_by"])
+        self.assertIsNone(card["blocked_reason"])
+        freed = [e for e in self.blocked_notes(waiting)
+                 if e["payload"].get("was_blocked_by") == blocker]
+        self.assertEqual(len(freed), 1, "exactly one unblock event")
+        self.assertEqual(freed[0]["actor"], "server")
+        self.assertEqual(freed[0]["payload"]["text"],
+                         "no longer blocked — #%d landed" % blocker)
+        self.assertEqual(len(self.blocked_notes(waiting)), before + 1)
+
+    def test_it_fires_once_even_if_the_blocker_is_closed_again(self):
+        blocker = self.new_card("ship the API")["num"]
+        waiting = self.new_card("use the new API")["num"]
+        self.block(waiting, blocker)
+        self.close_completed(blocker)
+        # reopened and closed a second way: nobody is pointing at it any more,
+        # so there is nothing left to announce
+        self.post("/api/cards/%d/action" % blocker, {"action": "reopen"})
+        self.post("/api/cards/%d/action" % blocker, {"action": "cancel"})
+        freed = [e for e in self.blocked_notes(waiting)
+                 if e["payload"].get("was_blocked_by") == blocker]
+        self.assertEqual(len(freed), 1)
+
+    def test_a_canceled_blocker_says_what_actually_happened(self):
+        blocker = self.new_card("we are not doing this")["num"]
+        waiting = self.new_card("waiting on it")["num"]
+        self.block(waiting, blocker)
+        self.post("/api/cards/%d/action" % blocker, {"action": "cancel"})
+        card = self.card(waiting)
+        self.assertIsNone(card["blocked_by"])
+        self.assertEqual(self.blocked_notes(waiting)[-1]["payload"]["text"],
+                         "no longer blocked — #%d canceled" % blocker)
+
+    def test_every_card_waiting_on_it_is_freed(self):
+        blocker = self.new_card("the one thing")["num"]
+        waiters = [self.new_card("waiter %d" % i)["num"] for i in range(3)]
+        for w in waiters:
+            self.block(w, blocker)
+        self.close_completed(blocker)
+        for w in waiters:
+            self.assertIsNone(self.card(w)["blocked_by"], "#%d should be free" % w)
+
+    def test_a_blocker_that_merely_moves_changes_nothing(self):
+        blocker = self.new_card("still going")["num"]
+        waiting = self.new_card("waiting")["num"]
+        self.block(waiting, blocker)
+        self.to_in_progress(blocker)
+        self.assertEqual(self.card(waiting)["blocked_by"], blocker)
+
+
+class TestBlockedBySweep(BlockedByBase):
+    """The parked-card sweep says what the card is actually waiting for."""
+
+    def setUp(self):
+        super().setUp()
+        self.app.sweep_thresholds["queued"] = 1.0
+        self.app.sweep_thresholds["blocked"] = 1.0
+
+    def age(self, num, seconds):
+        with self.app.lock:
+            self.app.conn.execute(
+                "UPDATE events SET ts=ts-? WHERE card_num=?", (seconds, num))
+            self.app.conn.execute(
+                "UPDATE cards SET updated_at=updated_at-? WHERE num=?", (seconds, num))
+
+    def stuck_texts(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return [e["payload"]["text"] for e in detail["timeline"] if e["kind"] == "stuck"]
+
+    def test_a_queued_blocked_card_is_nagged_about_the_blocker(self):
+        blocker = self.new_card("the wall")["num"]
+        waiting = self.new_card("behind the wall")["num"]
+        self.block(waiting, blocker, "needs the endpoint")
+        self.age(waiting, 5.0)
+
+        self.assertGreaterEqual(self.app.sweep_stuck(), 1)
+        texts = self.stuck_texts(waiting)
+        self.assertEqual(len(texts), 1)
+        self.assertIn("waiting on #%d" % blocker, texts[0])
+        self.assertNotIn("dispatch it or say why not", texts[0])
+
+    def test_an_unblocked_card_gets_the_ordinary_nag_again(self):
+        blocker = self.new_card("the wall")["num"]
+        waiting = self.new_card("behind the wall")["num"]
+        self.block(waiting, blocker)
+        self.age(waiting, 5.0)
+        self.app.sweep_stuck()
+        self.assertIn("waiting on #%d" % blocker, self.stuck_texts(waiting)[0])
+
+        # the blocker lands: the card is dispatchable again, so the amber drops
+        # and its clock restarts...
+        self.close_completed(blocker)
+        self.assertFalse(self.card(waiting)["stuck"],
+                         "the wall came down — the old reminder is spent")
+        # ...and once nobody picks it up, the sweep re-ambers it in the usual
+        # words, because now there really is nothing stopping anyone.
+        self.age(waiting, 5.0)
+        self.app.sweep_stuck()
+        texts = self.stuck_texts(waiting)
+        self.assertEqual(len(texts), 2, "the unblock re-arms the reminders")
+        self.assertIn("dispatch it or say why not", texts[-1])
+        self.assertNotIn("waiting on #", texts[-1])
+
+    def test_a_card_with_no_blocker_is_nagged_the_old_way(self):
+        num = self.new_card("nobody is on it")["num"]
+        self.age(num, 5.0)
+        self.app.sweep_stuck()
+        self.assertIn("dispatch it or say why not", self.stuck_texts(num)[0])
+
+
+class TestBlockedByDocs(Base):
+    """The orchestrator sets the link instead of writing a sentence about it."""
+
+    def read_repo_file(self, *parts):
+        path = os.path.join(os.path.dirname(HERE), *parts)
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_skill_tells_the_session_to_set_blocked_by(self):
+        doc = self.read_repo_file("skills", "sprint", "SKILL.md")
+        self.assertIn('"action":"blocked_by"', doc)
+        self.assertIn("no longer blocked", doc)
+
+    def test_the_spec_records_the_field(self):
+        spec = self.read_repo_file("SPEC.md")
+        self.assertIn("blocked_by", spec)
+
+
+# --------------------------------------------------------------------------
+# #62 -- the board picks up new code by itself
+# --------------------------------------------------------------------------
+
+WEB_DIR = os.path.join(os.path.dirname(HERE), "web")
+
+FAKE_SOURCE = "# a stand-in for bin/sprintd\nVALUE = 1\n"
+
+
+class SelfRestartBase(Base):
+    """An App pointed at a throwaway 'source file' it is pretending to run.
+
+    Nothing here execs anything: `_execv` is the one seam, and every test
+    swaps it for a recorder. The real exec is proven end to end further down,
+    against a real daemonized server (TestSelfRestartEndToEnd).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.code = os.path.join(self.tmp, "fake-sprintd")
+        self.write_code(FAKE_SOURCE)
+        self.app.code_path = self.code
+        self.app.code_sha = sprintd.code_digest(self.code)["sha"]
+        self.app.selfrestart_path = os.path.join(self.tmp, "last-restart.json")
+        self.app.restart_argv = [sys.executable, self.code, "start", "--foreground"]
+        self.app.code_settle_seconds = 0.0
+        self.app.restart_drain_seconds = 0.5
+        self.execs = []
+        self.app._execv = lambda path, argv: self.execs.append((path, list(argv)))
+
+    def write_code(self, text):
+        with open(self.code, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def look(self, times=2):
+        """The watcher looks every few seconds; a change needs two looks."""
+        out = []
+        for _ in range(times):
+            out.append(self.app.check_code_update())
+        return out
+
+    def server_notes(self):
+        rows = self.app.q("SELECT * FROM events WHERE card_num IS NULL "
+                          "AND actor='server' AND kind='note' ORDER BY seq")
+        return [sprintd.App.event_json(r) for r in rows]
+
+    def code_notes(self):
+        return [e for e in self.server_notes() if e["payload"].get("code_update")]
+
+
+class TestSelfRestart(SelfRestartBase):
+    def test_new_code_re_execs_this_process(self):
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "restarting"])
+        self.assertEqual(len(self.execs), 1, "exactly one exec")
+        path, argv = self.execs[0]
+        self.assertEqual(path, sys.executable)
+        self.assertEqual(argv, [sys.executable, self.code, "start", "--foreground"])
+
+    def test_the_same_bytes_are_never_new_code(self):
+        """A touch, a checkout that lands where it started: not a restart."""
+        os.utime(self.code, (time.time() - 1000, time.time() - 1000))
+        self.assertEqual(self.app.check_code_update(), "unchanged")
+        os.utime(self.code, None)
+        self.assertEqual(self.app.check_code_update(), "unchanged")
+        self.assertEqual(self.execs, [])
+
+    def test_a_file_written_a_moment_ago_is_left_alone(self):
+        self.app.code_settle_seconds = 30.0
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "settling"])
+        self.assertEqual(self.execs, [])
+
+    def test_a_source_file_that_cannot_be_parsed_is_never_exec_ed(self):
+        """The half-written file is the whole risk. It must cost a wait, not the board."""
+        self.write_code("def broken(:\n")
+        self.assertEqual(self.look(), ["settling", "broken"])
+        self.assertEqual(self.execs, [])
+        notes = self.code_notes()
+        self.assertTrue(notes)
+        self.assertIn("does not compile", notes[-1]["payload"]["text"])
+        # ...and once it parses, the restart happens on its own
+        self.write_code(FAKE_SOURCE + "VALUE = 3\n")
+        self.assertEqual(self.look(), ["settling", "restarting"])
+        self.assertEqual(len(self.execs), 1)
+
+    def test_a_missing_source_file_is_not_an_event(self):
+        os.rename(self.code, self.code + ".gone")
+        self.assertEqual(self.app.check_code_update(), "unreadable")
+        self.assertEqual(self.execs, [])
+        os.rename(self.code + ".gone", self.code)
+
+    def test_the_stamp_is_written_before_the_exec(self):
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.look()
+        stamp = self.app.read_restart_stamp()
+        self.assertTrue(os.path.exists(self.app.selfrestart_path))
+        self.assertEqual(stamp["pid"], os.getpid())
+        self.assertEqual(stamp["burst_count"], 1)
+        self.assertAlmostEqual(stamp["at"], time.time(), delta=30)
+        self.assertEqual(stamp["sha"], sprintd.code_digest(self.code)["sha"])
+
+    def test_one_quiet_line_in_the_log_says_it_restarted(self):
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.look()
+        notes = self.code_notes()
+        self.assertEqual([n["payload"]["text"] for n in notes],
+                         ["restarted to pick up new code"])
+        self.assertEqual(notes[0]["actor"], "server")
+        # information, not a task: nothing pending for anyone to do
+        self.assertNotIn("restart_pending", notes[0]["payload"])
+
+
+class TestSelfRestartCrashLoopGuard(SelfRestartBase):
+    """New code that keeps arriving must never become a board that keeps dying."""
+
+    def test_a_second_restart_inside_the_minimum_interval_is_held(self):
+        self.app.write_restart_stamp("deadbeef")          # we just restarted
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "held"])
+        self.assertEqual(self.execs, [])
+
+    def test_the_interval_passing_lets_the_restart_through(self):
+        self.app.write_restart_stamp(
+            "deadbeef", at=time.time() - sprintd.DEFAULT_SELFRESTART_MIN_INTERVAL - 5)
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "restarting"])
+        self.assertEqual(len(self.execs), 1)
+
+    def test_a_burst_of_restarts_stops_being_automatic(self):
+        """Three inside the window and the board stays put, interval or no interval."""
+        old = time.time() - sprintd.DEFAULT_SELFRESTART_MIN_INTERVAL - 5
+        with open(self.app.selfrestart_path, "w", encoding="utf-8") as fh:
+            json.dump({"at": old, "sha": "x", "pid": os.getpid(),
+                       "burst_started_at": time.time() - 60,
+                       "burst_count": sprintd.DEFAULT_SELFRESTART_MAX_BURST}, fh)
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "held"])
+        self.assertEqual(self.execs, [])
+        self.assertIn("paused", self.code_notes()[-1]["payload"]["text"])
+
+    def test_the_burst_window_expires(self):
+        old = time.time() - sprintd.DEFAULT_SELFRESTART_BURST_WINDOW - 60
+        with open(self.app.selfrestart_path, "w", encoding="utf-8") as fh:
+            json.dump({"at": old, "sha": "x", "pid": os.getpid(),
+                       "burst_started_at": old,
+                       "burst_count": 99}, fh)
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "restarting"])
+        self.assertEqual(len(self.execs), 1)
+        self.assertEqual(self.app.read_restart_stamp()["burst_count"], 1)
+
+    def test_the_held_notice_goes_to_the_SESSION_and_never_to_the_user(self):
+        """The fallback is an event the orchestrator handles, not a chore on screen."""
+        self.app.write_restart_stamp("deadbeef")
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.look()
+        note = self.code_notes()[-1]
+        self.assertTrue(note["payload"]["restart_pending"])
+        self.assertEqual(note["actor"], "server")
+        self.assertNotIn("sprintd stop", note["payload"]["text"])
+        self.assertNotIn("sprintd start", note["payload"]["text"])
+        # the sidebar is user+session lines only, so this is log, not chrome
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        for line in board["sidebar"]:
+            self.assertNotIn("restart", (line["payload"].get("text") or ""))
+
+    def test_the_same_held_news_is_said_once_not_every_tick(self):
+        self.app.write_restart_stamp("deadbeef")
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        for _ in range(6):
+            self.app.check_code_update()
+        self.assertEqual(len(self.code_notes()), 1)
+
+
+class TestSelfRestartWaitsForIdle(SelfRestartBase):
+    def test_a_request_in_flight_defers_the_restart(self):
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.app.enter_request()
+        try:
+            self.assertEqual(self.look(), ["settling", "busy"])
+            self.assertEqual(self.execs, [])
+        finally:
+            self.app.exit_request()
+        # nothing in flight now: the very next look restarts
+        self.assertEqual(self.app.check_code_update(), "restarting")
+        self.assertEqual(len(self.execs), 1)
+
+    def test_ordinary_requests_are_counted_while_they_are_served(self):
+        seen = []
+        original = self.app.board
+
+        def slow_board():
+            seen.append(self.app.inflight())
+            return original()
+
+        self.app.board = slow_board
+        try:
+            status, _ = self.get("/api/board")
+        finally:
+            self.app.board = original
+        self.assertEqual(status, 200)
+        self.assertEqual(seen, [1])
+        self.assertEqual(self.app.inflight(), 0, "the counter comes back down")
+
+    def test_a_held_open_stream_does_not_count_as_in_flight(self):
+        """SSE is held for hours by design; waiting for it would mean never."""
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        try:
+            conn.request("GET", "/api/stream", headers={
+                "Authorization": "Bearer test-token", "Accept": "text/event-stream"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)   # headers out: the stream is open
+            deadline = time.time() + 5
+            while self.app.inflight() > 0 and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(self.app.inflight(), 0)
+            self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+            self.assertEqual(self.look(), ["settling", "restarting"])
+        finally:
+            conn.close()
+
+
+class TestSelfRestartFailureIsRecoverable(SelfRestartBase):
+    def test_a_failed_exec_goes_back_to_serving_and_says_so(self):
+        resumed = []
+        self.app.resume_serving = lambda: resumed.append(True)
+
+        def boom(_path, _argv):
+            raise OSError(8, "Exec format error")
+
+        self.app._execv = boom
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "failed"])
+        self.assertEqual(resumed, [True])
+        note = self.code_notes()[-1]
+        self.assertIn("could not restart", note["payload"]["text"])
+        self.assertTrue(note["payload"]["restart_pending"])
+        # the board is still answering
+        self.assertEqual(self.get("/api/board")[0], 200)
+
+    def test_no_argv_means_no_restart(self):
+        self.app.restart_argv = None
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "failed"])
+        self.assertEqual(self.execs, [])
+
+
+class TestRestartArgv(unittest.TestCase):
+    """What the re-exec replays: the same launch, minus what must not repeat."""
+
+    def test_a_flag_and_its_value_come_out(self):
+        self.assertEqual(
+            sprintd.strip_flag(["start", "--name", "Billing", "--port", "9"], "--name"),
+            ["start", "--port", "9"])
+        self.assertEqual(
+            sprintd.strip_flag(["start", "--name=Billing", "--port", "9"], "--name"),
+            ["start", "--port", "9"])
+        self.assertEqual(sprintd.strip_flag(["start"], "--name"), ["start"])
+
+    def test_the_code_path_is_absolute_and_is_this_file(self):
+        self.assertTrue(os.path.isabs(sprintd.SPRINTD_PATH))
+        self.assertEqual(sprintd.SPRINTD_PATH, os.path.realpath(SPRINTD_PATH))
+
+
+class TestNoRestartBannerInTheWeb(unittest.TestCase):
+    """User, verbatim: "don't show me this notice"."""
+
+    def js_sources(self):
+        out = {}
+        for name in sorted(os.listdir(WEB_DIR)):
+            if not name.endswith(".js"):
+                continue
+            with open(os.path.join(WEB_DIR, name), "r", encoding="utf-8") as fh:
+                out[name] = fh.read()
+        return out
+
+    @staticmethod
+    def strip_comments(text):
+        """Drop // lines and /* */ blocks -- what is left is what SHIPS."""
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+        return "\n".join(re.sub(r"(^|\s)//.*$", "", line) for line in text.splitlines())
+
+    def test_no_page_tells_the_user_to_restart_a_board(self):
+        for name, src in self.js_sources().items():
+            code = self.strip_comments(src)
+            for banned in ("needs a restart", "sprintd stop", "sprintd start"):
+                self.assertNotIn(banned, code,
+                                 "%s still says %r to the user" % (name, banned))
+
+    def test_the_staleness_machinery_is_gone_entirely(self):
+        for name, src in self.js_sources().items():
+            code = self.strip_comments(src)
+            for banned in ("serverIsStale", "onServerStale", "noteMissingEndpoint"):
+                self.assertNotIn(banned, code, "%s still imports %r" % (name, banned))
+
+
+class TestSelfRestartEndToEnd(unittest.TestCase):
+    """The real thing: a daemonized board, a changed file, the SAME pid serving
+    the new code afterwards. `os.execv` replaces the image in place, so pid,
+    port and token all survive -- which is the whole reason nobody has to be
+    told to restart anything."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-exec-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "project")
+        os.makedirs(self.root)
+        # A COPY of the tree, so the test can edit the code it is running.
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        self.script = os.path.join(self.bin, "sprintd")
+        shutil.copy2(SPRINTD_PATH, self.script)
+        shutil.copytree(WEB_DIR, os.path.join(self.tmp, "web"))
+        self.registry = os.path.join(self.tmp, "hubstate", "registry.json")
+        self.port = self._free_port()
+        self.addCleanup(self._kill)
+
+    def _free_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def _kill(self):
+        info = sprintd.read_server_json(
+            os.path.join(self.root, ".sprint", sprintd.SERVER_JSON))
+        for pid in [(info or {}).get("pid"), getattr(self, "pid", None)]:
+            if isinstance(pid, int):
+                try:
+                    os.kill(pid, 15)
+                except OSError:
+                    pass
+
+    def _env(self):
+        env = dict(os.environ)
+        env.update({"SPRINT_REGISTRY": self.registry,
+                    "SPRINT_CODE_WATCH_TICK": "0.4",
+                    "SPRINT_CODE_SETTLE_SECONDS": "0",
+                    "SPRINT_RESTART_DRAIN_SECONDS": "5"})
+        return env
+
+    def _health(self):
+        try:
+            status, raw = sprintd.http_get("127.0.0.1", self.port, "/healthz", timeout=3)
+        except (OSError, http.client.HTTPException):
+            return None
+        return json.loads(raw.decode("utf-8")) if status == 200 else None
+
+    def test_touching_the_source_restarts_the_board_in_place(self):
+        import subprocess
+        r = subprocess.run([sys.executable, self.script, "--project-root", self.root,
+                            "start", "--port", str(self.port), "--token", "exec-token",
+                            "--no-tailscale"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           env=self._env(), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        before = self._health()
+        self.assertIsNotNone(before)
+        self.pid = before["pid"]
+        gen = before["generation"]
+
+        with open(self.script, "a", encoding="utf-8") as fh:
+            fh.write("\n# a change, landed while the board was running\n")
+
+        deadline = time.time() + 40
+        after = None
+        while time.time() < deadline:
+            h = self._health()
+            if h and h["generation"] != gen:
+                after = h
+                break
+            time.sleep(0.25)
+        self.assertIsNotNone(after, "the board never picked up the new code")
+        # Same process, new build: exec keeps the pid, the port and the token.
+        self.assertEqual(after["pid"], before["pid"])
+        self.assertGreater(after["started_at"], before["started_at"])
+        status, raw = sprintd.http_get("127.0.0.1", self.port, "/api/board",
+                                       "exec-token", timeout=5)
+        self.assertEqual(status, 200)          # same token, same port, still serving
+        # ...and it said so, in one line, in the log.
+        status, raw = sprintd.http_get("127.0.0.1", self.port,
+                                       "/api/events?after=0&limit=500",
+                                       "exec-token", timeout=5)
+        self.assertEqual(status, 200)
+        events = json.loads(raw.decode("utf-8"))["events"]
+        said = [e["payload"]["text"] for e in events
+                if e["payload"].get("restart_kind") == "restarted"]
+        self.assertEqual(said, ["restarted to pick up new code"])
+        # and nothing anywhere told a human to go restart anything
+        for e in events:
+            self.assertNotIn("sprintd stop", e["payload"].get("text") or "")
+
+
+# --------------------------------------------------------------------------
+# #63 -- a sprint names itself on launch
+# --------------------------------------------------------------------------
+
+
+class TestSprintNames(Base):
+    """User, verbatim: "every session should name itself on launch"."""
+
+    def name_now(self):
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        return board["name"]
+
+    def test_the_default_is_still_the_directory(self):
+        self.assertEqual(self.name_now(), "project")
+        self.assertEqual(self.get("/healthz", token=None)[1]["sprint_name"], "project")
+        self.assertEqual(self.get("/api/settings")[1]["name"], "project")
+
+    def test_a_name_shows_up_everywhere_a_board_is_labelled(self):
+        status, res = self.req("PUT", "/api/settings", {"name": "Board self-restart"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["name"], "Board self-restart")
+        # the header reads the sprint title; the switcher and the hub read `name`
+        status, board = self.get("/api/board")
+        self.assertEqual(board["name"], "Board self-restart")
+        self.assertEqual(board["sprint"]["title"], "Board self-restart")
+        self.assertEqual(self.get("/healthz", token=None)[1]["sprint_name"],
+                         "Board self-restart")
+        self.assertEqual(self.get("/api/settings")[1]["name"], "Board self-restart")
+        status, sibs = self.get("/api/siblings?fresh=1")
+        self.assertEqual(status, 200, sibs)
+        mine = [s for s in sibs["sprints"] if s["self"]]
+        self.assertEqual([s["name"] for s in mine], ["Board self-restart"])
+
+    def test_post_is_the_same_write_as_put(self):
+        status, res = self.post("/api/settings", {"name": "Renamed by POST"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.name_now(), "Renamed by POST")
+
+    def test_a_rename_reaches_the_registry_the_switcher_reads(self):
+        sprintd.registry_register(sprintd.registry_entry(
+            self.project_root, self.port, "127.0.0.1"))
+        key = os.path.realpath(self.project_root)
+        self.assertEqual(sprintd.read_registry()[key]["name"], "project")
+        status, _ = self.req("PUT", "/api/settings", {"name": "Named later"})
+        self.assertEqual(status, 200)
+        self.assertEqual(sprintd.read_registry()[key]["name"], "Named later")
+
+    def test_a_registry_row_carries_the_name_it_was_started_with(self):
+        entry = sprintd.registry_entry(self.project_root, 8399, "127.0.0.1",
+                                       name="Billing week")
+        self.assertEqual(entry["name"], "Billing week")
+        # ...and falls back to the directory when nobody named it
+        self.assertEqual(
+            sprintd.registry_entry(self.project_root, 8399, "127.0.0.1")["name"],
+            "project")
+
+    def test_renaming_twice_is_a_rename_not_a_second_sprint(self):
+        self.req("PUT", "/api/settings", {"name": "First"})
+        self.req("PUT", "/api/settings", {"name": "Second"})
+        status, sprints = self.get("/api/sprints")
+        self.assertEqual(status, 200, sprints)
+        self.assertEqual(len(sprints["sprints"]), 1)
+        self.assertEqual(self.name_now(), "Second")
+
+    def test_the_rename_is_one_quiet_line_in_the_log(self):
+        self.req("PUT", "/api/settings", {"name": "Named"})
+        self.req("PUT", "/api/settings", {"name": "Renamed"})
+        rows = self.app.q("SELECT * FROM events WHERE card_num IS NULL "
+                          "AND kind='note' ORDER BY seq")
+        texts = [sprintd.jload(r["payload"], {}).get("text") for r in rows]
+        named = [t for t in texts if t and "named" in t]
+        self.assertEqual(len(named), 2, texts)
+        self.assertIn("“Named”", named[0])
+        self.assertIn("“Named” → “Renamed”", named[1])
+
+    def test_saving_the_same_name_writes_nothing(self):
+        self.req("PUT", "/api/settings", {"name": "Steady"})
+        before = self.get("/api/board")[1]["seq"]
+        self.req("PUT", "/api/settings", {"name": "Steady"})
+        self.assertEqual(self.get("/api/board")[1]["seq"], before)
+
+    def test_a_name_only_write_leaves_dispatch_policy_alone(self):
+        status, res = self.req("PUT", "/api/settings",
+                               {"settings": {"worker": {"concurrency": 4}}})
+        self.assertEqual(status, 200, res)
+        status, res = self.req("PUT", "/api/settings", {"name": "Only the name"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["settings"]["worker"]["concurrency"], 4)
+        self.assertEqual(self.name_now(), "Only the name")
+
+    def test_a_name_and_a_settings_patch_in_one_request(self):
+        status, res = self.req("PUT", "/api/settings",
+                               {"name": "Both", "worker": {"concurrency": 3}})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["settings"]["worker"]["concurrency"], 3)
+        self.assertEqual(res["name"], "Both")
+
+    def test_a_name_that_is_not_a_name_is_refused_by_field(self):
+        for bad in ("", "   ", "x" * (sprintd.SPRINT_NAME_MAX + 1), 7, None, []):
+            status, res = self.req("PUT", "/api/settings", {"name": bad})
+            if bad is None:
+                # `null` means "no name in this request", not "clear the name"
+                self.assertEqual(status, 200, res)
+                continue
+            self.assertEqual(status, 400, (bad, res))
+            self.assertEqual(res["field"], "name")
+        self.assertEqual(self.name_now(), "project")
+
+    def test_whitespace_is_collapsed_not_preserved(self):
+        status, res = self.req("PUT", "/api/settings",
+                               {"name": "  Board   self  restart \n"})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["name"], "Board self restart")
+
+    def test_the_settings_panel_is_told_the_limit_and_the_fallback(self):
+        status, res = self.get("/api/settings")
+        self.assertEqual(res["name_max"], sprintd.SPRINT_NAME_MAX)
+        self.assertEqual(res["name_default"], "project")
+
+
+class TestNamedBoardsOnTheHub(unittest.TestCase):
+    """A live board is the authority on its own name; the registry is the
+    fallback for one that is not answering."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-hubname-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.registry = os.path.join(self.tmp, "hubstate", "registry.json")
+        self._old = os.environ.get("SPRINT_REGISTRY")
+        os.environ["SPRINT_REGISTRY"] = self.registry
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        if self._old is None:
+            os.environ.pop("SPRINT_REGISTRY", None)
+        else:
+            os.environ["SPRINT_REGISTRY"] = self._old
+
+    def test_an_unreachable_board_keeps_the_registry_name(self):
+        entry = sprintd.registry_entry(os.path.join(self.tmp, "alpha"), 1, "127.0.0.1",
+                                       name="Alpha work")
+        row = sprintd.hub_summarize(entry, timeout=0.2)
+        self.assertEqual(row["name"], "Alpha work")
+        self.assertFalse(row["reachable"])
+
+
+class TestNameAtLaunch(unittest.TestCase):
+    """`sprintd start --name` is the boot path: the session names the sprint
+    after what it is about, not after the folder it happens to sit in."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-name-cli-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "project")
+        os.makedirs(self.root)
+        self.registry = os.path.join(self.tmp, "hubstate", "registry.json")
+        self.server_json = os.path.join(self.root, ".sprint", sprintd.SERVER_JSON)
+        self.port = self._free_port()
+        self.addCleanup(self._kill)
+
+    def _free_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def _kill(self):
+        info = sprintd.read_server_json(self.server_json)
+        if info and isinstance(info.get("pid"), int):
+            try:
+                os.kill(info["pid"], 15)
+            except OSError:
+                pass
+
+    def _run(self, *argv, timeout=60):
+        import subprocess
+        env = dict(os.environ)
+        env["SPRINT_REGISTRY"] = self.registry
+        return subprocess.run(
+            [sys.executable, SPRINTD_PATH, "--project-root", self.root] + list(argv),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=timeout)
+
+    def _name(self):
+        status, raw = sprintd.http_get("127.0.0.1", self.port, "/healthz", timeout=3)
+        self.assertEqual(status, 200)
+        return json.loads(raw.decode("utf-8"))["sprint_name"]
+
+    def test_a_session_names_its_sprint_on_launch(self):
+        r = self._run("start", "--port", str(self.port), "--token", "name-token",
+                      "--no-tailscale", "--name", "Board self-restart")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(self._name(), "Board self-restart")
+        key = os.path.realpath(self.root)
+        self.assertEqual(sprintd.read_registry(self.registry)[key]["name"],
+                         "Board self-restart")
+
+    def test_starting_again_with_a_new_name_renames_the_live_board(self):
+        r = self._run("start", "--port", str(self.port), "--no-tailscale",
+                      "--token", "name-token", "--name", "First idea")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        r2 = self._run("start", "--port", str(self.port), "--no-tailscale",
+                       "--name", "What it turned out to be")
+        self.assertEqual(r2.returncode, 0, r2.stderr.decode())
+        self.assertIn("already running", r2.stdout.decode())
+        self.assertEqual(self._name(), "What it turned out to be")
+        key = os.path.realpath(self.root)
+        self.assertEqual(sprintd.read_registry(self.registry)[key]["name"],
+                         "What it turned out to be")
+
+    def test_starting_again_with_no_name_keeps_the_one_it_has(self):
+        self._run("start", "--port", str(self.port), "--no-tailscale",
+                  "--token", "name-token", "--name", "Keeps its name")
+        r2 = self._run("start", "--port", str(self.port), "--no-tailscale")
+        self.assertEqual(r2.returncode, 0, r2.stderr.decode())
+        self.assertEqual(self._name(), "Keeps its name")
+        key = os.path.realpath(self.root)
+        self.assertEqual(sprintd.read_registry(self.registry)[key]["name"],
+                         "Keeps its name")
+
+    def test_no_name_means_the_directory_name(self):
+        r = self._run("start", "--port", str(self.port), "--no-tailscale",
+                      "--token", "name-token")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(self._name(), "project")
+
+    def test_a_name_nobody_could_read_is_refused_at_launch(self):
+        r = self._run("start", "--port", str(self.port), "--no-tailscale",
+                      "--name", "x" * 200)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("60 characters", r.stderr.decode())
 
 
 

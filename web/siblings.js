@@ -13,7 +13,7 @@
 // the counting; this file only decides what to draw and where a click goes.
 
 import { h, clear } from './util.js';
-import { api, noteMissingEndpoint } from './api.js';
+import { api } from './api.js';
 
 const POLL_MS = 30000;      // no SSE: the other boards are not on our event log
 
@@ -83,12 +83,11 @@ export function startSiblings(onChange) {
     try {
       body = await api.siblings();
     } catch (err) {
-      // A 404 is not a failed poll: it is a server that has never heard of this
-      // endpoint, i.e. one older than the page asking. Say so once (the header
-      // renders "this board needs a restart") instead of silently rendering a
-      // board with no switcher and letting it read as a missing feature.
-      if (err && err.status === 404) noteMissingEndpoint('/api/siblings');
-      // Otherwise a failed poll leaves the last known list alone. Blanking the
+      // A 404 here means a server older than this page — one that never had
+      // /api/siblings. That used to raise a banner asking the user to restart
+      // the board; it no longer does, because the board notices its own code
+      // changed and restarts itself, and the next poll (30s) finds the
+      // endpoint. A failed poll leaves the last known list alone. Blanking the
       // title into plain text because one fetch timed out would be a worse lie
       // than a slightly stale menu, and this is never worth a toast.
       return;
@@ -212,7 +211,7 @@ export function renderTitle(wrap, title) {
 
   const menu = h('div.menu.sprint-menu', { role: 'menu', hidden: !state.open },
     h('p.menu-head', 'Sprints on this machine'),
-    sprints.map((s) => h('button.menu-item.sprint-item', {
+    sprints.map((s, i) => h('button.menu-item.sprint-item', {
       type: 'button',
       role: 'menuitem',
       class: s.self ? 'is-current' : null,
@@ -224,8 +223,15 @@ export function renderTitle(wrap, title) {
         if (href) location.href = href;       // same tab: it is the same work
       },
     },
-    // Every row keeps its slot whether or not it has a square, so the names
-    // stay in one column instead of shuffling left when a board goes quiet.
+    // Card #57: "each session has a number next to it, i can hit the number to
+    // go to the session". The number is drawn even for a mouse user, because a
+    // shortcut nobody can see is a shortcut nobody uses.
+    i < 9 ? h('span.si-key', { 'aria-hidden': 'true' }, String(i + 1)) : null,
+    // …and then the square, which replaced the old needs-you dot: a dot could
+    // only say "something", and a board sitting at needs_you 0 / ready 8 lit
+    // nothing at all. Every row keeps its slot whether or not it has a square,
+    // so the names stay in one column instead of shuffling left when a board
+    // goes quiet.
     h('span.si-slot', markSquare(boardMark(s), { where: s.self ? 'this sprint' : s.name })),
     h('span.si-body',
       h('span.si-name', s.name || s.project_root || 'sprint'),
@@ -240,5 +246,33 @@ export function renderTitle(wrap, title) {
 export function closeSiblingMenu() {
   if (!state.open) return false;
   state.open = false;
+  return true;
+}
+
+// ---- the keyboard's half (card #57) --------------------------------------
+
+export function siblingMenuOpen() { return !!state.open; }
+
+/** How many rows the menu has, i.e. how high its numbers go. */
+export function siblingCount() { return state.sprints.length; }
+
+/**
+ * "." opens the switcher. Returns false when there is nothing to switch BETWEEN
+ * — one board on the machine and the title is a title, not a menu, so the caller
+ * says that out loud instead of opening an empty dropdown.
+ */
+export function openSiblingMenu() {
+  if (state.sprints.length < 2) return false;
+  state.open = true;
+  return true;
+}
+
+/** Go to the nth sprint (0-based, the order the menu draws). Own board = stay. */
+export function gotoSibling(i) {
+  const s = state.sprints[i];
+  if (!s || s.self) return false;
+  const href = siblingHref(s);
+  if (!href) return false;
+  location.href = href;
   return true;
 }

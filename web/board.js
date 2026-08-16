@@ -17,6 +17,7 @@ import { h, timeEl, firstLine } from './util.js';
 import {
   boardColumns, cardState, needsKind, motionState, blockedReason, waitingMark,
   meterSegments, sections, isSilent, isStuck, STUCK_HINT, STATE_LABEL,
+  blockedByMark,
 } from './state.js';
 import { phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
@@ -138,6 +139,12 @@ export function renderCardFace(card, app) {
   const sub = faceSub(card, state, col, app);
   if (sub.text) face.appendChild(h('span.card-sub', { style: sub.color ? { color: sub.color } : null }, sub.text));
 
+  // "waiting on #58" gets its own line rather than a slot in the foot: the
+  // foot already carries the agent and the age, and a card number that got
+  // ellipsised away is the one word this marker exists to say (#61).
+  const waitingOn = blockedByMark(card);
+  if (waitingOn) face.appendChild(waitingOn);
+
   if (col === 'in_motion') {
     const st = motionState(card);
     face.appendChild(h('span.prog-track', { title: st.title },
@@ -246,11 +253,13 @@ function elsewhereStrip(app) {
     strip.appendChild(h('button.pill', {
       type: 'button',
       class: `pill${mark === 'held' ? ' is-held' : ''}${blocked ? ' is-blocked' : ''}`,
+      'data-num': card.num,        // the keyboard's Waiting column, on the Fold
       title: card.title,
       onclick: () => app.openCard(card.num),
     },
       h('span.pill-num', '#' + card.num),
       h('span.pill-title', card.title),
+      blockedByMark(card),
       h('span.pill-mark', mark)));
   }
   return strip;
