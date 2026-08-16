@@ -8,29 +8,33 @@
 // last happened, and clicking anywhere on it hands the card to the rail. That is
 // the whole contract — every decision is made in one place, with the thread
 // under it, rather than half on a tile and half in a panel.
+// Column order is the life of a card, left to right, on the user's ruling:
+// waiting (queued → held → blocked) · in progress · needs you · review
+// (awaiting review → complete). The two things that are on HIM are deliberately
+// apart: answering a question and signing off a finished branch are not the
+// same job.
 import { h, timeEl, firstLine } from './util.js';
 import {
-  columns, cardState, needsKind, motionState, blockedReason, waitingMark,
+  boardColumns, cardState, needsKind, motionState, blockedReason, waitingMark,
   meterSegments, sections, isSilent, STATE_LABEL,
 } from './state.js';
 import { renderMeter } from './meter.js';
-import { renderDone } from './done.js';
 import { shortAgent } from './list.js';
 
 const scrollMemo = new Map();
 
 export function renderBoard(root, app) {
-  const secs = sections();
-  root.appendChild(renderMeter(meterSegments(secs)));
+  // The meter stays in urgency order (need you → in motion → blocked → queued),
+  // not column order: it answers "what shape is this sprint in", and the column
+  // strip right below it answers "where is everything".
+  root.appendChild(renderMeter(meterSegments(sections())));
   root.appendChild(boardGrid(app, { fold: false }));
-  root.appendChild(renderDone(secs.done, app));
 }
 
 /**
- * The Fold interior: the same four buckets, but only three get a column —
- * vertical space is the scarce thing on a 740px-tall screen, so the queue moves
- * to the "Elsewhere" strip at the bottom and Done drops out entirely (it is a
- * desktop reading surface; on the Fold it would cost a third of the height).
+ * The Fold interior: vertical space is the scarce thing on a 740px-tall screen,
+ * so the three columns that are about live work get the grid and the waiting
+ * pile drops to the "Elsewhere" strip at the bottom as pills.
  */
 export function renderFold(root, app) {
   root.appendChild(boardGrid(app, { fold: true }));
@@ -39,18 +43,34 @@ export function renderFold(root, app) {
 
 function boardGrid(app, { fold }) {
   const grid = h('div', { class: fold ? 'fold-cols' : 'board' });
+  // On the Fold the waiting pile becomes the Elsewhere strip; everything that is
+  // live, or waiting on the user, keeps a real column.
   const wanted = fold
-    ? ['needs_you', 'in_motion', 'blocked']
-    : ['needs_you', 'in_motion', 'blocked', 'waiting'];
+    ? ['in_motion', 'needs_you', 'review']
+    : ['waiting', 'in_motion', 'needs_you', 'review'];
 
-  for (const col of columns()) {
+  for (const col of boardColumns()) {
     if (!wanted.includes(col.key)) continue;
     // remember where each column was scrolled to across re-renders
     const prev = scrollMemo.get(col.key);
 
     const body = h('div.col-body', { 'data-col': col.key });
-    if (!col.cards.length) body.appendChild(h('p.col-empty', emptyText(col.key)));
-    for (const card of col.cards) body.appendChild(renderCardFace(card, app));
+    if (!col.count) body.appendChild(h('p.col-empty', col.empty));
+    // Sections appear only when they have something in them — an empty "Held"
+    // heading is a promise of a pile that isn't there.
+    for (const sec of col.sections) {
+      if (!sec.cards.length) continue;
+      if (sec.label && col.sections.length > 1) {
+        body.appendChild(h('div.col-sec',
+          h('span.col-sec-name', sec.label),
+          h('span.grow'),
+          h('span.col-sec-count', String(sec.cards.length))));
+      }
+      if (sec.note) body.appendChild(h('p.col-note', sec.note));
+      const group = h('div.col-group', { class: sec.quiet ? 'col-group is-quiet' : 'col-group' });
+      for (const card of sec.cards) group.appendChild(renderCardFace(card, app));
+      body.appendChild(group);
+    }
     if (prev) requestAnimationFrame(() => { body.scrollTop = prev; });
     body.addEventListener('scroll', () => scrollMemo.set(col.key, body.scrollTop), { passive: true });
 
@@ -59,19 +79,10 @@ function boardGrid(app, { fold }) {
         h('span.col-dot', { style: { background: col.dot } }),
         h('span.col-name', col.board),
         h('span.grow'),
-        h('span.col-count', String(col.cards.length))),
+        h('span.col-count', String(col.count))),
       body));
   }
   return grid;
-}
-
-function emptyText(key) {
-  return {
-    needs_you: 'Nothing needs you.',
-    in_motion: 'No agent is running.',
-    blocked: 'Nothing is stuck.',
-    waiting: 'Nothing waiting.',
-  }[key] || '—';
 }
 
 // ---- card face -----------------------------------------------------------
@@ -172,20 +183,24 @@ function pendingFace(card, app) {
 // ---- the Fold's "Elsewhere" strip ---------------------------------------
 
 function elsewhereStrip(app) {
-  const secs = sections();
+  const col = boardColumns().find((c) => c.key === 'waiting');
   const strip = h('div.elsewhere');
   strip.appendChild(h('span.elsewhere-label', 'Elsewhere'));
-  const cards = secs.waiting.cards;
+  // queued, held AND blocked: the Fold has no column for them, and a blocked
+  // card that is nowhere on the screen is a card you find out about too late.
+  const cards = col.sections.reduce((all, s) => all.concat(s.cards), []);
   if (!cards.length) {
     strip.appendChild(h('span.pill-mark', 'nothing queued'));
     return strip;
   }
   for (const card of cards) {
     if (card.pendingSubmit) continue;
-    const mark = waitingMark(card);
+    const state = cardState(card);
+    const blocked = ['blocked', 'failed', 'stale'].includes(state);
+    const mark = blocked ? (STATE_LABEL[state] || state).toLowerCase() : waitingMark(card);
     strip.appendChild(h('button.pill', {
       type: 'button',
-      class: `pill${mark === 'held' ? ' is-held' : ''}`,
+      class: `pill${mark === 'held' ? ' is-held' : ''}${blocked ? ' is-blocked' : ''}`,
       title: card.title,
       onclick: () => app.openCard(card.num),
     },
