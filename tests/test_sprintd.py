@@ -1424,6 +1424,43 @@ class TestStream(StreamReader, Base):
         beat = self._read_lines(resp, lambda t: t.startswith(": heartbeat"), timeout=6)
         self.assertTrue(any(t.startswith(": heartbeat") for t in beat), beat)
 
+    def test_holding_the_stream_open_is_proof_the_session_is_attached(self):
+        """`sprintd tail` sits on this stream instead of polling, so the stream
+        has to count as liveness the way the waiter's polling does -- but only
+        when it says so. A browser's EventSource cannot send the header, and
+        counting it would be exactly the fake green the marker exists to stop."""
+        self.new_card("liveness")
+        has_event = lambda t: t.startswith("data:") and '"seq"' in t  # noqa: E731
+
+        _conn, resp = self._open_stream()                     # a browser
+        self._read_lines(resp, has_event)
+        _, board = self.get("/api/board")
+        self.assertIsNone(board["session"]["waiter_seen_at"],
+                          "an unmarked stream is a browser, not the session")
+
+        _conn2, resp2 = self._open_stream(
+            headers={sprintd.WAITER_HEADER: "sprintd-tail"})
+        self._read_lines(resp2, has_event)
+        _, board = self.get("/api/board")
+        self.assertIsNotNone(board["session"]["waiter_seen_at"])
+        self.assertTrue(board["session"]["waiter_polling"])
+
+    def test_a_quiet_stream_keeps_refreshing_the_sighting(self):
+        """Marking only at connect time would let a session that is listening
+        perfectly well read as offline 30s later. The sighting refreshes every
+        tick, with nothing on the wire but heartbeats."""
+        self.new_card("quiet")
+        _conn, resp = self._open_stream(
+            headers={sprintd.WAITER_HEADER: "sprintd-tail"})
+        self._read_lines(resp, lambda t: t.startswith("data:") and '"seq"' in t)
+        _, board = self.get("/api/board")
+        first = board["session"]["waiter_seen_at"]
+        self.assertIsNotNone(first)
+        self._read_lines(resp, lambda t: t.startswith(": heartbeat"), timeout=6)
+        _, board = self.get("/api/board")
+        self.assertGreater(board["session"]["waiter_seen_at"], first,
+                           "a stream that is still open is still the session")
+
     def test_event_frames_are_id_plus_data_only(self):
         """Event frames: `id:` = seq, `data:` = one event JSON, and no `event:`
         line -- a named type would never reach the browser's default message
@@ -2709,6 +2746,352 @@ class TestStartStopSubprocess(unittest.TestCase):
         self.assertIsNotNone(sess["waiter_seen_at"])
         self.assertTrue(sess["waiter_polling"])
         self.assertEqual(self._run("stop").returncode, 0)
+
+
+class TestTailLine(unittest.TestCase):
+    """The line shape itself: fixed keys, always present, clipped text."""
+
+    def test_line_is_the_same_shape_for_every_event(self):
+        line = sprintd.tail_line({
+            "seq": 12, "card_num": 5, "ts": 1.0, "actor": "user", "kind": "chat",
+            "payload": {"text": "hello", "reply_to": "card:5", "detail": "long…"}})
+        self.assertEqual(list(line), ["seq", "card", "actor", "kind",
+                                      "reply_to", "text"])
+        self.assertEqual(line, {"seq": 12, "card": 5, "actor": "user",
+                                "kind": "chat", "reply_to": "card:5",
+                                "text": "hello"})
+
+    def test_keys_are_present_even_when_empty(self):
+        """A monitor reads a field without first checking it exists."""
+        line = sprintd.tail_line({"seq": 3, "card_num": None, "actor": "server",
+                                  "kind": "note", "payload": {"text": "sprint opened"}})
+        self.assertIsNone(line["card"])
+        self.assertIsNone(line["reply_to"], "only humans get a reply_to")
+        line = sprintd.tail_line({"seq": 4, "actor": "worker", "kind": "progress",
+                                  "payload": None})
+        self.assertEqual(line["text"], "")
+        self.assertIsNone(line["reply_to"])
+
+    def test_text_is_one_clipped_line(self):
+        line = sprintd.tail_line({"seq": 1, "card_num": 1, "actor": "user",
+                                  "kind": "chat",
+                                  "payload": {"text": "x" * 400}})
+        self.assertEqual(len(line["text"]), sprintd.TAIL_TEXT_MAX)
+        self.assertTrue(line["text"].endswith("…"))
+        line = sprintd.tail_line({"seq": 2, "card_num": 1, "actor": "user",
+                                  "kind": "chat",
+                                  "payload": {"text": "first\nsecond\nthird"}})
+        self.assertEqual(line["text"], "first", "one event is one line, always")
+
+    def test_a_forged_reply_to_is_still_only_a_string(self):
+        line = sprintd.tail_line({"seq": 9, "card_num": 1, "actor": "worker",
+                                  "kind": "note",
+                                  "payload": {"text": "hi", "reply_to": {"a": 1}}})
+        self.assertIsNone(line["reply_to"])
+
+
+class TestTail(unittest.TestCase):
+    """`sprintd tail` -- the quiet ingress.
+
+    The session used to relaunch a 60s long-poll forever, which is a wake per
+    minute whether or not anything happened. tail holds one stream open and
+    prints exactly one line per real event: one wake per event, zero idle
+    wakes. It runs under a streaming monitor, so it must never exit on its
+    own and must never print anything a monitor would wake on pointlessly.
+    """
+
+    HEARTBEAT = 0.3          # server-side SSE heartbeat, so beats are frequent
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sprintd-tail-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "project")
+        os.makedirs(self.root)
+        self.server_json = os.path.join(self.root, ".sprint", sprintd.SERVER_JSON)
+        self.port = self._free_port()
+        self.assertNotEqual(self.port, sprintd.DEFAULT_PORT,
+                            "never touch the real board's port")
+        self.token = "tail-token"
+        self.tails = []
+        self.addCleanup(self._kill_leftovers)
+        self.addCleanup(self._kill_tails)
+        self.start_server()
+        self.assertEqual(self.api("POST", "/api/sprint", {"action": "open"})[0], 200)
+
+    # -- server ---------------------------------------------------------
+
+    def _free_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def _kill_leftovers(self):
+        info = sprintd.read_server_json(self.server_json)
+        if info and isinstance(info.get("pid"), int):
+            try:
+                os.kill(info["pid"], 15)
+            except OSError:
+                pass
+
+    def _kill_tails(self):
+        for proc, _lines, _noise in self.tails:
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+
+    def _sprintd(self, *argv, timeout=60):
+        import subprocess
+        env = dict(os.environ, SPRINT_SSE_HEARTBEAT=str(self.HEARTBEAT))
+        return subprocess.run(
+            [sys.executable, SPRINTD_PATH, "--project-root", self.root] + list(argv),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=env)
+
+    def _healthz(self):
+        try:
+            return sprintd.http_get("127.0.0.1", self.port, "/healthz",
+                                    timeout=2.0)[0]
+        except (OSError, http.client.HTTPException):
+            return None
+
+    def _await(self, want, timeout=15.0, what="condition"):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            got = want()
+            if got:
+                return got
+            time.sleep(0.05)
+        self.fail("timed out waiting for %s" % (what() if callable(what) else what))
+
+    def start_server(self):
+        r = self._sprintd("start", "--port", str(self.port), "--token", self.token,
+                          "--no-tailscale")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self._await(lambda: self._healthz() == 200, what="the server to come up")
+
+    def stop_server(self):
+        r = self._sprintd("stop")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self._await(lambda: self._healthz() is None, what="the server to go away")
+
+    def generation(self):
+        status, raw = sprintd.http_get("127.0.0.1", self.port, "/healthz")
+        self.assertEqual(status, 200)
+        return json.loads(raw.decode())["generation"]
+
+    def api(self, method, path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10.0)
+        try:
+            headers = {"Authorization": "Bearer " + self.token,
+                       "Accept": "application/json"}
+            payload = None
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+                payload = json.dumps(body).encode("utf-8")
+            conn.request(method, path, body=payload, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+            return resp.status, json.loads(raw.decode("utf-8") or "{}")
+        finally:
+            conn.close()
+
+    # -- events the tests post -------------------------------------------
+
+    def user_says(self, text):
+        status, _ = self.api("POST", "/api/sidebar", {"text": text, "actor": "user"})
+        self.assertIn(status, (200, 201))
+
+    def session_says(self, text):
+        status, _ = self.api("POST", "/api/sidebar", {"text": text, "actor": "session"})
+        self.assertIn(status, (200, 201))
+
+    def new_card(self, text):
+        status, card = self.api("POST", "/api/cards", {"text": text})
+        self.assertEqual(status, 201, card)
+        return card
+
+    def head(self):
+        return self.api("GET", "/healthz")[1]["seq"]
+
+    # -- the tail process -------------------------------------------------
+
+    def tail(self, *argv):
+        import subprocess
+        proc = subprocess.Popen(
+            [sys.executable, SPRINTD_PATH, "--project-root", self.root, "tail",
+             "--port", str(self.port), "--token", self.token] + list(argv),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        lines, noise = [], []
+
+        def pump(stream, sink):
+            for raw in stream:
+                text = raw.decode("utf-8", "replace").strip()
+                if text:
+                    sink.append(text)
+
+        for stream, sink in ((proc.stdout, lines), (proc.stderr, noise)):
+            threading.Thread(target=pump, args=(stream, sink), daemon=True).start()
+        self.tails.append((proc, lines, noise))
+        return proc, lines, noise
+
+    def wait_lines(self, lines, count, timeout=20.0):
+        self._await(lambda: len(lines) >= count, timeout=timeout,
+                    what=lambda: "%d tail line(s); got %r" % (count, lines))
+        return [json.loads(t) for t in list(lines)]
+
+    def parsed(self, lines):
+        return [json.loads(t) for t in list(lines)]
+
+    # -- tests ------------------------------------------------------------
+
+    def test_one_line_per_event_carrying_the_routing_key(self):
+        """The whole product of this command: one compact line per event, and
+        `reply_to` on it, so a session knows where its answer belongs without
+        a second round trip."""
+        _proc, lines, noise = self.tail("--after", str(self.head()))
+        card = self.new_card("a card the user dropped")
+        self.user_says("and a sidebar message")
+        got = self.wait_lines(lines, 3)          # submitted, state, chat
+
+        by_kind = {ev.get("kind"): ev for ev in got if "kind" in ev}
+        self.assertEqual(by_kind["submitted"]["card"], card["num"])
+        self.assertEqual(by_kind["submitted"]["actor"], "user")
+        self.assertEqual(by_kind["submitted"]["reply_to"], "card:%d" % card["num"])
+        self.assertEqual(by_kind["submitted"]["text"], "a card the user dropped")
+        self.assertEqual(by_kind["chat"]["reply_to"], "sidebar")
+        self.assertIsNone(by_kind["state"]["reply_to"],
+                          "a server event has no human waiting behind it")
+
+        seqs = [ev["seq"] for ev in got]
+        self.assertEqual(seqs, sorted(seqs), "events arrive in log order")
+        self.assertEqual(len(seqs), len(set(seqs)), "one line per event, exactly")
+
+    def test_user_only_prints_only_what_a_human_wrote(self):
+        """The filter the session actually runs: the events it must answer."""
+        _proc, lines, noise = self.tail("--after", str(self.head()), "--user-only")
+        self.session_says("a reply the session posted itself")
+        self.new_card("a card, which is a user event")   # + a server state event
+        self.user_says("the human again")
+        got = self.wait_lines(lines, 2)
+        self.assertTrue(all(ev["actor"] == "user" for ev in got), got)
+        self.assertEqual([ev["text"] for ev in got],
+                         ["a card, which is a user event", "the human again"])
+
+    def test_after_catches_up_from_the_cursor_before_streaming(self):
+        """Restarting a monitor must not replay the whole sprint, and must not
+        lose what landed while it was down."""
+        self.user_says("before the cursor")
+        cursor = self.head()
+        self.user_says("landed while the monitor was down")
+        _proc, lines, noise = self.tail("--after", str(cursor), "--user-only")
+        self.user_says("landed while it was watching")
+        got = self.wait_lines(lines, 2)
+        self.assertEqual([ev["text"] for ev in got],
+                         ["landed while the monitor was down",
+                          "landed while it was watching"])
+        self.assertTrue(all(ev["seq"] > cursor for ev in got), got)
+
+    def test_heartbeats_and_cursor_moves_print_nothing(self):
+        """The reason this command exists. A heartbeat that reached stdout
+        would wake the monitor every 15s forever -- the exact idle churn the
+        long-poll waiter was costing."""
+        _proc, lines, noise = self.tail("--after", str(self.head()))
+        self.user_says("the only real event")
+        self.wait_lines(lines, 1)
+        # many heartbeats, plus the single most frequent frame on the wire
+        for seq in range(1, 4):
+            self.assertEqual(
+                self.api("POST", "/api/cursors/orchestrator", {"seq": seq})[0], 200)
+            time.sleep(0.5)
+        self.assertEqual(len(lines), 1, self.parsed(lines))
+
+    def test_a_dropped_connection_resumes_silently_without_duplicates(self):
+        """The stream drops (idle timeout here; a flaky socket in life). The
+        reconnect is bookkeeping, not news: nothing extra reaches stdout, and
+        nothing already printed is printed twice."""
+        # a read timeout well under the heartbeat: the stream drops constantly
+        _proc, lines, noise = self.tail("--after", str(self.head()), "--read-timeout", "0.15")
+        self.user_says("one")
+        self.wait_lines(lines, 1)
+        time.sleep(2.0)                          # several forced reconnects
+        self.user_says("two")
+        got = self.wait_lines(lines, 2)
+        self.assertEqual([ev["text"] for ev in got], ["one", "two"])
+        self.assertFalse([ev for ev in got if "restart" in ev],
+                         "same server, same generation -- no restart line")
+        self.assertEqual(noise, [], "reconnect chatter on stderr is still chatter")
+
+    def test_a_server_restart_says_so_once_and_resumes_from_seq(self):
+        """A restarted backend is the one piece of transport news the session
+        does need: same port, new process. Everything after it must arrive
+        exactly once, from where the tail left off."""
+        _proc, lines, noise = self.tail("--after", str(self.head()),
+                                 "--unreachable-after", "600")
+        self.user_says("before the restart")
+        self.wait_lines(lines, 1)
+        before = self.generation()
+
+        self.stop_server()
+        self.start_server()
+        self.assertNotEqual(self.generation(), before, "restart must be a new process")
+        self.user_says("after the restart")
+
+        got = self.wait_lines(lines, 3)
+        restarts = [ev for ev in got if ev.get("restart")]
+        self.assertEqual(len(restarts), 1, got)
+        self.assertEqual(restarts[0]["generation"], self.generation())
+        texts = [ev.get("text") for ev in got if "seq" in ev]
+        self.assertEqual(texts, ["before the restart", "after the restart"])
+        seqs = [ev["seq"] for ev in got if "seq" in ev]
+        self.assertEqual(len(seqs), len(set(seqs)), "resume must not replay")
+
+    def test_unreachable_is_said_once_and_the_tail_keeps_going(self):
+        """It lives under a monitor: dying is not an option, and neither is
+        screaming once a second while the server is down."""
+        proc, lines, noise = self.tail("--after", str(self.head()),
+                                "--unreachable-after", "1", "--read-timeout", "2")
+        self.user_says("still up")
+        self.wait_lines(lines, 1)
+
+        self.stop_server()
+        self._await(lambda: any(json.loads(t).get("error") for t in list(lines)),
+                    timeout=20, what="the unreachable line")
+        time.sleep(3.0)                          # keep it down, stay quiet
+        errors = [ev for ev in self.parsed(lines) if ev.get("error")]
+        self.assertEqual(len(errors), 1, self.parsed(lines))
+        self.assertEqual(errors[0], {"error": "unreachable"})
+        self.assertEqual(noise, [], "one line on stdout, nothing anywhere else")
+        self.assertIsNone(proc.poll(), "tail must never exit on its own")
+
+        self.start_server()
+        self.user_says("and we are back")
+        got = self.wait_lines(lines, 3)
+        self.assertEqual(got[-1]["text"], "and we are back")
+        self.assertIsNone(proc.poll())
+
+    def test_tail_is_the_sessions_proof_of_life(self):
+        """Sitting on the stream replaces the waiter's polling, so it has to
+        buy the same thing: a board that does not tell the user 'session
+        offline' while the session is right there listening."""
+        _proc, lines, noise = self.tail("--after", str(self.head()))
+        self.user_says("wake up")
+        self.wait_lines(lines, 1)
+        session = self._await(
+            lambda: self.api("GET", "/api/board")[1]["session"].get("waiter_seen_at")
+            and self.api("GET", "/api/board")[1]["session"],
+            what="the board to see the tail as the session")
+        self.assertTrue(session["waiter_polling"])
+        self.assertNotEqual(session["status"], "offline")
 
 
 class TestEventDetail(Base):
