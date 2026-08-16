@@ -1,11 +1,12 @@
 <!doctype html>
-<html lang="en" class="skin-calm">
+<html lang="en" class="skin-chaos">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Option B — The digest · sprint mockups</title>
 <link rel="stylesheet" href="fonts/fonts.css">
 <link rel="stylesheet" href="mock.css">
+<script src="skin.js"></script>
 <style>
 /* ---- Option B: a briefing, not a table ---------------------------------
    Every work unit is a short paragraph in plain English — the kind of thing a
@@ -42,7 +43,7 @@
 
 .thumb {
   width: 100%; margin: 16px 0 0 0;
-  border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: #0a0b0d;
+  border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: var(--void);
 }
 .thumb img { width: 100%; }
 .thumb figcaption {
@@ -62,7 +63,9 @@
 
 .entry.settled .lede { color: var(--dim); font-size: 20px; }
 .entry.settled p.say { color: var(--faint); font-size: 14px; }
-.entry.settled .tail { color: #6d6c68; }
+/* #6d6c68 is 3.7:1 at 11px — the settled entry is already dimmed by its
+   lede and its prose, so the tail holds the floor instead of stepping past it */
+.entry.settled .tail { color: var(--faint); }
 
 .closing {
   margin-top: 34px; padding-top: 22px; border-top: 1px solid var(--rule);
@@ -75,6 +78,55 @@
   .entry > .thumb { grid-column: 1; grid-row: auto; max-width: 420px; }
   .verbs .btn { min-height: 44px; }
 }
+
+/* ---- B in Chaos ---------------------------------------------------------
+   This is the shape the skin fights. B's whole hierarchy is one big soft
+   sentence over smaller prose, and Chaos's display face cannot set a sentence:
+   at 23px Press Start 2P a 60-character lede is four lines of pixel type and
+   the page stops being readable. Held to 11px — the product's own --size-h2 —
+   the lede fits one line but is now SMALLER than the 15px paragraph under it,
+   which inverts the very hierarchy the shape is built on.
+
+   So Chaos has to rebuild the lede's authority out of something other than
+   size: it becomes a name plate — the header gradient, the ink outline, the
+   bevel — sitting on top of its own paragraph. That reads. It is also an
+   honest cost: this is the only option where Chaos changes the construction
+   and not just the frame, and the result is more furniture per entry in the
+   shape that was already the longest of the four. */
+
+html.skin-chaos .entry { border-top: 2px solid var(--border); padding: 26px 0 24px 0; }
+html.skin-chaos .entry:first-of-type { border-top: none; }
+html.skin-chaos .entry .lede {
+  font-size: 11px; line-height: 1.9; color: var(--ink); letter-spacing: .5px;
+  background: var(--head-bg); border: 2px solid var(--border);
+  box-shadow: var(--row-shadow); padding: 12px 14px; margin-bottom: 4px;
+  text-shadow: 0 2px 0 #0a0618;
+}
+html.skin-chaos .entry p.say { font-size: 14.5px; line-height: 1.75; }
+html.skin-chaos .entry .look {
+  border-left: 4px solid var(--rail-signoff); background: var(--panel);
+  border-top: 2px solid var(--border); border-right: 2px solid var(--border); border-bottom: 2px solid var(--border);
+  padding: 12px 14px; color: var(--body-ink);
+}
+html.skin-chaos .digest .intro { color: var(--dim); }
+html.skin-chaos .thumb { border: 2px solid var(--border); border-radius: 0; box-shadow: var(--row-shadow); }
+html.skin-chaos .thumb figcaption { border-top: 2px solid var(--border); background: var(--panel-thread); color: var(--dim); font-size: 11px; }
+html.skin-chaos .tail { color: var(--faint); font-size: 11px; }
+/* settled entries keep the plate but lose the light — never the contrast */
+html.skin-chaos .entry.settled .lede {
+  font-size: 11px; color: var(--dim);
+  background: linear-gradient(180deg, #2e2a55, #1e1b3c);
+}
+html.skin-chaos .entry.settled p.say { color: var(--dim); font-size: 14px; }
+html.skin-chaos .entry.settled .tail { color: var(--faint); }
+html.skin-chaos .closing { border-top: 2px solid var(--border); color: var(--dim); }
+
+@media (max-width: 1000px) {
+  /* 11px pixel type is ~11px per glyph: a 60-character lede is 700px wide and
+     wraps to three lines below about 800px of measure. The plate absorbs it,
+     but this is where the shape is most obviously carrying the skin. */
+  html.skin-chaos .entry .lede { font-size: 10px; line-height: 2; }
+}
 </style>
 </head>
 <body>
@@ -82,6 +134,7 @@
 <div class="mock-bar">
   <b>Option B</b> <span>The digest</span>
   <span class="grow"></span>
+  <span data-skin-toggle></span>
   <a href="index.html">← all options</a>
 </div>
 
@@ -214,11 +267,22 @@
     session to write real prose per unit (a bad summariser makes this shape worse than a table), and
     it is the worst for finding one specific card fast.
     <br><br>
-    <span class="label">In Chaos</span>
-    Paragraphs sit inside the JRPG dialogue frame — ink outline, bevel, gold plate on the lede — and
-    the verbs become the menu row at the bottom of the box (APPROVE / SEND BACK / LOOK). Body text
-    stays IBM Plex; Press Start 2P is used only for the lede and the verbs, which is the one place
-    it stays readable.
+    <span class="label">How it held up in Chaos — <span class="verdict-bad">does not survive intact</span></span>
+    This is the shape the skin fights, and it is worth saying plainly rather than papering over.
+    B's entire hierarchy is <em>one big soft sentence over smaller prose</em>. Chaos's display face
+    cannot set a sentence: at Calm's 23px, a 60-character lede is four lines of pixel type and the
+    page stops being readable at a glance. Held to <b>11px</b> — the product's own
+    <span class="mono">--size-h2</span> — it fits on one line, but it is now <em>smaller</em> than
+    the 15px paragraph beneath it, which inverts the exact hierarchy the shape is built on.
+    <br><br>
+    The only honest fix was to rebuild the lede's authority out of something other than size: it
+    becomes a <b>name plate</b> — header gradient, ink outline, bevel — sitting on top of its own
+    paragraph, which is a real JRPG pattern and does read. But that is a construction change, not a
+    costume: B is the only one of the four where Chaos alters what the thing <em>is</em>, and it
+    spends that change adding furniture to the option that was already the longest vertically.
+    <b>If you want B's words in Chaos</b>, the workable version is this page with the lede handed
+    back to the body face and no pixel type above 11px anywhere — a legitimate thing to pick, it
+    just means one surface where Chaos's display face never appears.
   </div>
 </div>
 

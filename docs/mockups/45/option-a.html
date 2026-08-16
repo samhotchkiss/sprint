@@ -1,11 +1,12 @@
 <!doctype html>
-<html lang="en" class="skin-calm">
+<html lang="en" class="skin-chaos">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Option A — One at a time · sprint mockups</title>
 <link rel="stylesheet" href="fonts/fonts.css">
 <link rel="stylesheet" href="mock.css">
+<script src="skin.js"></script>
 <style>
 /* ---- Option A: the surface IS the current decision ----------------------
    No list. One thing is on screen, at the size of a thing you are meant to
@@ -54,7 +55,7 @@
 .check p { font-size: 14px; line-height: 1.6; color: var(--body-ink); text-wrap: pretty; }
 .check.rest p { color: var(--faint); font-size: 13px; }
 
-.shot { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: #0a0b0d; }
+.shot { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--void); }
 .shot img { width: 100%; }
 .shot-foot {
   display: flex; align-items: center; gap: 10px; padding: 9px 12px;
@@ -79,7 +80,9 @@
 .after-row .what { font-size: 13.5px; color: var(--dim); text-wrap: pretty; }
 .after-row .when { font-family: var(--font-mono); font-size: 11px; color: var(--faint); }
 .after-row.is-merging .what { color: var(--faint); }
-.after-row.is-merging .nums { color: #4f5a52; }
+/* #4f5a52 is 2.7:1 on Calm's canvas — under the floor for 11.5px. The row
+   already says "merging" in words, so the numbers just go quiet, not dark. */
+.after-row.is-merging .nums { color: var(--faint); }
 .merging-tag { color: var(--good); font-family: var(--font-mono); font-size: 11px; }
 
 @media (max-width: 1000px) {
@@ -88,6 +91,60 @@
   .decision h2 { font-size: 25px; max-width: none; }
   .verdict .btn.approve, .verdict .btn.bounce { min-height: 44px; }
 }
+
+/* ---- A in Chaos ---------------------------------------------------------
+   This shape has exactly ONE thing to costume, and the costume fits: the
+   decision panel becomes the dialogue box. The headline is the only place the
+   pixel face is spent, and it is spent at 15px — the product's --size-claim,
+   not a 30px serif blown up. One sentence at 15px Press Start 2P is two lines
+   in a 34ch measure, which is the most this face can carry and still be read.
+   Everything under it stays in the body face, exactly as the product does. */
+
+html.skin-chaos .decision {
+  border: 2px solid var(--border);
+  border-left: 4px solid var(--rail-signoff);
+  box-shadow: var(--panel-shadow);
+  padding: 26px 28px 24px 28px;
+}
+html.skin-chaos .decision h2 {
+  font-size: 15px; line-height: 1.85; max-width: 34ch; letter-spacing: 0;
+  text-shadow: 0 2px 0 #0a0618;
+}
+html.skin-chaos .claim { font-size: 15px; line-height: 1.7; }
+html.skin-chaos .eyebrow .who {
+  font-family: var(--font-display); font-size: 8px; line-height: 1.9;
+  color: #0f2b14; background: linear-gradient(180deg, #9df0a8, #3fae5a);
+  border: 2px solid var(--border); padding: 5px 8px; box-shadow: var(--row-shadow);
+}
+html.skin-chaos .eyebrow { align-items: center; }
+html.skin-chaos .eyebrow .rest { color: var(--dim); }
+html.skin-chaos .checks { border-top: 2px solid var(--border); }
+html.skin-chaos .check .n {
+  border: 2px solid var(--border); background: linear-gradient(180deg, #2b2470, #1a1450);
+  color: var(--accent); width: 22px; height: 22px; font-size: 10px;
+  box-shadow: var(--row-shadow);
+}
+html.skin-chaos .shot { border: 2px solid var(--border); box-shadow: var(--row-shadow); }
+html.skin-chaos .shot-foot { border-top: 2px solid var(--border); background: var(--panel-thread); color: var(--dim); }
+html.skin-chaos .verdict { border-top: 2px solid var(--border); }
+/* the Calm rule paints a dark green tint over the button; Chaos wants the
+   full approve plate the product ships, so it is restated here */
+html.skin-chaos .verdict .btn.approve {
+  background: linear-gradient(180deg, #9df0a8, #3fae5a); color: #06210f; font-weight: 700;
+  border-color: var(--border-chip);
+  box-shadow: inset 1px 1px 0 #d6ffdd, inset -1px -1px 0 #1c6b31, 0 3px 0 #0a0618;
+}
+html.skin-chaos .verdict .tests { color: var(--good); }
+html.skin-chaos .after-row { border-top: 2px solid var(--border); }
+html.skin-chaos .after-row .what { color: var(--dim); }
+/* #4f5a52 is a grey; on purple it drops to 2.4:1, so merging steps to --faint,
+   which is the Chaos floor for anything at this size */
+html.skin-chaos .after-row.is-merging .nums { color: var(--faint); }
+html.skin-chaos .after-row.is-merging .what { color: var(--faint); }
+
+@media (max-width: 1000px) {
+  html.skin-chaos .decision h2 { font-size: 13px; max-width: none; }
+}
 </style>
 </head>
 <body>
@@ -95,6 +152,7 @@
 <div class="mock-bar">
   <b>Option A</b> <span>One at a time</span>
   <span class="grow"></span>
+  <span data-skin-toggle></span>
   <a href="index.html">← all options</a>
 </div>
 
@@ -208,11 +266,17 @@
     thirteen is thirteen screens. Approving is easy; noticing that two of the four touch the same
     file is not.
     <br><br>
-    <span class="label">In Chaos</span>
-    The panel becomes a gold-plated dialogue box with the hard bevel and ink outline, the claim
-    sets in Press Start 2P at ~15px (it is short enough to survive that face), and <b>After this</b>
-    renders as the JRPG party list down the side. Nothing about the shape changes — Chaos is a
-    costume, and this shape has exactly one thing to costume.
+    <span class="label">How it held up in Chaos — <span class="verdict-good">survives</span></span>
+    One decision on screen is one dialogue box, and a dialogue box is the most native object in this
+    whole vocabulary — the panel takes the 2px ink outline, the bevel and the signoff rail without
+    arguing. The headline is the only place the pixel face is spent and it is spent at <b>15px</b>,
+    the product's own <span class="mono">--size-claim</span>: at that size a 40-character sentence
+    is two lines in a 34ch measure, which is the most Press Start 2P can carry and still be
+    <em>read</em> rather than decoded. Everything below it — the claim, the check steps, After this
+    — stays in the body face, which is exactly what the product does. Nothing was resized to fit and
+    nothing was reconstructed. <b>What it cost:</b> at 980 the headline steps to 13px, and the
+    quiet After-this rows are thinner against purple than against Calm's near-black, because Calm's
+    grey for a merged card lands under 3:1 here and had to be re-cut from the lilac ramp.
   </div>
 </div>
 

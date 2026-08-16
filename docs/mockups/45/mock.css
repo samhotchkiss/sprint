@@ -1,10 +1,14 @@
 /* ===========================================================================
    Card #45 mockups — shared shell.
 
-   The token block below is copied VERBATIM from web/styles.css (the Calm skin),
-   so every colour, radius and face here is the product's own. Nothing else in
-   this file exists in the product: it is just enough page chrome to show one
-   surface — Awaiting review — in four different shapes.
+   The two token blocks below are copied VERBATIM from web/styles.css, so every
+   colour, radius and face here is the product's own. Nothing else in this file
+   exists in the product: it is just enough page chrome to show one surface —
+   Awaiting review — in four different shapes.
+
+   CHAOS IS THE PRIMARY SKIN. It is what loads first on every page; Calm is the
+   secondary view behind the toggle in the bar. The four shapes are the
+   question — the skin is the room they have to work in.
 
    No external requests: fonts are the board's own vendored woff2 (./fonts is a
    symlink to web/fonts), screenshots are downscaled copies of real evidence
@@ -15,6 +19,7 @@
 html.skin-calm {
   /* surfaces */
   --canvas: #0b0c0e;
+  --canvas-flat: #0b0c0e;
   --aside-bg: #0e1013;
   --head-bg: none;
   --panel: #101216;
@@ -99,7 +104,131 @@ html.skin-calm {
   --label-space: .06em;
   --display-case: none;
   --display-weight: 400;
+
+  /* mock-only: the two surfaces the product's page chrome doesn't have a token
+     for — a sunken well inside a panel, and the void behind a screenshot */
+  --well: #0d0f12;
+  --void: #08090b;
+  --well-line: var(--rule);
+  /* how much display face a shape may spend on running prose. Calm's display
+     is Instrument Serif, which sets a sentence happily; Chaos overrides it. */
+  --size-lede: 23px;
+  --lede-leading: 1.35;
+  --lede-face: var(--font-display);
+  --shot-radius: 8px;
 }
+
+/* ===========================================================================
+   CHAOS — the primary skin.
+
+   Token block copied VERBATIM from web/styles.css `html.skin-chaos`, plus the
+   same two mock-only surfaces. The shape rules under it are the mock-chrome
+   half of styles.css's own "Chaos — shape" section: 2px ink outline, bevel,
+   radius 0, and Press Start 2P held to the sizes the product holds it to.
+   =========================================================================== */
+
+html.skin-chaos {
+  /* surfaces */
+  --canvas: radial-gradient(120% 90% at 50% 0%, #1a1140 0%, #0d0820 70%);
+  --canvas-flat: #0d0820;   /* where a gradient cannot go (borders) */
+  --aside-bg: linear-gradient(180deg, #191340, #110c2a);
+  --head-bg: linear-gradient(180deg, #3a2f86 0%, #251d5e 55%, #1a1344 100%);
+  --panel: linear-gradient(180deg, #1e1846, #161132);
+  --panel-thread: linear-gradient(180deg, #191340, #110c2a);
+  --input: #100a26;
+  --chip: #100a26;
+  --hover: #241c52;
+  --scrim: rgba(6, 3, 20, .72);
+
+  /* lines — one ink outline, everywhere */
+  --rule: #0a0618;
+  --rule-row: #0a0618;
+  --border: #0a0618;
+  --border-chip: #0a0618;
+
+  /* ink */
+  --ink: #f0edfb;
+  --body-ink: #e6e1f7;
+  --dim: #b9b1e0;
+  --faint: #9c93d0;         /* 6.5:1 on the panel — the floor for 11–13px */
+  --meta: #9c93d0;          /* Calm can afford a third step down here; on purple
+                               it lands under 4.5:1, so Chaos stops at faint. */
+
+  /* meaning */
+  --accent: #f5c542;
+  --accent-hi: #ffe08a;
+  --good: #6ee07a;
+  --bad: #e2919e;
+  --approve: #9df0a8;
+  --approve-hi: #b8f7c0;
+  --warn: #ffb03a;
+  --phase-ink: #7dff8b;
+  --phase-bg: #0d1f18;
+  --phase-line: #0a0618;
+  --phase-late-ink: #ffc857;
+  --phase-late-bg: #2a1a06;
+  --phase-late-line: #0a0618;
+  --info: #8fb4ff;
+  --alt: #c79cff;
+  --rail-needs: #f5c542;
+  --rail-signoff: #3fae5a;
+  --seg-blocked: #4a3f8e;
+  --seg-queued: #2b2470;
+
+  /* voices in a thread */
+  --you-tint: #9db4ff;
+  --you-bg: linear-gradient(180deg, #2b2470, #1a1450);
+  --you-line: #0a0618;
+  --session-tint: #f5c542;
+  --session-bg: linear-gradient(180deg, #2e2a55, #1e1b3c);
+  --session-line: #0a0618;
+  --agent-tint: #6ee07a;
+  --agent-bg: linear-gradient(180deg, #1e1846, #161132);
+  --agent-line: #0a0618;
+
+  /* controls */
+  --send-bg: linear-gradient(180deg, #ffd964, #c9971f);
+  --send-fg: #2a1c02;
+  --send-hi: linear-gradient(180deg, #ffe58c, #e0aa25);
+  --on-bg: linear-gradient(180deg, #ffd964, #c9971f);
+  --on-fg: #2a1c02;
+
+  /* shape — nothing is round in a 16-bit game */
+  --radius: 0;
+  --radius-ctl: 0;
+  --radius-pill: 0;
+  --panel-shadow: inset 1px 1px 0 #524691, inset -1px -1px 0 #100b26, 0 3px 0 #0b0720;
+  --row-shadow: inset 1px 1px 0 #4a3f8e, inset -1px -1px 0 #100b26, 0 3px 0 #0b0720;
+  --plate: plateSheen 5s linear infinite;
+  --glow: goldEdge 2.6s ease-in-out infinite;
+  --flash: goldFlash 1.6s ease-in-out infinite;
+
+  /* type */
+  --font-display: 'Press Start 2P', 'Courier New', ui-monospace, monospace;
+  --font-body: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-label: var(--font-display);
+  --size-h1: 14px;
+  --size-h2: 11px;
+  --size-claim: 15px;
+  --label-size: 8px;
+  --label-space: .5px;
+  --display-case: none;
+  --display-weight: 400;
+
+  /* mock-only */
+  --well: #150f33;
+  --void: #0a0618;
+  --well-line: #0a0618;
+  /* Press Start 2P cannot set a sentence. A shape whose hierarchy depends on a
+     display-face lede has to spend it at 11px — the product's own h2 — or hand
+     the lede back to the body face. Both answers are visible in the options. */
+  --size-lede: 11px;
+  --lede-leading: 1.9;
+  --lede-face: var(--font-display);
+  --shot-radius: 0;
+}
+
 /* ---- base, lifted from the product ------------------------------------- */
 
 html, body { margin: 0; padding: 0; background: var(--canvas); }
@@ -173,16 +302,131 @@ img { display: block; max-width: 100%; }
 .mono { font-family: var(--font-mono); }
 .meta { font-family: var(--font-mono); font-size: 11.5px; color: var(--faint); }
 
-/* the note every option carries about the other skin */
+/* the note every option carries — what it is, what it trades, how it held up
+   in Chaos. The Chaos paragraph is a finding now, not a promise. */
 .chaos-note {
   margin-top: 54px; padding: 16px 18px;
   border: 1px solid var(--rule); border-radius: var(--radius);
-  background: #0d0f12; color: var(--faint); font-size: 13px; line-height: 1.65; max-width: 78ch;
+  background: var(--well); color: var(--faint); font-size: 13px; line-height: 1.65; max-width: 78ch;
 }
 .chaos-note b { color: var(--dim); font-weight: 500; }
 .chaos-note .label { display: block; margin-bottom: 7px; }
+.chaos-note .verdict-good { color: var(--good); }
+.chaos-note .verdict-bad { color: var(--warn); }
+
+/* ---- the skin toggle, in every bar -------------------------------------- */
+
+.skin-toggle { display: inline-flex; align-items: stretch; border: 1px solid var(--border-chip); border-radius: var(--radius-ctl); overflow: hidden; }
+.skin-toggle button {
+  background: none; border: 0; cursor: pointer;
+  padding: 4px 10px; font-family: var(--font-label); font-size: var(--label-size);
+  letter-spacing: var(--label-space); text-transform: uppercase; color: var(--faint);
+}
+.skin-toggle button:hover { color: var(--ink); }
+.skin-toggle button.is-on { background: var(--on-bg); color: var(--on-fg); }
+
+/* the CRT — a fixed overlay above everything, never in the way of a click */
+.scanlines { display: none; }
+html.skin-chaos .scanlines {
+  display: block; position: fixed; inset: 0; z-index: 100; pointer-events: none;
+  background: repeating-linear-gradient(180deg, rgba(0, 0, 0, .16) 0 1px, rgba(0, 0, 0, 0) 1px 3px);
+  mix-blend-mode: multiply;
+}
 
 @media (max-width: 1000px) {
   .page { padding: 20px 18px 80px 18px; }
   .mock-bar { padding: 9px 18px; gap: 10px; flex-wrap: wrap; }
+}
+
+/* ===========================================================================
+   CHAOS — shape (the mock-chrome half)
+
+   Same two drivers as the product's own Chaos section: a JRPG menu is a PLATE
+   (2px ink outline, bevel, no radius), and Press Start 2P is spent only where
+   it stays legible. Every 8–13px pair below is checked against the surface it
+   actually sits on, not against the canvas.
+   =========================================================================== */
+
+html.skin-chaos body { background: var(--canvas); background-attachment: fixed; }
+
+html.skin-chaos ::-webkit-scrollbar-thumb { background: #4a3f8e; border-radius: 0; border: 2px solid var(--canvas-flat); }
+html.skin-chaos ::-webkit-scrollbar-thumb:hover { background: #6455b8; }
+
+/* the bar is the header plate — --faint is 3.9:1 on its lightest stop, so
+   every resting label in it steps up to --dim, exactly as the product does */
+html.skin-chaos .mock-bar {
+  background: var(--head-bg);
+  border-bottom: 3px solid var(--rule);
+  box-shadow: inset 0 2px 0 #8b7ce0, inset 0 -2px 0 #120c30;
+  color: var(--dim);
+  font-family: var(--font-display);
+  font-size: 9px;
+  letter-spacing: .5px;
+  line-height: 1.9;
+  gap: 16px;
+}
+html.skin-chaos .mock-bar b { color: var(--accent); }
+html.skin-chaos .mock-bar a { color: var(--dim); font-family: var(--font-body); font-size: 12px; }
+html.skin-chaos .mock-bar a:hover { color: var(--ink); }
+html.skin-chaos .mock-bar .skin-toggle { border: 2px solid var(--border-chip); background: #1a1344; box-shadow: var(--row-shadow); }
+html.skin-chaos .skin-toggle button { color: var(--dim); padding: 6px 10px; line-height: 1.6; }
+html.skin-chaos .skin-toggle button + button { border-left: 2px solid var(--border-chip); }
+/* `html.skin-chaos .skin-toggle button` (one type + two classes) outranks
+   `.skin-toggle button.is-on`, so the selected label has to restate its own
+   colour or it goes lilac-on-gold at 1.9:1 — the same trap styles.css calls
+   out on .seg-btn.is-on. Caught it in the first Chaos screenshot. */
+html.skin-chaos .skin-toggle button.is-on,
+html.skin-chaos .skin-toggle button.is-on:hover { color: var(--on-fg); }
+
+/* Press Start 2P has no descender room to spare; a pixel face needs the extra
+   leading or two lines of a heading collide */
+html.skin-chaos .topline h1 { line-height: 1.8; letter-spacing: 0; max-width: 34ch; }
+html.skin-chaos .topline { align-items: center; gap: 16px; }
+html.skin-chaos .topline .sub { color: var(--dim); }
+html.skin-chaos .section-head h2 { line-height: 1.9; }
+html.skin-chaos .section-head { gap: 12px; align-items: center; }
+html.skin-chaos .rule { background: linear-gradient(90deg, #4a3f8e, transparent); height: 2px; }
+
+/* 8px pixel type is a LABEL and nothing else — it gets the ink step, never
+   --faint, because at 8px the face is one pixel wide per stroke */
+html.skin-chaos .label { color: var(--dim); line-height: 1.9; }
+
+html.skin-chaos .btn {
+  border: 2px solid var(--border-chip);
+  background: linear-gradient(180deg, #2b2470, #1a1450);
+  box-shadow: var(--row-shadow);
+  color: var(--ink);
+}
+html.skin-chaos .btn:hover { filter: brightness(1.18); border-color: var(--border-chip); }
+html.skin-chaos .btn.ghost { background: none; box-shadow: none; border-color: transparent; color: var(--dim); }
+html.skin-chaos .btn.ghost:hover { border-color: var(--border-chip); color: var(--ink); }
+html.skin-chaos .btn.approve {
+  background: linear-gradient(180deg, #9df0a8, #3fae5a); color: #06210f; border-color: var(--border-chip);
+  box-shadow: inset 1px 1px 0 #d6ffdd, inset -1px -1px 0 #1c6b31, 0 3px 0 #0a0618;
+}
+html.skin-chaos .btn.approve:hover { background: linear-gradient(180deg, #b8f7c0, #4fc46c); color: #06210f; }
+html.skin-chaos .btn.bounce { background: linear-gradient(180deg, #2b2470, #1a1450); color: var(--bad); }
+html.skin-chaos .btn.solid { background: var(--send-bg); color: var(--send-fg); box-shadow: inset 1px 1px 0 #fff3c4, inset -1px -1px 0 #8a6510, 0 3px 0 #0a0618; }
+
+html.skin-chaos .chaos-note {
+  border: 2px solid var(--border); background: var(--panel); box-shadow: var(--panel-shadow);
+  color: var(--dim); padding: 18px 20px;
+}
+html.skin-chaos .chaos-note b { color: var(--ink); }
+
+/* Chaos only — reached through --glow / --plate, which are `none` in Calm.
+   Copied verbatim from web/styles.css. */
+@keyframes goldEdge {
+  0%, 100% { box-shadow: inset 0 0 0 1px #f5c542, 0 0 14px rgba(245, 197, 66, .22); }
+  50%      { box-shadow: inset 0 0 0 1px #ffe08a, 0 0 20px rgba(245, 197, 66, .42); }
+}
+@keyframes plateSheen {
+  0%   { background-position: -220% 0; }
+  100% { background-position: 220% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+  /* A frozen sheen parks the plate at 220% (i.e. blank), so Chaos drops it. */
+  html.skin-chaos { --plate: none; --glow: none; --flash: none; }
 }

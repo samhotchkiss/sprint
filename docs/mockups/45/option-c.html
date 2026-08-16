@@ -1,11 +1,12 @@
 <!doctype html>
-<html lang="en" class="skin-calm">
+<html lang="en" class="skin-chaos">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Option C — Contact sheet · sprint mockups</title>
 <link rel="stylesheet" href="fonts/fonts.css">
 <link rel="stylesheet" href="mock.css">
+<script src="skin.js"></script>
 <style>
 /* ---- Option C: the evidence IS the row ---------------------------------
    You judge by looking. The screenshot is the primary object on screen and the
@@ -21,7 +22,7 @@
   border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
   background: var(--panel); display: block;
 }
-.tile .frame { position: relative; background: #08090b; border-bottom: 1px solid var(--rule); }
+.tile .frame { position: relative; background: var(--void); border-bottom: 1px solid var(--rule); }
 /* a contact sheet crops — every tile is the same window onto its evidence, so
    nothing wins the grid just by being a taller screenshot */
 .tile .frame img { width: 100%; display: block; aspect-ratio: 16 / 10; object-fit: cover; object-position: top left; }
@@ -43,7 +44,7 @@
 .strip { display: flex; gap: 6px; padding: 12px 16px 0 16px; }
 .strip img {
   width: 76px; height: 46px; object-fit: cover; object-position: top left;
-  border: 1px solid var(--border-chip); border-radius: 5px; background: #08090b;
+  border: 1px solid var(--border-chip); border-radius: 5px; background: var(--void);
 }
 .strip .more {
   display: grid; place-items: center; width: 46px; height: 46px;
@@ -54,7 +55,7 @@
 /* a unit is a bracket around the tiles that shipped together */
 .unit {
   border: 1px solid var(--border); border-left: 3px solid var(--rail-signoff);
-  border-radius: var(--radius); padding: 14px; background: #0d0f12;
+  border-radius: var(--radius); padding: 14px; background: var(--well);
 }
 .unit-head { display: flex; align-items: baseline; gap: 10px; padding: 2px 4px 13px 4px; }
 .unit-head .name { font-size: 13.5px; color: var(--dim); }
@@ -86,6 +87,55 @@
   .sheet > * { margin-bottom: 16px; }
   .tile .acts .btn { min-height: 44px; }
 }
+
+/* ---- C in Chaos ---------------------------------------------------------
+   The shape Chaos was waiting for. A contact sheet is already a grid of framed
+   objects, which is exactly what the skin turns everything into — the tiles
+   become inventory slots with the ink outline and the bevel, the badge becomes
+   the gold plate with the sheen crawling across it, and the unit bracket
+   becomes the party frame. Nothing had to be resized, because the only pixel
+   type on the page is the 8px badge and the 8px section label, which is what
+   Press Start 2P is FOR. The words were already captions; the pictures were
+   already carrying the meaning. */
+
+html.skin-chaos .tile { border: 2px solid var(--border); box-shadow: var(--row-shadow); }
+html.skin-chaos .tile .frame { border-bottom: 2px solid var(--border); }
+html.skin-chaos .tile .badge {
+  font-family: var(--font-display); font-size: 8px; line-height: 1.9; letter-spacing: .5px;
+  background: linear-gradient(90deg, #b8890f, #e0ad28 40%, #b8890f);
+  background-size: 220% 100%; animation: var(--plate);
+  border: 2px solid var(--border); color: #1f1500;
+  backdrop-filter: none; padding: 5px 8px; box-shadow: 0 2px 0 #0a0618;
+}
+html.skin-chaos .tile .cap p { color: var(--body-ink); }
+html.skin-chaos .tile .meta { color: var(--faint); font-size: 11px; }
+html.skin-chaos .strip img { border: 2px solid var(--border); border-radius: 0; }
+html.skin-chaos .strip .more {
+  border: 2px dashed #4a3f8e; border-radius: 0; color: var(--dim);
+  font-family: var(--font-display); font-size: 8px; line-height: 1.9;
+}
+html.skin-chaos .unit {
+  border: 2px solid var(--border); border-left: 4px solid var(--rail-signoff);
+  background: var(--panel-thread); box-shadow: var(--panel-shadow); padding: 12px;
+}
+/* 8px pixel type wraps hard in a narrow column, so the unit head gets its own
+   two rows rather than three things fighting over one line */
+html.skin-chaos .unit-head { flex-wrap: wrap; align-items: center; row-gap: 6px; }
+html.skin-chaos .unit-head .name {
+  font-family: var(--font-display); font-size: 8px; line-height: 1.9; color: var(--accent);
+  letter-spacing: .5px; flex-basis: 100%;
+}
+html.skin-chaos .unit-head .where { color: var(--faint); font-size: 11px; white-space: nowrap; }
+html.skin-chaos .unit .tile { background: linear-gradient(180deg, #211a48, #181233); }
+html.skin-chaos .tile.textonly .frame { background: var(--input); }
+html.skin-chaos .tile.textonly .frame p { color: var(--body-ink); }
+/* .58 opacity on purple takes the caption under 3:1 — Chaos dims a merged tile
+   with grayscale and a step of ink, never by fading the whole plate out */
+html.skin-chaos .tile.is-merging { opacity: 1; }
+html.skin-chaos .tile.is-merging .frame img { filter: grayscale(.75) brightness(.72); }
+html.skin-chaos .tile.is-merging .cap p { color: var(--faint); }
+html.skin-chaos .tile .merging-line { color: var(--good); font-size: 11px; }
+html.skin-chaos .annot { border: 2px dashed #4a3f8e; color: var(--dim); }
 </style>
 </head>
 <body>
@@ -93,6 +143,7 @@
 <div class="mock-bar">
   <b>Option C</b> <span>Contact sheet</span>
   <span class="grow"></span>
+  <span data-skin-toggle></span>
   <a href="index.html">← all options</a>
 </div>
 
@@ -225,11 +276,20 @@
     images — it is the most vertical space per decision, and a screenshot can look right while the
     thing behind it is wrong, so the check steps get demoted to a click.
     <br><br>
-    <span class="label">In Chaos</span>
-    Tiles get the ink outline and hard bevel and become inventory slots; the badge is a gold plate in
-    the corner; the bracket around a unit is the party frame. Because the pictures carry the meaning
-    and Chaos only restyles frames, this is the shape that survives the skin change with the least
-    translation work.
+    <span class="label">How it held up in Chaos — <span class="verdict-good">survives best</span></span>
+    A contact sheet is already a grid of framed objects, which is precisely what this skin turns
+    everything into — the product's own Chaos rule is that the reading column becomes a tile grid,
+    and C was born a tile grid. The tiles took the 2px outline and the bevel and became inventory
+    slots; the badge became the gold plate with the sheen crawling across it; the bracket around a
+    unit became the party frame. <b>Nothing was resized.</b> The only pixel type on the page is the
+    8px badge and the 8px section label — short, upper-case, on a plate — which is what Press Start
+    2P is <em>for</em>. The captions were already body text and the pictures were already carrying
+    the meaning, so the skin had nothing to fight over.
+    <br><br>
+    <b>What it cost:</b> one thing. Calm dims the merging tile with <span class="mono">opacity:
+    .58</span>; on purple that takes the caption under 3:1, so the merged tile keeps its full plate
+    and is dimmed by greyscaling the picture and stepping the caption ink instead. Same signal,
+    different mechanism.
   </div>
 </div>
 

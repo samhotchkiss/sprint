@@ -1,11 +1,12 @@
 <!doctype html>
-<html lang="en" class="skin-calm">
+<html lang="en" class="skin-chaos">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Awaiting review — four shapes · card #45</title>
 <link rel="stylesheet" href="fonts/fonts.css">
 <link rel="stylesheet" href="mock.css">
+<script src="skin.js"></script>
 <style>
   .lede { max-width: 74ch; font-size: 15px; line-height: 1.72; color: var(--body-ink); }
   .lede + .lede { margin-top: 13px; }
@@ -14,9 +15,9 @@
   .today {
     display: grid; grid-template-columns: 300px 1fr; gap: 26px; align-items: start;
     margin: 30px 0 8px 0; padding: 20px; border: 1px solid var(--rule); border-radius: var(--radius);
-    background: #0d0f12;
+    background: var(--well);
   }
-  .today img { border: 1px solid var(--border); border-radius: 8px; width: 100%; }
+  .today img { border: 1px solid var(--border); border-radius: var(--shot-radius); width: 100%; }
   .today ol { margin: 0; padding-left: 20px; color: var(--dim); font-size: 14px; line-height: 1.7; }
   .today li { margin-bottom: 7px; text-wrap: pretty; }
   .today li b { color: var(--ink); font-weight: 500; }
@@ -33,9 +34,16 @@
     font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .05em; text-transform: uppercase;
     color: var(--good); border: 1px solid #2f3f34; border-radius: var(--radius-pill); padding: 2px 8px;
   }
+  /* the shape that won the other skin still says so — the pick moved because
+     the room changed, not because the shape got worse */
+  .opt-head .tag.was { color: var(--faint); border-color: var(--border-chip); }
+  html.skin-chaos .opt-head .tag.was {
+    color: var(--dim); background: linear-gradient(180deg, #2b2470, #1a1450);
+    border-color: var(--border); box-shadow: 0 2px 0 #0a0618;
+  }
   .preview {
     height: 300px; overflow: hidden; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
-    background: #08090b; position: relative;
+    background: var(--void); position: relative;
   }
   .preview iframe {
     width: 1440px; height: 1000px; border: 0; transform: scale(.35); transform-origin: top left;
@@ -50,7 +58,7 @@
 
   .verdict-note {
     margin-top: 34px; padding: 20px 22px; border: 1px solid #2f3f34; border-radius: var(--radius);
-    background: #0e1210; max-width: 82ch;
+    background: var(--well); max-width: 82ch;
   }
   .verdict-note .label { display: block; margin-bottom: 10px; color: var(--approve); }
   .verdict-note p { font-size: 14.5px; line-height: 1.72; color: var(--body-ink); text-wrap: pretty; }
@@ -64,6 +72,62 @@
     .preview { height: 240px; }
     .preview iframe { transform: scale(.28); }
   }
+
+  /* ---- the index in Chaos --------------------------------------------- */
+  html.skin-chaos .lede { color: var(--body-ink); }
+  html.skin-chaos .lede em { color: var(--accent); }
+  html.skin-chaos .today {
+    border: 2px solid var(--border); background: var(--panel); box-shadow: var(--panel-shadow);
+  }
+  html.skin-chaos .today img { border: 2px solid var(--border); box-shadow: var(--row-shadow); }
+  html.skin-chaos .today ol { color: var(--body-ink); }
+  html.skin-chaos .today li b { color: var(--accent); font-weight: 500; }
+  html.skin-chaos .opt {
+    border: 2px solid var(--border); background: var(--panel); box-shadow: var(--panel-shadow);
+  }
+  html.skin-chaos .opt.pick { border-color: var(--rail-signoff); }
+  /* an option name is four words — the one length Press Start 2P is happy at */
+  html.skin-chaos .opt-head { align-items: center; padding: 14px 16px 12px 16px; }
+  html.skin-chaos .opt-head h3 { font-size: 11px; line-height: 1.9; letter-spacing: .5px; text-shadow: 0 2px 0 #0a0618; }
+  html.skin-chaos .opt-head .tag {
+    font-family: var(--font-display); font-size: 8px; line-height: 1.9; letter-spacing: .5px;
+    color: #0f2b14; background: linear-gradient(180deg, #9df0a8, #3fae5a);
+    border: 2px solid var(--border); border-radius: 0; padding: 4px 7px; box-shadow: 0 2px 0 #0a0618;
+  }
+  html.skin-chaos .preview { border-top: 2px solid var(--border); border-bottom: 2px solid var(--border); }
+  html.skin-chaos .opt-body p { color: var(--body-ink); }
+  html.skin-chaos .opt-body p.trade { color: var(--dim); }
+  html.skin-chaos .opt-body p b { color: var(--accent); }
+  html.skin-chaos .verdict-note {
+    border: 2px solid var(--border); border-left: 4px solid var(--rail-signoff);
+    background: var(--panel); box-shadow: var(--panel-shadow);
+  }
+  html.skin-chaos .verdict-note .label { color: var(--approve); }
+  html.skin-chaos .verdict-note p { color: var(--body-ink); }
+  html.skin-chaos .verdict-note p b { color: var(--accent); }
+  html.skin-chaos .how { color: var(--dim); }
+  html.skin-chaos .survives {
+    margin-top: 30px; border: 2px solid var(--border); background: var(--panel);
+    box-shadow: var(--panel-shadow);
+  }
+  .survives { margin-top: 30px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); overflow: hidden; }
+  .survives .label { display: block; padding: 15px 18px 4px 18px; }
+  .survives table { width: 100%; border-collapse: collapse; }
+  .survives td, .survives th { text-align: left; padding: 11px 18px; border-top: 1px solid var(--rule-row); vertical-align: top; }
+  .survives th { font-family: var(--font-label); font-size: var(--label-size); letter-spacing: var(--label-space); text-transform: uppercase; color: var(--faint); font-weight: 400; }
+  html.skin-chaos .survives th { color: var(--dim); line-height: 1.9; }
+  .survives td.who { white-space: nowrap; color: var(--ink); font-size: 13.5px; }
+  .survives td.verdict-cell { white-space: nowrap; font-family: var(--font-mono); font-size: 11.5px; }
+  html.skin-chaos .survives td.verdict-cell { font-size: 11px; }
+  .survives td.why { font-size: 13.5px; color: var(--dim); line-height: 1.6; text-wrap: pretty; }
+  html.skin-chaos .survives td.why { color: var(--body-ink); }
+  .survives .ok { color: var(--good); }
+  .survives .cost { color: var(--warn); }
+  html.skin-chaos .survives td, html.skin-chaos .survives th { border-top: 2px solid var(--border); }
+  @media (max-width: 1000px) {
+    .survives td, .survives th { padding: 10px 14px; }
+    .survives td.who { white-space: normal; }
+  }
 </style>
 </head>
 <body>
@@ -71,6 +135,7 @@
 <div class="mock-bar">
   <b>Card #45</b> <span>Awaiting review — four shapes</span>
   <span class="grow"></span>
+  <span data-skin-toggle></span>
   <span>mockups only · nothing here is wired to the board</span>
 </div>
 
@@ -85,6 +150,12 @@
     is filled with the real work sitting on your board right now: the six design-core cards, the two
     cards on <span class="mono">sprint/card-32</span>, #29 and #31 on their own, and #30 which you
     already approved and is merging.</p>
+  <p class="lede">You said you live on the <em>Chaos</em> board on desktop, so Chaos is what every
+    page here loads in — the real radial canvas, the panel and row gradients, the 2px ink outlines,
+    the bevels, radius zero, Press Start 2P and the gold plate, all lifted verbatim out of
+    <span class="mono">web/styles.css</span>. Calm is behind the toggle in the bar if you want the
+    other read. The question is still which <em>shape</em>; the skin is just the room it has to work
+    in — and one of the four does not fit the room. That is noted below.</p>
   <p class="lede">Pick one, or pick pieces — “B's words with D's keyboard” is a legitimate answer.</p>
 
   <div class="today">
@@ -135,8 +206,8 @@
       </div>
     </div>
 
-    <div class="opt pick">
-      <div class="opt-head"><h3>B · The digest</h3><span class="tag">my pick</span></div>
+    <div class="opt">
+      <div class="opt-head"><h3>B · The digest</h3><span class="tag was">my pick in Calm</span></div>
       <div class="preview">
         <iframe src="option-b.html" title="Option B preview" scrolling="no" tabindex="-1"></iframe>
         <a class="cover" href="view.html?o=option-b.html&amp;w=1440" aria-label="open Option B"></a>
@@ -156,8 +227,8 @@
       </div>
     </div>
 
-    <div class="opt">
-      <div class="opt-head"><h3>C · Contact sheet</h3></div>
+    <div class="opt pick">
+      <div class="opt-head"><h3>C · Contact sheet</h3><span class="tag">my pick in Chaos</span></div>
       <div class="preview">
         <iframe src="option-c.html" title="Option C preview" scrolling="no" tabindex="-1"></iframe>
         <a class="cover" href="view.html?o=option-c.html&amp;w=1440" aria-label="open Option C"></a>
@@ -200,22 +271,68 @@
 
   </div>
 
-  <div class="verdict-note">
-    <span class="label">If it were mine</span>
-    <p><b>B at rest, A when you decide.</b> The list is the digest — paragraphs you can read straight
-      down, no counts leading anything — and “Review next” opens exactly the one-at-a-time surface in
-      A. That gets you the overview and the undivided decision without the two controls fighting,
-      because they become one thing: the list is for reading, the panel is for deciding.</p>
-    <p>C is the strongest single answer if most of what you approve is UI, and it is the shape that
-      Chaos costumes best. D is the right answer only if the queue is routinely ten or more deep —
-      today it is four, and dense-and-fast is solving a problem you do not have.</p>
+  <div class="survives">
+    <span class="label">How each shape held up in Chaos</span>
+    <table>
+      <tr><th>Shape</th><th>Verdict</th><th>What the skin did to it</th></tr>
+      <tr>
+        <td class="who">A · One at a time</td>
+        <td class="verdict-cell ok">survives</td>
+        <td class="why">One panel is one dialogue box, which is the most native thing in the whole
+          vocabulary. The headline is the only pixel type and it is spent at 15px — the product's own
+          claim size — so it stays a sentence you read rather than a sign you decode.</td>
+      </tr>
+      <tr>
+        <td class="who">B · The digest</td>
+        <td class="verdict-cell cost">does not survive intact</td>
+        <td class="why">B's hierarchy is a big soft lede over smaller prose, and Press Start 2P
+          cannot set a sentence: at Calm's 23px a 60-character lede is four lines of pixel type. Held
+          to 11px it fits, but the lede is now smaller than the paragraph beneath it — the hierarchy
+          inverts. The only fix was to rebuild the lede's authority as a name plate, which is real
+          construction change, not a costume, and it adds furniture to the longest shape.</td>
+      </tr>
+      <tr>
+        <td class="who">C · Contact sheet</td>
+        <td class="verdict-cell ok">survives best</td>
+        <td class="why">A grid of framed pictures is what this skin turns everything into anyway.
+          Tiles became inventory slots, the badge became the gold plate with the sheen, the unit
+          bracket became the party frame. Nothing was resized: the only pixel type on the page is the
+          8px badge and the 8px label, which is what the face is for.</td>
+      </tr>
+      <tr>
+        <td class="who">D · Inbox</td>
+        <td class="verdict-cell ok">survives, on one condition</td>
+        <td class="why">Density is D's only advantage and per-row plates would have cost it — a 2px
+          outline plus a 3px bevel on each of thirteen rows is a stack of buttons. The list had to
+          become one plate with ink rules inside it, which is what a 16-bit item menu actually is.
+          What it does cost: dimming. Calm greys a merged row; on purple, grey drops under 3:1, so
+          every quiet state is re-cut from the lilac ramp and the live/settled gap is thinner.</td>
+      </tr>
+    </table>
   </div>
 
-  <p class="how">All four run on the board's own Calm tokens and vendored fonts — no external
-    requests, no CDN. Every claim, check step, test count, card number and branch name on these
-    pages is real, lifted from the evidence packets on the live board; the screenshots are the real
-    attachments, downscaled. Nothing here is wired to anything: the buttons do not post verdicts.
-    Chaos translation is noted at the bottom of each option page.</p>
+  <div class="verdict-note">
+    <span class="label">If it were mine</span>
+    <p><b>B at rest, A when you decide</b> — that was my read in Calm, and Chaos changes it. B is the
+      one shape the skin damages: the sentence-as-headline is the whole idea, and this display face
+      cannot set a sentence. If you live in Chaos, the honest recommendation flips to
+      <b>C at rest, A when you decide</b> — the contact sheet is the shape the skin was already
+      built for, and “Review next” still opens A's one-at-a-time panel. You keep the undivided
+      decision and lose nothing but the prose.</p>
+    <p>If you would rather keep B's words, the workable version is B's paragraphs with the lede
+      handed back to the body face — no pixel type above 11px anywhere. That is a legitimate answer
+      to pick; it just means Chaos gets one surface where the display face does not appear.</p>
+    <p>D remains the right answer only if the queue is routinely ten or more deep. Today it is four,
+      and dense-and-fast solves a problem you do not have yet.</p>
+  </div>
+
+  <p class="how">Every page here runs on the board's own tokens — both blocks copied verbatim out of
+    <span class="mono">web/styles.css</span> — and the board's own vendored fonts. No external
+    request, no CDN. Every claim, check step, test count, card number and branch name is real, lifted
+    from the evidence packets on the live board; the screenshots are the real attachments,
+    downscaled. Nothing here is wired to anything: the buttons do not post verdicts. Every 8–13px
+    pairing was checked against the surface it actually sits on — on purple, Calm's greys fall under
+    4.5:1, so anything small was re-cut from the skin's own ramp rather than carried over.</p>
 </div>
 
 </body>
