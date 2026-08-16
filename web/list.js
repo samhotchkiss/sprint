@@ -9,6 +9,7 @@ import {
   sections, meterSegments, cardState, needsKind, motionState, blockedReason,
   waitingMark, isStuck, BLOCKED_NOTE,
 } from './state.js';
+import { phaseChip } from './phase.js';
 import { renderMeter } from './meter.js';
 import { renderDone } from './done.js';
 import { reviewBlock } from './review.js';
@@ -148,9 +149,13 @@ export function motionRow(card, app) {
   row.appendChild(h('span.row-main',
     h('span.row-title', card.title),
     last ? h('span.row-sub', last) : null));
+  // A live phase takes the label slot: it is the same information the plain
+  // "active · 4m" was trying to convey, except it says what the agent is DOING
+  // and its clock is the phase's own, not the age of the last thing typed.
+  const chip = st.phase ? phaseChip(card, { ph: st.phase }) : null;
   row.appendChild(h('span.row-prog', { title: st.title },
     h('span.prog-track', h('span.prog-fill', { style: { width: st.pct + '%', background: st.color } })),
-    h('span.prog-label', { style: { color: st.color } }, st.label)));
+    chip || h('span.prog-label', { style: { color: st.color } }, st.label)));
   row.appendChild(h('span.row-agent', shortAgent(card.agent_name)));
   return row;
 }
@@ -158,6 +163,9 @@ export function motionRow(card, app) {
 function lastAction(card, app) {
   const ev = card.last_event;
   if (!ev || ev.kind === 'agent_silent') return '';
+  // The chip already says "testing · 2m" — repeating "phase: testing" under the
+  // title would spend the only free line on the row saying it twice.
+  if (ev.payload && ev.payload.phase) return '';
   return firstLine(app.eventText(ev), 160);
 }
 

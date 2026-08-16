@@ -1,6 +1,7 @@
 // The client-side projection of the board. Tolerant normalizers: the server owns the
 // truth, we only ever *display* it, so unknown/missing fields degrade instead of throwing.
 import { age, firstLine, ms } from './util.js';
+import { phaseOf } from './phase.js';
 
 export const SILENT_MS = 5 * 60 * 1000;   // spec: 5 minutes with no worker event
 
@@ -27,14 +28,18 @@ export const COLUMNS = [
     key: 'needs_you',
     title: 'Needs you',
     board: 'Needs you',
-    states: ['needs_you', 'ready', 'integrating'],
+    // `integrating` is NOT here. User, verbatim: "Why do these cards stay in
+    // 'needs you' once they're already approved?" — the moment you approve, the
+    // card is the session's job, not yours. It runs in In motion as `merging`.
+    states: ['needs_you', 'ready'],
     dot: 'var(--accent)',
   },
   {
     key: 'in_motion',
     title: 'In motion',
     board: 'In progress',
-    states: ['triaging', 'in_progress'],
+    // `integrating` is work being done BY the session — a phase like any other.
+    states: ['triaging', 'in_progress', 'integrating'],
     dot: 'var(--good)',
   },
   {
@@ -200,6 +205,11 @@ export function normCard(c) {
     // in the tab).
     stuck: !!c.stuck,
     state_since: c.state_since || c.updated_at || null,
+    // What the agent says it is doing right now, and for how long it expects to
+    // be doing it. Projected by the server from the event log.
+    phase: c.phase || null,
+    phase_since: c.phase_since || null,
+    phase_expected_seconds: c.phase_expected_seconds != null ? num(c.phase_expected_seconds) : null,
   };
 }
 
@@ -365,6 +375,11 @@ export function applyEvents(events) {
         const before = card.state;
         card.state = to;
         card.state_since = ev.ts || card.state_since;
+        // A card that moved on is not still testing. Same rule the server
+        // projects with, applied live so the chip never outlives its state.
+        card.phase = null;
+        card.phase_since = null;
+        card.phase_expected_seconds = null;
         if (to !== 'needs_you') card.question = null;
         if (ev.payload.reason) card.reason = ev.payload.reason;
         if (before !== to) card.stuck = false;   // it moved: the sweep re-arms
@@ -390,6 +405,13 @@ export function applyEvents(events) {
       // only thing that proves somebody dealt with it.
       card.stuck = true;
     }
+    if (ev.payload && typeof ev.payload.phase === 'string' && ev.payload.phase.trim()) {
+      // A phase-carrying event is the newest word on what is happening now.
+      card.phase = ev.payload.phase.trim();
+      card.phase_since = ev.ts || Date.now() / 1000;
+      const exp = Number(ev.payload.expected_seconds);
+      card.phase_expected_seconds = exp > 0 ? exp : null;
+    }
     if (ev.actor === 'worker' || ev.actor === 'session' || ev.actor === 'user') {
       card.last_activity_at = ev.ts || card.last_activity_at;
       if (ev.actor === 'worker') card.silent = false;
@@ -411,6 +433,11 @@ export function isSilent(card, now = Date.now()) {
   const st = cardState(card);
   if (st !== 'in_progress' && st !== 'triaging') return false;
   if (card.long_running) return false;
+  // A phase still inside the time it claimed is not silence — the agent said in
+  // advance that this stretch would be quiet. Same rule the server's timer uses;
+  // this is the browser agreeing with it between board fetches.
+  const ph = phaseOf(card, now);
+  if (ph && ph.expectMs && !ph.overdue) return false;
   if (card.silent === true) return true;
   const t = ms(card.last_activity_at);
   if (t == null) return false;
@@ -481,7 +508,8 @@ export const BOARD_COLUMNS = [
     board: 'In progress',
     dot: 'var(--good)',
     empty: 'No agent is running.',
-    sections: [{ key: 'in_motion', label: null, states: ['triaging', 'in_progress'] }],
+    sections: [{ key: 'in_motion', label: null,
+                 states: ['triaging', 'in_progress', 'integrating'] }],
   },
   {
     key: 'needs_you',
@@ -496,7 +524,9 @@ export const BOARD_COLUMNS = [
     dot: 'var(--good)',
     empty: 'Nothing to review.',
     sections: [
-      { key: 'awaiting', label: 'Awaiting review', states: ['ready', 'integrating'] },
+      // Awaiting review means awaiting YOU. An approved card is merging, and
+      // it does that over in In progress until it lands in Complete.
+      { key: 'awaiting', label: 'Awaiting review', states: ['ready'] },
       {
         key: 'complete',
         label: 'Complete',
@@ -588,6 +618,12 @@ export function needsKind(card) {
  * the server's own agent_silent timer. Full bar = just heard from it; empty bar
  * = the session is about to go check on it. Long jobs suppress the drain, since
  * silence there is expected and the amber would be a lie.
+ *
+ * A DECLARED PHASE replaces all of that guessing while it is live: the label is
+ * the phase and its own clock ("testing · 2m"), and the bar drains over the time
+ * the agent said the phase would take. Amber only once the phase itself runs
+ * past what it claimed — which is the whole point of card #32: a working card
+ * must not look broken.
  */
 export function motionState(card, now = Date.now()) {
   const st = cardState(card);
@@ -595,6 +631,27 @@ export function motionState(card, now = Date.now()) {
   const since = ms(card.last_activity_at);
   const elapsed = since == null ? SILENT_MS : Math.max(0, now - since);
   let pct = Math.round(100 * (1 - Math.min(1, elapsed / SILENT_MS)));
+
+  // Approved, and the session is doing the git work. It is not a decision you
+  // owe anybody — it is a job running, with a name for what it is doing.
+  if (st === 'integrating') {
+    return { key: 'merging', label: 'merging', color: 'var(--good)', pct: 100,
+      title: 'you approved it — the session is rebasing, gating and merging the branch' };
+  }
+  // A declared phase outranks the recency bar's guesswork: it says what is
+  // happening now, on its own clock, and the bar drains over the time the agent
+  // said it would take instead of over the generic five-minute window.
+  const ph = phaseOf(card, now);
+  if (ph) {
+    return {
+      key: ph.overdue ? 'phase-late' : 'phase',
+      label: ph.text,
+      color: ph.overdue ? 'var(--warn)' : 'var(--good)',
+      pct: ph.overdue ? 0 : Math.max(6, Math.round(100 * ph.left)),
+      title: ph.title,
+      phase: ph,
+    };
+  }
 
   if (card.long_running) {
     return { key: 'long', label: 'long job', color: 'var(--info)', pct: 100,

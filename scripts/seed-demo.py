@@ -91,6 +91,27 @@ def event(num, kind, text, detail=None, actor=None):
     call("POST", "/api/cards/%d/events" % num, body)
 
 
+def phase(num, name, expect=None):
+    """Declare a phase — what the agent is doing right now, on its own clock.
+
+    The board renders this as a chip on the card face ("testing · 2m") instead
+    of the last thing anybody typed, and holds off its silence timer for as long
+    as the phase claimed it would take.
+    """
+    payload = {"phase": name,
+               "text": "phase: %s%s" % (name, " (expect ~%ds)" % expect if expect else "")}
+    if expect:
+        payload["expected_seconds"] = expect
+    call("POST", "/api/cards/%d/events" % num, {"kind": "progress", "payload": payload})
+
+
+def verdict(num, kind, notes=None):
+    body = {"verdict": kind}
+    if notes:
+        body["notes"] = notes
+    call("POST", "/api/cards/%d/verdict" % num, body)
+
+
 def ask(num, text, options=None):
     body = {"text": text}
     if options:
@@ -240,11 +261,18 @@ def main():
           "styles/tokens.css: --toolbar-fg (3.8:1), --toolbar-muted (2.9:1), "
           "--toolbar-icon (4.1:1).")
     event(n131, "progress", "Swapped the toolbar tokens; re-running the contrast check.")
+    # Healthy: a phase well inside the time it claimed. The face reads
+    # "testing · Nm" in green, and the silence timer stays off its back.
+    phase(n131, "testing", expect=900)
 
     n132 = submit("Stripe webhook retries double-charge when we answer 409.")
     assign(n132, "sprint-card-132", "sprint/132-webhook-409", "Webhook retries double-charge")
     state(n132, "in_progress")
     event(n132, "progress", "Reproducing the double-charge against the sandbox key.")
+    # Overdue on purpose: a one-minute claim that will be past due by the time
+    # anybody looks, so the demo board shows the amber face as well as the green
+    # one — "testing · 6m (expected 1m)".
+    phase(n132, "reproducing", expect=60)
 
     n133 = submit("Run a full regression sweep before we cut the release.")
     assign(n133, "sprint-card-133", "sprint/133-regression", "Full regression sweep")
@@ -255,6 +283,10 @@ def main():
     event(n133, "progress", "Suite at 780/1204 — no failures yet.",
           "The suite takes about 45 minutes end to end. I post a count every few hundred "
           "tests so the gap never looks like a hang.")
+
+    # Approved, and now the session's problem rather than yours: it leaves Needs
+    # you and runs in In motion as `merging` until the branch actually lands.
+    verdict(n136, "approve")
 
     n144 = submit("Dark mode: the drawer scrim is too dark to read through.")
     assign(n144, "sprint-batch-7", "sprint/batch-7-css", "Drawer scrim too dark")

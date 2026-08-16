@@ -16,6 +16,7 @@
 // it is for actually changed.
 import { h, clear, reconcile } from './util.js';
 import { store, cardState, isSilent, draft, attachedImages } from './state.js';
+import { phaseOf, phaseChip } from './phase.js';
 import { renderThread, renderChat } from './thread.js';
 import { initCompose } from './compose.js';
 import { flowBarSig, reviewBar } from './review.js';
@@ -116,7 +117,11 @@ function barSig(card) {
 
 function headSig(detail, card) {
   if (!card) return 'loading:' + detail.num;
-  return [detail.num, card.title, cardState(card), card.pinned ? 'p' : ''].join('|');
+  // The phase (and whether it has run past what it claimed) is part of the head
+  // now, so it has to be part of what makes the head repaint.
+  const ph = phaseOf(card);
+  return [detail.num, card.title, cardState(card), card.pinned ? 'p' : '',
+    ph ? `${ph.name}@${ph.since}${ph.overdue ? '!' : ''}` : ''].join('|');
 }
 
 function composerSig(card) {
@@ -152,6 +157,10 @@ function cardHead(detail, card, app) {
   const head = h('div.rail-head');
   head.appendChild(h('span.rail-num', '#' + detail.num));
   head.appendChild(h('span.rail-title', { title: card ? card.title : '' }, card ? card.title : 'Loading…'));
+  // The same chip the card face carries: opening a card should not cost you the
+  // one line that says what its agent is doing right now.
+  const chip = card ? phaseChip(card) : null;
+  if (chip) head.appendChild(chip);
   if (card) head.appendChild(cardMenu(card, state, app));
   head.appendChild(h('button.rail-close', {
     type: 'button', onclick: () => app.closeCard(),

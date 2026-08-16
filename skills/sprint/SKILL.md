@@ -482,7 +482,8 @@ thinks it's a continuation.
 ## 5. `agent_silent` — investigate, don't just re-nudge
 
 The server already did the timing math (5 minutes, no worker event,
-`long_running` not set) — by the time you see this event, act:
+`long_running` not set, and no declared phase still inside the time it
+claimed) — by the time you see this event, act:
 
 1. `SendMessage` the agent by name — a plain ping ("status?") lands on
    its next turn if it's alive, or you'll notice it never responds.
@@ -493,7 +494,10 @@ The server already did the timing math (5 minutes, no worker event,
    just amber silently with no explanation attached.
 4. Act on what you found:
    - Legitimately still working, just forgot to flag it → tell it to
-     `sprint-post ... --long-running` from here on, and let it continue.
+     declare phases (`sprint-post <num> phase "testing" --expect 300`)
+     from here on, and `--long-running` for a genuinely long job. A
+     phase both explains the quiet stretch on the card face and holds
+     the timer off for exactly as long as it said it needed.
    - Wedged/crashed → restart it: same agent name, fresh dispatch, prior
      transcript context if available, told explicitly to re-verify
      worktree state before continuing (same caution as resume, step 7 —

@@ -403,6 +403,42 @@ def one_line(text, limit: int = ONE_LINER_MAX) -> str:
     return s if len(s) <= limit else s[:limit - 1].rstrip() + "…"
 
 
+# A phase is a short word for what is happening right now ("testing",
+# "capturing evidence"). Free-form on purpose — a worker knows its own work
+# better than a fixed enum does — but it renders in a chip on a card face, so
+# it is one short line or it is nothing.
+PHASE_MAX = 40
+PHASE_EXPECT_MAX = 24 * 3600.0
+RECOMMENDED_PHASES = ("reading", "coding", "testing", "capturing evidence",
+                      "assembling packet", "waiting")
+
+
+def clean_phase(payload: dict) -> dict:
+    """Normalize `phase` / `expected_seconds` on an incoming event payload.
+
+    Anything unusable is a 400 naming the field rather than a phase the board
+    would render as an empty chip or a clock that never runs out.
+    """
+    if not isinstance(payload, dict) or "phase" not in payload:
+        return payload
+    phase = payload.get("phase")
+    if not isinstance(phase, str) or not phase.strip():
+        raise ApiError(400, "bad_phase", "phase must be a non-empty string",
+                       field="phase")
+    payload = dict(payload)
+    payload["phase"] = one_line(phase, PHASE_MAX)
+    exp = payload.get("expected_seconds")
+    if exp is not None:
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)) \
+                or exp <= 0 or exp > PHASE_EXPECT_MAX:
+            raise ApiError(400, "bad_expected_seconds",
+                           "expected_seconds must be a positive number of "
+                           "seconds no greater than %d" % PHASE_EXPECT_MAX,
+                           field="expected_seconds")
+        payload["expected_seconds"] = float(exp)
+    return payload
+
+
 def find_project_root(start: str = None) -> str:
     start = os.path.realpath(start or os.getcwd())
     try:
@@ -877,6 +913,13 @@ class App:
         stp = jload(st["payload"], {}) if st else {}
         out["state_since"] = st["ts"] if st else row["updated_at"]
         out["reason"] = stp.get("reason") if stp.get("to") == row["state"] else None
+        # What the agent says it is DOING right now, on its own clock. A card
+        # face that shows the last thing said reads as broken the moment that
+        # line is three minutes old; a phase reads as working.
+        ph = self.card_phase(num, st["seq"] if st else 0)
+        out["phase"] = ph["phase"] if ph else None
+        out["phase_since"] = ph["since"] if ph else None
+        out["phase_expected_seconds"] = ph["expected_seconds"] if ph else None
         err = self.q1("SELECT * FROM events WHERE card_num=? AND kind='error' "
                       "ORDER BY seq DESC LIMIT 1", (num,))
         out["error"] = (jload(err["payload"], {}) or {}).get("text") if err else None
@@ -1156,6 +1199,58 @@ class App:
         self.conn.execute("UPDATE cards SET state=?, updated_at=? WHERE num=?",
                           (to_state, now(), num))
 
+    # -- phases -----------------------------------------------------------
+    #
+    # A worker declares a PHASE at every stretch of work — reading, coding,
+    # testing, capturing evidence, assembling packet. It is not a status line
+    # (which goes stale the second it is written) but a claim about what is
+    # happening NOW, with its own clock and, optionally, how long it should
+    # take. The user's ruling: "these states need to be better so it doesn't
+    # look like everything is broken when it's not."
+    #
+    # It is a PROJECTION of the log, never a column: the latest phase-carrying
+    # event since the card's last transition. Changing state ends the phase by
+    # construction — a card that moved on is not still "testing".
+
+    def card_phase(self, num: int, since_seq: int = None):
+        """The card's live phase, or None. `since_seq` is the last `state`
+        event's seq (card_json already has it; everyone else may pass None)."""
+        if since_seq is None:
+            st = self.q1("SELECT seq FROM events WHERE card_num=? AND kind='state' "
+                         "ORDER BY seq DESC LIMIT 1", (num,))
+            since_seq = int(st["seq"]) if st is not None else 0
+        rows = self.q(
+            "SELECT seq, ts, payload FROM events WHERE card_num=? AND seq>? "
+            "AND payload LIKE '%\"phase\"%' ORDER BY seq DESC LIMIT 8", (num, since_seq))
+        for row in rows:
+            payload = jload(row["payload"], {}) or {}
+            phase = payload.get("phase")
+            if not isinstance(phase, str) or not phase.strip():
+                continue
+            exp = payload.get("expected_seconds")
+            return {
+                "phase": phase.strip(),
+                "since": row["ts"],
+                "expected_seconds": float(exp) if isinstance(exp, (int, float))
+                                    and not isinstance(exp, bool) and exp > 0 else None,
+            }
+        return None
+
+    def phase_shields(self, num: int, row=None) -> bool:
+        """True while a declared phase is still inside the time it claimed.
+
+        Declaring "testing, expect 10 minutes" IS an act of liveness: it says
+        in advance that the next stretch is quiet on purpose, which is exactly
+        what the five-minute timer cannot otherwise know. The shield lasts
+        exactly as long as the claim — once the expected time is up with no new
+        word, the card ambers on the normal rule. A phase with no `--expect`
+        shields nothing; the default clock is the promise you didn't make.
+        """
+        ph = self.card_phase(num)
+        if not ph or not ph["expected_seconds"]:
+            return False
+        return (now() - float(ph["since"])) < ph["expected_seconds"]
+
     # -- liveness ---------------------------------------------------------
 
     def card_baseline(self, num: int, row=None):
@@ -1206,7 +1301,9 @@ class App:
         if row is None or row["state"] != "in_progress" or row["long_running"]:
             return False
         ts, _seq = self.card_baseline(num)
-        return (now() - ts) >= self.silence_seconds
+        if (now() - ts) < self.silence_seconds:
+            return False
+        return not self.phase_shields(num, row)
 
     def _silence_loop(self):
         while not self.stopping.wait(self.silence_tick):
@@ -1226,10 +1323,16 @@ class App:
                 continue
             if self.silence_notified(num, seq):
                 continue  # one event per silence episode
+            # A phase that is still inside the time it claimed is not silence:
+            # the agent told us in advance this stretch would be quiet.
+            if self.phase_shields(num):
+                continue
             with self.lock:
                 # re-check under lock (a worker event may have just landed)
                 ts2, seq2 = self.card_baseline(num)
                 if (now() - ts2) < self.silence_seconds or self.silence_notified(num, seq2):
+                    continue
+                if self.phase_shields(num):
                     continue
                 self.conn.execute("BEGIN IMMEDIATE")
                 try:
@@ -1840,6 +1943,7 @@ class App:
         self.card_row(num)
         if not isinstance(payload, dict):
             payload = {"text": payload if isinstance(payload, str) else jdump(payload)}
+        payload = clean_phase(payload)
         if long_running is None:
             long_running = payload.get("long_running")
         with self.lock:

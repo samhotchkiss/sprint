@@ -52,12 +52,6 @@ class Base(unittest.TestCase):
     WAITER_PERSIST = 5.0
     SSE_HEARTBEAT = 15.0
     START_BACKGROUND = False
-    # None == production defaults (the staleness sweep never fires inside a
-    # test that didn't ask for it). TestStaleSweep shrinks them to seconds.
-    SWEEP_TICK = None
-    SWEEP_THRESHOLDS = None
-    SWEEP_BACKOFF = None
-    SWEEP_MAX_REMINDERS = None
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="sprintd-test-")
@@ -77,10 +71,6 @@ class Base(unittest.TestCase):
             waiter_gone_seconds=self.WAITER_GONE,
             waiter_persist_seconds=self.WAITER_PERSIST,
             sse_heartbeat=self.SSE_HEARTBEAT,
-            sweep_tick=self.SWEEP_TICK,
-            sweep_thresholds=self.SWEEP_THRESHOLDS,
-            sweep_backoff=self.SWEEP_BACKOFF,
-            sweep_max_reminders=self.SWEEP_MAX_REMINDERS,
         )
         self.httpd = sprintd.make_server(self.app, "127.0.0.1", 0)
         self.host, self.port = self.httpd.server_address[0], self.httpd.server_address[1]
@@ -1141,314 +1131,6 @@ class TestSilenceTimer(Base):
             time.sleep(0.3)
         self.assertEqual(len(self._wait_for_silent(mine)), 1,
                          "a different agent's chatter must not cover for a quiet one")
-
-
-class SweepBase(Base):
-    """Cards parked in a state somebody owes an action on.
-
-    Ages are faked by rewinding the card's own events rather than by sleeping:
-    a ten-minute rule tested with a ten-minute threshold is the real rule, and
-    a test that sleeps through it isn't a test anyone will run.
-    """
-
-    def backdate(self, num, seconds):
-        with self.app.lock:
-            self.app.conn.execute("UPDATE events SET ts=ts-? WHERE card_num=?",
-                                  (seconds, num))
-            self.app.conn.execute("UPDATE cards SET updated_at=updated_at-? WHERE num=?",
-                                  (seconds, num))
-
-    def stuck_events(self, num):
-        _, detail = self.get("/api/cards/%d" % num)
-        return [e for e in detail["timeline"] if e["kind"] == "stuck"]
-
-    def board_card(self, num):
-        _, board = self.get("/api/board")
-        return {c["num"]: c for c in board["cards"]}[num]
-
-    # -- fixtures, one per parked state ----------------------------------
-
-    def a_queued_card(self):
-        return self.new_card("nobody has picked this up")["num"]
-
-    def a_blocked_card(self):
-        num = self.new_card("walled off")["num"]
-        status, _ = self.post("/api/cards/%d/state" % num,
-                              {"state": "blocked", "reason": "ci_red"})
-        self.assertEqual(status, 200)
-        return num
-
-    def a_needs_you_card(self):
-        num = self.new_card("has a question")["num"]
-        self.to_in_progress(num)
-        status, body = self.post("/api/cards/%d/question" % num,
-                                 {"text": "sqlite or a file lock?"})
-        self.assertEqual(status, 201, body)
-        self.assertEqual(self.state_of(num), "needs_you")
-        return num
-
-    def a_ready_card(self):
-        num = self.new_card("waiting on a verdict")["num"]
-        self.to_in_progress(num)
-        status, body = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
-        self.assertEqual(status, 200, body)
-        return num
-
-    def an_integrating_card(self):
-        num = self.a_ready_card()
-        status, body = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
-        self.assertEqual(status, 200, body)
-        self.assertEqual(self.state_of(num), "integrating")
-        return num
-
-
-class TestStaleSweep(SweepBase):
-    """The five rules, at their real production thresholds."""
-
-    def test_integrating_past_ten_minutes_is_stuck(self):
-        """Today's failure, exactly: approved, then forgotten at 'merging'."""
-        num = self.an_integrating_card()
-        self.backdate(num, 11 * 60)
-        self.assertEqual(self.app.sweep_stuck(), 1)
-
-        events = self.stuck_events(num)
-        self.assertEqual(len(events), 1, "one opening notice")
-        ev = events[0]
-        self.assertEqual(ev["actor"], "server")
-        self.assertEqual(ev["payload"]["state"], "integrating")
-        self.assertEqual(ev["payload"]["threshold_seconds"], 600.0)
-        self.assertGreaterEqual(ev["payload"]["stuck_for_seconds"], 660)
-        self.assertIn("still merging", ev["payload"]["text"])
-        self.assertIn("11m", ev["payload"]["text"])
-        self.assertIsNone(ev["payload"].get("reply_to"),
-                          "a server event has no human waiting behind it")
-
-    def test_queued_with_nobody_on_it_past_fifteen_minutes_is_stuck(self):
-        num = self.a_queued_card()
-        self.backdate(num, 16 * 60)
-        self.assertEqual(self.app.sweep_stuck(), 1)
-        p = self.stuck_events(num)[0]["payload"]
-        self.assertEqual(p["state"], "queued")
-        self.assertEqual(p["threshold_seconds"], 900.0)
-        self.assertIn("dispatch it", p["text"])
-
-    def test_blocked_past_thirty_minutes_is_stuck(self):
-        num = self.a_blocked_card()
-        self.backdate(num, 31 * 60)
-        self.assertEqual(self.app.sweep_stuck(), 1)
-        p = self.stuck_events(num)[0]["payload"]
-        self.assertEqual(p["state"], "blocked")
-        self.assertEqual(p["threshold_seconds"], 1800.0)
-        self.assertIn("re-checking", p["text"])
-
-    def test_needs_you_unanswered_past_thirty_minutes_is_stuck(self):
-        num = self.a_needs_you_card()
-        self.backdate(num, 31 * 60)
-        self.assertEqual(self.app.sweep_stuck(), 1)
-        p = self.stuck_events(num)[0]["payload"]
-        self.assertEqual(p["state"], "needs_you")
-        self.assertEqual(p["threshold_seconds"], 1800.0)
-        self.assertIn("waiting on you", p["text"])
-
-    def test_ready_past_a_day_is_stuck(self):
-        num = self.a_ready_card()
-        self.backdate(num, 25 * 3600)
-        self.assertEqual(self.app.sweep_stuck(), 1)
-        p = self.stuck_events(num)[0]["payload"]
-        self.assertEqual(p["state"], "ready")
-        self.assertEqual(p["threshold_seconds"], 86400.0)
-        self.assertIn("verdict", p["text"])
-        self.assertIn("1d", p["text"])
-
-    def test_ready_under_a_day_is_not_stuck_yet(self):
-        """The thresholds are per-state, not one global clock: 23h of `ready`
-        is fine where 11m of `integrating` is not."""
-        num = self.a_ready_card()
-        self.backdate(num, 23 * 3600)
-        self.assertEqual(self.app.sweep_stuck(), 0)
-        self.assertEqual(self.stuck_events(num), [])
-
-    def test_healthy_cards_are_left_alone(self):
-        """Every card the sweep must NOT touch, in one place."""
-        fresh_queued = self.a_queued_card()          # young
-        fresh_integrating = self.an_integrating_card()
-
-        working = self.new_card("an agent is on it")["num"]
-        self.to_in_progress(working)                 # in_progress is not swept
-        self.backdate(working, 6 * 3600)
-
-        held = self.new_card("not dispatched yet", hold=True)["num"]
-        self.backdate(held, 6 * 3600)                # held is deliberate, not stale
-
-        done = self.an_integrating_card()
-        status, _ = self.post("/api/cards/%d/integrated" % done, {"ok": True})
-        self.assertEqual(status, 200)
-        self.backdate(done, 6 * 3600)                # terminal states are over
-
-        picked_up = self.a_queued_card()             # queued but assigned == mid-pickup
-        status, _ = self.post("/api/cards/%d/assign" % picked_up,
-                              {"agent_name": "sprint-card-x", "worktree": "/tmp/wt",
-                               "branch": "sprint/x"})
-        self.assertEqual(status, 200)
-        with self.app.lock:                          # assign also moves it to triaging
-            self.app.conn.execute("UPDATE cards SET state='queued' WHERE num=?", (picked_up,))
-        self.backdate(picked_up, 6 * 3600)
-
-        self.assertEqual(self.app.sweep_stuck(), 0)
-        for num in (fresh_queued, fresh_integrating, working, held, done, picked_up):
-            self.assertEqual(self.stuck_events(num), [], "#%d should be healthy" % num)
-
-    def test_a_note_on_a_blocked_card_restarts_its_recheck_clock(self):
-        """`blocked` is the one re-check rule: somebody looking at the wall and
-        saying so is exactly the action the reminder was asking for."""
-        num = self.a_blocked_card()
-        self.backdate(num, 31 * 60)
-        status, _ = self.post("/api/cards/%d/events" % num,
-                              {"kind": "note", "payload": {"text": "ci still red"}})
-        self.assertEqual(status, 201)
-        self.assertEqual(self.app.sweep_stuck(), 0)
-        self.assertEqual(self.stuck_events(num), [])
-
-    def test_the_board_ambers_a_stuck_card_until_it_moves(self):
-        num = self.an_integrating_card()
-        self.assertFalse(self.board_card(num)["stuck"])
-        self.backdate(num, 11 * 60)
-        self.app.sweep_stuck()
-        self.assertTrue(self.board_card(num)["stuck"])
-        _, detail = self.get("/api/cards/%d" % num)
-        self.assertTrue(detail["card"]["stuck"])
-
-        status, _ = self.post("/api/cards/%d/integrated" % num, {"ok": True})
-        self.assertEqual(status, 200)
-        self.assertFalse(self.board_card(num)["stuck"],
-                         "moving the card clears the flag")
-
-    def test_a_reminder_does_not_count_as_activity(self):
-        """Otherwise the card face reads 'just now' in amber — the age and the
-        colour contradicting each other on one line."""
-        num = self.an_integrating_card()
-        self.backdate(num, 11 * 60)
-        before = self.board_card(num)["last_activity_at"]
-        self.app.sweep_stuck()
-        after = self.board_card(num)
-        self.assertTrue(after["stuck"])
-        self.assertEqual(after["last_activity_at"], before,
-                         "the sweep's own reminder is not activity")
-        self.assertEqual(after["last_event"]["kind"], "stuck",
-                         "it is still the latest event, just not activity")
-
-    def test_thresholds_are_env_tunable(self):
-        """The SPRINT_SWEEP_* knobs the tests (and a ten-second demo) rely on."""
-        names = {state: envname for state, envname, _d in sprintd.STUCK_RULES}
-        self.assertEqual(sorted(names.values()), sorted([
-            "SPRINT_SWEEP_BLOCKED_SECONDS", "SPRINT_SWEEP_INTEGRATING_SECONDS",
-            "SPRINT_SWEEP_NEEDS_YOU_SECONDS", "SPRINT_SWEEP_QUEUED_SECONDS",
-            "SPRINT_SWEEP_READY_SECONDS"]))
-        saved = {k: os.environ.get(k) for k in list(names.values()) + ["SPRINT_SWEEP_TICK"]}
-        try:
-            for envname in names.values():
-                os.environ[envname] = "7"
-            os.environ["SPRINT_SWEEP_TICK"] = "0.25"
-            app = sprintd.App(self.project_root, data_dir=os.path.join(self.tmp, "envdir"),
-                              token="t", log=self.logfh)
-            try:
-                self.assertEqual(app.sweep_tick, 0.25)
-                for state in names:
-                    self.assertEqual(app.sweep_thresholds[state], 7.0, state)
-            finally:
-                app.close()
-        finally:
-            for k, v in saved.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
-
-
-class TestStuckBackoff(SweepBase):
-    """One notice, three backing-off reminders, then silence — until it moves."""
-
-    SWEEP_BACKOFF = (600.0, 1800.0, 5400.0)
-    SWEEP_MAX_REMINDERS = 3
-
-    def _age_last_stuck(self, num, seconds):
-        """Pretend the last reminder was `seconds` ago."""
-        rows = self.app.q("SELECT seq FROM events WHERE card_num=? AND kind='stuck' "
-                          "ORDER BY seq DESC LIMIT 1", (num,))
-        self.assertTrue(rows, "no stuck event to age")
-        with self.app.lock:
-            self.app.conn.execute("UPDATE events SET ts=ts-? WHERE seq=?",
-                                  (seconds, rows[0]["seq"]))
-
-    def test_reminders_back_off_then_stop_at_three(self):
-        num = self.an_integrating_card()
-        self.backdate(num, 11 * 60)
-
-        self.assertEqual(self.app.sweep_stuck(), 1)          # the opening notice
-        self.assertEqual(len(self.stuck_events(num)), 1)
-
-        # A second sweep a moment later says nothing: the ladder starts at 10m.
-        self.assertEqual(self.app.sweep_stuck(), 0)
-        self._age_last_stuck(num, 9 * 60)
-        self.assertEqual(self.app.sweep_stuck(), 0, "9m < the 10m first gap")
-
-        for gap, want in ((10 * 60, 2), (30 * 60, 3), (90 * 60, 4)):
-            self._age_last_stuck(num, gap)
-            self.assertEqual(self.app.sweep_stuck(), 1, "gap %ds should fire" % gap)
-            self.assertEqual(len(self.stuck_events(num)), want)
-
-        # Cap reached: one notice + three reminders, and then it shuts up
-        # however long the card sits there.
-        for _ in range(3):
-            self._age_last_stuck(num, 24 * 3600)
-            self.assertEqual(self.app.sweep_stuck(), 0, "capped at 3 reminders")
-        self.assertEqual(len(self.stuck_events(num)), 4)
-        self.assertEqual([e["payload"]["reminder"] for e in self.stuck_events(num)],
-                         [0, 1, 2, 3])
-
-    def test_a_state_change_re_arms_the_episode(self):
-        num = self.an_integrating_card()
-        self.backdate(num, 11 * 60)
-        for _ in range(4):
-            self.app.sweep_stuck()
-            self._age_last_stuck(num, 24 * 3600)
-        self.assertEqual(len(self.stuck_events(num)), 4)
-        self.assertEqual(self.app.sweep_stuck(), 0, "episode is spent")
-
-        # The session finally lands it, the user re-opens it, it stalls again:
-        # a fresh episode, counted from zero.
-        status, _ = self.post("/api/cards/%d/integrated" % num,
-                              {"ok": False, "reason": "rebase conflict"})
-        self.assertEqual(status, 200)
-        self.assertEqual(self.state_of(num), "in_progress")
-        status, _ = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
-        self.assertEqual(status, 200)
-        status, _ = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
-        self.assertEqual(status, 200)
-        self.backdate(num, 11 * 60)
-
-        self.assertEqual(self.app.sweep_stuck(), 1, "a state change re-arms it")
-        self.assertEqual(self.stuck_events(num)[-1]["payload"]["reminder"], 0)
-
-
-class TestSweepThreadFiresOnItsOwn(SweepBase):
-    """The rule the user actually asked for: nobody has to run anything."""
-
-    SWEEP_TICK = 0.1
-    SWEEP_THRESHOLDS = {"integrating": 0.5, "queued": 0.5, "blocked": 0.5,
-                        "needs_you": 0.5, "ready": 0.5}
-    START_BACKGROUND = True
-
-    def test_a_forgotten_merge_flags_itself(self):
-        num = self.an_integrating_card()
-        deadline = time.time() + 12
-        while time.time() < deadline and not self.stuck_events(num):
-            time.sleep(0.1)
-        events = self.stuck_events(num)
-        self.assertTrue(events, "the sweep thread never fired")
-        self.assertEqual(events[0]["payload"]["state"], "integrating")
-        self.assertEqual(events[0]["payload"]["threshold_seconds"], 0.5)
-        self.assertTrue(self.board_card(num)["stuck"])
 
 
 class TestHoldMode(Base):
@@ -3170,8 +2852,7 @@ class TestTail(unittest.TestCase):
 
     def _sprintd(self, *argv, timeout=60):
         import subprocess
-        env = dict(os.environ, SPRINT_SSE_HEARTBEAT=str(self.HEARTBEAT),
-                   **getattr(self, "extra_env", {}))
+        env = dict(os.environ, SPRINT_SSE_HEARTBEAT=str(self.HEARTBEAT))
         return subprocess.run(
             [sys.executable, SPRINTD_PATH, "--project-root", self.root] + list(argv),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=env)
@@ -3294,31 +2975,6 @@ class TestTail(unittest.TestCase):
         seqs = [ev["seq"] for ev in got]
         self.assertEqual(seqs, sorted(seqs), "events arrive in log order")
         self.assertEqual(len(seqs), len(set(seqs)), "one line per event, exactly")
-
-    def test_default_tail_prints_the_sweep(self):
-        """A `stuck` event is an ordinary event on the ordinary stream: the
-        session's default tail wakes on it with no special casing. `--user-only`
-        does not show it, on purpose — that filter is "a human is waiting", and
-        the whole point of the sweep is that no human is."""
-        self.stop_server()
-        self.extra_env = {"SPRINT_SWEEP_TICK": "0.2",
-                          "SPRINT_SWEEP_QUEUED_SECONDS": "1"}
-        self.start_server()
-        self.assertEqual(self.api("POST", "/api/sprint", {"action": "open"})[0], 200)
-
-        _proc, lines, _noise = self.tail("--after", str(self.head()))
-        _uproc, ulines, _unoise = self.tail("--after", str(self.head()), "--user-only")
-        card = self.new_card("nobody will dispatch this")
-
-        got = self._await(
-            lambda: [ev for ev in self.parsed(lines) if ev.get("kind") == "stuck"],
-            timeout=25.0, what="a stuck line on the default tail")
-        self.assertEqual(got[0]["card"], card["num"])
-        self.assertEqual(got[0]["actor"], "server")
-        self.assertIn("dispatch it", got[0]["text"])
-        self.assertIsNone(got[0]["reply_to"])
-        self.assertEqual([ev for ev in self.parsed(ulines) if ev.get("kind") == "stuck"],
-                         [], "--user-only is a human filter, and this is the server")
 
     def test_user_only_prints_only_what_a_human_wrote(self):
         """The filter the session actually runs: the events it must answer."""
@@ -4462,210 +4118,272 @@ class TestHubCli(unittest.TestCase):
                              sprintd.read_registry(home_reg))
 
 
-class SiblingsBase(HubBase):
-    """`GET /api/siblings` — the same machine-wide picture as the hub, but read
-    from INSIDE one board so its title can become a switcher.
+class TestPhases(Base):
+    """A phase is what the agent says it is DOING, on its own clock. It is a
+    projection of the event log, so a card that moved on can't still be
+    'testing'."""
 
-    Everything runs against a temp registry (RegistryBase) so the real
-    ~/.sprint on this machine is never read or written.
-    """
+    def phase(self, num, phase, expect=None, kind="progress"):
+        payload = {"text": "phase: %s" % phase, "phase": phase}
+        if expect is not None:
+            payload["expected_seconds"] = expect
+        return self.post("/api/cards/%d/events" % num, {"kind": kind, "payload": payload})
 
-    def board(self, name, token=None, write_token=True):
-        b = super().board(name, token=token, write_token=write_token)
-        # what `sprintd start` stamps once the socket is really bound
-        b["app"].port = b["port"]
-        b["app"].hosts = ["127.0.0.1"]
-        return b
+    def card_of(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return detail["card"]
 
-    def siblings(self, b, fresh=True, token="__own__"):
-        path = "/api/siblings" + ("?fresh=1" if fresh else "")
-        tok = b["token"] if token == "__own__" else token
-        status, raw = sprintd.http_get("127.0.0.1", b["port"], path, tok)
-        body = json.loads(raw.decode("utf-8")) if raw else {}
-        return status, body
+    def board_card(self, num):
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200, board)
+        return {c["num"]: c for c in board["cards"]}[num]
 
-    def by_name(self, body):
-        return {r["name"]: r for r in body["sprints"]}
+    def test_a_phase_event_shows_up_on_the_card_and_the_board(self):
+        num = self.new_card("phase me")["num"]
+        self.to_in_progress(num)
+        before = self.card_of(num)
+        self.assertIsNone(before["phase"])
+        self.assertIsNone(before["phase_since"])
+        self.assertIsNone(before["phase_expected_seconds"])
 
-    def _closed_port(self):
-        """A port nothing is listening on — a board that went away."""
-        s = socket.socket()
-        try:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
-        finally:
-            s.close()
+        status, body = self.phase(num, "testing", expect=300)
+        self.assertEqual(status, 201, body)
 
+        for card in (self.card_of(num), self.board_card(num), body["card"]):
+            self.assertEqual(card["phase"], "testing")
+            self.assertEqual(card["phase_expected_seconds"], 300.0)
+            self.assertIsNotNone(card["phase_since"])
+            self.assertGreater(card["phase_since"], 0)
 
-class TestSiblingsEndpoint(SiblingsBase):
-    def test_lists_every_live_sprint_with_this_one_flagged_self(self):
-        a = self.board("alpha")
-        self.board("beta")
-        status, body = self.siblings(a)
-        self.assertEqual(status, 200, body)
-        rows = self.by_name(body)
-        self.assertEqual(set(rows), {"alpha", "beta"})
-        self.assertEqual(body["count"], 2)
-        self.assertTrue(rows["alpha"]["self"], "the board answering is itself in the list")
-        self.assertFalse(rows["beta"]["self"])
-        self.assertTrue(rows["alpha"]["alive"] and rows["beta"]["alive"])
-        # ...and the same question asked from the OTHER board flips the flag
-        _, other = self.siblings(self.boards["beta"])
-        self.assertTrue(self.by_name(other)["beta"]["self"])
-        self.assertFalse(self.by_name(other)["alpha"]["self"])
+    def test_the_latest_phase_wins_and_plain_events_do_not_clear_it(self):
+        num = self.new_card("many phases")["num"]
+        self.to_in_progress(num)
+        self.phase(num, "reading")
+        self.phase(num, "coding", expect=600)
+        self.post("/api/cards/%d/events" % num,
+                  {"kind": "progress", "payload": {"text": "found the bug"}})
+        card = self.card_of(num)
+        self.assertEqual(card["phase"], "coding",
+                         "a plain progress line is not the end of a phase")
+        self.assertEqual(card["phase_expected_seconds"], 600.0)
 
-    def test_a_single_board_lists_only_itself_so_the_title_stays_plain(self):
-        a = self.board("solo")
-        status, body = self.siblings(a)
+    def test_a_state_change_clears_the_phase(self):
+        num = self.new_card("phase then move")["num"]
+        self.to_in_progress(num)
+        self.phase(num, "assembling packet", expect=120)
+        self.assertEqual(self.card_of(num)["phase"], "assembling packet")
+
+        status, _ = self.post("/api/cards/%d/state" % num,
+                              {"state": "blocked", "reason": "ci_red"})
         self.assertEqual(status, 200)
-        self.assertEqual(body["count"], 1)
-        self.assertTrue(body["sprints"][0]["self"])
-        self.assertEqual(body["needs_you_elsewhere"], 0)
+        card = self.card_of(num)
+        self.assertIsNone(card["phase"], "a card that moved on is not still packing")
+        self.assertIsNone(card["phase_since"])
+        self.assertIsNone(card["phase_expected_seconds"])
 
-    def test_the_counts_are_each_board_s_own(self):
-        a = self.board("alpha")
-        b = self.board("beta")
-        self.card_needs_you(a, "a1")
-        self.card_needs_you(b, "b1")
-        self.card_needs_you(b, "b2")
-        self.card_ready(b, "b3")
-        self.card_in_progress(b, "b4")
-        rows = self.by_name(self.siblings(a)[1])
-        self.assertEqual(rows["alpha"]["needs_you"], 1)
-        self.assertEqual((rows["beta"]["needs_you"], rows["beta"]["ready"],
-                          rows["beta"]["in_motion"]), (2, 1, 1))
+    def test_an_expectation_without_a_phase_carries_no_clock(self):
+        num = self.new_card("no phase")["num"]
+        self.to_in_progress(num)
+        status, _ = self.post("/api/cards/%d/events" % num,
+                              {"kind": "progress",
+                               "payload": {"text": "x", "expected_seconds": 300}})
+        self.assertEqual(status, 201)
+        self.assertIsNone(self.card_of(num)["phase"])
 
-    def test_needs_you_elsewhere_ignores_this_board_s_own_pile(self):
-        """The dot on the title means ANOTHER sprint wants you — this board's
-        own needs-you cards are already on the page behind the title."""
-        a = self.board("alpha")
-        b = self.board("beta")
-        self.card_needs_you(a, "mine")
-        self.assertEqual(self.siblings(a)[1]["needs_you_elsewhere"], 0)
-        self.card_needs_you(b, "theirs")
-        self.assertEqual(self.siblings(a)[1]["needs_you_elsewhere"], 1)
-        # and from beta's side it is alpha's card that counts
-        self.assertEqual(self.siblings(b)[1]["needs_you_elsewhere"], 1)
+    def test_junk_phases_are_named_400s_not_empty_chips(self):
+        num = self.new_card("junk")["num"]
+        self.to_in_progress(num)
+        for bad in ("", "   ", 7, None):
+            status, body = self.post("/api/cards/%d/events" % num,
+                                     {"kind": "progress",
+                                      "payload": {"text": "x", "phase": bad}})
+            self.assertEqual(status, 400, body)
+            self.assertEqual(body["error"], "bad_phase")
+        for bad in (0, -5, "soon", 25 * 3600, True):
+            status, body = self.phase(num, "testing", expect=bad)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(body["error"], "bad_expected_seconds")
+        self.assertIsNone(self.card_of(num)["phase"], "nothing junk was recorded")
 
-    def test_the_sibling_waiting_on_you_sorts_first_after_this_one(self):
-        a = self.board("alpha")
-        self.board("quiet")
-        waiting = self.board("waiting")
-        self.card_needs_you(waiting)
-        names = [r["name"] for r in self.siblings(a)[1]["sprints"]]
-        self.assertEqual(names, ["alpha", "waiting", "quiet"])
-
-    def test_each_row_links_with_that_board_s_own_token(self):
-        a = self.board("alpha", token="alpha-secret")
-        b = self.board("beta", token="beta-secret")
-        rows = self.by_name(self.siblings(a)[1])
-        self.assertEqual(rows["beta"]["url"],
-                         "http://127.0.0.1:%d/?t=beta-secret" % b["port"])
-        self.assertEqual(rows["alpha"]["url"],
-                         "http://127.0.0.1:%d/?t=alpha-secret" % a["port"])
-        # the link really signs you in to that board
-        status, _ = sprintd.http_get("127.0.0.1", b["port"], "/api/board", "beta-secret")
-        self.assertEqual(status, 200)
-
-    def test_a_dead_registry_row_is_left_out_of_the_menu(self):
-        """The hub greys a dead board because its job is to say it died. A
-        dropdown exists to be clicked: a row you cannot navigate to is noise."""
-        a = self.board("alpha")
-        dead_root = os.path.join(self.tmp, "gone")
-        os.makedirs(dead_root, exist_ok=True)
-        sprintd.registry_register(sprintd.registry_entry(
-            dead_root, self._closed_port(), "127.0.0.1", pid=999999,
-            started_at=sprintd.now() - 240))
-        body = self.siblings(a)[1]
-        self.assertEqual([r["name"] for r in body["sprints"]], ["alpha"])
-        # ...and it is NOT pruned from the registry: only the hub prunes
-        self.assertIn(os.path.realpath(dead_root), sprintd.read_registry())
-
-    def test_a_port_stolen_by_another_project_is_never_offered(self):
-        """Ports get recycled. Without the /healthz project_root guard the menu
-        would offer one project's board wearing another project's name."""
-        a = self.board("alpha", token="a-shared-token")
-        self.card_needs_you(a, "alpha's own question")
-        # A stale row for a project that is gone, still pointing at a port that
-        # something else now owns -- and (worst case) holding a token that port
-        # accepts, so nothing downstream of the guard would notice.
-        impostor_root = os.path.join(self.tmp, "impostor")
-        os.makedirs(os.path.join(impostor_root, ".sprint"), exist_ok=True)
-        sprintd.write_token_file(
-            os.path.join(impostor_root, ".sprint", "token"), "a-shared-token")
-        sprintd.registry_register(sprintd.registry_entry(
-            impostor_root, a["port"], "127.0.0.1", pid=999999))
-        body = self.siblings(a)[1]
-        self.assertEqual([r["name"] for r in body["sprints"]], ["alpha"],
-                         "the /healthz project_root check is what rejects this row")
-        self.assertEqual(body["count"], 1)
-        self.assertEqual(body["needs_you_elsewhere"], 0,
-                         "alpha's own question must never count as a sibling's")
-
-    def test_a_board_missing_from_the_registry_still_lists_itself(self):
-        a = self.board("alpha")
-        sprintd.registry_unregister(os.path.realpath(a["root"]))
-        body = self.siblings(a)[1]
-        self.assertEqual(body["count"], 1)
-        row = body["sprints"][0]
-        self.assertTrue(row["self"])
-        self.assertEqual(row["name"], "alpha")
-        self.assertEqual(row["url"], "http://127.0.0.1:%d/?t=alpha-token" % a["port"])
-
-    def test_it_needs_the_board_s_token(self):
-        a = self.board("alpha")
-        status, _ = self.siblings(a, token=None)
-        self.assertEqual(status, 401, "the sibling list hands out other boards' tokens")
-        status, _ = self.siblings(a, token="not-the-token")
-        self.assertEqual(status, 401)
-
-    def test_the_snapshot_is_cached_and_fresh_bypasses_the_cache(self):
-        """A dozen tabs polling every 30s must not become a dozen health-check
-        sweeps of every board on the machine."""
-        a = self.board("alpha")
-        b = self.board("beta")
-        self.assertEqual(self.by_name(self.siblings(a, fresh=False)[1])["beta"]["needs_you"], 0)
-        self.card_needs_you(b, "new question")
-        cached = self.by_name(self.siblings(a, fresh=False)[1])
-        self.assertEqual(cached["beta"]["needs_you"], 0, "served from the 10s cache")
-        fresh = self.by_name(self.siblings(a, fresh=True)[1])
-        self.assertEqual(fresh["beta"]["needs_you"], 1)
-
-    def test_the_cache_ttl_is_tunable_and_expires(self):
-        a = self.board("alpha")
-        b = self.board("beta")
-        a["app"].siblings_ttl = 0.05
-        self.siblings(a, fresh=False)
-        self.card_needs_you(b, "later")
-        time.sleep(0.2)
-        self.assertEqual(self.by_name(self.siblings(a, fresh=False)[1])["beta"]["needs_you"], 1)
+    def test_a_long_phase_is_clipped_to_a_chip(self):
+        num = self.new_card("long phase")["num"]
+        self.to_in_progress(num)
+        self.phase(num, "capturing evidence " * 10)
+        card = self.card_of(num)
+        self.assertLessEqual(len(card["phase"]), 40)
+        self.assertTrue(card["phase"].startswith("capturing evidence"))
 
 
-class TestBoardRollupIsSharedWithTheHub(SiblingsBase):
-    def test_the_hub_row_and_the_sibling_row_agree_on_every_count(self):
-        """One counter, two callers: the dropdown and the hub can never drift
-        apart on what "2 need you" means."""
-        a = self.board("alpha")
-        b = self.board("beta")
-        self.card_needs_you(b, "b1")
-        self.card_needs_you(b, "b2")
-        self.card_ready(b, "b3")
-        self.card_in_progress(b, "b4")
-        self.card(b, "b5")
-        hub_row = {r["name"]: r for r in sprintd.HubApp(token="hub-tok").refresh()["sprints"]}["beta"]
-        sib_row = self.by_name(self.siblings(a)[1])["beta"]
-        for field in ("needs_you", "ready", "in_motion", "queued", "blocked"):
-            self.assertEqual(sib_row[field], hub_row[field], field)
+class TestPhaseAndSilence(Base):
+    """The falsification pair: the SAME quiet stretch, one card shielded by a
+    phase that claimed it and one not. If the shield stopped working, the first
+    assertion below is the one that fails."""
 
-    def test_the_self_row_matches_what_the_hub_sees_over_http(self):
-        a = self.board("alpha")
-        self.card_needs_you(a, "a1")
-        self.card_ready(a, "a2")
-        hub_row = {r["name"]: r for r in sprintd.HubApp(token="hub-tok").refresh()["sprints"]}["alpha"]
-        self_row = self.by_name(self.siblings(a)[1])["alpha"]
-        self.assertTrue(self_row["self"])
-        for field in ("needs_you", "ready", "in_motion", "queued", "blocked"):
-            self.assertEqual(self_row[field], hub_row[field], field)
+    SILENCE_SECONDS = 2.0
+    SILENCE_TICK = 0.2
+    START_BACKGROUND = True
+
+    def silent_events(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return [e for e in detail["timeline"] if e["kind"] == "agent_silent"]
+
+    def wait_for_silent(self, num, timeout=12.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            events = self.silent_events(num)
+            if events:
+                return events
+            time.sleep(0.1)
+        return []
+
+    def phase(self, num, phase, expect=None):
+        payload = {"text": "phase: %s" % phase, "phase": phase}
+        if expect is not None:
+            payload["expected_seconds"] = expect
+        status, body = self.post("/api/cards/%d/events" % num,
+                                 {"kind": "progress", "payload": payload})
+        self.assertEqual(status, 201, body)
+
+    def test_a_declared_phase_holds_the_timer_and_a_bare_line_does_not(self):
+        shielded = self.new_card("declared a long phase")["num"]
+        control = self.new_card("just said something")["num"]
+        for num in (shielded, control):
+            self.post("/api/cards/%d/assign" % num,
+                      {"agent_name": "sprint-card-%d" % num, "worktree": "/tmp/wt",
+                       "branch": "sprint/card-%d" % num})
+            self.to_in_progress(num)
+
+        # Same instant, same silence afterwards. The only difference is that one
+        # of them said how long it would be quiet for.
+        self.phase(shielded, "testing", expect=8)
+        self.post("/api/cards/%d/events" % control,
+                  {"kind": "progress", "payload": {"text": "running the tests"}})
+
+        # Past the 2s threshold: the control ambers, the shielded card does not.
+        self.assertEqual(len(self.wait_for_silent(control)), 1,
+                         "the control card proves the timer is armed and firing")
+        self.assertEqual(self.silent_events(shielded), [],
+                         "a phase inside the time it claimed is not silence")
+        _, board = self.get("/api/board")
+        by_num = {c["num"]: c for c in board["cards"]}
+        self.assertFalse(by_num[shielded]["silent"])
+        self.assertTrue(by_num[control]["silent"])
+
+    def test_the_shield_lasts_exactly_as_long_as_the_claim(self):
+        num = self.new_card("overran its phase")["num"]
+        self.to_in_progress(num)
+        self.phase(num, "testing", expect=3)
+        time.sleep(2.4)
+        self.assertEqual(self.silent_events(num), [], "still inside the claim")
+        # ...and once the claim runs out with no new word, it ambers as usual.
+        self.assertEqual(len(self.wait_for_silent(num)), 1,
+                         "an expectation that ran out is exactly what amber is for")
+        self.assertTrue(self.get("/api/cards/%d" % num)[1]["card"]["silent"])
+
+    def test_a_phase_with_no_expectation_shields_nothing(self):
+        num = self.new_card("no expectation")["num"]
+        self.to_in_progress(num)
+        self.phase(num, "coding")
+        self.assertEqual(len(self.wait_for_silent(num)), 1,
+                         "the default clock is the promise you didn't make")
+
+    def test_a_new_phase_re_arms_the_shield(self):
+        num = self.new_card("phase after phase")["num"]
+        self.to_in_progress(num)
+        self.phase(num, "coding")
+        self.assertEqual(len(self.wait_for_silent(num)), 1)
+        self.phase(num, "testing", expect=8)
+        _, board = self.get("/api/board")
+        self.assertFalse({c["num"]: c for c in board["cards"]}[num]["silent"])
+        time.sleep(self.SILENCE_SECONDS + 1.0)
+        self.assertEqual(len(self.silent_events(num)), 1,
+                         "declaring a phase is an act of liveness")
+
+
+class TestSprintPostPhaseHelper(Base):
+    """`sprint-post 42 phase "testing" --expect 5m` — sugar over a progress
+    event, validated before it ever hits the network."""
+
+    SPRINT_POST = os.path.join(os.path.dirname(HERE), "bin", "sprint-post")
+
+    def run_post(self, *argv):
+        import subprocess
+        env = dict(os.environ,
+                   SPRINT_SERVER="http://%s:%d" % (self.host, self.port),
+                   SPRINT_TOKEN="test-token")
+        return subprocess.run([sys.executable, self.SPRINT_POST] + [str(a) for a in argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, timeout=60)
+
+    def last_payload(self, num):
+        _, detail = self.get("/api/cards/%d" % num)
+        return detail["timeline"][-1]["payload"]
+
+    def working_card(self, text="phase helper"):
+        num = self.new_card(text)["num"]
+        self.to_in_progress(num)
+        return num
+
+    def test_phase_posts_a_progress_event_carrying_the_phase(self):
+        num = self.working_card()
+        r = self.run_post(num, "phase", "capturing evidence")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        p = self.last_payload(num)
+        self.assertEqual(p["phase"], "capturing evidence")
+        self.assertNotIn("expected_seconds", p)
+        self.assertEqual(p["text"], "phase: capturing evidence")
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["timeline"][-1]["kind"], "progress",
+                         "phase is sugar, not a new event kind on the wire")
+        self.assertEqual(detail["card"]["phase"], "capturing evidence")
+
+    def test_expect_takes_seconds_or_a_unit(self):
+        for raw, want in (("300", 300), ("90s", 90), ("5m", 300), ("1h", 3600)):
+            num = self.working_card("expect " + raw)
+            r = self.run_post(num, "phase", "testing", "--expect", raw)
+            self.assertEqual(r.returncode, 0, r.stderr.decode())
+            p = self.last_payload(num)
+            self.assertEqual(p["expected_seconds"], want)
+            self.assertIn("expect ~", p["text"],
+                          "the timeline line says the expectation out loud")
+            self.assertEqual(self.get("/api/cards/%d" % num)[1]["card"]
+                             ["phase_expected_seconds"], float(want))
+
+    def test_a_bad_expectation_is_a_named_client_side_failure(self):
+        num = self.working_card()
+        for bad in ("soon", "0", "-30", "25h", ""):
+            r = self.run_post(num, "phase", "testing", "--expect", bad)
+            self.assertEqual(r.returncode, 2, "%r should not post" % bad)
+            self.assertIn("expect", r.stderr.decode())
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertNotIn("phase", detail["timeline"][-1]["payload"],
+                         "nothing reached the server")
+
+    def test_expect_without_a_phase_is_rejected(self):
+        num = self.working_card()
+        r = self.run_post(num, "progress", "running tests", "--expect", "300")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("expect", r.stderr.decode())
+
+    def test_a_phase_with_no_name_names_the_missing_field(self):
+        num = self.working_card()
+        r = self.run_post(num, "phase")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("text", r.stderr.decode())
+
+    def test_a_long_phase_is_clipped_before_it_is_sent(self):
+        num = self.working_card()
+        r = self.run_post(num, "phase", "testing " * 20)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertLessEqual(len(self.last_payload(num)["phase"]), 40)
+
+    def test_it_tells_you_what_the_card_now_says(self):
+        num = self.working_card()
+        r = self.run_post(num, "phase", "testing", "--expect", "5m")
+        out = r.stdout.decode()
+        self.assertIn("testing", out)
+        self.assertIn("5m", out)
 
 
 if __name__ == "__main__":
