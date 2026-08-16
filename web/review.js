@@ -37,7 +37,7 @@
 // (expand-to-see-the-members) row, the per-member review rows, and the
 // Review-next walkthrough. All three existed to organise a list that should not
 // be there.
-import { h, timeEl, firstLine, plural } from './util.js';
+import { h, timeEl, firstLine, plural, richText } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
 import { store, cardState, draft, bounceComposing } from './state.js';
 import { shortAgent, openable } from './list.js';
@@ -366,7 +366,7 @@ export function unitOutline(unit, app) {
   if (p && p.claim) {
     root.appendChild(h('div.unit-sec',
       h('p.packet-label.good', 'What the branch says it did'),
-      h('p.packet-claim', p.claim)));
+      h('p.packet-claim', richText(p.claim, app.openCard))));
   }
   root.appendChild(h('p.unit-intro',
     `${plural(unit.size, 'card')} on one branch — approve them together at the bottom, `
@@ -374,15 +374,16 @@ export function unitOutline(unit, app) {
 
   if (p && p.steps.length) {
     const list = h('div.steps');
-    p.steps.forEach((s, i) => {
-      list.appendChild(h('div.step', h('span.step-n', String(i + 1)), h('p', s)));
+    p.steps.forEach((step, i) => {
+      list.appendChild(h('div.step', h('span.step-n', String(i + 1)),
+        h('p', richText(step, app.openCard))));
     });
     root.appendChild(h('div.unit-sec', h('p.packet-label.accent', 'Check it yourself'), list));
   }
   if (p && p.readback.trim()) {
     root.appendChild(h('div.unit-sec',
       h('p.packet-label.accent', 'What came back'),
-      h('pre.packet-readback', p.readback.trim())));
+      h('pre.packet-readback', richText(p.readback.trim(), app.openCard))));
   }
 
   root.appendChild(h('p.packet-label.accent.unit-changes-label',
@@ -436,11 +437,16 @@ function changeSection(unit, card, n, app) {
     }, '#' + card.num)));
 
   const bodyWrap = h('div.unit-change-body');
-  bodyWrap.appendChild(h('p.unit-change-claim', part.claim || 'No claim recorded for this one.'));
+  // A claim and its checks are prose the agent wrote: a `#7` in them is a card
+  // and a URL is a link you can follow (cards #54 and #29), here exactly as in
+  // the packet the outline replaced.
+  bodyWrap.appendChild(h('p.unit-change-claim',
+    richText(part.claim || 'No claim recorded for this one.', app.openCard)));
   if (part.steps.length) {
     const list = h('div.steps');
-    part.steps.forEach((s, i) => {
-      list.appendChild(h('div.step', h('span.step-n', String(i + 1)), h('p', s)));
+    part.steps.forEach((step, i) => {
+      list.appendChild(h('div.step', h('span.step-n', String(i + 1)),
+        h('p', richText(step, app.openCard))));
     });
     bodyWrap.appendChild(list);
   }

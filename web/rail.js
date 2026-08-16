@@ -20,6 +20,7 @@ import { phaseOf, phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
 import { renderThread, renderChat } from './thread.js';
 import { initCompose } from './compose.js';
+import { syncPart, syncOptional } from './slots.js';
 import {
   unitInReview, unitSig, unitHead, unitOutline, unitBar, verdictBarSig, packetVerdictBar,
 } from './review.js';
@@ -93,42 +94,6 @@ export function renderRail(root, app) {
     if (!same || prevTop == null) t.scrollTop = t.scrollHeight;
     else if (atBottom && t.scrollTop !== t.scrollHeight) t.scrollTop = t.scrollHeight;
   });
-}
-
-/**
- * Replace one fixed part of the rail only when its signature changed. The parts
- * are ordered head → thread → composer and each is built once, so replacing one
- * never disturbs the others (and never disturbs the thread's scroll position).
- */
-function syncPart(root, cls, sig, build) {
-  const found = root.querySelector('.' + cls);
-  const want = String(sig);
-  if (found && found.dataset.sig === want) return found;
-  const node = build();
-  node.dataset.sig = want;
-  if (found) root.replaceChild(node, found);
-  else root.appendChild(node);
-  return node;
-}
-
-/**
- * A part that is sometimes not there at all. Same signature contract as
- * `syncPart`; a null signature removes it. It has to be placed before the
- * composer, so it is inserted rather than appended.
- */
-function syncOptional(root, cls, sig, build) {
-  const found = root.querySelector('.' + cls);
-  if (sig == null) {
-    if (found) root.removeChild(found);
-    return null;
-  }
-  const want = String(sig);
-  if (found && found.dataset.sig === want) return found;
-  const node = build();
-  node.dataset.sig = want;
-  if (found) root.replaceChild(node, found);
-  else root.insertBefore(node, root.querySelector('.composer') || null);
-  return node;
 }
 
 function headSig(detail, card) {
