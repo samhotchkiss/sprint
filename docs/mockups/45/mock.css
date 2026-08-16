@@ -1,0 +1,188 @@
+/* ===========================================================================
+   Card #45 mockups — shared shell.
+
+   The token block below is copied VERBATIM from web/styles.css (the Calm skin),
+   so every colour, radius and face here is the product's own. Nothing else in
+   this file exists in the product: it is just enough page chrome to show one
+   surface — Awaiting review — in four different shapes.
+
+   No external requests: fonts are the board's own vendored woff2 (./fonts is a
+   symlink to web/fonts), screenshots are downscaled copies of real evidence
+   attachments off the live board.
+   =========================================================================== */
+
+:root,
+html.skin-calm {
+  /* surfaces */
+  --canvas: #0b0c0e;
+  --aside-bg: #0e1013;
+  --head-bg: none;
+  --panel: #101216;
+  --panel-thread: #12151a;
+  --input: #14161a;
+  --chip: #171a1e;
+  --hover: #131518;
+  --scrim: rgba(4, 5, 8, .62);
+
+  /* lines */
+  --rule: #1a1c20;
+  --rule-row: #16181c;
+  --border: #22252a;
+  --border-chip: #26292f;
+
+  /* ink */
+  --ink: #f4f1ec;
+  --body-ink: #e9e6e1;
+  --dim: #cfcbc4;
+  --faint: #8b8a86;
+  --meta: #9a9894;
+
+  /* meaning */
+  --accent: #d8a45c;
+  --accent-hi: #f0c98a;
+  --good: #7fa88a;
+  --bad: #b5807f;
+  --approve: #a8c9ae;
+  --approve-hi: #bcd9c1;
+  --warn: #c9a05e;          /* silence */
+  --info: #6f8fae;          /* long job */
+  --alt: #8f7fae;           /* triaging */
+  /* phase chip — what the agent says it is doing, on its own clock */
+  --phase-ink: #9cc4a8;
+  --phase-bg: #12181a;
+  --phase-line: #223029;
+  --phase-late-ink: #e0b878;
+  --phase-late-bg: #1a150f;
+  --phase-late-line: #3a2e1a;
+  --rail-needs: #d8a45c;
+  --rail-signoff: #3d5544;
+  --seg-blocked: #5c4a4c;
+  --seg-queued: #2a2d33;
+
+  /* voices in a thread */
+  --you-tint: #8fb4d8;
+  --you-bg: #141a20;
+  --you-line: #233240;
+  --session-tint: #d8a45c;
+  --session-bg: #16151a;
+  --session-line: #2a2630;
+  --agent-tint: #7fa88a;
+  --agent-bg: #12161a;
+  --agent-line: #232a2c;
+
+  /* controls */
+  --send-bg: #d8a45c;
+  --send-fg: #0b0c0e;
+  --send-hi: #e8b975;
+  --on-bg: #e9e6e1;
+  --on-fg: #0b0c0e;
+
+  /* shape */
+  --radius: 12px;
+  --radius-ctl: 9px;
+  --radius-pill: 99px;
+  --panel-shadow: none;
+  --row-shadow: none;
+  --plate: none;    /* the sheen crawling across a gold column plate */
+  --glow: none;     /* the pulse around anything that needs you */
+  --flash: none;    /* the Chat button when the session said something */
+
+  /* type */
+  --font-display: 'Instrument Serif', Georgia, 'Times New Roman', serif;
+  --font-body: 'IBM Plex Sans', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-label: var(--font-mono);
+  --size-h1: 27px;
+  --size-h2: 21px;
+  --size-claim: 19px;
+  --label-size: 11.5px;
+  --label-space: .06em;
+  --display-case: none;
+  --display-weight: 400;
+}
+/* ---- base, lifted from the product ------------------------------------- */
+
+html, body { margin: 0; padding: 0; background: var(--canvas); }
+body {
+  font-family: var(--font-body);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3, h4, h5, p, dl, dd, ol, ul { margin: 0; }
+button { font: inherit; color: inherit; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { color: var(--accent-hi); }
+img { display: block; max-width: 100%; }
+.grow { flex: 1; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #25272c; border-radius: 99px; border: 2px solid var(--canvas); }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  min-height: 34px; padding: 0 13px;
+  background: none; border: 1px solid var(--border-chip); border-radius: var(--radius-ctl);
+  color: var(--dim); font-size: 13px; cursor: pointer; white-space: nowrap;
+}
+.btn:hover { border-color: var(--accent); }
+.btn.tiny { min-height: 30px; padding: 0 10px; font-size: 12px; }
+.btn.ghost { border-color: transparent; color: var(--faint); }
+.btn.ghost:hover { border-color: var(--border-chip); color: var(--ink); }
+.btn.approve { color: var(--approve); border-color: #2f3f34; }
+.btn.approve:hover { background: #16201a; border-color: var(--approve); color: var(--approve-hi); }
+.btn.bounce { color: var(--bad); border-color: #3a2a2c; }
+.btn.bounce:hover { border-color: var(--bad); }
+.btn.solid { background: var(--send-bg); color: var(--send-fg); border-color: transparent; font-weight: 500; }
+.btn.solid:hover { background: var(--send-hi); }
+
+/* ---- the page shell around a single surface ---------------------------- */
+
+.mock-bar {
+  position: sticky; top: 0; z-index: 5;
+  display: flex; align-items: center; gap: 14px;
+  padding: 10px 30px;
+  background: #08090b; border-bottom: 1px solid var(--rule);
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--faint);
+  letter-spacing: var(--label-space); text-transform: uppercase;
+}
+.mock-bar b { color: var(--accent); font-weight: 500; }
+.mock-bar a { color: var(--faint); text-transform: none; letter-spacing: 0; font-size: 12px; }
+.mock-bar a:hover { color: var(--ink); }
+
+.page { max-width: 1180px; margin: 0 auto; padding: 26px 30px 90px 30px; }
+.topline { display: flex; align-items: baseline; gap: 14px; padding-bottom: 22px; }
+.topline h1 {
+  font-family: var(--font-display); font-size: var(--size-h1); font-weight: var(--display-weight);
+  color: var(--ink); letter-spacing: .01em;
+}
+.topline .sub { font-size: 13px; color: var(--faint); }
+.rule { height: 1px; background: linear-gradient(90deg, #2a2c31, transparent); flex: 1; }
+
+.section-head { display: flex; align-items: baseline; gap: 14px; padding-bottom: 16px; }
+.section-head h2 {
+  font-family: var(--font-display); font-size: var(--size-h2); font-weight: var(--display-weight);
+  color: var(--ink);
+}
+.label {
+  font-family: var(--font-label); font-size: var(--label-size);
+  letter-spacing: var(--label-space); text-transform: uppercase; color: var(--faint);
+}
+.mono { font-family: var(--font-mono); }
+.meta { font-family: var(--font-mono); font-size: 11.5px; color: var(--faint); }
+
+/* the note every option carries about the other skin */
+.chaos-note {
+  margin-top: 54px; padding: 16px 18px;
+  border: 1px solid var(--rule); border-radius: var(--radius);
+  background: #0d0f12; color: var(--faint); font-size: 13px; line-height: 1.65; max-width: 78ch;
+}
+.chaos-note b { color: var(--dim); font-weight: 500; }
+.chaos-note .label { display: block; margin-bottom: 7px; }
+
+@media (max-width: 1000px) {
+  .page { padding: 20px 18px 80px 18px; }
+  .mock-bar { padding: 9px 18px; gap: 10px; flex-wrap: wrap; }
+}

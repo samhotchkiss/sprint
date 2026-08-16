@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en" class="skin-calm">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Option B — The digest · sprint mockups</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="mock.css">
+<style>
+/* ---- Option B: a briefing, not a table ---------------------------------
+   Every work unit is a short paragraph in plain English — the kind of thing a
+   chief of staff would say out loud. No counts lead anything, no card numbers
+   in the first line, no column of "2 checks · 254 pass". The verdict is a verb
+   at the end of the sentence you just read. */
+
+.digest { max-width: 1020px; }
+.entry .col > * { max-width: 68ch; }
+.digest .intro { font-size: 15px; line-height: 1.7; color: var(--faint); padding-bottom: 34px; max-width: 62ch; }
+
+.entry {
+  padding: 30px 0 26px 0; border-top: 1px solid var(--rule);
+  display: grid; grid-template-columns: minmax(0, 1fr) 210px; column-gap: 32px; align-items: start;
+}
+.entry > .lede { grid-column: 1 / -1; }
+.entry > .col { grid-column: 1; min-width: 0; }
+.entry > .thumb { grid-column: 2; grid-row: 2; }
+.entry:first-of-type { border-top: none; padding-top: 6px; }
+
+.entry .lede {
+  font-family: var(--font-display); font-weight: var(--display-weight);
+  font-size: 23px; line-height: 1.35; color: var(--ink); text-wrap: pretty;
+}
+.entry p.say {
+  margin-top: 13px; font-size: 15px; line-height: 1.72; color: var(--body-ink); text-wrap: pretty;
+}
+.entry p.say + p.say { margin-top: 11px; }
+.entry .look {
+  margin-top: 15px; padding-left: 15px; border-left: 2px solid var(--rail-signoff);
+  font-size: 14px; line-height: 1.65; color: var(--dim); text-wrap: pretty;
+}
+.entry .look b { color: var(--ink); font-weight: 500; }
+
+.thumb {
+  width: 100%; margin: 16px 0 0 0;
+  border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: #0a0b0d;
+}
+.thumb img { width: 100%; }
+.thumb figcaption {
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--faint);
+  padding: 6px 8px; border-top: 1px solid var(--rule);
+}
+
+.verbs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 20px; clear: both; }
+.verbs .btn { min-height: 36px; }
+.verbs .btn.approve { font-weight: 500; }
+
+.tail {
+  margin-top: 14px; font-family: var(--font-mono); font-size: 11px; color: var(--faint);
+  letter-spacing: .02em;
+}
+.tail span + span::before { content: ' · '; opacity: .55; }
+
+.entry.settled .lede { color: var(--dim); font-size: 20px; }
+.entry.settled p.say { color: var(--faint); font-size: 14px; }
+.entry.settled .tail { color: #6d6c68; }
+
+.closing {
+  margin-top: 34px; padding-top: 22px; border-top: 1px solid var(--rule);
+  font-size: 14px; color: var(--faint); line-height: 1.7;
+}
+
+@media (max-width: 1000px) {
+  .digest { max-width: none; }
+  .entry { grid-template-columns: 1fr; }
+  .entry > .thumb { grid-column: 1; grid-row: auto; max-width: 420px; }
+  .verbs .btn { min-height: 44px; }
+}
+</style>
+</head>
+<body>
+
+<div class="mock-bar">
+  <b>Option B</b> <span>The digest</span>
+  <span class="grow"></span>
+  <a href="index.html">← all options</a>
+</div>
+
+<div class="page">
+  <div class="topline">
+    <h1>Waiting on you</h1>
+    <span class="rule"></span>
+  </div>
+
+  <div class="digest">
+    <p class="intro">Four pieces of work finished and want a yes or a no. Read down; say yes where
+      you agree. Nothing here is urgent and nothing expires.</p>
+
+    <div class="entry">
+      <p class="lede">Six cards on one branch rebuild the board on the Calm design.</p>
+      <figure class="thumb">
+        <img src="shots/design-core-list.jpg" alt="the rebuilt List view">
+        <figcaption>list · 1440 · 5 shots</figcaption>
+      </figure>
+      <div class="col">
+      <p class="say">List is the default view now, Board keeps its four columns, and the right rail
+        holds chat, the card thread and the evidence packet in 480px. The Fold interior gets a real
+        three-column layout instead of a squeeze, and there is an honest fallback for a narrow
+        phone.</p>
+      <p class="say">The four fonts are vendored into the repo, so the board still makes no external
+        request of any kind, and Return submits everywhere it should.</p>
+      <p class="look"><b>To see it:</b> open the live board and look at the top — a 4px meter, then a
+        spacious <em>Needs you</em> section where the answer chips are clickable right on the card.
+        Flip LIST/BOARD in the header and reload; it remembers where you were.</p>
+      <div class="verbs">
+        <button class="btn approve" type="button">Approve the branch</button>
+        <button class="btn bounce" type="button">Send it back</button>
+        <a class="btn ghost" href="#">See it live ↗</a>
+        <button class="btn ghost" type="button">Open the six cards</button>
+      </div>
+      <p class="tail"><span>#9–#14</span><span>sprint/design-core</span><span>batch-1</span><span>144 pass, 0 fail</span><span>3h ago</span></p>
+      </div>
+    </div>
+
+    <div class="entry">
+      <p class="lede">Two cards on one branch make the board honest about what an agent is doing.</p>
+      <figure class="thumb">
+        <img src="shots/c32-phase.jpg" alt="phase chips on In motion rows">
+        <figcaption>in motion · 1440</figcaption>
+      </figure>
+      <div class="col">
+      <p class="say">An agent now declares a <em>phase</em> at each stretch of work — reading,
+        coding, testing — and the card shows that phase on its own fresh clock instead of the stale
+        last thing it said. A card only goes amber when the agent overshoots the time it promised,
+        so a healthy job stops looking broken.</p>
+      <p class="say">The second card is the one you asked about: a card you approved leaves
+        <em>Needs you</em> immediately and runs under In&nbsp;progress as “merging” until its branch
+        actually lands.</p>
+      <p class="look"><b>To see it:</b> on the live board, #6 reads “testing · 2m” in green and #7
+        reads “reproducing · 6m (expected 1m)” in amber. Both agents have been quiet exactly as long
+        — the amber one is amber only because it promised a minute.</p>
+      <div class="verbs">
+        <button class="btn approve" type="button">Approve both</button>
+        <button class="btn bounce" type="button">Send one back</button>
+        <a class="btn ghost" href="#">See it live ↗</a>
+        <button class="btn ghost" type="button">Open the two cards</button>
+      </div>
+      <p class="tail"><span>#32, #34</span><span>sprint/card-32</span><span>card-32</span><span>256 pass, 0 fail</span><span>18m ago</span></p>
+      </div>
+    </div>
+
+    <div class="entry">
+      <p class="lede">The board now sweeps itself.</p>
+      <figure class="thumb">
+        <img src="shots/c29-drawer.jpg" alt="a stuck card, ambered, in the drawer">
+        <figcaption>drawer · 1440</figcaption>
+      </figure>
+      <div class="col">
+      <p class="say">A card parked somewhere that owes someone an action — approved but still
+        merging, ready but never read — posts a <em>stuck</em> note that wakes the session and turns
+        the card amber, without you having to notice first.</p>
+      <p class="look"><b>To see it:</b> the demo board runs the sweep on a ten-second clock, so a
+        card you approve goes amber ten seconds later instead of ten minutes. The same one-liner
+        works on any board.</p>
+      <div class="verbs">
+        <button class="btn approve" type="button">Approve</button>
+        <button class="btn bounce" type="button">Send it back</button>
+        <a class="btn ghost" href="#">See it live ↗</a>
+      </div>
+      <p class="tail"><span>#29</span><span>sprint/card-29</span><span>card-29</span><span>254 pass, 0 fail</span><span>1h ago</span></p>
+      </div>
+    </div>
+
+    <div class="entry">
+      <p class="lede">The board title becomes a list of the other sprints on this machine.</p>
+      <figure class="thumb">
+        <img src="shots/c31-menu.jpg" alt="the sibling-sprint dropdown open">
+        <figcaption>title menu · 1440</figcaption>
+      </figure>
+      <div class="col">
+      <p class="say">When more than one sprint is running here, the title turns into a dropdown of
+        all of them, with an amber dot on the title when another board has a question waiting and a
+        dot beside that sprint in the menu. A machine running one sprint sees plain text, exactly as
+        before.</p>
+      <p class="look"><b>To see it:</b> click the title — russ is marked HERE, flowbee carries the
+        amber dot. Click flowbee: the same tab lands on that board already signed in.</p>
+      <div class="verbs">
+        <button class="btn approve" type="button">Approve</button>
+        <button class="btn bounce" type="button">Send it back</button>
+        <a class="btn ghost" href="#">See it live ↗</a>
+      </div>
+      <p class="tail"><span>#31</span><span>sprint/card-31</span><span>card-31</span><span>253 pass, 0 fail</span><span>2h ago</span></p>
+      </div>
+    </div>
+
+    <div class="entry settled">
+      <p class="lede">And the slash-key fix is on its way in.</p>
+      <div class="col">
+      <p class="say">You said yes to it four minutes ago — pressing <em>/</em> opens Drop work from
+        an empty chat box, and takes a slash when you have already typed something. The session is
+        rebasing and merging that branch now; it needs nothing from you.</p>
+      <p class="tail"><span>#30</span><span>sprint/card-28</span><span>merging</span></p>
+      </div>
+    </div>
+
+    <p class="closing">That is everything. Two more agents are still working — #33 and #43 — and
+      nothing is blocked.</p>
+  </div>
+
+  <div class="chaos-note">
+    <span class="label">What this is / what it trades</span>
+    Each finished branch is a short paragraph a human wrote to be read, with the verdict as a verb at
+    the end of it. Numbers move to the last line, where they belong; nothing leads with a count.
+    <b>Trades:</b> it is the longest of the four vertically, it is the only one that needs the
+    session to write real prose per unit (a bad summariser makes this shape worse than a table), and
+    it is the worst for finding one specific card fast.
+    <br><br>
+    <span class="label">In Chaos</span>
+    Paragraphs sit inside the JRPG dialogue frame — ink outline, bevel, gold plate on the lede — and
+    the verbs become the menu row at the bottom of the box (APPROVE / SEND BACK / LOOK). Body text
+    stays IBM Plex; Press Start 2P is used only for the lede and the verbs, which is the one place
+    it stays readable.
+  </div>
+</div>
+
+</body>
+</html>

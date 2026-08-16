@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en" class="skin-calm">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Option A — One at a time · sprint mockups</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="mock.css">
+<style>
+/* ---- Option A: the surface IS the current decision ----------------------
+   No list. One thing is on screen, at the size of a thing you are meant to
+   read. Everything else in the queue is one quiet line at the bottom. */
+
+.deck { display: flex; flex-direction: column; gap: 30px; }
+
+.eyebrow { display: flex; align-items: baseline; gap: 10px; padding-bottom: 14px; }
+.eyebrow .who {
+  font-family: var(--font-mono); font-size: 11.5px; letter-spacing: var(--label-space);
+  text-transform: uppercase; color: var(--good);
+}
+.eyebrow .rest { font-size: 13px; color: var(--faint); }
+
+.decision {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--panel); padding: 30px 34px 26px 34px;
+  border-left: 3px solid var(--rail-signoff);
+}
+.decision h2 {
+  font-family: var(--font-display); font-weight: var(--display-weight);
+  font-size: 30px; line-height: 1.28; color: var(--ink); text-wrap: pretty;
+  max-width: 30ch;
+}
+.claim {
+  margin-top: 16px; font-size: 16.5px; line-height: 1.62; color: var(--body-ink);
+  max-width: 68ch; text-wrap: pretty;
+}
+.covers {
+  margin-top: 18px; font-family: var(--font-mono); font-size: 11.5px; color: var(--faint);
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+}
+.covers .n { color: var(--dim); }
+.covers .dot { opacity: .5; }
+
+.body-grid { display: grid; grid-template-columns: 1fr 380px; gap: 30px; margin-top: 26px; align-items: start; }
+
+.checks { border-top: 1px solid var(--rule); padding-top: 18px; }
+.checks .label { display: block; margin-bottom: 12px; color: var(--dim); }
+.check { display: grid; grid-template-columns: 22px 1fr; gap: 12px; padding: 7px 0; }
+.check .n {
+  font-family: var(--font-mono); font-size: 11px; color: var(--faint);
+  border: 1px solid var(--border-chip); border-radius: var(--radius-pill);
+  width: 20px; height: 20px; display: grid; place-items: center; margin-top: 2px;
+}
+.check p { font-size: 14px; line-height: 1.6; color: var(--body-ink); text-wrap: pretty; }
+.check.rest p { color: var(--faint); font-size: 13px; }
+
+.shot { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: #0a0b0d; }
+.shot img { width: 100%; }
+.shot-foot {
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border-top: 1px solid var(--rule); font-family: var(--font-mono); font-size: 11px; color: var(--faint);
+}
+
+.verdict {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 26px; padding-top: 20px; border-top: 1px solid var(--rule);
+}
+.verdict .btn.approve, .verdict .btn.bounce { min-height: 42px; padding: 0 20px; font-size: 14.5px; }
+.verdict .btn.approve { background: #16201a; border-color: #3d5544; color: var(--approve-hi); font-weight: 500; }
+.verdict .tests { font-family: var(--font-mono); font-size: 11.5px; color: var(--good); }
+
+.after { padding: 0 4px; }
+.after .label { display: block; margin-bottom: 12px; }
+.after-row {
+  display: grid; grid-template-columns: 74px 1fr auto; gap: 14px; align-items: baseline;
+  padding: 11px 6px; border-top: 1px solid var(--rule-row);
+}
+.after-row .nums { font-family: var(--font-mono); font-size: 11.5px; color: var(--faint); }
+.after-row .what { font-size: 13.5px; color: var(--dim); text-wrap: pretty; }
+.after-row .when { font-family: var(--font-mono); font-size: 11px; color: var(--faint); }
+.after-row.is-merging .what { color: var(--faint); }
+.after-row.is-merging .nums { color: #4f5a52; }
+.merging-tag { color: var(--good); font-family: var(--font-mono); font-size: 11px; }
+
+@media (max-width: 1000px) {
+  .body-grid { grid-template-columns: 1fr; gap: 22px; }
+  .decision { padding: 22px 20px 20px 20px; }
+  .decision h2 { font-size: 25px; max-width: none; }
+  .verdict .btn.approve, .verdict .btn.bounce { min-height: 44px; }
+}
+</style>
+</head>
+<body>
+
+<div class="mock-bar">
+  <b>Option A</b> <span>One at a time</span>
+  <span class="grow"></span>
+  <a href="index.html">← all options</a>
+</div>
+
+<div class="page">
+  <div class="topline">
+    <h1>Your call</h1>
+    <span class="sub">four things finished while you were out</span>
+    <span class="rule"></span>
+  </div>
+
+  <div class="deck">
+
+    <div>
+      <div class="eyebrow">
+        <span class="who">Signoff</span>
+        <span class="rest">from batch-1 · finished 3h ago</span>
+      </div>
+
+      <div class="decision">
+        <h2>The board is rebuilt on the Calm design.</h2>
+        <p class="claim">List becomes the default view, Board keeps the four columns, the right rail
+          is 480px and carries chat, the card thread and the evidence packet. The Fold interior gets
+          its own three-column layout and there is a narrow-phone fallback. The four fonts are
+          vendored locally — the board makes no external request — and Return submits everywhere.</p>
+
+        <div class="covers">
+          <span>six cards, one branch</span>
+          <span class="dot">·</span>
+          <span class="n">#9 #10 #11 #12 #13 #14</span>
+          <span class="dot">·</span>
+          <span>sprint/design-core</span>
+        </div>
+
+        <div class="body-grid">
+          <div class="checks">
+            <span class="label">Check it yourself</span>
+            <div class="check">
+              <span class="n">1</span>
+              <p>Open the live board. You should see a 4px meter across the top, a generously spaced
+                <em>Needs you</em> section where #1's answer chips (Slug / UUID / Both columns) are
+                clickable right there, then quieter In&nbsp;motion / Blocked / Queued sections, with
+                the session chat in a 480px rail on the right.</p>
+            </div>
+            <div class="check rest">
+              <span class="n">2</span>
+              <p>Click LIST/BOARD in the header — the same cards become four kanban columns; reload
+                and it remembers which one you were on.</p>
+            </div>
+            <div class="check rest">
+              <span class="n">3</span>
+              <p>Narrow the window to 980px: three columns, 44px touch targets, the rail slides over
+                instead of docking.</p>
+            </div>
+          </div>
+
+          <div>
+            <div class="shot">
+              <img src="shots/design-core-list.jpg" alt="the rebuilt List view at 1440">
+              <div class="shot-foot">
+                <span>list · 1440</span><span class="grow"></span><span>5 screenshots</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="verdict">
+          <button class="btn approve" type="button">Approve all six</button>
+          <button class="btn bounce" type="button">Send it back</button>
+          <button class="btn ghost" type="button">Not now</button>
+          <a class="btn ghost" href="#">See it live ↗</a>
+          <span class="grow"></span>
+          <span class="tests">144 pass, 0 fail</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="after">
+      <span class="label">After this</span>
+      <div class="after-row">
+        <span class="nums">#32 #34</span>
+        <span class="what">Cards now show what the agent is doing on its own clock, and an approved
+          card leaves Needs you the moment your verdict lands — one branch, two cards.</span>
+        <span class="when">18m</span>
+      </div>
+      <div class="after-row">
+        <span class="nums">#29</span>
+        <span class="what">The board sweeps itself: a card parked where someone owes an action goes
+          amber and wakes the session.</span>
+        <span class="when">1h</span>
+      </div>
+      <div class="after-row">
+        <span class="nums">#31</span>
+        <span class="what">The board title becomes a dropdown of the other sprints running on this
+          machine, with a dot on the ones that need you.</span>
+        <span class="when">2h</span>
+      </div>
+      <div class="after-row is-merging">
+        <span class="nums">#30</span>
+        <span class="what">Pressing / opens Drop work from an empty chat box — <span class="merging-tag">you said yes 4m ago, the session is merging it now.</span></span>
+        <span class="when">4m</span>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="chaos-note">
+    <span class="label">What this is / what it trades</span>
+    One decision fills the screen, at the size of something you are meant to read; the rest of the
+    queue is four quiet lines with no buttons on them. <b>Trades:</b> you lose the overview — you
+    cannot see all four packets at once, cherry-pick, or compare two branches, and a queue of
+    thirteen is thirteen screens. Approving is easy; noticing that two of the four touch the same
+    file is not.
+    <br><br>
+    <span class="label">In Chaos</span>
+    The panel becomes a gold-plated dialogue box with the hard bevel and ink outline, the claim
+    sets in Press Start 2P at ~15px (it is short enough to survive that face), and <b>After this</b>
+    renders as the JRPG party list down the side. Nothing about the shape changes — Chaos is a
+    costume, and this shape has exactly one thing to costume.
+  </div>
+</div>
+
+</body>
+</html>

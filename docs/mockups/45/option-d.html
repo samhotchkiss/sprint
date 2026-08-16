@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en" class="skin-calm">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Option D — Inbox · sprint mockups</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="mock.css">
+<style>
+/* ---- Option D: it is mail ----------------------------------------------
+   Sender is the agent, subject is what it claims it did, snippet is the first
+   thing you would check. One line each, dense enough that thirteen fit on a
+   screen. The row you are on opens in place; j/k/a/b never leave the keyboard.
+   A shared branch is a thread. */
+
+.inbox { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--panel); }
+
+.tools {
+  display: flex; align-items: center; gap: 12px; padding: 9px 14px;
+  border-bottom: 1px solid var(--rule); background: #0d0f12;
+}
+.tools .sel { font-size: 12.5px; color: var(--dim); }
+.tools .hint { font-family: var(--font-mono); font-size: 11px; color: var(--faint); }
+.tools .btn.tiny { min-height: 28px; }
+
+.mrow {
+  display: grid; grid-template-columns: 26px 18px 92px 1fr 62px;
+  align-items: center; gap: 10px;
+  padding: 0 14px; height: 42px;
+  border-bottom: 1px solid var(--rule-row);
+  border-left: 2px solid transparent;
+  cursor: default; white-space: nowrap;
+}
+.mrow:hover { background: var(--hover); }
+.mrow .box {
+  width: 14px; height: 14px; border: 1px solid var(--border-chip); border-radius: 3px;
+  display: grid; place-items: center; font-size: 10px; color: var(--send-fg); background: transparent;
+}
+.mrow.picked .box { background: var(--accent); border-color: var(--accent); }
+.mrow .chev { font-size: 10px; color: var(--faint); text-align: center; }
+.mrow .who { font-family: var(--font-mono); font-size: 11.5px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; }
+.mrow .line { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.mrow .subj { font-size: 13.5px; font-weight: 450; color: var(--ink); }
+.mrow .snip { font-size: 13px; color: var(--faint); }
+.mrow .snip::before { content: ' — '; opacity: .6; }
+.mrow .when { font-family: var(--font-mono); font-size: 11px; color: var(--faint); text-align: right; }
+.mrow .n { font-family: var(--font-mono); font-size: 11px; color: var(--good); }
+
+.mrow.thread .subj::after {
+  content: attr(data-n); margin-left: 8px;
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--good);
+  border: 1px solid #2f3f34; border-radius: var(--radius-pill); padding: 1px 6px;
+}
+.mrow.child { padding-left: 40px; background: #0e1013; }
+.mrow.child .subj { font-weight: 400; color: var(--dim); font-size: 13px; }
+.mrow.is-merging .subj, .mrow.is-merging .snip { color: var(--faint); }
+.mrow.is-merging .who { color: #5d6a62; }
+
+.mrow.on { border-left-color: var(--accent); background: var(--hover); }
+
+/* the row you are on opens in place — the reading pane, inline */
+.open {
+  border-bottom: 1px solid var(--rule-row); background: #0e1114;
+  border-left: 2px solid var(--accent); padding: 18px 22px 18px 60px;
+  display: grid; grid-template-columns: 1fr 260px; gap: 24px; align-items: start;
+}
+.open .claim { font-size: 15px; line-height: 1.65; color: var(--body-ink); text-wrap: pretty; max-width: 66ch; }
+.open .check { margin-top: 14px; padding-left: 13px; border-left: 2px solid var(--rail-signoff); }
+.open .check .label { display: block; margin-bottom: 6px; }
+.open .check p { font-size: 13.5px; line-height: 1.6; color: var(--dim); text-wrap: pretty; }
+.open .acts { display: flex; align-items: center; gap: 8px; margin-top: 18px; flex-wrap: wrap; }
+.open .kbd {
+  font-family: var(--font-mono); font-size: 10px; color: var(--faint);
+  border: 1px solid var(--border-chip); border-radius: 4px; padding: 1px 5px; margin-left: 6px;
+}
+.open .shot { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: #08090b; }
+.open .foot { margin-top: 12px; font-family: var(--font-mono); font-size: 11px; color: var(--faint); }
+
+.keys {
+  display: flex; gap: 18px; flex-wrap: wrap; padding: 12px 14px;
+  border-top: 1px solid var(--rule); background: #0d0f12;
+  font-family: var(--font-mono); font-size: 11px; color: var(--faint);
+}
+.keys b { color: var(--dim); font-weight: 400; }
+
+@media (max-width: 1000px) {
+  .mrow { grid-template-columns: 26px 18px 1fr 54px; height: 46px; }
+  .mrow .who { display: none; }
+  .mrow .snip { display: none; }
+  .open { grid-template-columns: 1fr; padding: 16px 16px 16px 40px; }
+  .open .shot { max-width: 420px; }
+  .keys { display: none; }
+}
+</style>
+</head>
+<body>
+
+<div class="mock-bar">
+  <b>Option D</b> <span>Inbox</span>
+  <span class="grow"></span>
+  <a href="index.html">← all options</a>
+</div>
+
+<div class="page">
+  <div class="topline">
+    <h1>Signoff</h1>
+    <span class="sub">finished branches, newest last</span>
+    <span class="rule"></span>
+  </div>
+
+  <div class="inbox">
+    <div class="tools">
+      <span class="sel">7 cards on 2 branches picked</span>
+      <button class="btn tiny approve" type="button">Approve both branches</button>
+      <button class="btn tiny ghost" type="button">Clear</button>
+      <span class="grow"></span>
+      <span class="hint">j / k move · a approve · b send back · x pick · ↵ open</span>
+    </div>
+
+    <div class="mrow thread picked">
+      <span class="box">✓</span>
+      <span class="chev">▸</span>
+      <span class="who">batch-1</span>
+      <span class="line"><span class="subj" data-n="6">The board rebuilt on the Calm design</span><span class="snip">open the live board — 4px meter, spacious Needs you, chips clickable on the card</span></span>
+      <span class="when">3h</span>
+    </div>
+
+    <div class="mrow thread on">
+      <span class="box"></span>
+      <span class="chev">▾</span>
+      <span class="who">card-32</span>
+      <span class="line"><span class="subj" data-n="2">Two cards on one branch: live phase, and approved leaves Needs you</span></span>
+      <span class="when">18m</span>
+    </div>
+
+    <div class="open">
+      <div>
+        <p class="claim">Workers declare a phase per stretch of work and the board renders it as a
+          chip on its own fresh clock — “testing · 2m” — in place of the stale last-word line. Amber
+          fires only once a phase outruns the time it claimed. The second card: an approved card
+          leaves Needs you the moment your verdict lands and runs as “merging” until the branch
+          lands.</p>
+        <div class="check">
+          <span class="label">First thing to check</span>
+          <p>On the live board, #6 reads “testing · 2m” in green and #7 reads “reproducing · 6m
+            (expected 1m)” in amber. Both agents have been quiet the same length of time — the amber
+            one is amber only because it promised a minute and blew through it.</p>
+        </div>
+        <div class="acts">
+          <button class="btn approve" type="button">Approve both<span class="kbd">a</span></button>
+          <button class="btn bounce" type="button">Send back<span class="kbd">b</span></button>
+          <a class="btn ghost" href="#">See it live ↗</a>
+          <button class="btn ghost" type="button">Next<span class="kbd">j</span></button>
+        </div>
+        <p class="foot">#32, #34 · sprint/card-32 · 256 pass, 0 fail · 3 checks · 6 screenshots</p>
+      </div>
+      <div>
+        <div class="shot"><img src="shots/c32-phase.jpg" alt="phase chips on In motion rows"></div>
+      </div>
+    </div>
+
+    <div class="mrow child">
+      <span class="box"></span><span class="chev"></span>
+      <span class="who">#32</span>
+      <span class="line"><span class="subj">Cards show a live phase, not a stale line</span><span class="snip">flip CALM/CHAOS and LIST/BOARD — the same chip everywhere</span></span>
+      <span class="when">18m</span>
+    </div>
+    <div class="mrow child">
+      <span class="box"></span><span class="chev"></span>
+      <span class="who">#34</span>
+      <span class="line"><span class="subj">Approved cards leave Needs you</span><span class="snip">#3 sits under In progress tagged MERGING, not in Awaiting review</span></span>
+      <span class="when">18m</span>
+    </div>
+
+    <div class="mrow picked">
+      <span class="box">✓</span>
+      <span class="chev"></span>
+      <span class="who">card-29</span>
+      <span class="line"><span class="subj">The board sweeps itself — a parked card goes amber and wakes the session</span><span class="snip">watch a card go stuck in ten seconds on the demo board</span></span>
+      <span class="when">1h</span>
+    </div>
+
+    <div class="mrow">
+      <span class="box"></span>
+      <span class="chev"></span>
+      <span class="who">card-31</span>
+      <span class="line"><span class="subj">Board title becomes a dropdown of the other sprints here</span><span class="snip">click the title: russ marked HERE, an amber dot beside flowbee</span></span>
+      <span class="when">2h</span>
+    </div>
+
+    <div class="mrow is-merging">
+      <span class="box"></span>
+      <span class="chev"></span>
+      <span class="who">card-28</span>
+      <span class="line"><span class="subj">Slash opens Drop work from an empty box</span><span class="snip">approved 4m ago — merging, nothing to decide</span></span>
+      <span class="when">4m</span>
+    </div>
+
+    <div class="keys">
+      <span><b>j / k</b> next, previous</span>
+      <span><b>↵</b> open in place</span>
+      <span><b>a</b> approve</span>
+      <span><b>b</b> send back with notes</span>
+      <span><b>x</b> pick</span>
+      <span><b>o</b> open the card's thread</span>
+      <span><b>?</b> keys</span>
+    </div>
+  </div>
+
+  <div class="chaos-note">
+    <span class="label">What this is / what it trades</span>
+    Mail, and you already know how to use mail: sender is the agent, subject is the claim, snippet is
+    the first check, and the row you are on opens in place with the evidence. It is the only shape
+    that stays comfortable at thirteen waiting, and the only one where a keyboard clears the queue
+    without the mouse. <b>Trades:</b> it is the closest of the four to the list of database rows you
+    already dislike — one line means one line, so the claim gets truncated and nuance dies in the
+    ellipsis — and picking multiple branches to approve at once is exactly the blind bulk approve the
+    spec rules out unless every picked packet has been opened.
+    <br><br>
+    <span class="label">In Chaos</span>
+    Rows become the bevelled item list, the focused row gets the gold plate with the sheen instead of
+    the amber left bar, and the key hints render as the JRPG command bar along the bottom. The
+    density survives; only the frame changes.
+  </div>
+</div>
+
+</body>
+</html>

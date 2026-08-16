@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en" class="skin-calm">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>viewing an option · sprint mockups</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="mock.css">
+<style>
+  html, body { height: 100%; overflow: hidden; }
+  .wrap { height: calc(100vh - 39px); display: grid; place-items: start center; overflow: auto; background: #08090b; }
+  iframe { border: 0; background: var(--canvas); display: block; box-shadow: 0 0 0 1px #1a1c20; }
+  .mock-bar .on { color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="mock-bar">
+  <b id="who">option</b>
+  <span id="wlabel"></span>
+  <span class="grow"></span>
+  <a href="#" id="l1440">1440 (desktop)</a>
+  <a href="#" id="l980">980 (Fold)</a>
+  <a href="#" id="lraw">open on its own</a>
+  <a href="index.html">← all options</a>
+</div>
+<div class="wrap"><iframe id="f" title="mockup"></iframe></div>
+<script>
+  var q = new URLSearchParams(location.search);
+  var o = (q.get('o') || 'option-a.html').replace(/[^a-z0-9.\-]/gi, '');
+  var w = parseInt(q.get('w'), 10) || 1440;
+  var names = { 'option-a.html': 'Option A — One at a time', 'option-b.html': 'Option B — The digest',
+                'option-c.html': 'Option C — Contact sheet', 'option-d.html': 'Option D — Inbox' };
+  document.getElementById('who').textContent = names[o] || o;
+  document.getElementById('wlabel').textContent = w + 'px wide';
+  var f = document.getElementById('f');
+  f.style.width = w + 'px';
+  f.style.height = (w === 980 ? 740 : window.innerHeight - 39) + 'px';
+  f.src = o;
+  document.getElementById('l1440').href = 'view.html?o=' + o + '&w=1440';
+  document.getElementById('l980').href = 'view.html?o=' + o + '&w=980';
+  document.getElementById('lraw').href = o;
+  if (w === 1440) document.getElementById('l1440').className = 'on';
+  if (w === 980) document.getElementById('l980').className = 'on';
+</script>
+</body>
+</html>

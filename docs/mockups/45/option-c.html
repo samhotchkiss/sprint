@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en" class="skin-calm">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Option C — Contact sheet · sprint mockups</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="mock.css">
+<style>
+/* ---- Option C: the evidence IS the row ---------------------------------
+   You judge by looking. The screenshot is the primary object on screen and the
+   words are its caption. A work unit is not a titled row — it is a bracket
+   drawn around the tiles that shipped together. */
+
+/* a real contact sheet packs — columns, not a grid with a tall cell holding a
+   row of short ones hostage */
+.sheet { columns: 3; column-gap: 20px; }
+.sheet > * { break-inside: avoid; margin: 0 0 20px 0; }
+
+.tile {
+  border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+  background: var(--panel); display: block;
+}
+.tile .frame { position: relative; background: #08090b; border-bottom: 1px solid var(--rule); }
+/* a contact sheet crops — every tile is the same window onto its evidence, so
+   nothing wins the grid just by being a taller screenshot */
+.tile .frame img { width: 100%; display: block; aspect-ratio: 16 / 10; object-fit: cover; object-position: top left; }
+.unit .tile .frame img { aspect-ratio: 16 / 9; }
+.tile .badge {
+  position: absolute; left: 12px; top: 12px;
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase;
+  background: rgba(8,9,11,.82); border: 1px solid var(--border-chip); border-radius: var(--radius-pill);
+  padding: 4px 9px; color: var(--dim); backdrop-filter: blur(3px);
+}
+.tile .cap { padding: 14px 16px 4px 16px; }
+.tile .cap p {
+  font-size: 14px; line-height: 1.55; color: var(--body-ink); text-wrap: pretty;
+}
+.tile.wide .cap p { font-size: 15.5px; line-height: 1.6; }
+.tile .acts { display: flex; align-items: center; gap: 7px; padding: 14px 14px 14px 16px; flex-wrap: wrap; }
+.tile .meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--faint); }
+
+.strip { display: flex; gap: 6px; padding: 12px 16px 0 16px; }
+.strip img {
+  width: 76px; height: 46px; object-fit: cover; object-position: top left;
+  border: 1px solid var(--border-chip); border-radius: 5px; background: #08090b;
+}
+.strip .more {
+  display: grid; place-items: center; width: 46px; height: 46px;
+  border: 1px dashed var(--border-chip); border-radius: 5px;
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--faint);
+}
+
+/* a unit is a bracket around the tiles that shipped together */
+.unit {
+  border: 1px solid var(--border); border-left: 3px solid var(--rail-signoff);
+  border-radius: var(--radius); padding: 14px; background: #0d0f12;
+}
+.unit-head { display: flex; align-items: baseline; gap: 10px; padding: 2px 4px 13px 4px; }
+.unit-head .name { font-size: 13.5px; color: var(--dim); }
+.unit-head .where { font-family: var(--font-mono); font-size: 11px; color: var(--faint); }
+.unit .pair { display: grid; grid-template-columns: 1fr; gap: 14px; }
+.unit .tile { background: var(--panel-thread); }
+.unit-acts { display: flex; align-items: center; gap: 8px; padding: 14px 4px 2px 4px; flex-wrap: wrap; }
+.unit-acts .meta { flex-basis: 100%; }
+
+.tile.textonly .frame {
+  min-height: 168px; display: grid; align-content: center; gap: 8px; padding: 20px 18px;
+}
+.tile.textonly .frame .label { color: var(--good); }
+.tile.textonly .frame p { font-size: 13.5px; line-height: 1.6; color: var(--dim); }
+
+.tile.is-merging { opacity: .58; }
+.tile.is-merging .cap p { color: var(--faint); }
+.tile.is-merging .frame img { filter: grayscale(.55); }
+.tile .merging-line { padding: 12px 16px 14px 16px; font-family: var(--font-mono); font-size: 11px; color: var(--good); }
+
+.annot {
+  border: 1px dashed var(--border-chip); border-radius: var(--radius);
+  padding: 16px; color: var(--faint); font-size: 12.5px; line-height: 1.6;
+}
+.annot .label { display: block; margin-bottom: 8px; }
+
+@media (max-width: 1100px) {
+  .sheet { columns: 2; column-gap: 16px; }
+  .sheet > * { margin-bottom: 16px; }
+  .tile .acts .btn { min-height: 44px; }
+}
+</style>
+</head>
+<body>
+
+<div class="mock-bar">
+  <b>Option C</b> <span>Contact sheet</span>
+  <span class="grow"></span>
+  <a href="index.html">← all options</a>
+</div>
+
+<div class="page">
+  <div class="topline">
+    <h1>Look at it</h1>
+    <span class="sub">finished work, as it looks — click any picture to fill the screen</span>
+    <span class="rule"></span>
+  </div>
+
+  <div class="sheet">
+
+    <div class="tile">
+      <div class="frame">
+        <img src="shots/design-core-list.jpg" alt="the rebuilt List view at 1440">
+        <span class="badge">6 cards · one branch</span>
+      </div>
+      <div class="strip">
+        <img src="shots/design-core-board.jpg" alt="board layout">
+        <img src="shots/design-core-list.jpg" alt="list layout">
+        <img src="shots/c31-menu.jpg" alt="rail packet">
+        <span class="more">+2</span>
+      </div>
+      <div class="cap">
+        <p>The board rebuilt on the Calm design — List by default, the 480px rail, the Fold layout,
+          fonts vendored so nothing phones home.</p>
+      </div>
+      <div class="acts">
+        <button class="btn approve tiny" type="button">Approve all six</button>
+        <button class="btn bounce tiny" type="button">Send back</button>
+        <a class="btn ghost tiny" href="#">Live ↗</a>
+        <span class="grow"></span>
+        <span class="meta">#9–#14 · 3h</span>
+      </div>
+    </div>
+
+    <div class="tile">
+      <div class="frame">
+        <img src="shots/c29-drawer.jpg" alt="a stuck card ambered in the drawer">
+      </div>
+      <div class="cap">
+        <p>A card parked where someone owes an action goes amber by itself and wakes the session.</p>
+      </div>
+      <div class="acts">
+        <button class="btn approve tiny" type="button">Approve</button>
+        <button class="btn bounce tiny" type="button">Send back</button>
+        <span class="grow"></span>
+        <span class="meta">#29 · 1h</span>
+      </div>
+    </div>
+
+    <div class="unit">
+      <div class="unit-head">
+        <span class="name">These two shipped together</span>
+        <span class="where">sprint/card-32</span>
+        <span class="grow"></span>
+        <span class="where">18m</span>
+      </div>
+      <div class="pair">
+        <div class="tile">
+          <div class="frame"><img src="shots/c32-phase.jpg" alt="phase chips on In motion rows"></div>
+          <div class="cap"><p>A live phase on its own clock — “testing · 2m” — instead of the last
+            stale thing the agent said.</p></div>
+          <div class="acts"><button class="btn bounce tiny" type="button">Send #32 back</button>
+            <span class="grow"></span><span class="meta">#32</span></div>
+        </div>
+        <div class="tile">
+          <div class="frame"><img src="shots/c34-list.jpg" alt="an approved card under In motion, merging"></div>
+          <div class="cap"><p>An approved card leaves Needs you at once and runs as “merging” until
+            the branch lands.</p></div>
+          <div class="acts"><button class="btn bounce tiny" type="button">Send #34 back</button>
+            <span class="grow"></span><span class="meta">#34</span></div>
+        </div>
+      </div>
+      <div class="unit-acts">
+        <button class="btn approve tiny" type="button">Approve both</button>
+        <a class="btn ghost tiny" href="#">Live ↗</a>
+        <span class="grow"></span>
+        <span class="meta">256 pass, 0 fail · card-32</span>
+      </div>
+    </div>
+
+    <div class="tile">
+      <div class="frame">
+        <img src="shots/c31-menu.jpg" alt="the sibling sprint dropdown open">
+      </div>
+      <div class="cap">
+        <p>The board title becomes a menu of the other sprints on this machine, dotted where one has
+          a question waiting.</p>
+      </div>
+      <div class="acts">
+        <button class="btn approve tiny" type="button">Approve</button>
+        <button class="btn bounce tiny" type="button">Send back</button>
+        <span class="grow"></span>
+        <span class="meta">#31 · 2h</span>
+      </div>
+    </div>
+
+    <div class="tile is-merging">
+      <div class="frame">
+        <img src="shots/c30-slash.jpg" alt="Drop work opened by the slash key">
+        <span class="badge">merging</span>
+      </div>
+      <div class="cap">
+        <p>Slash opens Drop work from an empty chat box.</p>
+      </div>
+      <div class="merging-line">You said yes 4m ago — the session is merging it.</div>
+    </div>
+
+    <div class="tile textonly">
+      <div class="frame">
+        <span class="label">Nothing to look at</span>
+        <p>When a packet has no screenshot, the tile is its first check step in the same space —
+          the grid never shows an empty grey rectangle, and a change with no picture is never
+          quietly ranked below one that has one.</p>
+      </div>
+      <div class="acts">
+        <span class="meta">how this shape handles non-UI work</span>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="chaos-note">
+    <span class="label">What this is / what it trades</span>
+    The evidence is the object; the words are its caption. For UI work this is the fastest possible
+    yes — you recognise a good screen in about a second, and the 6-card branch reads as one picture
+    with a filmstrip rather than six near-identical rows. <b>Trades:</b> it flatly favours work that
+    photographs well — a server fix with three checks and no picture is a text tile in a room full of
+    images — it is the most vertical space per decision, and a screenshot can look right while the
+    thing behind it is wrong, so the check steps get demoted to a click.
+    <br><br>
+    <span class="label">In Chaos</span>
+    Tiles get the ink outline and hard bevel and become inventory slots; the badge is a gold plate in
+    the corner; the bracket around a unit is the party frame. Because the pictures carry the meaning
+    and Chaos only restyles frames, this is the shape that survives the skin change with the least
+    translation work.
+  </div>
+</div>
+
+</body>
+</html>
