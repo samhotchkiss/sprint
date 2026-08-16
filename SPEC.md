@@ -330,6 +330,10 @@ root; several run at once in different tmux windows.
   you / N ready / N in motion", session dot (online/busy/offline), last activity age, "open board"
   link carrying that board's token. `needs_you > 0` sorts to the top with an amber left rail and the
   oldest open question's age ("stuck 22m"); longest wait first. 10s polling of `GET /api/hub`; no SSE.
+- **It is also the reviver.** The same poll that builds the page wakes a board whose own session
+  died — the hub is the only process on this machine that watches every board and is not itself one
+  of the sessions that can die. See *Autoheal*. A reviver that throws can never stop the page from
+  rendering the other boards.
 - Started once per machine by hand; boards register themselves. No launchd parity yet.
 - **From inside a board — the title switcher.** User verbatim: "When there are multiple sprints going
   on my box, the title should turn into a dropdown. Also, it should show a dot when another sprint has
@@ -455,6 +459,9 @@ events. Nothing was silent and nothing was broken — the work was simply *owed 
   (`SPRINT_SESSION_OFFLINE_SECONDS`, `SPRINT_WAITER_ONLINE_SECONDS`, `SPRINT_WAITER_GONE_SECONDS`).
   UI: banner ("session offline — items will queue") ONLY on `offline`; `busy` is the dot + tooltip,
   never a banner. Submissions/answers still accepted and queue in every state.
+  A session that is offline **and** has work owed to it for twenty minutes is no longer merely
+  offline — see *Autoheal*, which is the same three signals on a much longer clock, plus the two
+  guards (owed work, account limit) that turn "quiet" into "dead".
 
 ## Provider limit windows (auto-resume — SHIPPED)
 
@@ -886,7 +893,7 @@ example."* Scope ruling: *"Peer per card — mix grok-via-tmux and claude subage
 
 - **Store**: `.sprint/config.json` (a file, not a table — hand-editable, survives `stop`, diffs in a
   terminal). `{"worker": {"model_policy", "default_executor", "executors", "concurrency"},
-  "agent_name": ""}`.
+  "agent_name": "", "session_tmux_window": ""}`.
   `model_policy ∈ {lowest_feasible (default), always_opus, always_sonnet}`; `executors` is
   name → `{kind: subagent|tmux, command?, session?, model?, note?}` (a `tmux` executor REQUIRES a
   command; `session` defaults to `sprint-workers`); `concurrency` is 1–20, default 3.
@@ -918,6 +925,9 @@ example."* Scope ruling: *"Peer per card — mix grok-via-tmux and claude subage
   new hire, and the self-restart exec drops the flag for the same reason. Renaming on purpose is the
   `PUT` (or the settings panel's *Session name* field). Taking a name appends its own one-line `note`
   ("the session is called “Chuck”"), never a `settings changed` line — it isn't dispatch policy.
+- **Where that session can be reached** is the third top-level key, `session_tmux_window` (default
+  `""`), and it is an address rather than a name: **last write wins**, `""` unregisters, and it is
+  what makes dead-session autoheal possible at all. See *Autoheal* below.
 - **Per card**: `cards.executor`/`cards.model` (both nullable; NULL = the board's defaults), set via
   `POST /api/cards/:num/assign {executor?, model?}`, which refuses an executor that is not declared.
   Every card payload carries `dispatch: {executor, kind, command, session, model, source,
@@ -936,6 +946,82 @@ example."* Scope ruling: *"Peer per card — mix grok-via-tmux and claude subage
   events: a window whose `pane_current_command` fell back to a shell is a dead worker, and a
   non-terminal card there is `failed` + Retry (the tmux analogue of killed-agent detection). Terminal
   states kill the window, never the shared session.
+
+## Autoheal — when the SESSION dies (SHIPPED)
+
+User verbatim, on the day it happened twice: *"but also, how can we help this autoheal in the
+future?"* A Claude session was killed at a provider limit. Its board server was untouched — still
+serving, still sweeping, still accepting cards — but the brain was gone: five cards the user had
+already approved sat in `integrating` for six hours, sixteen sat queued, and the only thing that
+recovered it was a human noticing and typing a recovery brief into its tmux window by hand. Every
+fact needed to notice was already on the board (its orchestrator cursor stopped at 11:15 and never
+moved), and nothing was in a position to act on them.
+
+Three pieces in three places, because no single process can do it — the dead session cannot restart
+itself, and its board must not spawn processes.
+
+- **1. Registration (the session, at boot).** `session_tmux_window` in `.sprint/config.json`
+  (top-level, beside `agent_name`), settable with `PUT /api/settings {"session_tmux_window":
+  "russ-machine"}` or `sprintd start --tmux-window <target>`. SKILL.md boot step 5: detect tmux
+  (`$TMUX` + `tmux display-message`) and register what tmux says, verbatim. **Outside tmux, register
+  nothing** — autoheal simply does not apply, which is a fine outcome and much better than a guessed
+  window (the first hand-run recovery guessed wrong and a session that did not own that board started
+  posting to it). **LAST write wins**, the opposite of `agent_name`: a name is an identity that must
+  survive a restart untouched, a window is an ADDRESS and a session that moved has to correct it.
+  `""` unregisters. Validated as a tmux target (`^[A-Za-z0-9%][A-Za-z0-9._:@/-]{0,79}$`) because the
+  string becomes argv — anything readable as a second argument or a shell fragment is a 400 at the
+  door, and a hand-edited config with a broken one reads back as no window at all.
+- **2. Detection (the board's sweep).** One `session_dead` event, **once per death episode**, when
+  all three hold: no proof of life for `SPRINT_SESSION_DEAD_SECONDS` (default 1200 / 20 min), AND
+  cards exist in a state the SESSION owes an action on (`queued`, `in_progress`, `integrating` — not
+  `needs_you`/`ready`, which are the human's court and where waking a session achieves nothing), AND
+  no active account-kind limit. **Proof of life is three signals and they are all acts**: the drain
+  cursor moved, the waiter long-polled, or the session posted as `actor: "session"`. A `user` event
+  is deliberately not one (the russ outage had the user still typing into a board dead five hours),
+  and neither is a `server` event, or the sweep would keep resurrecting the session it is complaining
+  about. The episode runs from that last proof of life, exactly the way a card's stuck episode runs
+  from its last transition (#67): coming back re-arms the notice. Detection is independent of
+  revivability — a board with no registered window still says it died, and the event's detail says
+  why nothing will happen about it.
+- **3. Revival (the hub).** The hub is the natural home: it is the one machine-wide process that
+  already polls every board and is not itself one of the sessions that can die. On each poll, for a
+  board whose `/api/board` says `autoheal.revive_wanted`, it runs `tmux-send <window> <brief>` as a
+  subprocess (`SPRINT_TMUX_SEND`, default `~/.local/bin/tmux-send`; absent = one log line and skip,
+  checked BEFORE claiming so a machine without the skill never burns a board's budget;
+  `SPRINT_AUTOHEAL=0` disables). Every decision belongs to the board, which owns the durable event
+  log the guard is written in: the hub asks `POST /api/autoheal/revive`, which under one lock checks
+  the guards, writes the `revive_attempted` event and hands back the brief. **The claim is written
+  before the message is sent**, for the same reason the self-restart stamp is (#62): the case the
+  guard exists for is the one where what happens next never comes back. The hub reports delivery to
+  the same endpoint with `attempt_seq`, which appends a `revive_result` and spends no slot.
+- **The brief** is generated by the board from its own state, in the shape of the one that worked by
+  hand: the verdict, the cursor gap (`cursor: 750 of 773 — 23 events you never read`), the stranded
+  cards by number and pile (approved-but-never-merged / in motion / queued), an ownership header
+  naming the `project_root` (*"if this is not the project this session runs, reply “wrong session”,
+  touch nothing, and stop"*), and an ORDER whose first instruction is **do not dispatch anything
+  first**: catch the cursor up, land the approved branches one at a time gating each, then
+  re-dispatch from card timelines. `GET /api/autoheal?brief=1` renders it without sending it.
+- **Crash-loop guard**, mirrored from self-restart (#62) — same three questions, same bias toward
+  doing nothing: never twice inside `SPRINT_REVIVE_MIN_INTERVAL` (default 600 / 10 min) per board, at
+  most `SPRINT_REVIVE_MAX_BURST` (3) inside `SPRINT_REVIVE_BURST_WINDOW` (3600), then one
+  `revive_gave_up` event per episode and silence.
+- **Submission is not revival.** The second outage of the day had the session's process alive with a
+  `/status` dialog open in its terminal: tmux-send delivered and verified the message and nothing
+  happened, because an undismissed modal blocks the session from processing anything. So a wake-up
+  counts as having worked only if a proof of life lands within `SPRINT_REVIVE_GRACE_SECONDS`
+  (default 180); a delivered message that never stirs the session is a failed attempt and spends its
+  slot like any other. The give-up line branches on which failure it was, because they have different
+  next acts: *"the wake-up was delivered but the session never stirred; its terminal may be blocked
+  by an open dialog. Check the window by hand"* vs *"the wake-up could not be delivered to tmux window
+  “X”"*.
+- **Limit-aware.** While a machine-wide account window is on, a silent session is **parked, not
+  dead** — nothing it could be woken to do would run. The rule stays out of the way entirely
+  (`reason: "account_limited"`, no event, no claim) and #47's Resume flow re-arms it.
+- **UI.** No new chrome. The board's existing offline banner gains one clause — `session offline —
+  revival attempted 12:03`, or the give-up sentence when autoheal has stopped trying — and nothing
+  else moves. The hub page carries the same line on that board's row in amber, which is the only
+  place a person actually finds out: the board it happened on has no session left to tell anyone,
+  which is the whole reason a landing page that outlives them exists.
 
 ## Non-goals (v1)
 

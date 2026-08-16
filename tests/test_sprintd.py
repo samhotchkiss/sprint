@@ -11678,5 +11678,47 @@ class TestHubReviver(ReviverBase):
         self.assertEqual(self.sends, [])
 
 
+
+class TestAutohealDocs(Base):
+    """The procedure lives in SKILL.md; the server only makes it possible.
+
+    Registration is a thing the SESSION does, once, at boot -- so if the skill
+    does not say to do it, none of the rest of this card exists at all.
+    """
+
+    def read_repo_file(self, *parts):
+        path = os.path.join(os.path.dirname(HERE), *parts)
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_skill_tells_the_session_to_register_its_window_at_boot(self):
+        doc = self.read_repo_file("skills", "sprint", "SKILL.md")
+        self.assertIn("session_tmux_window", doc)
+        self.assertIn("--tmux-window", doc)
+        self.assertIn("$TMUX", doc)
+        # ...and to register NOTHING outside tmux, rather than guess a window
+        self.assertIn("register nothing", doc)
+
+    def test_the_skill_tells_a_woken_session_to_prove_it_owns_the_board(self):
+        doc = self.read_repo_file("skills", "sprint", "SKILL.md")
+        self.assertIn("woken by autoheal", doc)
+        self.assertIn("wrong session", doc)
+
+    def test_the_skill_gives_a_woken_session_the_order_of_operations(self):
+        doc = self.read_repo_file("skills", "sprint", "SKILL.md")
+        heal = doc[doc.index("woken by autoheal"):]
+        self.assertIn("Land what the user already approved, first", heal)
+        self.assertLess(heal.index("catch your cursor up"),
+                        heal.index("Then re-dispatch"))
+
+    def test_the_spec_records_the_whole_loop(self):
+        spec = self.read_repo_file("SPEC.md")
+        self.assertIn("## Autoheal", spec)
+        for word in ("session_tmux_window", "session_dead", "revive_attempted",
+                     "revive_gave_up", "SPRINT_SESSION_DEAD_SECONDS",
+                     "SPRINT_REVIVE_MAX_BURST", "SPRINT_TMUX_SEND",
+                     "Submission is not revival"):
+            self.assertIn(word, spec, word)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

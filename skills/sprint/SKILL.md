@@ -112,7 +112,7 @@ went green, the overlapping card landed, the dependency shipped).
    a live server already owns the port with a matching token it exits 0
    and tells you so; treat that identically to a fresh start (still
    re-read `server.json`, still proceed to drain — this IS the resume
-   path, see step 8), and `--name` renames that live board rather than
+   path, see step 9), and `--name` renames that live board rather than
    being ignored.
 3. Read `.sprint/server.json`, set `SPRINT_SERVER`/`SPRINT_TOKEN` per
    above. Print the URL for the user: `$SPRINT_SERVER/?t=$SPRINT_TOKEN`.
@@ -151,15 +151,46 @@ went green, the overlapping card landed, the dependency shipped).
    If the user later asks you to be called something else, that is a
    rename and it is theirs to make: same `PUT`, or the board's settings
    panel ("Session name"). An empty string takes the name back.
-5. `POST $SPRINT_SERVER/api/sprint {"action":"open"}` if there's no open
+5. **Register where you can be WOKEN — every boot, and every resume.**
+   This is the one line that makes dead-session autoheal possible, and
+   it costs one shell command. Twice in one day a session was killed at
+   a provider limit; its board kept serving, five cards the user had
+   already approved sat in `integrating` for six hours, and the only
+   thing that recovered it was a human noticing and typing into its
+   tmux window by hand. The board can now notice that itself — but only
+   the hub can reach a keyboard, and only if it knows which window.
+
+   a. **Are you in tmux?** `[ -n "$TMUX" ] && tmux display-message -p
+      '#{session_name}:#{window_index}'`. If `$TMUX` is unset you are
+      not in tmux: register nothing, and autoheal simply does not apply
+      to this board. That is a fine outcome, not a failure — do not
+      invent a window name, and do not guess one from the project. A
+      guessed window is how a wake-up brief gets typed into somebody
+      else's terminal, which has already happened once.
+   b. **Register what tmux told you**, verbatim:
+      `PUT $SPRINT_SERVER/api/settings {"session_tmux_window":
+      "<target>", "actor": "session"}` (or pass `--tmux-window
+      <target>` to `sprintd start`). A pane id (`%5`) or
+      `session:window` is more precise than a bare session name and is
+      preferred when tmux gives you one.
+   c. **LAST write wins here, unlike your name.** A name is an identity
+      and must survive a restart untouched; a window is an ADDRESS. If
+      you were resumed in a different window, re-register — an
+      un-corrected address means the hub types a recovery brief into
+      whatever is sitting in the old one now. So: re-register on every
+      boot, unconditionally. It is idempotent when nothing moved.
+   d. If you leave tmux (or the address stops being true and you cannot
+      say what the new one is), unregister with `""`. No channel is
+      strictly better than a wrong one.
+6. `POST $SPRINT_SERVER/api/sprint {"action":"open"}` if there's no open
    sprint yet (check `GET /api/board` first — if a sprint is already
    open, e.g. this is a resume, don't open a second one).
-6. Read the persisted cursor: `cursors` row named `orchestrator`
+7. Read the persisted cursor: `cursors` row named `orchestrator`
    (exposed via the board/events read path — if it's your first ever
    boot for this project there is none yet; treat that as cursor `0`).
-7. Reap orphaned worktrees (see step 3's reap procedure) — cheap
+8. Reap orphaned worktrees (see step 3's reap procedure) — cheap
    insurance even on a clean boot.
-8. Arm your ingress (step 2's `sprintd tail` under Monitor) and enter the
+9. Arm your ingress (step 2's `sprintd tail` under Monitor) and enter the
    drain loop (step 2). This is where boot and resume converge into the
    same loop — from here on there is no difference between "just
    started" and "been running for days."
@@ -373,6 +404,7 @@ and the table is prose.
 | server | `limit_cleared` | A provider limit window just ended. **This is a work signal, not a notification.** `payload.kind` says which procedure: `"model"` — re-dispatch what you downgraded, back on the model named in `payload.model`; `"account"` — the whole Claude account came back (the user pressed Resume after signing in with another session), so **re-dispatch every card parked or killed during the window, briefing each with its own timeline**. `payload.reason` says whether the clock got there or somebody cleared it early. See step 5b. |
 | server | `limit_declared` | A limit declaration — yours, or (for `kind: "account"`) one another board on this machine made. Nothing to do; the board is now showing the line or the banner. |
 | server | `stuck` | The board's staleness sweep: a card parked in a state somebody owes an action on. `payload.state` names which, and that is what you act on — see the row below. Nothing is broken; something is owed, and it's usually owed by you. |
+| server | `session_dead` / `revive_attempted` / `revive_gave_up` | Dead-session autoheal, and it is **about you**. If you are reading it live, the board was wrong about you being dead — nothing is owed except getting your cursor moving, which reading it already did. The case these events actually exist for is you reading them from the OTHER side: see "Step 8 — you were woken by autoheal" below. |
 | server | `state` (blocked) | Note the reason; you'll re-check blocked cards periodically (not driven by an event — see "Blocked sweep" below). |
 
 ### `stuck` — what to do per state
@@ -1395,6 +1427,57 @@ resume` — this skill should treat "resume" and "start a sprint" as the
 same trigger; the boot/resume distinction is internal to you (whether a
 cursor already exists), not something the user needs to phrase
 differently.
+
+---
+
+## 8. You were woken by autoheal — what to do first
+
+Sometimes the message that starts your turn is not from the user. It
+opens with *"Your sprint board thinks this session died"* and ends with
+*"(sprint autoheal, attempt 1 of 3 — nobody typed this)"*. That is a
+board on this machine whose own session stopped reading it, noticed,
+and had the hub type into your window. You may be that session coming
+back, or you may be a completely different one.
+
+**Before anything else, prove you own that board.** The brief names a
+`project:` path and a `port:`. If that path is not the project this
+session runs, reply **"wrong session"**, touch nothing, and stop — do
+not post to it, do not merge anything, do not dispatch. This is not
+hypothetical: the first hand-run recovery guessed the wrong tmux window,
+and a session that did not own the board started posting to it before
+it was caught. One check kills the whole class.
+
+Once you have confirmed it is yours, work the brief in the order it
+gives, which is the order that worked by hand:
+
+1. **Read before you write.** The brief carries `cursor: N of M`. Read
+   the event log from `N` to the head and catch your cursor up
+   (`POST /api/cursors/orchestrator`). Everything in that gap happened
+   while nobody was listening — approvals, questions, dead workers.
+2. **Land what the user already approved, first.** Cards sitting in
+   `integrating` are branches he said yes to and nobody merged. Do them
+   **one at a time, gating each** (step 6). This comes before anything
+   else because it is the only pile where the user is already waiting on
+   a promise you made.
+3. **Then re-dispatch.** `in_progress` cards whose agents died and the
+   queue. Brief each one from its OWN card timeline, not from memory —
+   your memory of it is exactly what was lost.
+4. **Do not dispatch anything before steps 1–3.** A fresh agent on top
+   of an un-drained cursor re-does work that already landed.
+5. Say what happened in the sidebar once you are underway, in one line.
+   The user will come back to a board with hours of silence on it and
+   deserves to see who fixed it and when.
+
+If you cannot act — you are mid-something, or the board is not yours —
+say so and stop. A wake-up you decline is fine; the hub will not repeat
+it inside ten minutes, and after three tries it gives up and says so on
+the hub page for the user to see.
+
+**What if the wake-ups never arrive?** Then you never registered a
+window (boot step 5), or you registered a stale one. Both are silent
+failures by design — the board says "no tmux window was registered, so
+nothing can wake it" on its own timeline and on the hub row. Re-register
+every boot and this does not happen.
 
 ---
 
