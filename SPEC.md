@@ -23,6 +23,7 @@ recovery must be easy. The user always runs claude inside tmux.
 | `skills/sprint/SKILL.md` | The orchestrator brain: boot, resume, event-drain loop, dispatch, batching, liveness response, evidence gate, verdicts, end-sprint. |
 | `agents/sprint-worker.md` | Worker subagent definition + reporting contract. |
 | `bin/sprint-post`, `bin/sprint-ask`, `bin/sprint-ready` | Thin curl wrappers workers call (python3, no deps). Client-side validate before POST; fail with one named missing field. |
+| `bin/sprint-recover`, `bin/sprint-limit` | The SESSION's two helpers, not the workers'. `sprint-recover <num…>` prints the recovery brief for a card whose agent died; `sprint-limit declare/list/clear` records a provider limit window from the kill message. |
 | `.claude-plugin/plugin.json` | Plugin manifest (name: `sprint`). |
 
 ## Data dir & server lifecycle
@@ -92,6 +93,10 @@ recovery must be easy. The user always runs claude inside tmux.
 - `cursors(name PRIMARY KEY, seq)` — the session persists its drain cursor here (`orchestrator`).
 - `questions(id, card_num, text, options JSON NULL, answered_at NULL)` — answer idempotency: second
   answer to the same question id is a 409, surfaced gently in UI.
+- `limits(id, model, resets_at, declared_at, cleared_at NULL, source NULL, note NULL)` — provider
+  usage limit windows (see below). `cards.model_reason` is the other half: free text saying WHY a
+  card is not on the default model ("fable limited until 23:50"), which is what makes "downgraded
+  because of a limit" a queryable fact rather than something the session has to remember.
 
 ## Card states
 
@@ -377,6 +382,47 @@ events. Nothing was silent and nothing was broken — the work was simply *owed 
   (`SPRINT_SESSION_OFFLINE_SECONDS`, `SPRINT_WAITER_ONLINE_SECONDS`, `SPRINT_WAITER_GONE_SECONDS`).
   UI: banner ("session offline — items will queue") ONLY on `offline`; `busy` is the dot + tooltip,
   never a banner. Submissions/answers still accepted and queue in every state.
+
+## Provider limit windows (auto-resume — SHIPPED)
+
+User verbatim, on the killed-agent work: **"does this also detect when the model tells us when the
+reset happens? i want to make sure it's surfaced to the user and it auto-restarts when the window
+resets"**. The incident behind it: three workers killed at once by a usage limit whose message said
+`resets 11:50pm (America/Denver)`; nothing captured that sentence, and the cards sat open for hours.
+
+- **A window is one fact**: this model is unavailable until this instant. Declared by the session the
+  moment it reads a kill message — `bin/sprint-limit declare --model fable --resets "11:50pm"` →
+  `POST /api/limits {model, resets_at, source?, note?}`.
+- **`resets_at` is parsed server-side, once**, so the CLI and the board can never disagree: an epoch,
+  an ISO 8601 timestamp (naive = local, offsets honoured), or a HUMAN CLOCK TIME (`11:50pm`, `9pm`,
+  `23:50`) meaning the **next occurrence** — at 11:52pm, "11:50pm" is tomorrow. The provider's own
+  zone may ride along in parentheses (`11:50pm (America/Denver)`) so the kill message pastes
+  verbatim; an unknown zone is a named 400, never a silent local reading.
+- **Active is COMPUTED, never a column**: `cleared_at IS NULL AND resets_at > now`. A board that was
+  down across the reset time comes back up knowing the window is over — no cleanup job is load-bearing.
+  `cleared_at` exists only to make the end-of-window event fire once.
+- **One active window per model.** Re-declaring the same window (the session sees the same kill
+  message on the second and third dead agent) updates it; a corrected reset time moves the window it
+  corrects. Two identical lines on the board is the bug this prevents.
+- **Ending a window emits exactly ONE `limit_cleared`** (`card_num` NULL, `actor: "server"`,
+  `payload.model`, `payload.reason ∈ {window_passed, cleared_early}`), guaranteed by a conditional
+  `UPDATE … WHERE cleared_at IS NULL`: whoever wins writes the event and every other caller — a
+  second sweep tick, a manual clear racing the clock, another thread — says nothing. This is not
+  log hygiene: the session re-dispatches on this event, so a duplicate is duplicate AGENTS on one
+  card. `POST /api/limits/:id/clear` ends one early; `limit_declared` is emitted on declaration.
+- **The sweep is a third rule on the existing sweep tick**, beside staleness and worker-gone.
+- API: `POST /api/limits`, `GET /api/limits` (`{active, recent, server_time}`),
+  `POST /api/limits/:id/clear`; `/api/board` carries `limits: [...]` (open windows only).
+  `assign` accepts `model_reason` — `""` clears it, omitting it leaves it alone.
+- **UI: one quiet board-level line per open window**, in the session-offline banner's slot and
+  register — *"fable is rate-limited until 11:50pm — work is running on opus"*. Not a modal, not a
+  toast, dashed rather than coloured, and **no new per-card chrome**: a re-dispatched card already
+  wears its model tag. The second half of the sentence is read off the board's own cards (the
+  distinct models of non-terminal cards carrying a `model_reason`) so it is only said when true.
+  The line goes away on the clock, not on an event.
+- **SKILL.md owns the reaction** (step 5b): declare the window → dispatch the fallback with
+  `model` + `model_reason` → on `limit_cleared`, re-dispatch everything downgraded or parked for it
+  back on the original model and clear the reason with `"model_reason": ""`.
 
 ## Evidence gate ("ready")
 

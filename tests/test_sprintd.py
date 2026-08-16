@@ -5632,7 +5632,10 @@ class TestDispatchModel(Base):
         # The schema as it was before `model` existed — the real shape of a
         # board that has been up since before this shipped.
         old_schema = sprintd.SCHEMA.replace("  model TEXT,\n", "")
-        self.assertNotIn("model TEXT", old_schema)
+        # The guard is that the replace actually LANDED, so it names the exact
+        # line it removed. A bare "model TEXT" also matches the `limits` table's
+        # own `model` column, which has nothing to do with this migration.
+        self.assertNotIn("  model TEXT,", old_schema)
         conn.executescript(old_schema)
         conn.execute("INSERT INTO sprints(opened_at) VALUES(1.0)")
         conn.execute("INSERT INTO cards(sprint_id, state, title, body, created_at, "

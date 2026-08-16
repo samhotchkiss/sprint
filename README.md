@@ -179,6 +179,36 @@ Details worth knowing:
   parity for it yet (`sprintd doctor --install-launchd` covers boards
   only).
 
+## When a provider limit kills your agents
+
+Agents get killed by usage limits, several at once, and the kill message
+is usually the only thing that says when it ends:
+
+```
+You've hit your session limit · resets 11:50pm (America/Denver)
+```
+
+Tell the board, and it takes it from there:
+
+```
+bin/sprint-limit declare --model fable --resets "11:50pm" --source "kill message"
+bin/sprint-limit list          # what's limited, and how long is left
+bin/sprint-limit clear 3       # it came back early
+```
+
+While the window is open the board carries one quiet line — *"fable is
+rate-limited until 11:50pm — work is running on opus"* — in the same
+place the session-offline banner goes. When it passes, the board emits a
+single `limit_cleared` event, and the session's job (per
+`skills/sprint/SKILL.md` step 5b) is to put whatever it downgraded back
+on the model it should have been on.
+
+`--resets` takes the provider's own wording: a clock time (`11:50pm`,
+`23:50` — meaning the *next* time it comes round), that same clock time
+with the zone in parentheses, an ISO 8601 timestamp, or an epoch. It
+prints back the exact instant it landed on, so a typo is caught before
+the board acts on it.
+
 ## Power-outage recovery
 
 The Mac this runs on is online 24/7, but power outages happen. Recovery

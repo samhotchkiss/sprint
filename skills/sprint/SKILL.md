@@ -38,9 +38,15 @@ port).
 All of your own (session-level) API calls use `curl` with
 `-H "Authorization: Bearer $SPRINT_TOKEN"`. The three worker helpers
 (`sprint-post`, `sprint-ask`, `sprint-ready`) are for workers, not you —
-you have the full API, they get the narrow card-scoped slice. There is
-one helper that is yours and not theirs: `bin/sprint-recover <num…>`,
-which prints the recovery brief for a card whose agent died (step 5b).
+you have the full API, they get the narrow card-scoped slice. Two
+helpers are yours and not theirs, and both belong to step 5b:
+
+- `bin/sprint-recover <num…>` — the recovery brief for a card whose
+  agent died: state, last 10 timeline lines, worktree, branch, what is
+  dirty.
+- `bin/sprint-limit declare --model fable --resets "11:50pm"` — record
+  the reset time a provider's kill message gave you, so the board can
+  show it and tell you when it is over. `list` and `clear <id>` too.
 
 ## Card state machine (reference)
 
@@ -283,6 +289,8 @@ and the table is prose.
 | worker | `question` | Server already flipped to `needs_you`. Nothing to do — the card face shows the question; you'll see the `answer` event when the user responds. |
 | worker | `evidence` (ready) | Card (or whole batch) just entered `ready`. Nothing required from you — it's now waiting on the user's verdict. Optional: a short sidebar note if the user seems to be waiting on it. |
 | server | `agent_silent` | See step 5 — go investigate. |
+| server | `limit_cleared` | A provider limit window just ended (`payload.model` names the model, `payload.reason` says whether the clock got there or somebody cleared it early). **This is a work signal, not a notification.** Re-dispatch everything you downgraded or parked for that limit, back on the original model — see step 5b's "When the window ends". |
+| server | `limit_declared` | Your own limit declaration, echoed. Nothing to do; the board is now showing the line. |
 | server | `stuck` | The board's staleness sweep: a card parked in a state somebody owes an action on. `payload.state` names which, and that is what you act on — see the row below. Nothing is broken; something is owed, and it's usually owed by you. |
 | server | `state` (blocked) | Note the reason; you'll re-check blocked cards periodically (not driven by an event — see "Blocked sweep" below). |
 
@@ -657,6 +665,38 @@ You find out one of three ways, and any one of them is enough:
 If you hit a provider limit dispatching one agent, assume it hit the
 others too. **Check every live card, not just the one you noticed.**
 
+### Read the reset time off the kill message FIRST
+
+The message that killed the agent usually says when it ends:
+
+```
+You've hit your session limit · resets 11:50pm (America/Denver)
+```
+
+**That sentence is the most valuable thing in the incident and it is
+gone the moment you scroll past it.** Record it before you do anything
+else — one command, and it can take the provider's wording verbatim:
+
+```
+bin/sprint-limit declare --model fable --resets "11:50pm" --source "kill message"
+```
+
+`--resets` also takes `"11:50pm (America/Denver)"`, an ISO 8601
+timestamp, or an epoch. A bare clock time means the **next** time it
+comes round, which at 11:52pm is tomorrow — the answer you meant. The
+command prints back the exact instant it landed on; read that line, it
+is how you catch a typo before the board acts on it.
+
+Declaring it does three things you would otherwise be doing by hand:
+the board shows a quiet line while the window is open ("fable is
+rate-limited until 11:50pm — work is running on opus"), `GET
+/api/limits` (and `/api/board`'s `limits`) can be asked what is
+limited, and when the window passes the board emits exactly one
+`limit_cleared` event — your cue to put the work back.
+
+If you cannot find a reset time, skip this and carry on; everything
+below still works. But look before you decide you cannot find it.
+
 ### The required response
 
 **Re-dispatch the same card(s) immediately, on the next model down.**
@@ -690,20 +730,72 @@ For each card:
      `git log origin/main..HEAD` and `git status` first, always. Redoing
      work on top of a half-finished commit is how a recoverable mess
      becomes a conflicted one.
-3. **Record the model** on the assign call so the user can see it:
-   `POST /api/cards/:num/assign {"agent_name":…, "worktree":…,
-   "branch":…, "model":"opus"}`. The card face shows the model **only
-   when it differs from the sprint default**, so an ordinary dispatch
-   stays quiet and a fallback is visible at a glance. The timeline note
-   reads "assigned to sprint-card-42 on opus".
+3. **Record the model AND why** on the assign call:
+
+   ```
+   POST /api/cards/:num/assign {"agent_name": …, "worktree": …, "branch": …,
+                                "model": "opus",
+                                "model_reason": "fable limited until 11:50pm"}
+   ```
+
+   The card face shows the model **only when it differs from the sprint
+   default**, so an ordinary dispatch stays quiet and a fallback is
+   visible at a glance. The timeline note reads "assigned to
+   sprint-card-42 on opus — fable limited until 11:50pm".
+
+   **`model_reason` is not decoration — it is how you find these cards
+   again.** When the window ends you will be re-reading `/api/board`,
+   possibly in a different session after a restart, and the cards that
+   were downgraded have to be knowable from the payload rather than
+   from your memory of what you did last night. Set it on every
+   limit-driven dispatch, and set it on anything you PARK for the limit
+   too (a card you left `queued` rather than dispatch): a queued card
+   with a `model_reason` is a card you owe a dispatch to.
 4. **Say it in the sidebar, once, for the batch**: which cards were
-   killed, what limit did it, and what they are now running on. One
-   line. The user should never be the one who notices that agents died.
+   killed, what limit did it, when it resets, and what they are now
+   running on. One line. The user should never be the one who notices
+   that agents died.
 
 If a card was already moved to `failed` by the board, the same procedure
 applies — the user's Retry and your re-dispatch are the same act; you do
 not need to wait for them to click it. `failed` preserves the timeline,
 the evidence, the branch and the worktree precisely so this works.
+
+### When the window ends — the `limit_cleared` reaction
+
+The board emits **one** `limit_cleared` event when a declared window
+passes (or when someone clears it early with `bin/sprint-limit clear
+<id>`). It is `card_num: null`, `actor: "server"`, and it names the
+model in `payload.model`. Your standing tail wakes on it like any other
+server event, and it is the second half of this procedure — without it,
+"downgrade now, restore later" is just "downgrade".
+
+On `limit_cleared`, in the same wakeup:
+
+1. **Find what was downgraded.** `GET /api/board` and take every
+   non-terminal card whose `model_reason` is set and whose `model` is
+   not the model that just came back. That is the list; there is no
+   filter endpoint and none is needed.
+2. **Put each one back on its original model.** For a card still in
+   flight, that means re-dispatching it on the model it should have had
+   — same worktree, same branch, and the same "inspect before you redo
+   anything" brief you used on the way down (`bin/sprint-recover <num>`
+   still prints it). For a card you parked in `queued`, dispatch it now.
+   Judgement applies to one case only: a downgraded agent that is nearly
+   done. Finishing beats switching horses — leave it, and clear the
+   reason when it lands.
+3. **Record the switch back**, the same way you recorded the switch
+   down: `assign` with the original `"model"` and `"model_reason": ""`.
+   The empty string is how you say "this is not a downgrade any more" —
+   omitting the field leaves the old reason on the card, which would
+   make it look downgraded forever. The timeline note is what tells the
+   user this card came home.
+4. **One sidebar line for the whole batch**: the window ended, and which
+   cards went back on which model.
+
+Then it is over: the board's limit line is already gone (it goes off the
+clock, not off your reaction), and no card is left wearing a reason that
+is no longer true.
 
 ---
 
