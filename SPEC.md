@@ -37,6 +37,21 @@ recovery must be easy. The user always runs claude inside tmux.
 - Bind: `tailscale ip -4` result + `127.0.0.1`, both. If no tailnet IP: bind loopback only and say so
   loudly. **Never 0.0.0.0, never a LAN interface.** Fixed default port **8377** (`--port` overridable);
   same port reused on restart so the URL survives reboots.
+- `.sprint/last-restart.json` — the self-restart stamp (when, which sha, how many lately). The board
+  hashes the source file it is running (`bin/sprintd`) every few seconds and, when that file becomes
+  DIFFERENT code, re-execs itself in place with the same argv (`os.execv`, so the pid, port, token,
+  log fds and launchd job all survive; the browser re-syncs off `generation` exactly as it does after
+  a manual restart). Gates, all of them load-bearing: content not mtime; the same new sha seen twice
+  and not written in the last couple of seconds; it must `compile()`; no in-flight non-streaming
+  request (SSE is excluded by design — it is held open for hours); and the DB write lock is held
+  across the exec. Crash-loop guard: never twice inside 60s, never more than 3 in 10 minutes, stamp
+  written BEFORE the exec so a build that never comes back still counts. When a guard blocks it, the
+  board appends a `note` (`actor: "server"`, `payload.restart_pending: true`) for the SESSION —
+  never a banner telling the user to run `sprintd stop`. That banner is gone from `web/` for good
+  (user, verbatim: "don't show me this notice"). Every threshold is env-tunable
+  (`SPRINT_CODE_WATCH_TICK`, `SPRINT_CODE_SETTLE_SECONDS`, `SPRINT_SELFRESTART_MIN_INTERVAL`,
+  `SPRINT_SELFRESTART_MAX_BURST`, `SPRINT_SELFRESTART_BURST_WINDOW`,
+  `SPRINT_RESTART_DRAIN_SECONDS`).
 - Auth: random bearer token generated at first start, stored in `.sprint/token` (and mirrored into
   `server.json` while running). `start` reuses it across stop/start; `--token` forces a value,
   `--new-token` rotates. Browser: `/?t=TOKEN` sets a cookie. API: `Authorization: Bearer` or cookie.
@@ -798,6 +813,12 @@ example."* Scope ruling: *"Peer per card — mix grok-via-tmux and claude subage
   the board down, and a change appends a `note` event (`actor: "server"`, carrying the new settings)
   so the session's own tail sees it. Read on demand, cached on mtime: `$EDITOR .sprint/config.json`
   needs no restart.
+- **The sprint's name** rides on the same endpoint (`PUT /api/settings {"name": "..."}`) but is NOT
+  in that file: it is the open sprint's title in the database, one source of truth, echoed back as
+  `name` on `/api/settings`, `/api/board` and `/healthz`. `sprintd start --name "..."` is the launch
+  path (and renames a board that is already up); the registry row follows it, so the title switcher
+  and the hub label a board by what it is about rather than by its directory. One line, ≤60 chars;
+  default is the project directory's name. A rename appends one `note` (`actor: "server"`).
 - **Per card**: `cards.executor`/`cards.model` (both nullable; NULL = the board's defaults), set via
   `POST /api/cards/:num/assign {executor?, model?}`, which refuses an executor that is not declared.
   Every card payload carries `dispatch: {executor, kind, command, session, model, source,

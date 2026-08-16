@@ -35,6 +35,18 @@ write depends on them being current. Re-read `server.json` any time
 `sprintd start` reports a change (e.g. after a restart on a different
 port).
 
+**The board restarts itself when its code changes, and you never ask the
+user to do it.** If `bin/sprintd` is edited under a running board, the
+board re-execs itself in place — same pid, same port, same token — and
+writes one `note` saying `restarted to pick up new code`. Nothing is
+required of you. If a guard stopped it (two restarts inside a minute, a
+burst, a file that will not compile), you get a `note` carrying
+`payload.restart_pending: true` instead; that one is addressed to YOU.
+Read `payload.text`, and if the board really does need to come back on
+new code, do it yourself at a quiet moment. Never put "run `sprintd
+stop` then `sprintd start`" in front of the user — that instruction is
+what card #62 deleted.
+
 All of your own (session-level) API calls use `curl` with
 `-H "Authorization: Bearer $SPRINT_TOKEN"`. The three worker helpers
 (`sprint-post`, `sprint-ask`, `sprint-ready`) are for workers, not you —
@@ -82,10 +94,26 @@ went green, the overlapping card landed, the dependency shipped).
 1. `bin/sprintd doctor` — fix anything it flags before proceeding
    (python3 <3.9, no git, etc.; missing tailscale is fine, it just
    degrades to loopback-only).
-2. `bin/sprintd start` — idempotent. If a live server already owns the
-   port with a matching token, it exits 0 and tells you so; treat that
-   identically to a fresh start (still re-read `server.json`, still
-   proceed to drain — this IS the resume path, see step 7).
+2. **`bin/sprintd start --name "<what this sprint is about>"` — name it,
+   every single boot.** User ruling, verbatim: *"every session should
+   name itself on launch"*. The name is what the header, the title
+   switcher and the hub all show, and a machine running four boards
+   called "russ", "sprint", "project" and "project" tells the user
+   nothing. So derive a name from what you are actually here to do —
+   the user's opening ask, the theme of the queued cards, the thing you
+   were resumed for — and pass it. Rules: plain English, ≤8 words / 60
+   characters, sentence case, names the WORK not the folder ("Board
+   self-restart and naming", "Mail redesign — dark mode", not "sprint"
+   or "russ"). Do not ask the user what to call it; name it, and say
+   what you called it in your first sidebar line. If it turns out to be
+   about something else an hour later, rename it (same flag, or
+   `PUT /api/settings {"name": "..."}` — both work on a live board).
+   Everything else about `start` is unchanged: it is idempotent, and if
+   a live server already owns the port with a matching token it exits 0
+   and tells you so; treat that identically to a fresh start (still
+   re-read `server.json`, still proceed to drain — this IS the resume
+   path, see step 7), and `--name` renames that live board rather than
+   being ignored.
 3. Read `.sprint/server.json`, set `SPRINT_SERVER`/`SPRINT_TOKEN` per
    above. Print the URL for the user: `$SPRINT_SERVER/?t=$SPRINT_TOKEN`.
 4. `POST $SPRINT_SERVER/api/sprint {"action":"open"}` if there's no open
@@ -1220,8 +1248,11 @@ tmux worker" in step 3.
 
 `sprintd start` is idempotent by design for exactly this. On resume:
 
-1. `sprintd start` (idempotent — recovers a stale PID file itself; if
-   its process check fails it cleans up and starts fresh).
+1. `sprintd start --name "<what this sprint is about>"` (idempotent —
+   recovers a stale PID file itself; if its process check fails it
+   cleans up and starts fresh). Name it on resume too: a board that
+   comes back nameless is a board the user cannot find in the switcher.
+   Passing the same name it already has is a no-op.
 2. Read `server.json`, set `SPRINT_SERVER`/`SPRINT_TOKEN`.
 3. Read the persisted `orchestrator` cursor and go straight into the
    drain loop (step 2) from there — do not special-case "resume" beyond
