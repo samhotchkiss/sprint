@@ -52,6 +52,13 @@ html.skin-calm {
   --warn: #c9a05e;          /* silence */
   --info: #6f8fae;          /* long job */
   --alt: #8f7fae;           /* triaging */
+  /* phase chip — what the agent says it is doing, on its own clock */
+  --phase-ink: #9cc4a8;
+  --phase-bg: #12181a;
+  --phase-line: #223029;
+  --phase-late-ink: #e0b878;
+  --phase-late-bg: #1a150f;
+  --phase-late-line: #3a2e1a;
   --rail-needs: #d8a45c;
   --rail-signoff: #3d5544;
   --seg-blocked: #5c4a4c;
@@ -146,6 +153,12 @@ html.skin-chaos {
   --approve: #9df0a8;
   --approve-hi: #b8f7c0;
   --warn: #ffb03a;
+  --phase-ink: #7dff8b;
+  --phase-bg: #0d1f18;
+  --phase-line: #0a0618;
+  --phase-late-ink: #ffc857;
+  --phase-late-bg: #2a1a06;
+  --phase-late-line: #0a0618;
   --info: #8fb4ff;
   --alt: #c79cff;
   --rail-needs: #f5c542;
@@ -536,6 +549,50 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
 }
 .prog-fill { display: block; height: 100%; border-radius: var(--radius-pill); }
 .prog-label { font-family: var(--font-mono); font-size: 11px; }
+
+/* --------------------------------------------------------------------------
+   phase chip — "testing · 2m"
+   User: "these states need to be better so it doesn't look like everything is
+   broken when it's not." One component, three surfaces (List row, Board face,
+   rail head) and two skins, all off the same tokens. Amber is reserved for a
+   phase that has actually run past what it said it would take.
+   -------------------------------------------------------------------------- */
+
+.phase-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 3px 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--phase-ink);
+  background: var(--phase-bg);
+  border: 1px solid var(--phase-line);
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.phase-chip .phase-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.phase-chip .phase-sep { opacity: .5; }
+.phase-chip .t { font-variant-numeric: tabular-nums; }
+.phase-chip .phase-expected { opacity: .8; }
+.phase-chip.is-late {
+  color: var(--phase-late-ink);
+  background: var(--phase-late-bg);
+  border-color: var(--phase-late-line);
+}
+/* On a card face and in the rail head the chip is the right-hand item: it may
+   shrink, but the clock inside it never wraps. */
+.card-top .phase-chip { flex: 0 1 auto; }
+.rail-head .phase-chip { flex: none; }
+.row-prog .phase-chip { align-self: flex-start; }
 .row-agent { font-family: var(--font-mono); font-size: 11.5px; color: var(--faint); text-align: right; }
 
 /* blocked — same shape, deliberately dimmer */
@@ -1547,6 +1604,18 @@ html.skin-chaos .row-prog .prog-track { flex: 1; }
 html.skin-chaos .row-agent,
 html.skin-chaos .row-age { text-align: left; }
 html.skin-chaos .prog-track { height: 4px; border: 1px solid var(--border); background: #100a26; }
+
+/* The phase chip in Chaos: an item plate, not a soft pill — hard edges, a bevel
+   and the skin's own green/amber. The chip carries 11px text, so both inks are
+   checked against the plate they sit on, not against the canvas. */
+html.skin-chaos .phase-chip {
+  border: 2px solid var(--phase-line);
+  border-radius: 0;
+  padding: 3px 8px;
+  box-shadow: inset 1px 1px 0 rgba(255, 255, 255, .12), 0 2px 0 #0a0618;
+  letter-spacing: .02em;
+}
+html.skin-chaos .row-prog .phase-chip { align-self: center; }
 
 html.skin-chaos .chip-btn { border: 2px solid var(--border); background: linear-gradient(180deg, #2b2470, #1a1450); box-shadow: var(--row-shadow); padding: 6px 11px; }
 html.skin-chaos .pill { border: 2px solid var(--border); box-shadow: var(--row-shadow); }

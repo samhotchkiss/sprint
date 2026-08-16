@@ -85,7 +85,10 @@ recovery must be easy. The user always runs claude inside tmux.
 plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 
 - **integrating**: user approved; the session is doing the real git work (rebase → gate → merge →
-  prune). UI shows "merging…" on the card (still in the Ready column). Session then calls
+  prune). User verbatim: *"Why do these cards stay in 'needs you' once they're already
+  approved?"* — so an approved card LEAVES Needs you / Awaiting review the moment the verdict
+  lands and runs under **In motion / In progress** as the phase `merging` until its branch
+  actually lands. Needs you means awaiting YOU; merging is the session's job. Session then calls
   `POST /api/cards/:num/integrated` `{ok: true}` → `completed`, or `{ok: false, reason}` →
   back to `in_progress` with an `error` event (integration failure is NOT a review bounce —
   bounce_count does not increment). A card only reaches Done when its branch actually landed.
@@ -187,6 +190,32 @@ root; several run at once in different tmux windows.
   link carrying that board's token. `needs_you > 0` sorts to the top with an amber left rail and the
   oldest open question's age ("stuck 22m"); longest wait first. 10s polling of `GET /api/hub`; no SSE.
 - Started once per machine by hand; boards register themselves. No launchd parity yet.
+
+## Phases (what an agent is DOING, not what it last said)
+
+User verbatim: **"But these states need to be better so it doesn't look like everything is
+broken when it's not."** A card face carrying the last thing an agent typed is stale by
+construction, and the silence amber that follows says "broken" about work that is fine.
+
+- A worker declares a phase at every stretch of work — `sprint-post <num> phase "testing"
+  [--expect 300|5m]`. Sugar for a `progress` event carrying `payload.phase` and optional
+  `payload.expected_seconds`; not a new event kind. Phases are free-form strings from a
+  recommended vocabulary (reading, coding, testing, capturing evidence, assembling packet,
+  waiting); `--expect` for anything slower than two minutes.
+- The server keeps NO phase column: the live phase is a projection of the log — the latest
+  phase-carrying event since the card's last `state` event — so a state change ends the phase by
+  construction. `/api/board` and `/api/cards/:num` carry `phase`, `phase_since`,
+  `phase_expected_seconds`.
+- **A declared phase suppresses `agent_silent` for as long as it claimed and not one second
+  longer.** Declaring "testing, about 5 minutes" IS an act of liveness — it is the one thing the
+  five-minute timer cannot otherwise know. Once the expected time elapses with no new event, the
+  card ambers on the normal rule. A phase with no expectation shields nothing. Per-agent clock
+  semantics are otherwise unchanged.
+- UI: the card face (List row, Board card) and the rail head render a **phase chip on its own
+  fresh clock** — `testing · 2m` — in place of the bare state age, and an overdue phase reads
+  amber: `testing · 6m (expected 5m)`. The In-motion hairline drains over the phase's expected
+  duration while one is live (still recency, never invented progress). Chip is one component over
+  tokens, styled per skin (Calm pill, Chaos plate).
 
 ## Liveness (auto — there is NO manual nudge button)
 
@@ -323,7 +352,9 @@ of all the underlying work... 'hey, why have #123, #127 and #128 been blocked fo
 
 Pre-allowed tool profile (no `rm`, no permission-prompting tools — a background worker must never
 be able to freeze the session; treat "would prompt" as: post a `blocked` event and return). Report
-via helpers: `sprint-post <num> progress "one-liner"` after each meaningful step; `sprint-ask <num>
+via helpers: `sprint-post <num> progress "one-liner"` after each meaningful step;
+`sprint-post <num> phase "testing" [--expect 300]` at every stretch boundary (see Phases);
+`sprint-ask <num>
 "question" [--options json]` then END YOUR TURN; `sprint-ready <num> packet.json` (client-side
 validates, then POSTs; on 422 fix and retry). First act on pickup: state→triaging + one-line
 restatement ("I read this as: X") + a condensed ≤8-word `title` on that same state POST. Long jobs: set `long_running` with a note first. Work only in
@@ -348,7 +379,8 @@ your assigned worktree; one branch; never push to main; never touch other cards'
   sections: awaiting review and complete (they start in awaiting review, then move to complete once
   I've approved)"*. So: **Waiting** (Queued → Held → Blocked, each section drawn only when it has
   something in it) · **In progress** · **Needs you** (open questions only) · **Review** (Awaiting
-  review = ready + integrating, then Complete = the closed states, dimmed). The two things that are
+  review = ready only, then Complete = the closed states, dimmed; an approved card is merging
+  over in In progress, not sitting in a review list you already dealt with). The two things that are
   on the user are deliberately apart: answering a question and signing off a finished branch are
   different jobs. The Blocked section carries the answer to "what even is blocked?" in place —
   *"an external wall (red CI, waiting on another branch). Nothing you type fixes these; the session
@@ -357,7 +389,9 @@ your assigned worktree; one branch; never push to main; never touch other cards'
   it says what shape the sprint is in, and the columns say where everything is.
   On the Fold the three live columns (In progress / Needs you / Review) keep the grid and the whole
   Waiting pile — queued, held **and blocked** — drops into the Elsewhere strip as pills.
-  Card face: `#num`, title, tag, last-activity one-liner, agent, state age, amber-on-silence.
+  Card face: `#num`, title, tag, last-activity one-liner, agent, state age, amber-on-silence —
+  and, whenever the agent has declared one, a **phase chip with its own clock** (`testing · 2m`)
+  in the tag slot instead of the state age, amber only once the phase outruns what it claimed.
   The title on the face is the **condensed** title (≤8 words, set by the session at assign time and
   refined by the worker at triage); the user's original submission is never rewritten and shows in
   full in the rail.

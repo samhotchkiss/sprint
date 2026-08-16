@@ -58,6 +58,9 @@ Three helpers, all on `PATH` as part of this plugin, all stdlib python3
 (no deps to install). All three read `--server`/`--token` from args or
 the `SPRINT_SERVER`/`SPRINT_TOKEN` environment variables your brief set.
 
+- `sprint-post <num> phase "testing" [--expect 300]` — what you are doing
+  right now, on its own clock. Declare one at every stretch boundary; see
+  "Say what you are DOING" below. It is the thing the card face shows.
 - `sprint-post <num> progress "one-liner"` — after each meaningful step.
   Not every tool call; every step a human would want to see if they
   glanced at the card ("read the CSS, found the misaligned flex item",
@@ -137,6 +140,41 @@ Before touching any file, do both halves of triage:
    same way on your `in_progress` state post if the shape of the work
    only becomes clear once you're in the code. For a batch, title each
    member card.
+
+## Say what you are DOING, not just what you last did — declare a phase
+
+User ruling, verbatim: **"But these states need to be better so it
+doesn't look like everything is broken when it's not."** A one-liner is
+about the past, and it goes stale the moment you write it: three minutes
+after "fix applied, running tests" the card face reads as a stalled job.
+A **phase** is about the present, and the board renders it with its own
+fresh clock — `testing · 2m` — in place of that stale line.
+
+```
+sprint-post 42 phase "reading"
+sprint-post 42 phase "coding"
+sprint-post 42 phase "testing" --expect 300
+sprint-post 42 phase "capturing evidence" --expect 4m
+sprint-post 42 phase "assembling packet"
+```
+
+- **Declare one at every stretch boundary** — whenever what you are doing
+  changes shape. The recommended vocabulary is `reading`, `coding`,
+  `testing`, `capturing evidence`, `assembling packet`, `waiting`; it is
+  free-form, so name the stretch honestly if none of those fit, but keep
+  it to a couple of words (it renders in a chip).
+- **`--expect` for anything slower than 2 minutes** (seconds, or `5m` /
+  `1h`). While a declared phase is inside the time it claimed, the
+  board's five-minute silence timer is held off — declaring the phase IS
+  the liveness signal. Once that time is up with no new word from you,
+  the chip goes amber and says so out loud: `testing · 6m (expected 5m)`.
+  So `--expect` is a promise, not a mute button: overshoot it and the
+  card looks worse than if you had never claimed it. Post again when you
+  come out the other side.
+- A phase ends by itself when the card changes state — you never have to
+  clear one.
+- It is still an ordinary progress event, so it shows up in the timeline
+  and it takes `--detail` like anything else.
 
 ## Long-running work
 

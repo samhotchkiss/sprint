@@ -18,6 +18,7 @@ import {
   boardColumns, cardState, needsKind, motionState, blockedReason, waitingMark,
   meterSegments, sections, isSilent, STATE_LABEL,
 } from './state.js';
+import { phaseChip } from './phase.js';
 import { renderMeter } from './meter.js';
 import { shortAgent } from './list.js';
 import { reviewBlock } from './review.js';
@@ -108,11 +109,14 @@ export function renderCardFace(card, app) {
     onclick: () => app.openCard(card.num),
   });
 
+  // A live phase IS the tag: "testing · 2m" on its own clock, in place of the
+  // state age that went stale the moment the agent stopped typing.
+  const chip = col === 'in_motion' ? phaseChip(card) : null;
   const tag = faceTag(card, state, col);
   face.appendChild(h('div.card-top',
     h('span.card-num', '#' + card.num),
     h('span.grow'),
-    h('span.card-tag', { style: tag.color ? { color: tag.color } : null }, tag.text)));
+    chip || h('span.card-tag', { style: tag.color ? { color: tag.color } : null }, tag.text)));
   face.appendChild(h('span.card-title', card.title));
 
   const sub = faceSub(card, state, col, app);
@@ -132,8 +136,10 @@ export function renderCardFace(card, app) {
 }
 
 function colOf(state) {
-  if (state === 'needs_you' || state === 'ready' || state === 'integrating') return 'needs_you';
-  if (state === 'triaging' || state === 'in_progress') return 'in_motion';
+  if (state === 'needs_you' || state === 'ready') return 'needs_you';
+  // Approved and merging is work in flight, not a decision you owe — user,
+  // verbatim: "Why do these cards stay in 'needs you' once they're approved?"
+  if (state === 'triaging' || state === 'in_progress' || state === 'integrating') return 'in_motion';
   if (state === 'blocked' || state === 'failed' || state === 'stale') return 'blocked';
   if (state === 'queued' || state === 'held') return 'waiting';
   return 'done';
@@ -171,9 +177,14 @@ function faceSub(card, state, col, app) {
     return { text: r.text, color: r.bad ? 'var(--bad)' : 'var(--faint)' };
   }
   if (col === 'in_motion') {
+    if (state === 'integrating') {
+      return { text: 'Approved — the session is merging the branch.', color: 'var(--good)' };
+    }
     const ev = card.last_event;
     // the tag already says "quiet Nm" — the face does not repeat it
     if (!ev || ev.kind === 'agent_silent') return { text: '', color: null };
+    // ...and if the tag is the phase chip, the chip already said this line.
+    if (ev.payload && ev.payload.phase) return { text: '', color: null };
     return { text: firstLine(app.eventText(ev), 140), color: null };
   }
   return { text: '', color: null };
