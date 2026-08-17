@@ -1342,15 +1342,30 @@ state, not off your reaction), on every board on the machine.
 ### The reviewer — a card reaching `ready` fires it, and it never approves
 
 The board can run a REVIEWER: an agent that reads a finished card before
-the user does and writes down what it found. It is off by default. When
-`board.reviewer.enabled` is true and a card enters `ready`, dispatch it.
+the user does, writes down what it found, and — when what it found is
+bad enough — sends the card straight back to the worker. It is off by
+default. When `board.reviewer.enabled` is true and a card enters
+`ready`, dispatch it.
 
 **The one rule everything here is built around, and it is the user's own
 standing rule: the reviewer NEVER approves.** He sees and acks every
-card. The reviewer's whole output is a note on the card — a
-recommendation and its receipts. It does not call `/verdict`, it does
-not close anything, it does not `sprint-ready` anything, and it never
-merges. Anything that would move the card is yours or the user's.
+card. It cannot approve, cannot reject, cannot close and never merges —
+the server refuses all three by name, so an agent that tries reads why.
+
+**It CAN bounce.** User's ruling on this exact fork, verbatim:
+*"Reviewer can bounce with notes."* So the reviewer has one action and
+one opinion:
+
+| it says | what happens | who has the card after |
+|---|---|---|
+| `--recommends bounce` | the card goes back to the worker, carrying its findings as the bounce notes | the worker |
+| `--recommends approve` | nothing moves — it is an opinion on the card | the user |
+| `--recommends look` | nothing moves — "worth your eyes" | the user |
+
+A bounce is a real bounce: `bounce_count` goes up, the second one still
+escalates, and the worker reads the notes and re-readies exactly as it
+would after one of the user's. The one difference is that the verdict
+carries `by: "reviewer"`, so nobody has to guess who sent it back.
 
 **When.** On the `ready` state event, before you go quiet on that card.
 Skip it if `card.reviewed` is already set — that field says the reviewer
@@ -1383,10 +1398,21 @@ the diff (`git -C <worktree> diff origin/main...<branch>`), plus:
   the change (and are they two different pictures), do the test counts
   match a run that really happened, does the diff do anything the card
   did not ask for;
-- **the boundary, in as many words**: it may post notes and nothing
-  else. It never approves, never bounces, never closes, never messages
-  the user directly. Say this even though its agent definition says it —
-  a tmux reviewer has no agent definition;
+- **the boundary, in as many words**: it may write findings, and it may
+  send a card back with them. It never approves, never rejects, never
+  closes, never merges and never messages the user directly. Say this
+  even though its agent definition says it — a tmux reviewer has no
+  agent definition;
+- **when a bounce is warranted, and when it is not.** A bounce costs the
+  worker a whole cycle and takes the card off the user's review pile
+  without him seeing it, so it is for things that are CHECKABLE rather
+  than judged: the suite is red, the test counts do not match a run that
+  happened, the two screenshots are the same picture, a `validate` step
+  does not work when followed, the diff contradicts the claim. Taste,
+  scope opinions, "I would have done it differently", anything the user
+  might reasonably disagree with — those are `look`, and they stay on
+  his pile. When in doubt, annotate: a note costs him ten seconds and a
+  wrong bounce costs a worker an hour;
 - how to report:
 
 ```bash
@@ -1399,8 +1425,20 @@ Discrepancies: …"
 `--reviewer` is what marks the note as the reviewer's findings, and it
 is the only thing that sets `card.reviewed`. A note without it is an
 ordinary note, deliberately: a marker anyone could type by accident
-would not be worth reading. `--recommends` is a RECOMMENDATION — the
-board renders it as one, and the verdict bar is unchanged.
+would not be worth reading.
+
+`--recommends bounce` **does the bounce itself**, in that one command —
+the note posts first (so the thing the bounce cites is already on the
+timeline when the worker wakes up), then the card moves. Its one-liner
+AND its detail both become the bounce notes, because the checks and the
+discrepancies are the useful half. If the bounce is refused for any
+reason the findings are still safely on the card and the command exits
+1 without retrying: the worst case is an annotated card the user bounces
+himself, never a lost review.
+
+Then treat it exactly like a bounce the user sent: `SendMessage` the
+worker with the notes, and honour the two-bounce escalation — a card
+the reviewer has now bounced twice comes to the user, same as ever.
 
 **Ideally its note lands before the user opens the card.** So dispatch
 it the moment `ready` fires rather than at the end of your loop, and
@@ -1408,10 +1446,11 @@ give it the fast model unless the user's `reviewer.model` says
 otherwise. If it is still working when the user acks the card anyway,
 that is fine and costs nothing — let it finish and post.
 
-**You still do everything you did before.** The reviewer changes nothing
-about the verdict flow below: the card sits in `ready`, the user
-approves or bounces, and you integrate. It is a second pair of eyes on
-the page, not a gate in front of it.
+**You still do everything you did before.** A card the reviewer leaves
+alone sits in `ready` exactly as it always did, waiting on the user, and
+you integrate on his approve. The reviewer is a second pair of eyes in
+front of his, never a gate instead of it: the only card it can take off
+his pile is one it is sending back to be fixed.
 
 ### Closing a card is the user's verb, never yours
 

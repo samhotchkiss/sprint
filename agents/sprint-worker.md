@@ -488,7 +488,19 @@ relaxing them:
 On success the card (or whole batch) moves to `ready` and waits for the
 user's verdict. You're not done-done until you see an `approve` — a
 `bounce` means notes came back; read them, fix, and call `sprint-ready`
-again. **An integration failure is different from a bounce**: if your
+again.
+
+**A bounce may come from the board's REVIEWER rather than the user.**
+Some boards run one: an agent that reads your packet against the card
+before the user does. If its verdict event carries `by: "reviewer"`, a
+second pair of eyes found something checkable — a red suite, test counts
+that don't match a real run, two "before/after" screenshots that are the
+same picture, a `validate` step that doesn't work when followed. Treat
+it exactly like the user's bounce: the notes are the whole brief, fix
+what they name, re-verify, `sprint-ready` again. It counts against your
+`bounce_count` the same way, so the second one still escalates. The
+reviewer never approves and never closes — only the user does that, so
+an approve is always his. **An integration failure is different from a bounce**: if your
 branch was approved but the session hits a rebase/gate/merge problem
 while landing it, the card comes back to `in_progress` (not `ready`,
 and your `bounce_count` is untouched) with an `error` note and a message

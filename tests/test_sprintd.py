@@ -3726,6 +3726,47 @@ class TestSprintPostHelper(Base):
         _, detail = self.get("/api/cards/%d" % num)
         self.assertEqual(detail["card"]["reviewed"]["recommendation"], "approve")
 
+    def test_recommending_a_bounce_actually_bounces_it(self):
+        """One command, both halves: the findings land on the timeline and the
+        card goes back to the worker carrying them. The note must be FIRST —
+        the bounce wakes the worker, and the thing it is about has to already
+        be there when it looks."""
+        num = self.new_card("recommended back")["num"]
+        self.to_in_progress(num)
+        self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        r = self.run_post(num, "note", "the two screenshots are the same picture",
+                          "--reviewer", "--recommends", "bounce",
+                          "--detail", "Checks: opened both. Discrepancies: one.")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("sent #%d back to the worker" % num, r.stdout.decode())
+
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["state"], "in_progress")
+        self.assertEqual(detail["card"]["bounce_count"], 1)
+        kinds = [e["kind"] for e in detail["timeline"]]
+        self.assertLess(kinds.index("note"), kinds.index("verdict"),
+                        "the findings must land before the bounce that cites them")
+        v = [e for e in detail["timeline"] if e["kind"] == "verdict"][0]["payload"]
+        self.assertEqual(v["by"], "reviewer")
+        # text AND detail both reach the worker: the one-liner alone would drop
+        # the checks and the discrepancies, which is the useful half
+        self.assertIn("the two screenshots are the same picture", v["notes"])
+        self.assertIn("Discrepancies: one.", v["notes"])
+
+    def test_recommending_approve_moves_nothing(self):
+        """The reviewer never approves — recommending it is an opinion, and the
+        card stays exactly where it was, waiting on the user."""
+        num = self.new_card("recommended through")["num"]
+        self.to_in_progress(num)
+        self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        r = self.run_post(num, "note", "evidence matches the card",
+                          "--reviewer", "--recommends", "approve")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertIn("recommends you approve", r.stdout.decode())
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["state"], "ready")
+        self.assertEqual([e for e in detail["timeline"] if e["kind"] == "verdict"], [])
+
     def test_the_flag_works_without_a_recommendation(self):
         num = self.new_card("no recommendation")["num"]
         self.to_in_progress(num)
@@ -6291,6 +6332,105 @@ class TestWorkerGoneGuards(WorkerGoneBase):
         self.assertEqual(self.app.sweep_worker_gone(), 0)
         self.assertEqual(self.state_of(num), "needs_you")
 
+    def test_answering_a_question_does_not_instantly_fail_the_card(self):
+        """The exact sequence that fired on card #70, replayed.
+
+        Its real timeline: `needs_you` (question asked) → the user answers 1h34m
+        later → answering moves the card to `in_progress` → the very next sweep
+        tick reads "worker gone: no events for 1h 34m" and FAILS it. The silence
+        was the user's own thinking time, charged to the worker, and the card
+        died before the fresh agent could say a word.
+
+        Note where the guard has to be: NOT in the `needs_you` exemption. By the
+        time this fires the card has already left `needs_you`, so exempting that
+        state would not have saved it. The clock is the bug.
+        """
+        num = self.working_card("asked something, answered much later")
+        status, body = self.post("/api/cards/%d/question" % num,
+                                 {"text": "which of these did you mean?"})
+        self.assertEqual(status, 201, body)
+        qid = body["question"]["id"]
+        self.assertEqual(self.state_of(num), "needs_you")
+
+        # the user takes a long time — far past the failure threshold
+        self.go_quiet(num, 600.0)
+        self.assertEqual(self.app.worker_gone_exempt(self.app.card_row(num)),
+                         "open_question")
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+
+        # ...and then answers. That MOVES the card off needs_you by itself.
+        status, body = self.post("/api/cards/%d/answer" % num,
+                                 {"question_id": qid, "text": "the second one"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "in_progress")
+        self.assertIsNone(self.app.worker_gone_exempt(self.app.card_row(num)),
+                          "the card is back with a worker — no exemption left")
+
+        # The card owes nothing yet: it was handed back a moment ago.
+        for _ in range(10):
+            self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "in_progress")
+        self.assertEqual(self.gone_notices(num), [])
+
+    def test_a_card_handed_back_still_fails_if_nobody_picks_it_up(self):
+        """The clock RESTARTS, it does not stop. Without this the fix above
+        would be a permanent exemption for every card that ever asked a
+        question."""
+        num = self.working_card("answered, then nobody came")
+        status, body = self.post("/api/cards/%d/question" % num, {"text": "which?"})
+        self.assertEqual(status, 201, body)
+        self.post("/api/cards/%d/answer" % num,
+                  {"question_id": body["question"]["id"], "text": "that one"})
+        self.assertEqual(self.state_of(num), "in_progress")
+        self.assertEqual(self.app.sweep_worker_gone(), 0)
+        # now the silence is the WORKER's, measured from the hand-back
+        self.go_quiet(num, 600.0)
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        self.assertEqual(self.state_of(num), "failed")
+
+    def test_a_bounce_gives_the_worker_a_fresh_clock_too(self):
+        """Same shape, different door: a card that sat in `ready` for hours and
+        is then bounced has a worker that owes something as of the bounce, not
+        as of whenever it last spoke."""
+        num = self.working_card("finished, sat in review, came back")
+        status, body = self.post("/api/cards/%d/ready" % num,
+                                 {"packet": dict(GOOD_PACKET,
+                                                 branch="sprint/card-%d" % num)})
+        self.assertEqual(status, 200, body)
+        self.go_quiet(num, 600.0)              # a long wait for a verdict
+        status, _ = self.post("/api/cards/%d/verdict" % num,
+                              {"verdict": "bounce", "notes": "the second shot is the first one"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "in_progress")
+        for _ in range(10):
+            self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_an_ordinary_quiet_card_still_fails_on_schedule(self):
+        """The control. Nothing moved this card and nobody said anything — it is
+        exactly what the rule is for, and it must still fire."""
+        num = self.working_card("nobody asked anything")
+        self.go_quiet(num, 600.0)
+        self.assertIsNone(self.app.worker_gone_exempt(self.app.card_row(num)))
+        self.assertEqual(self.app.sweep_worker_gone(), 1)
+        self.assertEqual(self.state_of(num), "failed")
+
+    def test_a_needs_you_card_with_no_open_question_is_still_not_the_workers(self):
+        """The state guard, widened off the question row (card #70). A card can
+        be parked on the user without an unanswered question row — and whatever
+        is owed there, it is never owed by the worker."""
+        num = self.working_card("parked on the user")
+        with self.app.lock:
+            self.app._apply_transition(num, "in_progress", "needs_you",
+                                       "session", "parked", None)
+        self.assertEqual(self.state_of(num), "needs_you")
+        self.go_quiet(num, 600.0)
+        self.assertEqual(self.app.worker_gone_exempt(self.app.card_row(num)),
+                         "needs_you")
+        for _ in range(10):
+            self.assertEqual(self.app.sweep_worker_gone(), 0)
+        self.assertEqual(self.state_of(num), "needs_you")
+
     def test_a_ready_card_is_not_the_workers_problem(self):
         num = self.working_card("finished and waiting on a verdict")
         status, body = self.post("/api/cards/%d/ready" % num,
@@ -7802,6 +7942,109 @@ class TestReviewedMarker(Base):
         # ...and reviewing the new one marks it again
         self.review(num, "Reviewer: this one holds up.")
         self.assertIsNotNone(self.card(num)["reviewed"])
+
+    def test_the_reviewer_can_send_a_card_back_with_its_findings(self):
+        """User's ruling on the #70 fork, verbatim: *"Reviewer can bounce with
+        notes."* The card goes back to the worker in `in_progress`, and the
+        findings are IN the verdict — that text is the only thing the worker
+        gets to work from."""
+        num = self.ready_card()
+        notes = ("the two screenshots are the same picture\n\n"
+                 "Checks performed: opened both, compared them byte for byte.")
+        status, body = self.post("/api/cards/%d/verdict" % num, {
+            "verdict": "bounce", "notes": notes, "by": "reviewer"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.card(num)["state"], "in_progress")
+        self.assertEqual(self.card(num)["bounce_count"], 1)
+
+        _, detail = self.get("/api/cards/%d" % num)
+        verdicts = [e for e in detail["timeline"] if e["kind"] == "verdict"]
+        self.assertEqual(len(verdicts), 1, detail["timeline"])
+        p = verdicts[0]["payload"]
+        self.assertEqual(p["verdict"], "bounce")
+        self.assertEqual(p["notes"], notes, "the findings ride the verdict verbatim")
+        # who sent it back is a fact on the event, not something to infer
+        self.assertEqual(p["by"], "reviewer")
+        self.assertIn("the reviewer sent it back", p["text"])
+        # ...but the one-liner stays a one-liner. It is what the card FACE
+        # shows, and the findings are multi-line by design — the checks and the
+        # discrepancies belong in `notes`, not smeared across the board.
+        self.assertNotIn("\n", p["text"])
+        self.assertLessEqual(len(p["text"]), sprintd.ONE_LINER_MAX)
+        self.assertNotIn("Checks performed", p["text"])
+        # The card face reads the state event's reason, and "bounced back with
+        # YOUR notes" would tell the user he sent this back when he did not.
+        self.assertEqual(self.card(num)["reason"], "sent back by the reviewer")
+
+    def test_the_reviewer_cannot_approve_and_is_told_why(self):
+        num = self.ready_card()
+        status, body = self.post("/api/cards/%d/verdict" % num, {
+            "verdict": "approve", "by": "reviewer"})
+        self.assertEqual(status, 403, body)
+        self.assertEqual(body["error"], "reviewer_cannot_approve")
+        self.assertEqual(body["field"], "verdict")
+        self.assertIn("never approves", body["message"])
+        # ...and nothing moved
+        self.assertEqual(self.card(num)["state"], "ready")
+
+    def test_the_reviewer_cannot_reject_either(self):
+        """Rejecting is closing, and closing is the user's verb."""
+        num = self.ready_card()
+        status, body = self.post("/api/cards/%d/verdict" % num, {
+            "verdict": "reject", "notes": "not worth it", "by": "reviewer"})
+        self.assertEqual(status, 403, body)
+        self.assertEqual(body["error"], "reviewer_cannot_reject")
+        self.assertEqual(self.card(num)["state"], "ready")
+
+    def test_the_user_can_still_approve_the_same_card(self):
+        """The control: the refusal is about WHO, not about the endpoint."""
+        num = self.ready_card()
+        status, body = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.card(num)["state"], "integrating")
+
+    def test_a_reviewers_bounce_has_to_say_what_it_found(self):
+        """The user is allowed a wordless bounce — he can be asked. An agent
+        that is not in the room cannot, so a reason is required."""
+        num = self.ready_card()
+        for empty in ("", "   ", None):
+            status, body = self.post("/api/cards/%d/verdict" % num, {
+                "verdict": "bounce", "notes": empty, "by": "reviewer"})
+            self.assertEqual(status, 400, "%r should be refused: %s" % (empty, body))
+            self.assertEqual(body["field"], "notes")
+        self.assertEqual(self.card(num)["state"], "ready")
+
+    def test_the_reviewer_sends_back_one_card_never_a_whole_unit(self):
+        num = self.ready_card()
+        status, body = self.post("/api/cards/%d/verdict" % num, {
+            "verdict": "bounce", "notes": "no", "by": "reviewer", "scope": "batch"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "scope")
+
+    def test_nobody_else_can_borrow_the_by_field(self):
+        num = self.ready_card()
+        status, body = self.post("/api/cards/%d/verdict" % num, {
+            "verdict": "approve", "by": "the_boss"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "by")
+        self.assertEqual(self.card(num)["state"], "ready")
+
+    def test_a_bounced_card_is_unreviewed_and_reviewable_again(self):
+        """The whole loop: findings, bounce, worker re-readies, reviewer reads
+        the NEW packet. Nothing clears a flag anywhere in that."""
+        num = self.ready_card()
+        self.review(num, "the claim does not match the diff", recommendation="bounce")
+        self.assertIsNotNone(self.card(num)["reviewed"])
+        status, _ = self.post("/api/cards/%d/verdict" % num, {
+            "verdict": "bounce", "notes": "the claim does not match the diff",
+            "by": "reviewer"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.card(num)["state"], "in_progress")
+        time.sleep(0.01)
+        status, body = self.post("/api/cards/%d/ready" % num,
+                                 {"packet": dict(GOOD_PACKET, claim="Now it matches.")})
+        self.assertEqual(status, 200, body)
+        self.assertIsNone(self.card(num)["reviewed"])
 
     def test_the_marker_rides_the_board_payload_too(self):
         num = self.ready_card()
