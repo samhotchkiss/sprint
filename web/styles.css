@@ -1528,7 +1528,12 @@ html.skin-chaos .verdicts.is-bouncing .icon-btn.attach {
   /* Card #73 turns an empty lane on its side to give its width to a busy one.
      Stacked one under another there is no width to give, so the header goes
      back to reading across. */
-  .fold-cols .col.is-collapsed .col-head { flex-direction: row; align-items: center; min-height: 0; padding: 9px 12px; }
+  .fold-cols .col.is-collapsed .col-head {
+    flex-direction: row;
+    align-items: center;
+    min-height: 0;
+    padding: 9px 12px;
+  }
   .fold-cols .col.is-collapsed .col-name { writing-mode: horizontal-tb; }
 
   /* needs-you keeps full rows with tappable chips; the rest compresses */
