@@ -13,9 +13,21 @@ Usage:
 `--reviewer` is for the board's REVIEWER agent and nobody else: it marks a note
 as the reviewer's findings on the card's current evidence packet, which is what
 lets the board say that packet has been read (and stop dispatching a second
-reviewer over the same one). `--recommends` says what it thinks the user should
-do. It is a recommendation and only that — the reviewer never approves, never
-bounces on its own and never closes a card; every verdict is the user's.
+reviewer over the same one).
+
+`--recommends` says what it thinks should happen next, and ONE of the three is
+an action:
+
+  bounce   sends the card back to the worker, then and there, with these exact
+           findings as the bounce notes (text + --detail). The note posts
+           first, so the thing the bounce is about is already on the timeline
+           when the worker wakes up.
+  approve  an opinion. The card stays in Awaiting review — the reviewer NEVER
+           approves, never rejects and never closes; those are the user's.
+  look     an opinion: "worth your eyes", nothing moves.
+
+That split is the user's own ruling on this: the reviewer may bounce with
+notes, and everything else still comes to him.
 
 A REPORT is a document — a findings write-up, a comparison table, a migration
 plan — and it does not fit in a one-liner. `--report PATH` attaches a .md or
@@ -313,6 +325,43 @@ def skim_line(text, detail):
     return line, full if detail is None else full + "\n\n" + detail
 
 
+def reviewer_bounce(server, token, num, text, detail):
+    """`--recommends bounce` is an ACTION, not an opinion (user's ruling on the
+    #70 fork: *"Reviewer can bounce with notes."*).
+
+    The card goes back to the worker in `in_progress` carrying these exact
+    findings as the bounce notes, because those notes are the only thing the
+    worker gets -- it reads them, fixes what they name, and calls sprint-ready
+    again. The other two recommendations (`approve`, `look`) stay opinions: the
+    reviewer never approves and never closes.
+
+    A failure here is reported and exits 1 WITHOUT retrying, and the findings
+    note is already safely on the card either way -- so the worst case is an
+    annotated card the user has to bounce himself, never a lost review.
+    """
+    notes = text if not detail else "%s\n\n%s" % (text, detail)
+    body = json.dumps({"verdict": "bounce", "notes": notes,
+                       "by": "reviewer", "actor": "worker"}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{server}/api/cards/{num}/verdict", data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+        print(f"sprint-post: sent #{num} back to the worker with those findings")
+        return 0
+    except urllib.error.HTTPError as e:
+        why = e.read().decode("utf-8", "replace")
+        print(f"sprint-post: the findings posted, but the bounce was refused "
+              f"({e.code}): {why}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as e:
+        print(f"sprint-post: the findings posted, but the bounce could not "
+              f"reach {server}: {e.reason}", file=sys.stderr)
+        return 1
+
+
 def main(argv):
     args = parse_args(argv)
     num, kind, text, detail, reports = validate(args)
@@ -361,9 +410,15 @@ def main(argv):
             extra = f" ({', '.join(bits)})" if bits else ""
             if payload.get("reviewer"):
                 rec = payload["reviewer"].get("recommendation")
-                said = " — recommends you %s" % rec if rec else ""
-                print(f"sprint-post: posted the reviewer's findings on #{num}"
-                      f"{said}{extra}")
+                print(f"sprint-post: posted the reviewer's findings on #{num}{extra}")
+                if rec == "bounce":
+                    # The findings landed FIRST, deliberately: the bounce moves
+                    # the card and wakes the worker, and the note it is about
+                    # has to already be on the timeline when that happens.
+                    return reviewer_bounce(server, args.token, num, text, detail)
+                if rec:
+                    print(f"sprint-post: it recommends you {rec} — the card is "
+                          f"still waiting on your verdict")
                 return 0
             if "phase" in payload:
                 said = payload["phase"]

@@ -4098,14 +4098,34 @@ class App:
                 "SELECT seq, ts FROM events WHERE card_num=? "
                 "AND actor IN ('worker','session') "
                 "ORDER BY seq DESC LIMIT 1", (num,))
-        if hit is not None:
-            return hit["ts"], hit["seq"]
-        # Nothing from the agent yet: the clock starts when this card last moved.
-        hit = self.q1(
+        # ...but never older than the card's last MOVE. A transition is the
+        # board saying the situation just changed, and the worker cannot have
+        # been silent since before the thing it is supposed to react to.
+        #
+        # This is the other half of the `needs_you` guard, and card #70 is why
+        # both halves exist. The card asked a decision request, the worker
+        # ended its turn (the documented contract), and the user answered 1h34m
+        # later. Answering moves the card `needs_you` -> `in_progress`, so the
+        # state guard stopped applying at exactly the moment the clock read
+        # "1h34m of silence" -- and the board failed the card in the same tick,
+        # before the fresh agent could say a single word. The silence was the
+        # user's thinking time, charged to the worker.
+        #
+        # Same for every other hand-back: a bounce, a retry, a failed
+        # integration. In all of them the card has just been given to a worker
+        # and owes nothing yet. A worker that then really does die still fails
+        # on schedule, because nothing moves the card again and the transition
+        # itself keeps ageing.
+        moved = self.q1(
             "SELECT seq, ts FROM events WHERE card_num=? AND kind='state' "
             "ORDER BY seq DESC LIMIT 1", (num,))
         if hit is not None:
+            if moved is not None and moved["ts"] > hit["ts"]:
+                return moved["ts"], moved["seq"]
             return hit["ts"], hit["seq"]
+        # Nothing from the agent yet: the clock starts when this card last moved.
+        if moved is not None:
+            return moved["ts"], moved["seq"]
         return (row["updated_at"] if row is not None else now()), 0
 
     def silence_notified(self, num: int, baseline_seq: int) -> bool:
@@ -4397,14 +4417,25 @@ class App:
             # still inside the time it claimed. That is a live claim, not
             # silence.
             return "phase"
-        if row["state"] == "needs_you" and self.q1(
-                "SELECT id FROM questions WHERE card_num=? AND answered_at IS NULL "
-                "LIMIT 1", (num,)) is not None:
-            # A worker parked on an open question is SUPPOSED to be silent --
-            # it ended its turn and the user has the ball. That quiet says
-            # nothing about whether the process is alive, and the `needs_you`
-            # sweep rule is already nagging the right person about it.
-            return "open_question"
+        if row["state"] == "needs_you":
+            # A worker on a `needs_you` card is SUPPOSED to be silent -- it
+            # asked, it ended its turn, and the ball is with the user. The
+            # quiet says nothing about whether any process is alive, and the
+            # `needs_you` sweep rule is already nagging the right person.
+            #
+            # This used to require an UNANSWERED question, and that gap fired
+            # on card #70: the worker asked a decision request and stopped
+            # (correctly -- that is the documented contract), the user answered
+            # hours later, and the moment `answered_at` was stamped the card
+            # stopped being exempt while still sitting in `needs_you` waiting
+            # for the session to re-dispatch. The board then declared a worker
+            # dead that had finished its turn on purpose. The state is the
+            # honest guard, not the question row: whatever is owed on a
+            # `needs_you` card, it is never owed by the worker.
+            if self.q1("SELECT id FROM questions WHERE card_num=? AND "
+                       "answered_at IS NULL LIMIT 1", (num,)) is not None:
+                return "open_question"
+            return "needs_you"
         return None
 
     def worker_gone_window(self, row):
@@ -5666,7 +5697,7 @@ class App:
     # -- verdicts ---------------------------------------------------------
 
     def verdict(self, num: int, verdict: str, notes: str = "", scope: str = "card",
-                actor: str = "user", images=None) -> dict:
+                actor: str = "user", images=None, by: str = None) -> dict:
         """A decision on one card (or a batch), optionally with screenshots.
 
         Card #66, user verbatim: "i need to be able to paste images into ANY
@@ -5680,6 +5711,39 @@ class App:
         if verdict not in ("approve", "bounce", "reject"):
             raise ApiError(400, "bad_verdict",
                            "verdict must be approve, bounce or reject")
+        # The REVIEWER's verdict is a narrower thing than the user's, and the
+        # narrowing is the whole design (card #70). User's ruling on the fork:
+        # *"Reviewer can bounce with notes."* Bounce, then -- and only bounce.
+        #
+        # Approving is not something the reviewer is bad at, it is something it
+        # must never do: the user's standing rule is that he sees and acks every
+        # card, and a reviewer that could sign one off would delete the one step
+        # this board exists to protect. Rejecting is closing, which is his verb
+        # too. So this refuses by name rather than quietly doing nothing -- an
+        # agent that tried has a bug, and it should read why.
+        if by is not None and by != "reviewer":
+            raise _bad("by", "the only verdict this board takes on somebody "
+                             "else's behalf is the reviewer's")
+        if by == "reviewer":
+            if verdict != "bounce":
+                raise ApiError(403, "reviewer_cannot_%s" % verdict,
+                               "the reviewer never %s — it can send a card back "
+                               "with notes, and that is all. Every %s is the "
+                               "user's."
+                               % ("approves" if verdict == "approve" else "rejects",
+                                  "approval" if verdict == "approve" else "rejection"),
+                               field="verdict")
+            if not (notes or "").strip():
+                # A bounce with no reason costs a worker a whole cycle and tells
+                # it nothing. The user is allowed a wordless bounce because he
+                # can be asked; an agent that is not in the room cannot.
+                raise ApiError(400, "missing_field",
+                               "a reviewer's bounce has to say what it found — "
+                               "those notes are the only thing the worker gets",
+                               field="notes")
+            if scope != "card":
+                raise _bad("scope", "the reviewer sends back one card at a "
+                                    "time, never a whole unit")
         row = self.card_row(num)      # 404 before we write anything to disk
         if self.is_conversation(row):
             raise ApiError(409, "not_a_work_card",
@@ -5733,6 +5797,13 @@ class App:
                     payload = {"verdict": verdict, "notes": notes or "",
                                "scope": scope, "bounce_count": bounce,
                                "text": ("%s — %s" % (label, notes)) if notes else label}
+                    if by == "reviewer":
+                        # Who sent it back, on the event itself. The worker
+                        # picking the card up reads its notes either way, but
+                        # "the reviewer found this" and "the user found this"
+                        # are different facts and it should not have to guess.
+                        payload["by"] = "reviewer"
+                        payload["text"] = "the reviewer sent it back — %s" % notes
                     if attachments:
                         payload["attachments"] = attachments
                         if not notes:
@@ -7703,7 +7774,11 @@ def make_handler(app: App):
                 return 200, app.verdict(num, body.get("verdict"), body.get("notes") or "",
                                         body.get("scope") or "card",
                                         actor=self.actor_or(body, "user"),
-                                        images=posted_images(body))
+                                        images=posted_images(body),
+                                        # `by` is provenance, not identity: the
+                                        # reviewer is a worker-class agent, and
+                                        # this says which worker-class agent.
+                                        by=body.get("by"))
             if verb == "events":
                 kind = body.get("kind")
                 payload = body.get("payload")
