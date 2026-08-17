@@ -1,10 +1,10 @@
 // Sprint settings — the board's dispatch policy, in a small panel.
 //
-// Five things live here, and all five are the USER's call rather than the
-// orchestrator's: what this sprint is CALLED, which model a worker gets by
-// default, whether workers run as Claude subagents or as a command driven in
-// its own tmux window, what those executors are called, and how many run at
-// once.
+// Everything here is the USER's call rather than the orchestrator's: what this
+// sprint is CALLED, which model a worker gets by default, whether workers run
+// as Claude subagents or as a command driven in its own tmux window, what those
+// executors are called, how many run at once, whether an agent pre-reads a card
+// that says it is done, and the standing instructions every brief carries.
 //
 // The panel is deliberately quiet: a ghost link in the header (the same
 // restraint as the other header links), a sheet the width of the Drop-work
@@ -120,6 +120,10 @@ let sprintName = { value: '', saved: '', max: 60, fallback: '' };
 // different thing from the sprint's name and deliberately next to it, so the
 // panel reads "this board is called X, the colleague running it is called Y".
 let agentName = { value: '', saved: '', max: 24 };
+// Standing instructions: the paragraph every agent this board sends is told,
+// on top of the card it was given. Same live-in-a-variable shape as the two
+// names above — typing writes here and repaints nothing (#46).
+let standing = { value: '', saved: '', max: 4000 };
 
 /** Wire the header link. Called once at boot. */
 export function installSettings(btn, afterSave) {
@@ -162,6 +166,11 @@ export async function openSettings() {
       saved: res.agent_name || '',
       max: res.agent_name_max || 24,
     };
+    standing = {
+      value: res.special_instructions || '',
+      saved: res.special_instructions || '',
+      max: res.special_instructions_max || 4000,
+    };
     setStatus('');
     paint();
   } catch (err) {
@@ -202,12 +211,41 @@ function build() {
   document.body.appendChild(wrap);
 }
 
+/**
+ * Where the caret was, so a repaint can put it back (#46).
+ *
+ * This sheet rebuilds its whole body on any structural change — a preset, the
+ * kind toggle, adding an executor. Every free-text field in it is therefore a
+ * field you can be mid-word in when something else on the page repaints, and
+ * the standing-instructions box is the worst case: it is a PARAGRAPH, so
+ * losing the caret in it means hunting for where you were in four lines of
+ * your own prose. The text itself was never at risk (it lives in a variable);
+ * the caret was.
+ */
+function caretNow() {
+  const el = document.activeElement;
+  if (!el || !el.id || !els.body || !els.body.contains(el)) return null;
+  if (el.selectionStart == null) return { id: el.id, start: null, end: null };
+  return { id: el.id, start: el.selectionStart, end: el.selectionEnd };
+}
+
+function caretBack(was) {
+  if (!was) return;
+  const el = els.body && els.body.querySelector('#' + CSS.escape(was.id));
+  if (!el) return;
+  el.focus({ preventScroll: true });
+  if (was.start != null && el.setSelectionRange) {
+    try { el.setSelectionRange(was.start, was.end); } catch { /* not selectable */ }
+  }
+}
+
 function paint() {
   if (!draft) return;
   const w = draft.worker;
   // The body scrolls, and a repaint that threw its scroll position away would
   // yank you back to the top of the sheet every time you touched a preset.
   const wasAt = els.body ? els.body.scrollTop : 0;
+  const caret = caretNow();
   clear(els.body);
 
   // 0. the sprint's name — what the header, the switcher and the hub call it.
@@ -283,7 +321,115 @@ function paint() {
 
   // 4. the executors themselves
   els.body.appendChild(executorsField(w));
+
+  // 5. who pre-reads a card that says it is done
+  els.body.appendChild(reviewerField());
+
+  // 6. what every agent is told on top of its card
+  els.body.appendChild(standingField());
+
   els.body.scrollTop = wasAt;
+  caretBack(caret);
+}
+
+// ---- standing instructions -----------------------------------------------
+
+/**
+ * The paragraph that rides along on every brief this board sends — worker and
+ * reviewer alike. It is policy, not a card: the card says what to do, this
+ * says how work is done here.
+ *
+ * It sits LAST because it is the field you visit least and read longest, and
+ * because a four-line box at the top of a sheet pushes everything else below
+ * the fold on a phone.
+ */
+function standingField() {
+  const ta = h('textarea.settings-standing', {
+    id: 'settings-standing',
+    rows: 5,
+    maxlength: String(standing.max),
+    value: standing.value,
+    spellcheck: true,
+    placeholder: 'e.g. All UI work must be checked at the Fold width (980px).',
+    // No repaint on input — this node has your caret in it, and it is the one
+    // field on this sheet you write whole sentences into (#46).
+    oninput: (e) => { standing.value = e.target.value; },
+  });
+  const box = field('Standing instructions', ta,
+    'Included in every agent’s brief, worker and reviewer alike, under a '
+    + 'heading of its own so nobody mistakes it for the card. Use it for how '
+    + 'work is done on this board — the gate to run, a width to check, a rule '
+    + 'you are tired of repeating. It applies from the next dispatch; agents '
+    + 'already running keep the brief they started with.');
+  box.classList.add('settings-standing-field');
+  return box;
+}
+
+// ---- reviewer -------------------------------------------------------------
+
+/**
+ * Who reads a card that reaches Awaiting review BEFORE you do.
+ *
+ * The one sentence that must be on screen and not in a doc: it never approves.
+ * Every verdict stays the user's — the reviewer reads the packet against the
+ * card and writes down what it found.
+ */
+function reviewerField() {
+  const r = draft.reviewer || (draft.reviewer = { enabled: false, executor: 'subagent', model: '' });
+  const w = draft.worker;
+  const box = h('div.settings-field.settings-reviewer');
+  box.appendChild(h('div.settings-label-row',
+    h('span.settings-label', 'Reviewer'),
+    h('span.grow'),
+    h('button.btn.tiny', {
+      type: 'button',
+      class: r.enabled ? 'btn tiny send' : 'btn tiny ghost',
+      'aria-pressed': r.enabled ? 'true' : 'false',
+      onclick: () => { r.enabled = !r.enabled; paint(); },
+    }, r.enabled ? 'On' : 'Off')));
+
+  if (r.enabled) {
+    const names = ['subagent'].concat(
+      Object.keys(w.executors || {}).filter((n) => n !== 'subagent'));
+    const select = h('select.settings-select', {
+      id: 'settings-reviewer-executor',
+      onchange: (e) => { r.executor = e.target.value; paint(); },
+    });
+    for (const name of names) {
+      const kind = name === 'subagent' ? 'subagent' : ((w.executors[name] || {}).kind || 'subagent');
+      select.appendChild(h('option', {
+        value: name, selected: r.executor === name,
+      }, name === kind ? name : `${name} · ${kind}`));
+    }
+    box.appendChild(h('div.exec-field',
+      h('label.exec-label', { for: 'settings-reviewer-executor' }, 'Runs as'),
+      select,
+      h('p.settings-hint', 'The same choices a worker has. A different agent '
+        + 'from the one that did the work is the point — it reads with fresh eyes.')));
+
+    const model = h('input.settings-text', {
+      id: 'settings-reviewer-model',
+      type: 'text', value: r.model || '', placeholder: 'opus',
+      spellcheck: false, autocomplete: 'off', autocapitalize: 'off',
+      oninput: (e) => { r.model = e.target.value; },
+    });
+    box.appendChild(h('div.exec-field',
+      h('label.exec-label', { for: 'settings-reviewer-model' }, 'Model (optional)'),
+      model,
+      h('p.settings-hint', 'Leave it blank and it uses whatever that executor '
+        + 'and the model policy above work out to.')));
+  }
+
+  box.appendChild(h('p.settings-hint.settings-never',
+    r.enabled
+      ? 'When a card reaches Awaiting review, this agent reads the evidence '
+        + 'against the card first and writes what it found on the card. It '
+        + 'never approves and never closes anything — every card still comes '
+        + 'to you.'
+      : 'Off: a card that says it is done comes straight to you. Turn this on '
+        + 'and an agent reads the evidence first and leaves you its findings — '
+        + 'it never approves, so you still see every card.'));
+  return box;
 }
 
 // ---- executors -----------------------------------------------------------
@@ -583,8 +729,11 @@ function commitExec(w) {
   if (e.original != null && e.original !== name) {
     delete next[e.original];
     // A rename moves the default with it, otherwise saving would fail on a
-    // default pointing at a name that no longer exists.
+    // default pointing at a name that no longer exists. Same for the reviewer.
     if (w.default_executor === e.original) w.default_executor = name;
+    if (draft.reviewer && draft.reviewer.executor === e.original) {
+      draft.reviewer.executor = name;
+    }
   }
   next[name] = spec;
   w.executors = next;
@@ -600,6 +749,12 @@ function removeExec(name) {
   delete next[name];
   w.executors = next;
   if (w.default_executor === name) w.default_executor = 'subagent';
+  // Same for the reviewer: an executor nobody declares any more is a save the
+  // server would refuse, and refusing it AFTER you removed the row is a dead
+  // end you cannot get out of from inside the sheet.
+  if (draft.reviewer && draft.reviewer.executor === name) {
+    draft.reviewer.executor = 'subagent';
+  }
   removing = null;
   paint();
 }
@@ -647,6 +802,7 @@ async function save() {
     return setStatus('Executors must be an object of name → definition.', true);
   }
   const wanted = (sprintName.value || '').trim();
+  const rev = draft.reviewer || { enabled: false, executor: 'subagent', model: '' };
   const patch = {
     worker: {
       model_policy: w.model_policy,
@@ -654,7 +810,17 @@ async function save() {
       concurrency: Number(w.concurrency),
       executors,
     },
+    reviewer: {
+      enabled: !!rev.enabled,
+      executor: rev.executor || 'subagent',
+      model: (rev.model || '').trim(),
+    },
   };
+  // Standing instructions are sent whenever they differ, blank included: "" is
+  // how you take them back off, the same way the session's name works.
+  if (standing.value !== standing.saved) {
+    patch.special_instructions = standing.value;
+  }
   // Only send a name when it actually changed: a rename writes an event to the
   // board, and saving the model policy is not a rename.
   if (wanted && wanted !== sprintName.saved) patch.name = wanted;
@@ -671,6 +837,9 @@ async function save() {
     sprintName.saved = sprintName.value;
     agentName.value = typeof res.agent_name === 'string' ? res.agent_name : wantedAgent;
     agentName.saved = agentName.value;
+    standing.value = typeof res.settings.special_instructions === 'string'
+      ? res.settings.special_instructions : standing.value;
+    standing.saved = standing.value;
     setStatus('');
     closeSettings();
     if (onSaved) onSaved(res.settings);

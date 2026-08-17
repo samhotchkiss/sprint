@@ -104,6 +104,13 @@ export const store = {
   agentName: '',
   columnOf: null,         // server-advised state -> column map (board.column_of)
   settings: null,         // dispatch policy: model, executors, concurrency
+  // The exact block every brief this board sends carries — heading and all,
+  // composed by the server so the words on screen are the words the agent got.
+  // '' on a board whose user has set no standing instructions, which is most.
+  standing: '',
+  // Who pre-reads a card that reaches Awaiting review, resolved: {enabled,
+  // executor, kind, model}. It never approves — see settings.js.
+  reviewer: null,
   // `cursor` is the session's real drain cursor: every event with seq <= cursor
   // has been read by the session. Never guessed — the server is the only writer.
   session: { status: 'online', online: true, since: null, cursor: null, waiterSeconds: null },
@@ -407,6 +414,13 @@ export function applyBoard(board) {
   // The board's dispatch policy rides along so the Settings panel and the card
   // faces are never a second fetch behind what the board just said.
   if (board.settings && typeof board.settings === 'object') store.settings = board.settings;
+  // Composed server-side rather than here: the session pastes this string into
+  // a brief and the rail renders this string, so they cannot drift into two
+  // different headings.
+  if (typeof board.standing_instructions === 'string') {
+    store.standing = board.standing_instructions;
+  }
+  if (board.reviewer && typeof board.reviewer === 'object') store.reviewer = board.reviewer;
 
   const list = Array.isArray(board.cards) ? board.cards : [];
   const next = new Map();

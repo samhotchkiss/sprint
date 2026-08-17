@@ -3710,6 +3710,47 @@ class TestSprintPostHelper(Base):
         _, detail = self.get("/api/cards/%d" % num)
         return detail["timeline"][-1]["payload"]
 
+    # -- the reviewer's door (#70) --------------------------------------
+
+    def test_the_reviewer_flag_marks_the_note_so_the_board_can_trust_it(self):
+        num = self.new_card("reviewed one")["num"]
+        self.to_in_progress(num)
+        self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        r = self.run_post(num, "note", "checked the evidence against the card",
+                          "--reviewer", "--recommends", "approve",
+                          "--detail", "Checks: ran the suite, opened both shots.")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        p = self.last_payload(num)
+        self.assertEqual(p["reviewer"], {"recommendation": "approve"})
+        self.assertIn("recommends you approve", r.stdout.decode())
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["reviewed"]["recommendation"], "approve")
+
+    def test_the_flag_works_without_a_recommendation(self):
+        num = self.new_card("no recommendation")["num"]
+        self.to_in_progress(num)
+        r = self.run_post(num, "note", "two things looked odd", "--reviewer")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(self.last_payload(num)["reviewer"], {"recommendation": None})
+
+    def test_a_recommendation_that_is_not_one_of_the_three_is_refused(self):
+        num = self.new_card("bad recommendation")["num"]
+        r = self.run_post(num, "note", "x", "--reviewer", "--recommends", "merge")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("recommends", r.stderr.decode())
+
+    def test_recommending_without_saying_you_are_the_reviewer_is_refused(self):
+        num = self.new_card("half a flag")["num"]
+        r = self.run_post(num, "note", "x", "--recommends", "approve")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("recommends", r.stderr.decode())
+
+    def test_the_reviewers_findings_are_a_note_not_a_progress_line(self):
+        num = self.new_card("wrong kind")["num"]
+        r = self.run_post(num, "progress", "looks fine", "--reviewer")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("reviewer", r.stderr.decode())
+
     def test_detail_flag_posts_text_plus_detail(self):
         num = self.new_card("helper")["num"]
         self.to_in_progress(num)
@@ -7379,6 +7420,396 @@ class TestSettings(Base):
     def test_put_to_anything_else_is_a_404(self):
         status, body = self.req("PUT", "/api/board", {})
         self.assertEqual(status, 404, body)
+
+
+class TestStandingInstructions(Base):
+    """Card #71 — the paragraph every brief this board sends carries.
+
+    User, verbatim (sidebar): *"and a place in the settings for special
+    instructions"*. It is per-sprint policy: the card says what to do, this
+    says how work is done here, and the session pastes it into every worker's
+    and the reviewer's brief under a heading of its own.
+    """
+
+    def settings(self, **kw):
+        status, body = self.get("/api/settings", **kw)
+        self.assertEqual(status, 200, body)
+        return body
+
+    def put(self, patch, **kw):
+        return self.req("PUT", "/api/settings", patch, **kw)
+
+    # -- round trip -----------------------------------------------------
+
+    def test_empty_by_default_and_present_on_every_read(self):
+        """Present-but-empty, deliberately. Settings is a whole document, and a
+        key that vanishes when it is empty is a key every reader has to guess
+        about -- the same rule `agent_name` already follows."""
+        body = self.settings()
+        self.assertEqual(body["settings"]["special_instructions"], "")
+        self.assertEqual(body["special_instructions"], "")
+        self.assertEqual(body["standing_instructions"], "")
+        self.assertEqual(body["defaults"]["special_instructions"], "")
+        board = self.get("/api/board")[1]
+        self.assertIn("special_instructions", board["settings"])
+        self.assertEqual(board["settings"]["special_instructions"], "")
+        self.assertEqual(board["standing_instructions"], "")
+
+    def test_it_round_trips_through_the_file_and_back(self):
+        text = "Run `make check` before any packet.\nCheck the Fold width on UI work."
+        status, body = self.put({"special_instructions": text})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["settings"]["special_instructions"], text)
+
+        path = os.path.join(self.project_root, ".sprint", "config.json")
+        with open(path, encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        self.assertEqual(on_disk["special_instructions"], text)
+        self.assertEqual(self.settings()["settings"]["special_instructions"], text)
+
+    def test_the_paragraphs_own_line_breaks_survive(self):
+        """A name is collapsed to one line. This is not a name -- its line
+        breaks are how it reads in a brief."""
+        self.put({"special_instructions": "  one\n\ntwo  "})
+        self.assertEqual(self.settings()["settings"]["special_instructions"],
+                         "one\n\ntwo")
+
+    def test_writing_it_leaves_dispatch_policy_alone(self):
+        self.put({"worker": {"concurrency": 7}})
+        self.put({"special_instructions": "be careful"})
+        s = self.settings()["settings"]
+        self.assertEqual(s["worker"]["concurrency"], 7)
+        self.assertEqual(s["special_instructions"], "be careful")
+
+    def test_blank_takes_them_back_off(self):
+        self.put({"special_instructions": "temporary rule"})
+        self.put({"special_instructions": ""})
+        self.assertEqual(self.settings()["settings"]["special_instructions"], "")
+        self.assertEqual(self.settings()["standing_instructions"], "")
+
+    # -- the block a brief actually carries -------------------------------
+
+    def test_the_server_composes_the_block_so_nothing_can_drift(self):
+        """The session pastes THIS string and the board renders THIS string.
+        One composition, so the heading cannot become two headings."""
+        self.put({"special_instructions": "Check the Fold width."})
+        block = self.settings()["standing_instructions"]
+        self.assertIn(sprintd.STANDING_HEADING, block)
+        self.assertIn("Check the Fold width.", block)
+        self.assertEqual(self.get("/api/board")[1]["standing_instructions"], block)
+        num = self.new_card()["num"]
+        self.assertEqual(self.get("/api/cards/%d" % num)[1]["standing_instructions"],
+                         block)
+
+    def test_the_heading_is_published_so_a_client_never_invents_one(self):
+        self.assertEqual(self.settings()["choices"]["standing_heading"],
+                         sprintd.STANDING_HEADING)
+
+    # -- the cap ----------------------------------------------------------
+
+    def test_a_runaway_paste_is_refused_by_name(self):
+        status, body = self.put({"special_instructions":
+                                 "x" * (sprintd.SPECIAL_INSTRUCTIONS_MAX + 1)})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "special_instructions")
+        self.assertEqual(body["error"], "too_long")
+        self.assertIn(str(sprintd.SPECIAL_INSTRUCTIONS_MAX), body["message"])
+        # ...and nothing was written
+        self.assertEqual(self.settings()["settings"]["special_instructions"], "")
+
+    def test_exactly_the_cap_is_fine(self):
+        text = "y" * sprintd.SPECIAL_INSTRUCTIONS_MAX
+        status, body = self.put({"special_instructions": text})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(len(self.settings()["settings"]["special_instructions"]),
+                         sprintd.SPECIAL_INSTRUCTIONS_MAX)
+
+    def test_something_that_is_not_text_is_refused_by_name(self):
+        for bad in (12, ["a"], {"a": 1}, True):
+            status, body = self.put({"special_instructions": bad})
+            self.assertEqual(status, 400, "%r should be refused: %s" % (bad, body))
+            self.assertEqual(body["field"], "special_instructions")
+
+    # -- the session finds out --------------------------------------------
+
+    def test_setting_them_lands_a_line_the_session_will_read(self):
+        before = self.get("/api/events?after=0&limit=500")[1]["head"]
+        self.put({"special_instructions": "Check the Fold width."})
+        page = self.get("/api/events?after=%d&limit=50" % before)[1]
+        notes = [e for e in page["events"]
+                 if e["kind"] == "note" and "special_instructions" in e["payload"]]
+        self.assertEqual(len(notes), 1, page["events"])
+        self.assertEqual(notes[0]["actor"], "server")
+        self.assertIn("next dispatch", notes[0]["payload"]["text"])
+        # the expanded half shows the exact block a brief will carry
+        self.assertIn(sprintd.STANDING_HEADING, notes[0]["payload"]["detail"])
+
+    def test_clearing_them_says_so_in_its_own_words(self):
+        self.put({"special_instructions": "temporary rule"})
+        before = self.get("/api/events?after=0&limit=500")[1]["head"]
+        self.put({"special_instructions": ""})
+        page = self.get("/api/events?after=%d&limit=50" % before)[1]
+        notes = [e for e in page["events"]
+                 if e["kind"] == "note" and "special_instructions" in e["payload"]]
+        self.assertEqual(len(notes), 1, page["events"])
+        self.assertIn("cleared", notes[0]["payload"]["text"])
+
+    def test_writing_the_same_words_again_writes_no_event(self):
+        self.put({"special_instructions": "same"})
+        head = self.get("/api/events?after=0&limit=500")[1]["head"]
+        self.put({"special_instructions": "same"})
+        self.assertEqual(self.get("/api/events?after=0&limit=500")[1]["head"], head)
+
+    # -- a hand-edited file ------------------------------------------------
+
+    def test_a_hand_edited_runaway_means_none_not_half(self):
+        """Half a sentence in every brief is worse than no sentence at all."""
+        path = os.path.join(self.project_root, ".sprint", "config.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"special_instructions":
+                       "z" * (sprintd.SPECIAL_INSTRUCTIONS_MAX + 500)}, fh)
+        self.assertEqual(self.settings()["settings"]["special_instructions"], "")
+
+    def test_a_hand_edited_file_is_picked_up_without_a_restart(self):
+        path = os.path.join(self.project_root, ".sprint", "config.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"special_instructions": "typed by hand"}, fh)
+        self.assertEqual(self.settings()["settings"]["special_instructions"],
+                         "typed by hand")
+
+
+class TestReviewer(Base):
+    """Card #70 — who pre-reads a card that says it is done.
+
+    User, verbatim (sidebar): *"we need an option to set the reviewer as
+    well."* The standing rule it is built around: the user sees and acks every
+    card, so the reviewer NEVER approves.
+    """
+
+    def settings(self, **kw):
+        status, body = self.get("/api/settings", **kw)
+        self.assertEqual(status, 200, body)
+        return body
+
+    def put(self, patch, **kw):
+        return self.req("PUT", "/api/settings", patch, **kw)
+
+    def declare_grok(self):
+        status, body = self.put({"worker": {"executors": {
+            "claude": {"kind": "subagent"},
+            "grok": {"kind": "tmux", "command": "grok", "session": "sprint-workers"}}}})
+        self.assertEqual(status, 200, body)
+
+    # -- round trip -------------------------------------------------------
+
+    def test_off_by_default_and_says_what_it_would_run_as(self):
+        body = self.settings()
+        self.assertEqual(body["settings"]["reviewer"],
+                         {"enabled": False, "executor": "subagent", "model": ""})
+        self.assertFalse(body["reviewer"]["enabled"])
+        # ...and it still resolves, so the panel can show the choice it holds
+        self.assertEqual(body["reviewer"]["executor"], "subagent")
+        self.assertEqual(body["reviewer"]["kind"], "subagent")
+
+    def test_it_round_trips_through_the_file_and_back(self):
+        self.declare_grok()
+        status, body = self.put({"reviewer": {"enabled": True, "executor": "grok",
+                                              "model": "grok-4"}})
+        self.assertEqual(status, 200, body)
+        path = os.path.join(self.project_root, ".sprint", "config.json")
+        with open(path, encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        self.assertEqual(on_disk["reviewer"],
+                         {"enabled": True, "executor": "grok", "model": "grok-4"})
+        again = self.settings()
+        self.assertEqual(again["settings"]["reviewer"]["executor"], "grok")
+        # resolved the way a worker's dispatch is, so nobody looks it up twice
+        self.assertEqual(again["reviewer"]["kind"], "tmux")
+        self.assertEqual(again["reviewer"]["command"], "grok")
+        self.assertEqual(again["reviewer"]["session"], "sprint-workers")
+        self.assertEqual(again["reviewer"]["model"], "grok-4")
+
+    def test_a_partial_write_leaves_the_rest_of_the_block_alone(self):
+        self.declare_grok()
+        self.put({"reviewer": {"executor": "grok", "model": "grok-4"}})
+        self.put({"reviewer": {"enabled": True}})
+        rev = self.settings()["settings"]["reviewer"]
+        self.assertEqual(rev, {"enabled": True, "executor": "grok", "model": "grok-4"})
+
+    def test_no_model_falls_back_to_the_boards_policy(self):
+        self.put({"worker": {"model_policy": "always_opus"},
+                  "reviewer": {"enabled": True}})
+        self.assertEqual(self.settings()["reviewer"]["model"], "opus")
+
+    def test_a_blank_model_takes_it_back_off(self):
+        self.put({"reviewer": {"model": "opus"}})
+        self.put({"reviewer": {"model": ""}})
+        self.assertEqual(self.settings()["settings"]["reviewer"]["model"], "")
+
+    def test_the_board_payload_carries_it(self):
+        self.declare_grok()
+        self.put({"reviewer": {"enabled": True, "executor": "grok"}})
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200)
+        self.assertEqual(board["settings"]["reviewer"]["executor"], "grok")
+        self.assertTrue(board["reviewer"]["enabled"])
+        self.assertEqual(board["reviewer"]["kind"], "tmux")
+        # ...and so does one card's drawer, which is where the rail reads it
+        num = self.new_card()["num"]
+        self.assertTrue(self.get("/api/cards/%d" % num)[1]["reviewer"]["enabled"])
+
+    # -- validation --------------------------------------------------------
+
+    def test_an_executor_nobody_declared_is_refused_and_named(self):
+        status, body = self.put({"reviewer": {"enabled": True, "executor": "grok"}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "reviewer.executor")
+        self.assertIn("grok", body["message"])
+        self.assertIn("subagent", body["message"])
+        # ...but declaring it in the same request is fine
+        status, body = self.put({
+            "worker": {"executors": {"grok": {"kind": "tmux", "command": "grok"}}},
+            "reviewer": {"enabled": True, "executor": "grok"}})
+        self.assertEqual(status, 200, body)
+
+    def test_a_typo_inside_the_block_is_refused_and_named(self):
+        status, body = self.put({"reviewer": {"enabld": True}})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "unknown_key")
+        self.assertEqual(body["field"], "reviewer.enabld")
+
+    def test_enabled_must_be_a_boolean(self):
+        for bad in ("yes", 1, None):
+            status, body = self.put({"reviewer": {"enabled": bad}})
+            self.assertEqual(status, 400, "%r should be refused: %s" % (bad, body))
+            self.assertEqual(body["field"], "reviewer.enabled")
+
+    def test_a_reviewer_block_that_is_not_an_object_is_refused(self):
+        status, body = self.put({"reviewer": "grok"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "reviewer")
+
+    def test_a_hand_edited_file_pointing_nowhere_falls_back(self):
+        """Same rule `default_executor` already follows: a broken hand edit is
+        that key's default, never a dead board."""
+        path = os.path.join(self.project_root, ".sprint", "config.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"reviewer": {"enabled": True, "executor": "nope",
+                                    "model": 12}}, fh)
+        rev = self.settings()["settings"]["reviewer"]
+        self.assertTrue(rev["enabled"])
+        self.assertEqual(rev["executor"], "subagent")
+        self.assertEqual(rev["model"], "")
+
+    # -- the session finds out ---------------------------------------------
+
+    def test_turning_it_on_lands_a_line_the_session_will_read(self):
+        before = self.get("/api/events?after=0&limit=500")[1]["head"]
+        self.put({"reviewer": {"enabled": True}})
+        page = self.get("/api/events?after=%d&limit=50" % before)[1]
+        notes = [e for e in page["events"]
+                 if e["kind"] == "note" and "reviewer" in e["payload"]]
+        self.assertEqual(len(notes), 1, page["events"])
+        self.assertEqual(notes[0]["actor"], "server")
+        self.assertTrue(notes[0]["payload"]["reviewer"]["enabled"])
+        # the rule that makes this safe is in the line itself, not only in a doc
+        self.assertIn("never approves", notes[0]["payload"]["detail"])
+
+    def test_turning_it_off_says_cards_come_straight_to_you(self):
+        self.put({"reviewer": {"enabled": True}})
+        before = self.get("/api/events?after=0&limit=500")[1]["head"]
+        self.put({"reviewer": {"enabled": False}})
+        page = self.get("/api/events?after=%d&limit=50" % before)[1]
+        notes = [e for e in page["events"]
+                 if e["kind"] == "note" and "reviewer" in e["payload"]]
+        self.assertEqual(len(notes), 1, page["events"])
+        self.assertIn("straight to you", notes[0]["payload"]["text"])
+
+
+class TestReviewedMarker(Base):
+    """Has the reviewer read the packet this card is CURRENTLY showing?
+
+    Derived at read time from a typed note, never stored -- see
+    `App.card_reviewed` for the argument. These tests are that argument's
+    receipts: it self-heals across a bounce, and a worker who happens to write
+    "Reviewer: ..." is not the reviewer.
+    """
+
+    def ready_card(self, text="fix the header"):
+        num = self.new_card(text)["num"]
+        self.to_in_progress(num)
+        status, body = self.post("/api/cards/%d/ready" % num,
+                                 {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200, body)
+        return num
+
+    def card(self, num):
+        status, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(status, 200, detail)
+        return detail["card"]
+
+    def review(self, num, text="Reviewer: evidence matches the card.",
+               recommendation="approve"):
+        status, body = self.post("/api/cards/%d/events" % num, {
+            "kind": "note",
+            "payload": {"text": text,
+                        "reviewer": {"recommendation": recommendation}}})
+        self.assertEqual(status, 201, body)
+
+    def test_a_card_with_no_packet_has_nothing_to_review(self):
+        num = self.new_card()["num"]
+        self.assertIsNone(self.card(num)["reviewed"])
+
+    def test_a_ready_card_starts_unreviewed(self):
+        num = self.ready_card()
+        self.assertEqual(self.card(num)["state"], "ready")
+        self.assertIsNone(self.card(num)["reviewed"])
+
+    def test_the_reviewers_note_marks_the_packet_read(self):
+        num = self.ready_card()
+        self.review(num, "Reviewer: the two screenshots are the same picture.",
+                    recommendation="bounce")
+        mark = self.card(num)["reviewed"]
+        self.assertIsNotNone(mark)
+        self.assertEqual(mark["recommendation"], "bounce")
+        self.assertIn("same picture", mark["text"])
+        self.assertIsNotNone(mark["seq"])
+
+    def test_an_ordinary_note_is_not_a_review(self):
+        """A text convention would make this card look reviewed. A typed field
+        does not: the marker means what it says."""
+        num = self.ready_card()
+        status, _ = self.post("/api/cards/%d/events" % num, {
+            "kind": "note", "payload": {"text": "Reviewer: I asked one to look."}})
+        self.assertEqual(status, 201)
+        self.assertIsNone(self.card(num)["reviewed"])
+
+    def test_a_new_packet_is_unreviewed_again_with_nobody_clearing_a_flag(self):
+        num = self.ready_card()
+        self.review(num)
+        self.assertIsNotNone(self.card(num)["reviewed"])
+        # the user sends it back, the worker fixes it and re-readies
+        status, _ = self.post("/api/cards/%d/verdict" % num,
+                              {"verdict": "bounce", "notes": "not yet"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.card(num)["state"], "in_progress")
+        time.sleep(0.01)
+        status, body = self.post("/api/cards/%d/ready" % num,
+                                 {"packet": dict(GOOD_PACKET, claim="Fixed properly.")})
+        self.assertEqual(status, 200, body)
+        self.assertIsNone(self.card(num)["reviewed"],
+                          "a fresh packet nobody has read is not reviewed")
+        # ...and reviewing the new one marks it again
+        self.review(num, "Reviewer: this one holds up.")
+        self.assertIsNotNone(self.card(num)["reviewed"])
+
+    def test_the_marker_rides_the_board_payload_too(self):
+        num = self.ready_card()
+        self.review(num)
+        board = self.get("/api/board")[1]
+        found = [c for c in board["cards"] if c["num"] == num]
+        self.assertEqual(len(found), 1)
+        self.assertIsNotNone(found[0]["reviewed"])
 
 
 class TestPerCardExecutor(Base):

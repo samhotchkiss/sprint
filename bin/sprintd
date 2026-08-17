@@ -233,6 +233,7 @@ POLICY_MODEL = {
 }
 
 DEFAULT_EXECUTORS = {"claude": {"kind": "subagent"}}
+DEFAULT_REVIEWER = {"enabled": False, "executor": "subagent", "model": ""}
 DEFAULT_SETTINGS = {
     "worker": {
         "model_policy": "lowest_feasible",
@@ -259,6 +260,24 @@ DEFAULT_SETTINGS = {
     # moved to a new window has to be able to say so or the hub will keep
     # typing into somebody else's terminal.
     "session_tmux_window": "",
+    # A standing brief addition, in the user's own words, that every agent this
+    # board dispatches is told -- worker and reviewer alike. "All UI work must
+    # check the Fold width", "this repo's gate is `make check`, not `npm test`".
+    #
+    # It is per-sprint policy, not per-card instruction: the card body says what
+    # to do, this says how work is done HERE. Empty by default and empty is the
+    # normal state -- a board with nothing standing to say adds nothing to any
+    # brief. Applies from the NEXT dispatch, like every other setting.
+    "special_instructions": "",
+    # WHO pre-reads a card that reaches `ready`, before the user does. Disabled
+    # out of the box. `executor` is the same vocabulary a worker's is (a name in
+    # worker.executors, or the builtin "subagent"); `model` is optional and ""
+    # means "whatever that executor's own model resolves to".
+    #
+    # The reviewer NEVER approves. User's standing rule: he sees and acks every
+    # card. It reads and it writes findings on the card -- see the reviewer
+    # section of SPEC.md.
+    "reviewer": dict(DEFAULT_REVIEWER),
 }
 # `default_executor` accepts either a named executor or the bare kind
 # "subagent" -- the out-of-the-box board has no named executors worth typing.
@@ -266,6 +285,34 @@ BUILTIN_EXECUTOR = "subagent"
 SETTINGS_KEYS = tuple(DEFAULT_SETTINGS["worker"].keys())
 EXECUTOR_FIELDS = ("kind", "command", "session", "model", "note")
 MAX_CONCURRENCY = 20
+REVIEWER_KEYS = ("enabled", "executor", "model")
+# The top-level keys `PUT /api/settings` will take. Named, because an accepted
+# typo reads back hours later as "the defaults are fine".
+TOP_SETTINGS_KEYS = ("worker", "agent_name", "session_tmux_window",
+                     "special_instructions", "reviewer")
+# Generous on purpose: this is a paragraph or two of standing guidance, and a
+# ceiling you hit while typing a real instruction is a ceiling set too low. It
+# is still a ceiling, because this string is pasted into EVERY brief -- an
+# accidental paste of a whole document would quietly tax every dispatch.
+SPECIAL_INSTRUCTIONS_MAX = 4000
+# The heading the block carries into a brief. One copy, here, so the board, the
+# session and the docs cannot drift into three different headings -- an agent
+# that cannot tell standing policy from the card's own text will read one as
+# the other.
+STANDING_HEADING = "Sprint standing instructions from the user"
+
+
+def standing_instructions_block(text) -> str:
+    """The exact words a brief carries, or "" when there is nothing to say.
+
+    The server composes it rather than each caller pasting its own heading:
+    the session appends this string to a worker's brief, the board renders
+    this string on the card, and they are the same bytes by construction.
+    """
+    body = (text or "").strip()
+    if not body:
+        return ""
+    return "## %s\n\n%s\n" % (STANDING_HEADING, body)
 
 # --------------------------------------------------------------------------
 # Staleness sweep
@@ -1697,6 +1744,65 @@ def clean_model_name(value, field: str = "model") -> str:
     return model
 
 
+def clean_special_instructions(value, field: str = "special_instructions") -> str:
+    """Free text, kept verbatim apart from trimming the ends.
+
+    Deliberately NOT collapsed to one line the way a name is: this is a
+    paragraph the user wrote, and its line breaks are how it reads in a brief.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise _bad(field, "%s must be text" % field)
+    text = value.strip()
+    if len(text) > SPECIAL_INSTRUCTIONS_MAX:
+        raise _bad(field,
+                   "%s is too long — %d characters, and the ceiling is %d. It "
+                   "rides along on every brief, so keep it to standing policy."
+                   % (field, len(text), SPECIAL_INSTRUCTIONS_MAX),
+                   code="too_long")
+    return text
+
+
+def validate_reviewer(patch, base: dict, executors: dict) -> dict:
+    """The reviewer block, merged per key onto what is already there.
+
+    `executors` is the map this same request settled on, so enabling a reviewer
+    on an executor the request also declares works in one write -- and pointing
+    it at one nobody declared is a 400 now rather than a dispatch that fails
+    the first time a card reaches `ready`.
+    """
+    if not isinstance(patch, dict):
+        raise _bad("reviewer", "reviewer must be an object")
+    for key in patch:
+        if key not in REVIEWER_KEYS:
+            raise ApiError(400, "unknown_key",
+                           "reviewer.%s is not a setting (allowed: %s)"
+                           % (key, ", ".join(REVIEWER_KEYS)),
+                           field="reviewer.%s" % key)
+    out = dict(base)
+    if "enabled" in patch:
+        if not isinstance(patch["enabled"], bool):
+            raise _bad("reviewer.enabled", "enabled must be true or false")
+        out["enabled"] = patch["enabled"]
+    if "executor" in patch:
+        out["executor"] = clean_executor_name(patch["executor"], "reviewer.executor")
+    if "model" in patch:
+        # "" is how you take a model back off, exactly like agent_name.
+        value = patch["model"]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            out["model"] = ""
+        else:
+            out["model"] = clean_model_name(value, "reviewer.model")
+    name = out["executor"]
+    if name != BUILTIN_EXECUTOR and name not in executors:
+        raise _bad("reviewer.executor",
+                   "reviewer.executor \"%s\" is not in worker.executors "
+                   "(known: %s)" % (name, ", ".join(
+                       sorted(list(executors.keys()) + [BUILTIN_EXECUTOR]))))
+    return out
+
+
 def validate_executor(name: str, spec) -> dict:
     field = "worker.executors.%s" % name
     if not isinstance(spec, dict):
@@ -1750,17 +1856,19 @@ def validate_settings(patch, base=None) -> dict:
         raise _bad("settings", "settings must be an object")
     current = normalize_settings(base)
     for key in patch:
-        if key not in ("worker", "agent_name", "session_tmux_window"):
+        if key not in TOP_SETTINGS_KEYS:
             raise ApiError(400, "unknown_key",
-                           "%s is not a setting (\"worker\", \"agent_name\" and "
-                           "\"session_tmux_window\" are the three that exist "
-                           "today)" % key, field=key)
+                           "%s is not a setting (the top-level ones are: %s)"
+                           % (key, ", ".join(TOP_SETTINGS_KEYS)), field=key)
     agent_name = current["agent_name"]
     if "agent_name" in patch:
         agent_name = clean_agent_name(patch["agent_name"])
     tmux_window = current["session_tmux_window"]
     if "session_tmux_window" in patch:
         tmux_window = clean_tmux_window(patch["session_tmux_window"])
+    instructions = current["special_instructions"]
+    if "special_instructions" in patch:
+        instructions = clean_special_instructions(patch["special_instructions"])
     worker_patch = patch.get("worker", {})
     if not isinstance(worker_patch, dict):
         raise _bad("worker", "worker must be an object")
@@ -1812,8 +1920,14 @@ def validate_settings(patch, base=None) -> dict:
                    "default_executor \"%s\" is not in worker.executors "
                    "(known: %s)" % (default, ", ".join(
                        sorted(list(worker["executors"].keys()) + [BUILTIN_EXECUTOR]))))
+    # Same reason, same place in the order: the reviewer's executor is checked
+    # against the executors THIS request settled on.
+    reviewer = validate_reviewer(patch.get("reviewer", {}), current["reviewer"],
+                                 worker["executors"])
     return {"worker": worker, "agent_name": agent_name,
-            "session_tmux_window": tmux_window}
+            "session_tmux_window": tmux_window,
+            "special_instructions": instructions,
+            "reviewer": reviewer}
 
 
 def normalize_settings(raw) -> dict:
@@ -1822,11 +1936,21 @@ def normalize_settings(raw) -> dict:
     must never be able to take the sprint down."""
     out = {"worker": dict(DEFAULT_SETTINGS["worker"]),
            "agent_name": DEFAULT_SETTINGS["agent_name"],
-           "session_tmux_window": DEFAULT_SETTINGS["session_tmux_window"]}
+           "session_tmux_window": DEFAULT_SETTINGS["session_tmux_window"],
+           "special_instructions": DEFAULT_SETTINGS["special_instructions"],
+           "reviewer": dict(DEFAULT_REVIEWER)}
     out["worker"]["executors"] = {
         k: dict(v) for k, v in DEFAULT_SETTINGS["worker"]["executors"].items()}
     if not isinstance(raw, dict):
         return out
+    try:
+        out["special_instructions"] = clean_special_instructions(
+            raw.get("special_instructions"))
+    except ApiError:
+        # A hand-edited instruction that is not text, or ran away past the
+        # ceiling, means NO standing instructions -- never a half-pasted one,
+        # because half a sentence in every brief is worse than none.
+        out["special_instructions"] = ""
     try:
         out["agent_name"] = clean_agent_name(raw.get("agent_name"))
     except ApiError:
@@ -1843,6 +1967,11 @@ def normalize_settings(raw) -> dict:
         out["session_tmux_window"] = ""
     worker = raw.get("worker")
     if not isinstance(worker, dict):
+        # No worker block is not the end of the file: a hand edit that only set
+        # a reviewer still gets its reviewer, judged against the default
+        # executors it fell back to.
+        out["reviewer"] = normalize_reviewer(raw.get("reviewer"),
+                                             out["worker"]["executors"])
         return out
     if worker.get("model_policy") in MODEL_POLICIES:
         out["worker"]["model_policy"] = worker["model_policy"]
@@ -1866,7 +1995,53 @@ def normalize_settings(raw) -> dict:
     if isinstance(default, str) and (
             default == BUILTIN_EXECUTOR or default in out["worker"]["executors"]):
         out["worker"]["default_executor"] = default
+    # Last, so it is judged against the executors this file actually declared.
+    out["reviewer"] = normalize_reviewer(raw.get("reviewer"),
+                                         out["worker"]["executors"])
     return out
+
+
+def normalize_reviewer(raw, executors: dict) -> dict:
+    """The reviewer block off disk, made whole. Per key, same rule as the rest:
+    a value that does not hold up is that key's default, not a dead board."""
+    out = dict(DEFAULT_REVIEWER)
+    if not isinstance(raw, dict):
+        return out
+    if isinstance(raw.get("enabled"), bool):
+        out["enabled"] = raw["enabled"]
+    name = raw.get("executor")
+    if isinstance(name, str) and (
+            name == BUILTIN_EXECUTOR or name in executors):
+        out["executor"] = name
+    model = raw.get("model")
+    if isinstance(model, str):
+        try:
+            out["model"] = clean_model_name(model) if model.strip() else ""
+        except ApiError:
+            out["model"] = ""
+    return out
+
+
+def resolve_reviewer(settings: dict) -> dict:
+    """What the reviewer actually RUNS as -- the same shape `resolve_dispatch`
+    hands back for a worker, so the session dispatches both the same way and
+    no surface has to look an executor up twice.
+
+    `enabled: false` still resolves: the panel shows what it WOULD run as, and
+    a board that has never turned the reviewer on still has an honest answer.
+    """
+    s = normalize_settings(settings)
+    rev = s["reviewer"]
+    spec = s["worker"]["executors"].get(rev["executor"]) or {"kind": "subagent"}
+    return {
+        "enabled": rev["enabled"],
+        "executor": rev["executor"],
+        "kind": spec.get("kind", "subagent"),
+        "command": spec.get("command"),
+        "session": spec.get("session"),
+        "model": rev["model"] or spec.get("model") or POLICY_MODEL.get(
+            s["worker"]["model_policy"], "sonnet"),
+    }
 
 
 def resolve_dispatch(settings: dict, executor=None, model=None) -> dict:
@@ -2276,6 +2451,48 @@ class App:
                         "text": text, "session_tmux_window": win or None,
                         "was": was or None,
                         "by": actor if actor in ACTORS else "user",
+                    })
+            # Standing instructions ARE dispatch policy -- they change what
+            # every next brief says -- but they are not a `worker.*` key, so
+            # they get their own line rather than riding a list of field names
+            # nobody would recognise them in.
+            if merged["special_instructions"] != current["special_instructions"]:
+                now_text = merged["special_instructions"]
+                if not now_text:
+                    text = "standing instructions cleared — briefs go back to the card alone"
+                elif not current["special_instructions"]:
+                    text = "standing instructions set — every brief carries them from the next dispatch"
+                else:
+                    text = "standing instructions changed — in effect for the next dispatch"
+                with self.lock:
+                    self._append_event(None, "server", "note", {
+                        "text": text,
+                        "special_instructions": now_text,
+                        "by": actor if actor in ACTORS else "user",
+                        "detail": standing_instructions_block(now_text) or None,
+                    })
+            # Who pre-reads a ready card. Its own line for the same reason, and
+            # because "the reviewer is on" is the single fact a session reading
+            # its tail needs -- not a diff of three keys.
+            if merged["reviewer"] != current["reviewer"]:
+                rev = merged["reviewer"]
+                if not rev["enabled"]:
+                    text = ("no reviewer — ready cards come straight to you"
+                            if current["reviewer"]["enabled"]
+                            else "reviewer settings changed (still off)")
+                else:
+                    text = ("a reviewer reads every ready card first — %s%s"
+                            % (rev["executor"],
+                               " on %s" % rev["model"] if rev["model"] else ""))
+                with self.lock:
+                    self._append_event(None, "server", "note", {
+                        "text": text, "reviewer": merged["reviewer"],
+                        "was": current["reviewer"],
+                        "by": actor if actor in ACTORS else "user",
+                        "detail": "The reviewer never approves and never closes "
+                                  "a card — it reads the packet and writes what "
+                                  "it found on the card, and you still ack "
+                                  "every one.",
                     })
             if not changed:
                 self.notify()
@@ -2949,9 +3166,59 @@ class App:
                       "ORDER BY seq DESC LIMIT 1", (num,))
         out["error"] = (jload(err["payload"], {}) or {}).get("text") if err else None
         out["evidence"] = self.latest_evidence(num, card_row=row)
+        # Has the reviewer already read THIS packet? Derived, never stored --
+        # see `card_reviewed`. Only asked of a card that has a packet at all,
+        # which is a handful of cards on a board of a hundred.
+        out["reviewed"] = (self.card_reviewed(num, out["evidence"])
+                           if out["evidence"] else None)
         if not brief:
             out["attachments"] = self.card_attachments(num)
         return out
+
+    def card_reviewed(self, num: int, evidence):
+        """`{at, seq, recommendation}` if the reviewer has read the packet this
+        card is currently showing -- otherwise None.
+
+        DERIVED, on purpose, and this is the whole argument for the shape:
+
+        - It is not a STATE. The reviewer never approves and never closes, so
+          "reviewed" is not a place a card sits; it is a fact about a packet.
+          A state would need a transition, a column and a rule for what happens
+          when the user acks a card the reviewer never got to.
+        - It is not a stored COLUMN either. A flag would have to be cleared by
+          hand on every bounce, and the one time somebody forgot, a re-readied
+          card would sit there looking reviewed with nobody having read the new
+          packet. Comparing the note's timestamp to the packet's is free and
+          self-heals: a new packet is automatically unreviewed.
+        - It is not a TEXT CONVENTION. Matching a "Reviewer:" prefix on a note
+          would make a worker who happens to write that sentence look like the
+          reviewer. The reviewer stamps `payload.reviewer` instead (one
+          boolean, `sprint-post --reviewer`), so the marker means what it says.
+
+        Same family as `queue_position` and the review UNIT: computed at read
+        time from the append-only log, so nothing can go stale behind it.
+        """
+        if not evidence:
+            return None
+        # One scan, newest first, stopping at the first reviewer note that is
+        # not older than the packet it would be about.
+        for r in self.q("SELECT * FROM events WHERE card_num=? AND kind='note' "
+                        "AND ts>=? ORDER BY seq DESC", (num, evidence["created_at"])):
+            payload = jload(r["payload"], {}) or {}
+            mark = payload.get("reviewer")
+            if not mark:
+                continue
+            return {
+                "at": r["ts"],
+                "seq": r["seq"],
+                "by": r["actor"],
+                # What it RECOMMENDS, when it said so in as many words. It is a
+                # recommendation and nothing else: the verdict is the user's.
+                "recommendation": (mark.get("recommendation")
+                                   if isinstance(mark, dict) else None),
+                "text": payload.get("text") or "",
+            }
+        return None
 
     def card_attachments(self, num: int) -> list:
         seen, out = set(), []
@@ -6511,8 +6778,20 @@ class App:
             "session": self.session_liveness(),
             # The board's own dispatch policy, so a card face can tell a
             # deliberate "grok · tmux" from whatever the defaults happen to be
-            # without a second fetch.
+            # without a second fetch. `special_instructions` is always here,
+            # `""` when there are none: settings is a whole document, and a key
+            # that vanishes when it is empty is a key every reader has to guess
+            # about (same rule `agent_name` already follows).
             "settings": self.settings(),
+            # The exact words every brief this board sends now carries, heading
+            # and all — "" when the user has set none. The session appends this
+            # string; the board renders this string. One composition, so they
+            # cannot drift.
+            "standing_instructions": standing_instructions_block(
+                self.settings()["special_instructions"]),
+            # Who pre-reads a card that reaches `ready`, resolved to what it
+            # would actually run as. It never approves — that is the user's.
+            "reviewer": resolve_reviewer(self.settings()),
             # Flat mirror of session.cursor: how far the session has drained.
             "cursor": self.cursor_seq(),
             "states": list(STATES),
@@ -6608,6 +6887,12 @@ class App:
             "batch": self.batch_json(row["batch_id"]) if row["batch_id"] else None,
             "column_of": dict(COLUMN_OF),
             "settings": self.settings(),
+            # What this card's agent was told on top of the card itself. The
+            # drawer renders it so "why did it do that" has an answer that is
+            # not "go read config.json".
+            "standing_instructions": standing_instructions_block(
+                self.settings()["special_instructions"]),
+            "reviewer": resolve_reviewer(self.settings()),
             # The drawer needs the drain cursor too: it is what tells the user
             # whether the message they just sent has been picked up yet.
             "session": self.session_liveness(),
@@ -7017,6 +7302,18 @@ def make_handler(app: App):
                     # russ-machine" without knowing which file it came from.
                     "session_tmux_window": app.session_tmux_window(),
                     "session_tmux_window_max": TMUX_WINDOW_MAX,
+                    # The standing brief addition, hoisted the same way, plus
+                    # the exact block a brief carries — so the panel can show
+                    # what an agent will actually be told without composing a
+                    # heading of its own.
+                    "special_instructions": app.settings()["special_instructions"],
+                    "special_instructions_max": SPECIAL_INSTRUCTIONS_MAX,
+                    "standing_instructions": standing_instructions_block(
+                        app.settings()["special_instructions"]),
+                    # ...and who reads a ready card first, resolved: enabled,
+                    # which executor, what kind it is and what model it lands
+                    # on, so the panel never re-does the executor lookup.
+                    "reviewer": resolve_reviewer(app.settings()),
                     "defaults": DEFAULT_SETTINGS,
                     "choices": {
                         "model_policy": list(MODEL_POLICIES),
@@ -7024,6 +7321,8 @@ def make_handler(app: App):
                         "policy_model": dict(POLICY_MODEL),
                         "builtin_executor": BUILTIN_EXECUTOR,
                         "max_concurrency": MAX_CONCURRENCY,
+                        "special_instructions_max": SPECIAL_INSTRUCTIONS_MAX,
+                        "standing_heading": STANDING_HEADING,
                     }})
 
             if path == "/api/cursors/orchestrator":

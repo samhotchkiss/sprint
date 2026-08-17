@@ -6,8 +6,16 @@ Usage:
                                      [--long-running] [--server URL] [--token TOKEN]
   sprint-post <num> phase "<phase>" [--expect 300]
   sprint-post <num> chat "<summary>" --report path.md [--report other.html]
+  sprint-post <num> note "<findings>" --reviewer [--recommends approve|bounce|look]
 
   kind must be one of: progress, chat, note, error, phase
+
+`--reviewer` is for the board's REVIEWER agent and nobody else: it marks a note
+as the reviewer's findings on the card's current evidence packet, which is what
+lets the board say that packet has been read (and stop dispatching a second
+reviewer over the same one). `--recommends` says what it thinks the user should
+do. It is a recommendation and only that — the reviewer never approves, never
+bounces on its own and never closes a card; every verdict is the user's.
 
 A REPORT is a document — a findings write-up, a comparison table, a migration
 plan — and it does not fit in a one-liner. `--report PATH` attaches a .md or
@@ -67,6 +75,10 @@ import urllib.error
 import urllib.request
 
 KINDS = ("progress", "chat", "note", "error")
+# What a reviewer may RECOMMEND. Not verdicts: the reviewer never approves and
+# never closes a card. These are the three things it can tell the user it
+# thinks, and the user decides.
+REVIEWER_RECOMMENDS = ("approve", "bounce", "look")
 # `phase` is not an event kind on the wire — it is a progress event carrying
 # payload.phase. One word at the command line, one concept on the board.
 PHASE_KIND = "phase"
@@ -126,6 +138,14 @@ def parse_args(argv):
                          "Reports library. Prefer .md — it renders with the board's "
                          "own typography; .html is supported but renders sandboxed "
                          "and unstyled.")
+    p.add_argument("--reviewer", action="store_true",
+                   help="this note is the REVIEWER's findings on the card's "
+                        "current evidence packet (marks the note so the board "
+                        "can say the packet has been read)")
+    p.add_argument("--recommends", default=None, choices=REVIEWER_RECOMMENDS,
+                   help="what the reviewer RECOMMENDS the user do: %s. A "
+                        "recommendation only — the verdict is the user's."
+                        % ", ".join(REVIEWER_RECOMMENDS))
     p.add_argument("--long-running", action="store_true", dest="long_running",
                     help="mark this as a legit long-running step (suppresses the 5-minute silence timer)")
     p.add_argument("--server", default=os.environ.get("SPRINT_SERVER"),
@@ -161,6 +181,11 @@ def validate(args):
     if args.reports and args.kind == PHASE_KIND:
         fail("report", "a phase says what you are doing right now — attach the "
                        "document to a chat or progress event instead")
+    if args.recommends and not args.reviewer:
+        fail("recommends", "--recommends is the reviewer's, so pass --reviewer too")
+    if args.reviewer and args.kind != "note":
+        fail("reviewer", "the reviewer's findings are a note: "
+                         "sprint-post %d note \"...\" --reviewer" % num)
     return num, args.kind, text, read_detail(args), read_reports(args.reports)
 
 
@@ -307,6 +332,11 @@ def main(argv):
         payload["reports"] = reports
     if args.long_running:
         payload["long_running"] = True
+    if args.reviewer:
+        # ONE typed field, so "the reviewer has read this packet" is a fact the
+        # board can stand behind rather than a prefix somebody might type by
+        # accident. The findings themselves are ordinary text + --detail.
+        payload["reviewer"] = {"recommendation": args.recommends}
 
     body = json.dumps({"kind": kind, "payload": payload}).encode("utf-8")
     server = args.server.rstrip("/")
@@ -329,6 +359,12 @@ def main(argv):
             if reports:
                 bits.append("1 report" if len(reports) == 1 else f"{len(reports)} reports")
             extra = f" ({', '.join(bits)})" if bits else ""
+            if payload.get("reviewer"):
+                rec = payload["reviewer"].get("recommendation")
+                said = " — recommends you %s" % rec if rec else ""
+                print(f"sprint-post: posted the reviewer's findings on #{num}"
+                      f"{said}{extra}")
+                return 0
             if "phase" in payload:
                 said = payload["phase"]
                 if payload.get("expected_seconds"):

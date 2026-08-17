@@ -2595,6 +2595,40 @@ html.skin-chaos .packet-readback {
 }
 .settings-json:focus { border-color: var(--accent); }
 
+/* ---- #70/#71: the reviewer, and the standing instructions box ------------ */
+
+/* Prose, not JSON: this is a paragraph the user writes in their own words, so
+   it gets the body face and comfortable line height rather than the mono the
+   executors textarea uses. */
+.settings-standing {
+  width: 100%;
+  min-height: 108px;
+  max-height: 34vh;
+  resize: vertical;
+  box-sizing: border-box;
+  background: var(--input);
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-ctl);
+  padding: 11px 12px;
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.6;
+  outline: none;
+}
+.settings-standing:focus { border-color: var(--accent); }
+.settings-standing-field { gap: 8px; }
+
+/* The reviewer sits with the executors it is chosen from, and its rule — it
+   never approves — reads as the panel's own voice rather than as a warning. */
+.settings-reviewer { gap: 10px; }
+.settings-reviewer .exec-field { margin-top: 2px; }
+.settings-never {
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+  max-width: 68ch;
+}
+
 .settings-foot { display: flex; align-items: center; gap: 10px; }
 .settings-status { font-size: 12.5px; color: var(--faint); }
 .settings-err {
@@ -2638,6 +2672,9 @@ html.skin-chaos .packet-readback {
   .settings-sheet { width: 100%; }
   .settings-body { max-height: 56vh; }
   .settings-json { min-height: 96px; }
+  /* Same reason: on the Fold the sheet's height is the scarce thing, and a
+     five-row prose box would push Save off the bottom. */
+  .settings-standing { min-height: 88px; max-height: 26vh; }
   .settings-foot .btn { min-height: 44px; }
   /* the header is 54px and already full — the link keeps its words, not an icon */
   .settings-btn { padding: 0 10px; }
@@ -2650,7 +2687,10 @@ html.skin-chaos .settings-select,
 html.skin-chaos .settings-text,
 html.skin-chaos .settings-num,
 html.skin-chaos .settings-json,
+html.skin-chaos .settings-standing,
 html.skin-chaos .settings-err { border: 2px solid var(--border); border-radius: 0; }
+html.skin-chaos .rail-standing { border-bottom: 2px solid var(--border); }
+html.skin-chaos .settings-never { border-left: 2px solid var(--border); }
 html.skin-chaos .settings-when,
 html.skin-chaos .settings-hint { line-height: 1.7; }
 html.skin-chaos .exec-tag {
@@ -2985,6 +3025,64 @@ html.skin-chaos .banner.account {
   flex: 1 0 100%;
   color: var(--faint);
   font-size: 12px;
+}
+
+/* ---- #71: the standing instructions this board adds to every brief ------- */
+
+/* Same voice as the blocked line — a fact about the card, under the head, no
+   button shape. Collapsed by default because it is the same paragraph on every
+   card: a line you can open, never a wall you have to scroll past. */
+.rail-standing {
+  border-bottom: 1px solid var(--border);
+  background: var(--input);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.rail-standing-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 9px 16px 10px;
+  cursor: pointer;
+  list-style: none;
+  min-height: 40px;
+  box-sizing: border-box;
+}
+.rail-standing-head::-webkit-details-marker { display: none; }
+.rail-standing-head::after {
+  content: '▸';
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.rail-standing[open] .rail-standing-head::after { content: '▾'; }
+.rail-standing-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.rail-standing-label {
+  font-family: var(--font-label);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-space);
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.rail-standing-what { color: var(--faint); font-size: 12px; }
+.rail-standing-heading {
+  margin: 0;
+  padding: 0 16px;
+  color: var(--faint);
+  font-size: 12px;
+}
+/* The user's own line breaks are how the paragraph reads in a brief, so they
+   survive here too. It wraps — a brief is prose, not a log. */
+.rail-standing-body {
+  margin: 5px 0 0;
+  padding: 0 16px 12px;
+  color: var(--body-ink);
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* ---- #58: the executor list and its form -------------------------------- */

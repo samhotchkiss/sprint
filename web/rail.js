@@ -68,6 +68,10 @@ export function renderRail(root, app) {
     // the answer to "why is this sitting here" is the first thing in the card's
     // details rather than something you have to find in the thread (#61).
     syncBlockedLine(root, card, app);
+    // What this card's agent was told on top of the card itself (#71). Under
+    // the blocked line for the same reason that one is under the head: both
+    // are facts about the card that the thread would bury.
+    syncStandingLine(root);
     if (!card) {
       reconcile(thread, [{ key: 'loading', ver: detail.error || 1,
         make: () => h('p.thread-empty', detail.error || 'Loading card…') }]);
@@ -128,6 +132,49 @@ function syncBlockedLine(root, card, app) {
   node.dataset.sig = sig;
   if (found) root.replaceChild(node, found);
   else root.insertBefore(node, root.querySelector('.thread') || null);
+}
+
+/**
+ * The standing instructions this board adds to every brief, shown as the brief
+ * itself carries them — the same heading, the same words, straight off the
+ * server (`board.standing_instructions` → `store.standing`).
+ *
+ * Why it is on the card and not only in Settings: when an agent does something
+ * you did not ask for on this card, the first question is "what was it told?",
+ * and the honest answer is the card's text PLUS this. A board with no standing
+ * instructions draws nothing at all, which is most boards.
+ *
+ * Collapsed by default — it is the same paragraph on every card, so it earns a
+ * line, not a wall. Native <details>, so the browser owns the toggle.
+ */
+function syncStandingLine(root) {
+  const found = root.querySelector('.rail-standing');
+  const text = store.standing || '';
+  if (!text) {
+    if (found) root.removeChild(found);
+    return;
+  }
+  if (found && found.dataset.sig === text) return;
+  const node = standingLine(text);
+  node.dataset.sig = text;
+  if (found) root.replaceChild(node, found);
+  else root.insertBefore(node, root.querySelector('.thread') || null);
+}
+
+function standingLine(block) {
+  // The block arrives as "## <heading>\n\n<body>" — the exact string the
+  // session pastes into the brief. Split it once for display; the body is
+  // rendered preformatted so the user's own line breaks survive.
+  const nl = block.indexOf('\n');
+  const heading = block.slice(0, nl < 0 ? block.length : nl).replace(/^#+\s*/, '');
+  const body = block.slice(nl < 0 ? block.length : nl + 1).trim();
+  const box = h('details.rail-standing');
+  box.appendChild(h('summary.rail-standing-head',
+    h('span.rail-standing-label', 'Standing instructions'),
+    h('span.rail-standing-what', 'in every brief on this board')));
+  box.appendChild(h('p.rail-standing-heading', heading));
+  box.appendChild(h('pre.rail-standing-body', body));
+  return box;
 }
 
 function blockedLine(card, app) {
