@@ -435,6 +435,22 @@ master session should get nudged and it should check on the subagent."
   session drains it, investigates the agent (SendMessage ping / transcript inspection), posts what it
   found to the card as a `note`, and acts: annotate long-running work (set `long_running`), restart a
   wedged agent, or flip to needs_you/failed.
+- **The clock never reads older than the card's last MOVE**, and this is load-bearing rather than a
+  nicety. The baseline is per-AGENT (an agent posting on card A is demonstrably not dead on card B),
+  which meant a card could inherit hours of perfectly correct silence and then be failed the instant
+  it was handed back to somebody. It happened to card #70: the worker posted a decision request and
+  ended its turn (the documented contract), the user answered 1h34m later, answering moved the card
+  `needs_you` → `in_progress`, and the very next sweep tick read *"worker gone: no events for 1h
+  34m"* and killed it — before the fresh agent could say a word. The silence was the user's thinking
+  time, charged to the worker. A transition is the board saying the situation just changed, so
+  `card_baseline` takes the later of (the agent's last word, the card's last state event). Every
+  hand-back is covered by the same line: an answered question, a bounce, a retry, a failed
+  integration. A worker that then really does die still fails on schedule, because nothing moves the
+  card again and the transition itself keeps ageing.
+- **A `needs_you` card is never a dead worker**, whether or not a question row is still open. The
+  guard used to require an UNANSWERED question, which stopped applying the moment `answered_at` was
+  stamped. Whatever a `needs_you` card owes, it is not owed by the worker — it ended its turn on
+  purpose, and the `needs_you` sweep rule is already nagging the right person.
 - Cards show last activity + elapsed; UI ambers a silent card. No spinners anywhere.
 
 ## Staleness sweep (auto — the board notices what nobody did)
@@ -677,10 +693,20 @@ found, before the user gets there.
 
 **The reviewer NEVER approves.** This is not a v1 limitation, it is the shape: the user's standing
 rule is that he sees and acks every card, so a reviewer that could sign one off would be deleting
-the only step this whole board exists to protect. It cannot approve, cannot close, cannot merge, and
-in the shipped version cannot bounce either — it annotates. Whether it may bounce ON ITS OWN is the
-one open question, and it is the user's to answer, not the board's (card #70 ends in a decision
-request asking exactly that).
+the only step this whole board exists to protect. It cannot approve, cannot reject, cannot close and
+cannot merge — the server refuses all three by name (`reviewer_cannot_approve`,
+`reviewer_cannot_reject`), because an agent that tried has a bug and should read why.
+
+**It CAN bounce, and that was the user's call, not the board's.** Card #70 shipped the annotate-only
+path and ended in a decision request on exactly this fork; his answer, verbatim: *"Reviewer can
+bounce with notes."* So the reviewer has one action and two opinions — `--recommends bounce` sends
+the card back to the worker then and there, `approve` and `look` move nothing. A bounce is a REAL
+bounce (`bounce_count` increments, the second one still escalates, the worker re-readies as usual);
+the only difference is `by: "reviewer"` on the verdict event, so nobody has to guess who sent it
+back. Its notes are required and are the findings verbatim — one-liner plus detail — because those
+notes are the only thing the worker gets. The doctrine for when to use it lives in SKILL.md: bounce
+on the CHECKABLE (red suite, counts that never ran, two identical screenshots, a `validate` step
+that does not work), annotate on the judged.
 
 - **Config**: `reviewer: {enabled, executor, model}` in `config.json`, default
   `{false, "subagent", ""}`. `executor` is the SAME vocabulary a worker's is — a name in
@@ -701,7 +727,11 @@ request asking exactly that).
 - **Its findings are a NOTE**, and there is no new endpoint, no new event kind and no new state for
   them: `sprint-post <num> note "…" --reviewer [--recommends approve|bounce|look]`, the one-liner
   being what it found and `--detail` carrying the checks performed and the discrepancies.
-  `--recommends` is a recommendation and is rendered as one; the verdict bar is untouched.
+  `--recommends bounce` also issues the bounce, in the same command: the note posts FIRST (so the
+  thing the bounce cites is on the timeline before the worker wakes), then `POST /verdict {verdict:
+  "bounce", by: "reviewer"}`. A refused bounce leaves the findings on the card and exits non-zero
+  without retrying — the worst case is an annotated card the user bounces himself, never a lost
+  review. `approve`/`look` stay opinions and the verdict bar is untouched.
 - **`card.reviewed` is DERIVED, never stored.** `{at, seq, by, recommendation, text}` when a note
   carrying `payload.reviewer` is not older than the card's current evidence packet; `null`
   otherwise. Three things were on the table and the reasoning matters more than the answer:

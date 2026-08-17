@@ -7966,6 +7966,15 @@ class TestReviewedMarker(Base):
         # who sent it back is a fact on the event, not something to infer
         self.assertEqual(p["by"], "reviewer")
         self.assertIn("the reviewer sent it back", p["text"])
+        # ...but the one-liner stays a one-liner. It is what the card FACE
+        # shows, and the findings are multi-line by design — the checks and the
+        # discrepancies belong in `notes`, not smeared across the board.
+        self.assertNotIn("\n", p["text"])
+        self.assertLessEqual(len(p["text"]), sprintd.ONE_LINER_MAX)
+        self.assertNotIn("Checks performed", p["text"])
+        # The card face reads the state event's reason, and "bounced back with
+        # YOUR notes" would tell the user he sent this back when he did not.
+        self.assertEqual(self.card(num)["reason"], "sent back by the reviewer")
 
     def test_the_reviewer_cannot_approve_and_is_told_why(self):
         num = self.ready_card()

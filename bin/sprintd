@@ -5803,7 +5803,13 @@ class App:
                         # "the reviewer found this" and "the user found this"
                         # are different facts and it should not have to guess.
                         payload["by"] = "reviewer"
-                        payload["text"] = "the reviewer sent it back — %s" % notes
+                        # The one-liner is what the card FACE shows, so it gets
+                        # the first line of the findings and nothing else. The
+                        # checks and the discrepancies are long and multi-line
+                        # by design; they stay in `notes`, which is what the
+                        # worker reads and what the thread expands.
+                        payload["text"] = one_line(
+                            "the reviewer sent it back — %s" % notes)
                     if attachments:
                         payload["attachments"] = attachments
                         if not notes:
@@ -5827,8 +5833,13 @@ class App:
                 except Exception:
                     self.conn.execute("ROLLBACK")
                     raise
+                # "bounced back with your notes" is the USER's sentence, and on a
+                # reviewer's bounce it would be a small lie in the one place the
+                # card face reads it -- it would tell him he sent this back.
+                reason = ("sent back by the reviewer" if by == "reviewer"
+                          else VERDICT_REASON[verdict])
                 self._apply_transition(cn, from_state, to_state, actor,
-                                       VERDICT_REASON[verdict], None)
+                                       reason, None)
             results.append({"num": cn, "state": to_state, "bounce_count": bounce,
                             "escalate": escalate})
         self.notify()
