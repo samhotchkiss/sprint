@@ -707,6 +707,35 @@ class TestEventsCursor(Base):
         self.assertEqual(card_seqs, sorted(card_seqs))
         self.assertTrue(set(card_seqs).issubset(set(seqs)))
 
+    def test_sidebar_after_cursor_stays_strictly_after_ascending_regardless_of_window(self):
+        """Card #75: after=0 flips to a newest-window read so the board payload
+        never renders stuck at the oldest 200 lines. A caller with a real
+        cursor (after>0) is catching up incrementally instead, and must keep
+        getting strictly-after lines in ascending seq order -- even once the
+        thread has grown well past the default window size."""
+        seqs = []
+        for i in range(1, 261):
+            res = self.app.sidebar_post("line %d" % i, "user")
+            seqs.append(res["event"]["seq"])
+        cursor = seqs[99]   # right after "line 100"
+
+        # the model method, limit-bounded: strictly-after, ascending, from
+        # right after the cursor -- not the tail window after=0 uses
+        events = self.app.sidebar_thread(after=cursor, limit=50)
+        self.assertEqual([e["payload"]["text"] for e in events],
+                         ["line %d" % i for i in range(101, 151)])
+        self.assertEqual([e["seq"] for e in events], sorted(e["seq"] for e in events))
+        self.assertTrue(all(e["seq"] > cursor for e in events))
+
+        # the HTTP endpoint agrees (it doesn't parse ?limit, so drain the rest)
+        status, page = self.get("/api/sidebar?after=%d" % cursor)
+        self.assertEqual(status, 200)
+        wire = page["events"]
+        self.assertEqual([e["payload"]["text"] for e in wire],
+                         ["line %d" % i for i in range(101, 261)])
+        self.assertEqual([e["seq"] for e in wire], sorted(e["seq"] for e in wire))
+        self.assertTrue(all(e["seq"] > cursor for e in wire))
+
     def test_cursor_roundtrip_and_session_liveness(self):
         self.new_card("one")
         status, board = self.get("/api/board")
@@ -2038,6 +2067,24 @@ class TestBoardPayloadForTheUI(Base):
         for e in lines:
             self.assertIsNone(e["card_num"], "sidebar is sprint-level only")
             self.assertIn(e["actor"], ("user", "session"))
+        self.assertEqual([e["seq"] for e in lines], sorted(e["seq"] for e in lines))
+
+    def test_board_sidebar_is_the_newest_lines_not_the_oldest_once_past_the_window(self):
+        """Card #75: sidebar_thread used to run ORDER BY seq LIMIT (ascending),
+        so once a board's sidebar thread passed 200 lines the board payload
+        returned the OLDEST 200 forever. A message posted after that point
+        rendered via the live event, then vanished the moment the rail
+        repainted from this payload. The window has to track the tail of the
+        thread, not the head."""
+        for i in range(1, 261):
+            self.app.sidebar_post("line %d" % i, "user")
+        lines = self.board()["sidebar"]
+        self.assertEqual(len(lines), 200)
+        texts = [e["payload"]["text"] for e in lines]
+        self.assertEqual(texts[0], "line 61")
+        self.assertEqual(texts[-1], "line 260")
+        self.assertIn("line 260", texts)
+        self.assertNotIn("line 1", texts)
         self.assertEqual([e["seq"] for e in lines], sorted(e["seq"] for e in lines))
 
     def test_board_sidebar_excludes_worker_telemetry(self):

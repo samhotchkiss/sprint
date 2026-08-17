@@ -6186,12 +6186,26 @@ class App:
         return {"ok": True, "event": self.event_row(seq)}
 
     def sidebar_thread(self, after: int = 0, limit: int = 500) -> list:
-        """Sprint-level user/session lines only -- never worker telemetry."""
+        """Sprint-level user/session lines only -- never worker telemetry.
+
+        after=0 means "give me a window" -- the board payload and a fresh
+        page load both want the TAIL of a long-running thread (the most
+        recent `limit` lines), not whichever lines happened to be posted
+        first. Once a client has a real cursor (after>0) it is catching up
+        incrementally and wants strictly-after lines in seq order, forever
+        -- that path is untouched.
+        """
+        if after:
+            rows = self.q(
+                "SELECT * FROM events WHERE card_num IS NULL AND kind IN ('chat','note','answer') "
+                "AND actor IN ('user','session') AND seq>? ORDER BY seq LIMIT ?",
+                (after, limit))
+            return [self.event_json(r) for r in rows]
         rows = self.q(
             "SELECT * FROM events WHERE card_num IS NULL AND kind IN ('chat','note','answer') "
-            "AND actor IN ('user','session') AND seq>? ORDER BY seq LIMIT ?",
-            (after, limit))
-        return [self.event_json(r) for r in rows]
+            "AND actor IN ('user','session') ORDER BY seq DESC LIMIT ?",
+            (limit,))
+        return [self.event_json(r) for r in reversed(rows)]
 
     # -- the session channel's own read receipt -----------------------------
     #
