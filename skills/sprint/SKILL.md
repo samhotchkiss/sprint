@@ -688,8 +688,24 @@ nothing is owed in response beyond noticing.
   "default_executor": "subagent",
   "executors": {"claude": {"kind": "subagent"},
                 "grok": {"kind": "tmux", "command": "grok", "session": "sprint-workers"}},
-  "concurrency": 3}}
+  "concurrency": 3},
+ "special_instructions": "All UI work must be checked at the Fold width.",
+ "reviewer": {"enabled": true, "executor": "subagent", "model": "opus"}}
 ```
+
+**`special_instructions` is a standing addition to EVERY brief**, and
+honouring it is not optional — see "The brief" below. The board hands
+you the finished block on `/api/board` as `standing_instructions`
+(`""` when the user has set none): paste that string, verbatim, heading
+and all. Don't re-word it, don't summarise it, don't compose your own
+heading — the heading is what stops an agent reading standing policy as
+part of the card it was given. It applies from the NEXT dispatch;
+agents already running keep the brief they started with.
+
+**`reviewer` is who pre-reads a card that reaches `ready`** — see "The
+reviewer" in step 6. `/api/board` carries it resolved, as `reviewer`:
+`{enabled, executor, kind, command, session, model}`, the same shape a
+worker's `dispatch` has, so you dispatch it exactly the same way.
 
 **Model policy — lowest feasible, and say which one you picked.** User
 verbatim: *"our standing instructions should be to use the lowest
@@ -746,6 +762,16 @@ you don't block on a worker, you find out what happened through the
 board and through `SendMessage` replies. Don't pass `isolation:
 "worktree"` — you already built the exact worktree it needs; the
 brief's job is to tell it where.
+
+**Every brief ends with the board's standing instructions, when there
+are any.** Take `standing_instructions` off the board payload and append
+it as-is — it already carries its own heading (`## Sprint standing
+instructions from the user`). Every brief means every one: subagent and
+tmux worker, single card and batch, a retry, a re-dispatch after a
+bounce, and the reviewer's brief too. An empty string means the user has
+set none and you append nothing. Never paraphrase it and never merge it
+into the card's own text: the heading is the only thing telling the
+agent which words are the card and which are the board's policy.
 
 Brief contents, every time:
 - The card's full text (all member cards' text, for a batch).
@@ -1312,6 +1338,80 @@ state, not off your reaction), on every board on the machine.
 ---
 
 ## 6. Verdicts
+
+### The reviewer — a card reaching `ready` fires it, and it never approves
+
+The board can run a REVIEWER: an agent that reads a finished card before
+the user does and writes down what it found. It is off by default. When
+`board.reviewer.enabled` is true and a card enters `ready`, dispatch it.
+
+**The one rule everything here is built around, and it is the user's own
+standing rule: the reviewer NEVER approves.** He sees and acks every
+card. The reviewer's whole output is a note on the card — a
+recommendation and its receipts. It does not call `/verdict`, it does
+not close anything, it does not `sprint-ready` anything, and it never
+merges. Anything that would move the card is yours or the user's.
+
+**When.** On the `ready` state event, before you go quiet on that card.
+Skip it if `card.reviewed` is already set — that field says the reviewer
+has read *this* packet, and it clears itself when a new packet lands, so
+a bounced-and-re-readied card gets read again with nobody resetting
+anything.
+
+**How.** Exactly like a worker, with three differences:
+
+```
+agent name   sprint-review-<num>   (batch: sprint-review-<batch id>)
+executor     board.reviewer.{executor,kind,command,session,model}
+worktree     the CARD's worktree, read-only — or none at all
+```
+
+- `kind: "subagent"` → the Agent tool, backgrounded, `description` set
+  to that name. `kind: "tmux"` → the same `tmux new-window` block as a
+  worker (step 3), same tmux-send discipline.
+- **It reads, it does not build.** Give it the card's worktree path to
+  read and the branch's diff, and say in the brief that it writes
+  nothing there: no commits, no edits, no `git` writes, no preview
+  server of its own. If a check needs running, it runs it read-only.
+
+**The brief.** The card's packet, the card's own text, the timeline, and
+the diff (`git -C <worktree> diff origin/main...<branch>`), plus:
+
+- the standing instructions block, exactly as any other brief carries it;
+- what it is checking: does the evidence actually show what the claim
+  says, do the `validate` steps work as written, do the screenshots show
+  the change (and are they two different pictures), do the test counts
+  match a run that really happened, does the diff do anything the card
+  did not ask for;
+- **the boundary, in as many words**: it may post notes and nothing
+  else. It never approves, never bounces, never closes, never messages
+  the user directly. Say this even though its agent definition says it —
+  a tmux reviewer has no agent definition;
+- how to report:
+
+```bash
+sprint-post <num> note "<one line: what it found>" \
+  --reviewer --recommends approve|bounce|look \
+  --detail "Checks performed: …
+Discrepancies: …"
+```
+
+`--reviewer` is what marks the note as the reviewer's findings, and it
+is the only thing that sets `card.reviewed`. A note without it is an
+ordinary note, deliberately: a marker anyone could type by accident
+would not be worth reading. `--recommends` is a RECOMMENDATION — the
+board renders it as one, and the verdict bar is unchanged.
+
+**Ideally its note lands before the user opens the card.** So dispatch
+it the moment `ready` fires rather than at the end of your loop, and
+give it the fast model unless the user's `reviewer.model` says
+otherwise. If it is still working when the user acks the card anyway,
+that is fine and costs nothing — let it finish and post.
+
+**You still do everything you did before.** The reviewer changes nothing
+about the verdict flow below: the card sits in `ready`, the user
+approves or bounces, and you integrate. It is a second pair of eyes on
+the page, not a gate in front of it.
 
 ### Closing a card is the user's verb, never yours
 

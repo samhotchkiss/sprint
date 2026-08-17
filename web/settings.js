@@ -150,6 +150,10 @@ export async function openSettings() {
   editing = null;
   removing = null;
   jsonMode = false;
+  // ...and you start over in the FIELDS too: a remembered caret from the last
+  // time this sheet was open would put you 200 characters into a paragraph you
+  // have not looked at yet.
+  caret = null;
   setStatus('loading…');
   try {
     const res = await api.settings();
@@ -212,31 +216,56 @@ function build() {
 }
 
 /**
- * Where the caret was, so a repaint can put it back (#46).
+ * Where you were in a text field, so a repaint can put you back (#46).
  *
  * This sheet rebuilds its whole body on any structural change — a preset, the
- * kind toggle, adding an executor. Every free-text field in it is therefore a
- * field you can be mid-word in when something else on the page repaints, and
- * the standing-instructions box is the worst case: it is a PARAGRAPH, so
- * losing the caret in it means hunting for where you were in four lines of
- * your own prose. The text itself was never at risk (it lives in a variable);
- * the caret was.
+ * model policy, the kind toggle, adding an executor. Every free-text field in
+ * it is therefore a field you can be mid-word in when something else on the
+ * sheet repaints, and the standing-instructions box is the worst case: it is a
+ * PARAGRAPH, so losing your place means hunting for it in four lines of your
+ * own prose. The text was never at risk — it lives in a variable. The PLACE
+ * was.
+ *
+ * Reading `document.activeElement` at repaint time does not work and it is
+ * worth saying why, because it looks like it should: by then you have clicked
+ * the control that caused the repaint, so focus is already on that button and
+ * the field you were typing in is not the active element any more. So the
+ * field records its own position as you move it, and the repaint reads that.
  */
-function caretNow() {
-  const el = document.activeElement;
-  if (!el || !el.id || !els.body || !els.body.contains(el)) return null;
-  if (el.selectionStart == null) return { id: el.id, start: null, end: null };
-  return { id: el.id, start: el.selectionStart, end: el.selectionEnd };
+let caret = null;   // {id, start, end, scroll, focused}
+
+/** Wire a text field so it remembers where you are in it. */
+function remembers(el) {
+  const save = () => {
+    caret = {
+      id: el.id,
+      start: el.selectionStart,
+      end: el.selectionEnd,
+      scroll: el.scrollTop,
+      focused: document.activeElement === el,
+    };
+  };
+  for (const ev of ['input', 'keyup', 'mouseup', 'select', 'focus', 'scroll']) {
+    el.addEventListener(ev, save);
+  }
+  return el;
 }
 
-function caretBack(was) {
-  if (!was) return;
+/**
+ * Put it back. The selection and the scroll always; the FOCUS only when it was
+ * still on that field the instant before the repaint — which is exactly the
+ * repaint that did not come from you clicking something else. Grabbing focus
+ * back off a button you just pressed would be its own bug.
+ */
+function caretBack(was, refocus) {
+  if (!was || !was.id) return;
   const el = els.body && els.body.querySelector('#' + CSS.escape(was.id));
   if (!el) return;
-  el.focus({ preventScroll: true });
+  if (was.scroll) el.scrollTop = was.scroll;
   if (was.start != null && el.setSelectionRange) {
     try { el.setSelectionRange(was.start, was.end); } catch { /* not selectable */ }
   }
+  if (refocus) el.focus({ preventScroll: true });
 }
 
 function paint() {
@@ -245,11 +274,15 @@ function paint() {
   // The body scrolls, and a repaint that threw its scroll position away would
   // yank you back to the top of the sheet every time you touched a preset.
   const wasAt = els.body ? els.body.scrollTop : 0;
-  const caret = caretNow();
+  // Still on the field the instant before we tear the body down? Then this
+  // repaint did not come from a click, and focus is ours to give back.
+  const held = !!(caret && document.activeElement
+                  && document.activeElement.id === caret.id);
+  const where = caret;
   clear(els.body);
 
   // 0. the sprint's name — what the header, the switcher and the hub call it.
-  const nameInput = h('input.settings-text', {
+  const nameInput = remembers(h('input.settings-text', {
     id: 'settings-name',
     type: 'text',
     maxlength: String(sprintName.max),
@@ -257,7 +290,7 @@ function paint() {
     placeholder: sprintName.fallback || 'this sprint',
     spellcheck: false,
     oninput: (e) => { sprintName.value = e.target.value; },
-  });
+  }));
   els.body.appendChild(field('Sprint name', nameInput,
     'What this sprint is called, everywhere it appears: the title above, the '
     + 'switcher, and the hub. Name it after the work, not the folder. Leave it '
@@ -265,7 +298,7 @@ function paint() {
 
   // 0b. who is running it. Normally the session sets this itself at launch;
   // this is the door for changing it, and for taking it back (clear the box).
-  const agentInput = h('input.settings-text', {
+  const agentInput = remembers(h('input.settings-text', {
     id: 'settings-agent-name',
     type: 'text',
     maxlength: String(agentName.max),
@@ -273,7 +306,7 @@ function paint() {
     placeholder: 'Session',
     spellcheck: false,
     oninput: (e) => { agentName.value = e.target.value; },
-  });
+  }));
   els.body.appendChild(field('Session name', agentInput,
     'What the session running this board calls itself — a first name, like '
     + '“Chuck”. It signs every line the session writes, in the sidebar and in '
@@ -329,7 +362,7 @@ function paint() {
   els.body.appendChild(standingField());
 
   els.body.scrollTop = wasAt;
-  caretBack(caret);
+  caretBack(where, held);
 }
 
 // ---- standing instructions -----------------------------------------------
@@ -344,7 +377,7 @@ function paint() {
  * the fold on a phone.
  */
 function standingField() {
-  const ta = h('textarea.settings-standing', {
+  const ta = remembers(h('textarea.settings-standing', {
     id: 'settings-standing',
     rows: 5,
     maxlength: String(standing.max),
@@ -354,7 +387,7 @@ function standingField() {
     // No repaint on input — this node has your caret in it, and it is the one
     // field on this sheet you write whole sentences into (#46).
     oninput: (e) => { standing.value = e.target.value; },
-  });
+  }));
   const box = field('Standing instructions', ta,
     'Included in every agent’s brief, worker and reviewer alike, under a '
     + 'heading of its own so nobody mistakes it for the card. Use it for how '
@@ -407,12 +440,12 @@ function reviewerField() {
       h('p.settings-hint', 'The same choices a worker has. A different agent '
         + 'from the one that did the work is the point — it reads with fresh eyes.')));
 
-    const model = h('input.settings-text', {
+    const model = remembers(h('input.settings-text', {
       id: 'settings-reviewer-model',
       type: 'text', value: r.model || '', placeholder: 'opus',
       spellcheck: false, autocomplete: 'off', autocapitalize: 'off',
       oninput: (e) => { r.model = e.target.value; },
-    });
+    }));
     box.appendChild(h('div.exec-field',
       h('label.exec-label', { for: 'settings-reviewer-model' }, 'Model (optional)'),
       model,
@@ -675,13 +708,13 @@ function execEditor(w) {
 /** One labelled text input that writes straight into the editor's draft. */
 function textField(e, key, label, placeholder, hint) {
   const id = 'exec-' + key;
-  const input = h('input.settings-text', {
+  const input = remembers(h('input.settings-text', {
     id, type: 'text', value: e[key] || '', placeholder, spellcheck: false,
     autocomplete: 'off', autocapitalize: 'off',
     class: e.errField === key ? 'settings-text is-bad' : 'settings-text',
     // No repaint on input: this node has your caret in it.
     oninput: (ev) => { e[key] = ev.target.value; },
-  });
+  }));
   return h('div.exec-field',
     h('label.exec-label', { for: id }, label),
     input,

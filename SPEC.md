@@ -669,6 +669,59 @@ question.
   per-card bar (Approve / Bounce / Reject), which decides that card alone — the branch is approved
   from its outline, never from under one card's thread.
 
+## The reviewer — a second pair of eyes, never a signoff (SHIPPED)
+
+User verbatim: *"we need an option to set the reviewer as well."* An agent that reads a card that
+has reached `ready` — the packet against the card, the diff, the timeline — and writes down what it
+found, before the user gets there.
+
+**The reviewer NEVER approves.** This is not a v1 limitation, it is the shape: the user's standing
+rule is that he sees and acks every card, so a reviewer that could sign one off would be deleting
+the only step this whole board exists to protect. It cannot approve, cannot close, cannot merge, and
+in the shipped version cannot bounce either — it annotates. Whether it may bounce ON ITS OWN is the
+one open question, and it is the user's to answer, not the board's (card #70 ends in a decision
+request asking exactly that).
+
+- **Config**: `reviewer: {enabled, executor, model}` in `config.json`, default
+  `{false, "subagent", ""}`. `executor` is the SAME vocabulary a worker's is — a name in
+  `worker.executors` or the builtin `"subagent"` — and it is validated against the executors the
+  same request settled on, so enabling a reviewer on an executor nobody declared is a 400 naming
+  `reviewer.executor` rather than a dispatch that fails the first time a card finishes. `model` is
+  optional; `""` means the executor's own model, else the board's model policy. A typo inside the
+  block is a 400 naming `reviewer.<key>`.
+- **Resolved on the payload**: `/api/board`, `/api/cards/:num` and `/api/settings` carry
+  `reviewer: {enabled, executor, kind, command, session, model}` — the same shape a card's
+  `dispatch` has, so the session dispatches a reviewer exactly the way it dispatches a worker and no
+  surface looks an executor up twice. It resolves even when disabled: the panel can show what it
+  WOULD run as.
+- **The session drives it**, as it drives everything (SKILL.md, step 6): on the `ready` event, if
+  enabled and the packet is not already reviewed, spawn `sprint-review-<num>` with the card's packet
+  + timeline + diff, the standing instructions, and a read-only stance — the card's worktree to read
+  or no worktree at all. It commits nothing and starts no preview server.
+- **Its findings are a NOTE**, and there is no new endpoint, no new event kind and no new state for
+  them: `sprint-post <num> note "…" --reviewer [--recommends approve|bounce|look]`, the one-liner
+  being what it found and `--detail` carrying the checks performed and the discrepancies.
+  `--recommends` is a recommendation and is rendered as one; the verdict bar is untouched.
+- **`card.reviewed` is DERIVED, never stored.** `{at, seq, by, recommendation, text}` when a note
+  carrying `payload.reviewer` is not older than the card's current evidence packet; `null`
+  otherwise. Three things were on the table and the reasoning matters more than the answer:
+  - *A state* was wrong because the reviewer never approves — "reviewed" is a fact about a PACKET,
+    not a place a card sits, and a state would need a transition, a column, and a rule for a card
+    the user acks before the reviewer arrives.
+  - *A stored column* was wrong because it would have to be cleared by hand on every bounce, and the
+    one time that was missed a re-readied card would sit there looking reviewed with nobody having
+    read the new packet. Comparing the note's timestamp to the packet's is free and self-heals.
+  - *A text convention* (`"Reviewer: …"`) was wrong because a worker who happens to write that
+    sentence would look like the reviewer. One typed boolean in the payload costs nothing and means
+    what it says.
+  Same family as `queue_position` and the review UNIT: computed at read time off the append-only
+  log, so nothing can go stale behind it.
+- **UI**: a Reviewer section in the settings sheet — an On/Off toggle, an executor select drawn from
+  the same list the default-executor select uses, an optional model box — and the rule on screen in
+  the panel's own voice rather than in a doc: *it never approves and never closes anything — every
+  card still comes to you*. Removing or renaming an executor moves the reviewer with it, the way it
+  already moves `default_executor`, so the sheet can never save into a state the server refuses.
+
 ## Batching & hold mode
 
 User verbatim: "I may say 'hey, I'm going to dump a bunch of issues — don't start working on them
@@ -925,7 +978,8 @@ example."* Scope ruling: *"Peer per card — mix grok-via-tmux and claude subage
 
 - **Store**: `.sprint/config.json` (a file, not a table — hand-editable, survives `stop`, diffs in a
   terminal). `{"worker": {"model_policy", "default_executor", "executors", "concurrency"},
-  "agent_name": "", "session_tmux_window": ""}`.
+  "agent_name": "", "session_tmux_window": "", "special_instructions": "",
+  "reviewer": {"enabled", "executor", "model"}}`.
   `model_policy ∈ {lowest_feasible (default), always_opus, always_sonnet}`; `executors` is
   name → `{kind: subagent|tmux, command?, session?, model?, note?}` (a `tmux` executor REQUIRES a
   command; `session` defaults to `sprint-workers`); `concurrency` is 1–20, default 3.
@@ -960,13 +1014,39 @@ example."* Scope ruling: *"Peer per card — mix grok-via-tmux and claude subage
 - **Where that session can be reached** is the third top-level key, `session_tmux_window` (default
   `""`), and it is an address rather than a name: **last write wins**, `""` unregisters, and it is
   what makes dead-session autoheal possible at all. See *Autoheal* below.
+- **Standing instructions** (SHIPPED, card #71) are the fourth: `special_instructions`, default
+  `""`, ≤4000 chars, free text with its line breaks kept (it is a paragraph, not a name). User
+  verbatim: *"and a place in the settings for special instructions"*. Per-sprint policy rather than
+  per-card instruction — the card says what to do, this says how work is done on this board ("all UI
+  work must be checked at the Fold width", "the gate here is `make check`"). Over the ceiling is a
+  400 naming `special_instructions` with `too_long`; a hand-edited file that busts it reads back as
+  none, never as half a sentence.
+  - **The SERVER composes the block a brief carries**, and that is the point of the design: one
+    heading (`## Sprint standing instructions from the user`), one string, published as
+    `standing_instructions` on `/api/board`, `/api/cards/:num` and `/api/settings` — `""` when there
+    are none. The session appends that string to every worker's and the reviewer's brief; the rail
+    renders that string on a card. Neither composes its own, so a heading cannot become two
+    headings, and an agent can always tell standing policy from the card's own words. SKILL.md's
+    *The brief* owns the obligation; the server owns the words.
+  - Always present on the payload, `""` and all — settings is a whole document, and a key that
+    disappears when it is empty is a key every reader has to guess about (`agent_name`'s rule).
+  - Applies from the NEXT dispatch. Changing it appends its own one-line `note` (`actor: "server"`),
+    with the composed block as its detail — never a `settings changed` line, because it is not a
+    `worker.*` key and nobody would recognise it in a list of field names.
+- **The reviewer** (SHIPPED, card #70) is the fifth: `reviewer: {enabled: false, executor:
+  "subagent", model: ""}` — see *The reviewer* below.
 - **Per card**: `cards.executor`/`cards.model` (both nullable; NULL = the board's defaults), set via
   `POST /api/cards/:num/assign {executor?, model?}`, which refuses an executor that is not declared.
   Every card payload carries `dispatch: {executor, kind, command, session, model, source,
   is_default}` — the server's resolution of card-over-policy, so no surface has to redo it.
 - **UI**: a quiet `Settings` link in the header opens a sheet (sprint name, session name, model policy
-  segmented control, default executor select, concurrency, executors as JSON) whose standing sentence is *a change takes effect
-  for the NEXT dispatch — cards already running keep the executor and model they started with*. Card
+  segmented control, default executor select, concurrency, the executor list and its form, the
+  reviewer, and the standing instructions box last) whose standing sentence is *a change takes effect
+  for the NEXT dispatch — cards already running keep the executor and model they started with*. Every
+  free-text field in it remembers where your caret is and puts it back after a repaint (#46): the
+  sheet rebuilds its whole body on any structural change, and the standing-instructions box is a
+  PARAGRAPH, so losing your place there means hunting for it in your own prose. Focus is given back
+  only when the repaint did not come from you clicking something else. Card
   faces, List rows and the rail head carry a small `grok · tmux` tag **only when that card is not on
   the defaults**; the model is on the tooltip and the rail head, not on the crowded face.
 - **Orchestration** (SKILL.md owns the procedure, since the session drives, not the server): lowest
