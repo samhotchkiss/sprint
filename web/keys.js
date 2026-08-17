@@ -265,6 +265,10 @@ export function clearNav() {
  * a different verb, and it is the one that moves the caret.
  */
 function select(entry, { preview = true } = {}) {
+  // Leaving an empty lane you were holding open (card #73) has to redraw the
+  // board, or the lane you walked out of stays a full column until some
+  // unrelated event happens to repaint it.
+  const leftAnEmptyLane = !!(nav && nav.num == null && nav.col !== entry.col);
   nav = { col: entry.col, num: entry.num };
   entry.node.focus({ preventScroll: true });
   // Card #59: each Board column scrolls on its own, so arrowing past the bottom
@@ -279,6 +283,7 @@ function select(entry, { preview = true } = {}) {
     if (entry.node.classList.contains('unit-card')) app.openUnit(entry.num);
     else app.openCard(entry.num, { focus: 'none' });
   }
+  if (leftAnEmptyLane) app.render();
 }
 
 /**
