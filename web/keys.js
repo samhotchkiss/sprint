@@ -39,6 +39,8 @@ const NAV_SEL = '.card[data-num], .row[data-num], .review-item[data-num], .unit-
 
 /** The four numbered columns, in the order the Board draws them. */
 export const COLUMN_KEYS = BOARD_COLUMNS.map((c) => c.key);
+const COLUMN_LABEL = {};
+for (const c of BOARD_COLUMNS) COLUMN_LABEL[c.key] = c.board;
 
 /** card state → which numbered column it belongs to. */
 const COL_OF_STATE = {};
@@ -295,6 +297,9 @@ function select(entry, { preview = true } = {}) {
  *   ("Nothing waiting.") instead of a toast that says the same thing somewhere
  *   else. It folds back the moment the cursor leaves — press another number, or
  *   Escape.
+ *
+ * The List has no columns to open, so there the old toast is still the only
+ * honest answer, and it is what you get.
  */
 export function focusColumn(index) {
   const col = COLUMN_KEYS[index];
@@ -303,10 +308,16 @@ export function focusColumn(index) {
   const nodes = navNodes(col);
   if (!nodes.length) {
     nav = { col, num: null };
-    // The sliver expands on THIS paint, and the focus lands one frame later so
-    // it lands on the header the paint drew, not the one it replaced.
+    // The sliver expands on THIS paint, and the cursor lands one frame later, so
+    // it lands on the header the paint drew rather than the one it replaced.
     app.render();
-    requestAnimationFrame(() => focusNavCursor());
+    requestAnimationFrame(() => {
+      if (focusNavCursor()) return;
+      // Nowhere to stand: this layout draws no header for that column (the
+      // List, or the Fold's Waiting, which is the Elsewhere strip).
+      nav = null;
+      app.toast(`${COLUMN_LABEL[col]} is empty.`);
+    });
     return true;
   }
   select(nodes[0]);
