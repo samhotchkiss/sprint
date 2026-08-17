@@ -834,7 +834,21 @@ Then record it and deliver the brief:
    - the full reporting protocol (phase + progress per stretch, ask and
      stop, evidence packet, never let "committed" be the last word);
    - the non-negotiables: no `rm`, no prompting commands, one branch,
-     never push to main, work only in that worktree.
+     never push to main, work only in that worktree;
+   - **the closing line, verbatim-ish, every time — this is not optional
+     and it is not covered by anything else in the brief:** "Never end a
+     turn without posting to the board — progress, blocked, a question,
+     or the packet. If you have nothing to report, you are not done;
+     keep working. Ending your turn silently strands the card, because
+     nothing restarts you." A tmux worker has no harness re-invoking it
+     the way a subagent does; if it goes quiet at an idle prompt, the
+     card just sits there amber until a human or the session happens to
+     type into the window. Evidence: the first live grok-via-tmux batch
+     had two of seven workers stall this exact way — ended their turn
+     silently, mid-card, with nothing posted — and both resumed the
+     instant something was typed into the pane. This is the mechanism,
+     not a one-off; put the line at the end of every tmux brief so it's
+     the last thing the agent read before it started.
 
 ### Reaching a tmux worker afterwards
 
@@ -974,13 +988,35 @@ The server already did the timing math (5 minutes, no worker event,
 `long_running` not set, and no declared phase still inside the time it
 claimed) — by the time you see this event, act:
 
-1. `SendMessage` the agent by name — a plain ping ("status?") lands on
-   its next turn if it's alive, or you'll notice it never responds. For a
-   **tmux** worker (`dispatch.kind == "tmux"`) the ping is a `tmux-send`
-   into its window, and the pane check comes first: a window whose
-   `pane_current_command` is back to a shell is a dead worker, and no
-   amount of pinging will tell you that (see "Liveness for a tmux
-   worker" in step 3).
+1. **Subagent:** `SendMessage` the agent by name — a plain ping
+   ("status?") lands on its next turn if it's alive, or you'll notice it
+   never responds.
+
+   **tmux worker** (`dispatch.kind == "tmux"`): do NOT start with a
+   ping. The first diagnostic is reading the pane, because a tmux worker
+   can be alive and still silent — its process running, but the CLI
+   agent ended its own turn without posting, sitting at an idle prompt
+   with nobody there to restart it. This is the expected failure mode
+   for this executor, not an edge case: the first live grok-via-tmux
+   batch had two of seven workers stall exactly this way.
+
+   ```
+   tmux capture-pane -p -t <session>:<window> | tail
+   ```
+
+   - **Shows an idle prompt** (empty input box, nothing running): that
+     IS the diagnosis, no further investigation needed. The response is
+     a continuation prompt, immediately, via `tmux-send` — canned
+     wording: *"You went quiet mid-card #N without posting. Report your
+     state to the board now, then continue to the packet."* Then watch
+     for the next board event the way you would after any nudge.
+   - **Shows the agent actively producing output**: it's alive and
+     working; a `tmux-send` ping is fine but don't expect an immediate
+     answer, same as the subagent path.
+   - **`pane_current_command` is back to a bare shell** (see "Liveness
+     for a tmux worker" in step 3): that is a dead process, not an idle
+     prompt — no continuation prompt will reach anyone. Go straight to
+     the dead-worker procedure (`failed` + note + Retry) instead.
 2. If you can inspect its transcript/task status directly, do that too
    — a wedged loop, a crashed process, and "still grinding on a slow
    step it forgot to flag" all look different once you look.

@@ -978,6 +978,16 @@ example."* Scope ruling: *"Peer per card — mix grok-via-tmux and claude subage
   events: a window whose `pane_current_command` fell back to a shell is a dead worker, and a
   non-terminal card there is `failed` + Retry (the tmux analogue of killed-agent detection). Terminal
   states kill the window, never the shared session.
+- **The two executors fail differently, and that difference is load-bearing.** A subagent that stops
+  is a signal in itself — the session finds out it stopped and can act. A tmux CLI agent has no such
+  backstop: it can end its own turn silently, mid-card, with nothing posted and nothing telling the
+  session anything happened, and the window just sits there at an idle prompt until someone types
+  into it. Evidence: the first live grok-via-tmux batch had two of seven workers stall exactly this
+  way, and both resumed instantly once prompted again. So silence-at-an-idle-prompt is the *expected*
+  failure mode for a tmux executor, not an anomaly — the mitigations are the standing "never end a
+  turn without posting" line every tmux brief closes with, and the amber runbook's tmux-first
+  diagnostic (`tmux capture-pane`, then a continuation prompt if it shows idle) rather than a plain
+  ping. See SKILL.md's tmux-dispatch and `agent_silent` sections.
 
 ## Autoheal — when the SESSION dies (SHIPPED)
 

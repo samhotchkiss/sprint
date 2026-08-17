@@ -89,7 +89,10 @@ the `SPRINT_SERVER`/`SPRINT_TOKEN` environment variables your brief set.
   is accepted. The moment you commit, the same one-liner must say what's
   still ahead: "committed — verifying next (tests, screenshots, packet)".
   User verbatim when this confused him: "some say committed but still in
-  motion".
+  motion". If you are a tmux worker, this rule has no safety net: nothing
+  restarts you when you go quiet, so ending a turn without posting — after
+  a commit or anywhere else — strands the card until a human happens to
+  type into your window.
   Also used for `chat`/`note`/`error` kinds:
   `sprint-post <num> note "..."`, `sprint-post <num> error "..."`.
 
