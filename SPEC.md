@@ -465,7 +465,8 @@ events. Nothing was silent and nothing was broken — the work was simply *owed 
   `integrating` >10 min (the session owes `/integrated` — today's failure), `queued` with no agent
   >15 min, `blocked` >30 min since its last real activity (a re-check interval, so a note on a
   blocked card restarts it), `needs_you` unanswered >30 min (the UI chimed once at the flip; this
-  lets the session re-notify in words), `ready` >24 h (gentle review reminder).
+  lets the session re-notify in words), `ready` >24 h (one aged-review reminder, then quiet — see
+  below).
 - Payload: `{state, stuck_for_seconds, threshold_seconds, text}` — `text` is a plain-English
   one-liner ("approved 12m ago, still merging — the session owes it a /integrated").
 - Repeats back off: one opening notice, then reminders at 10m → 30m → 90m, then silence. Three
@@ -474,20 +475,26 @@ events. Nothing was silent and nothing was broken — the work was simply *owed 
   (`SPRINT_SWEEP_INTEGRATING_SECONDS`, `SPRINT_SWEEP_QUEUED_SECONDS`, `SPRINT_SWEEP_BLOCKED_SECONDS`,
   `SPRINT_SWEEP_NEEDS_YOU_SECONDS`, `SPRINT_SWEEP_READY_SECONDS`, `SPRINT_SWEEP_TICK`,
   `SPRINT_SWEEP_MAX_REMINDERS`), which is the only honest way to test a ten-minute rule.
-- **`needs_you` is the one exception to the repeat cadence (#67).** The other four states are parked
-  on the session or the agent — something that can act on a repeat nag. `needs_you` is parked on the
-  human, and re-nagging the session every 10-30 minutes about a question only the user can answer
-  gives the session nothing to do with it; the gold square and the hub badge already carry the signal
-  for as long as the question stays open. So `needs_you` gets **at most one** `stuck` event per
-  episode — the normal opening delay, no 10m/30m/90m repeats — and then goes quiet. Answering the
-  question and getting asked a new one re-arms it for exactly one more, the same way any other state
-  change re-arms an episode. This cap is not env-tunable — it is `NEEDS_YOU_MAX_REMINDERS = 0` in
-  `bin/sprintd`, distinct from `SPRINT_SWEEP_MAX_REMINDERS` which still governs the other four states.
+- **`needs_you` and `ready` are the two exceptions to the repeat cadence (#67, #74).** The other three
+  states are parked on the session or the agent — something that can act on a repeat nag. `needs_you`
+  is parked on the human, and re-nagging the session every 10-30 minutes about a question only the
+  user can answer gives the session nothing to do with it; the gold square and the hub badge already
+  carry the signal for as long as the question stays open. `ready` is the same shape: with a dozen-plus
+  cards sitting in review overnight, the old cadence dripped "ready for review 1d — waiting on a
+  verdict" per card, and the session cannot act on that either — the review column and the card's own
+  green square already carry "this is unreviewed" continuously. So each of them gets **at most one**
+  `stuck` event per episode — the normal opening delay, no 10m/30m/90m repeats — and then goes quiet.
+  For `needs_you`, answering the question and getting asked a new one re-arms it for exactly one more;
+  for `ready`, a bounce (back to `in_progress`) followed by a re-`sprint-ready` does the same. Both are
+  the normal rule: any state change re-arms an episode. Neither cap is env-tunable — they are
+  `NEEDS_YOU_MAX_REMINDERS = 0` and `READY_MAX_REMINDERS = 0` in `bin/sprintd`, distinct from
+  `SPRINT_SWEEP_MAX_REMINDERS` which still governs the other three states (`integrating`, `queued`,
+  `blocked`).
   Because the timeline won't keep restating the age, an open question's card face carries its own
   ticking "waiting Nm" line (`web/board.js`, `.needsyou-wait` in `web/styles.css`) built from the
   card's `state_since` — a cheap, always-on stand-in for the reminder that no longer repeats.
   `agent_silent` and the worker-gone clock are untouched: this cap is a `stuck`-event rule only, and
-  applies only while the card sits in `needs_you`.
+  applies only while the card sits in `needs_you` or `ready` respectively.
 - `stuck` rides the normal stream, so the session's default `sprintd tail` wakes on it with no
   special casing. `--user-only` does NOT show it — that filter means "a human is waiting", and the
   point of the sweep is that no human is. SKILL.md's event-reaction table carries a per-state row.

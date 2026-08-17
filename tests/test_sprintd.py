@@ -10163,6 +10163,111 @@ class TestNeedsYouSweep(TestNeedsYouSweepBase):
         self.assertIn("agent_silent", kinds)
 
 
+# --------------------------------------------------------------------------
+# #74 -- ready gets at most one stuck reminder per episode (extends #67)
+# --------------------------------------------------------------------------
+
+class TestReadySweep(TestNeedsYouSweepBase):
+    """The parked-card sweep, driven by hand, on a card awaiting a verdict."""
+
+    def setUp(self):
+        super().setUp()
+        self.app.sweep_thresholds["ready"] = 1.0
+
+    def make_ready(self, num=None):
+        """queued -> in_progress -> ready, or (if num given) in_progress -> ready."""
+        if num is None:
+            num = self.new_card("done, needs a look")["num"]
+            self.to_in_progress(num)
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "ready")
+        return num
+
+    def bounce(self, num, notes="not quite"):
+        status, body = self.post("/api/cards/%d/verdict" % num,
+                                 {"verdict": "bounce", "notes": notes})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "in_progress")
+
+    def test_exactly_one_waiting_event_across_many_ticks(self):
+        num = self.make_ready()
+        self.age(num, 5.0)
+
+        # Many sweep ticks, with the clock pushed further stale between each
+        # one -- a repeat nag would show up as a second, third, fourth event.
+        for _ in range(6):
+            self.app.sweep_stuck()
+            self.age(num, 5.0)
+
+        events = self.stuck_events(num)
+        self.assertEqual(len(events), 1, "ready owes exactly one nag, per episode")
+        self.assertIn("waiting on a verdict", events[0]["payload"]["text"])
+        self.assertEqual(events[0]["payload"]["reminder"], 0, "the opening notice")
+
+    def test_the_card_goes_quiet_before_the_old_backoff_would_have_fired_again(self):
+        """Regression against the old shared cadence: even inside what used to
+        be the 10m repeat window, a second sweep_stuck() call must add nothing
+        once the opening notice has fired -- the cap, not the backoff gap, is
+        what is stopping it."""
+        num = self.make_ready()
+        self.age(num, 5.0)
+        self.assertEqual(self.app.sweep_stuck(), 1)
+        self.assertEqual(len(self.stuck_events(num)), 1)
+
+        self.age(num, 5.0)
+        self.assertEqual(self.app.sweep_stuck(), 0)
+        self.assertEqual(len(self.stuck_events(num)), 1)
+
+    def test_bounce_then_re_ready_re_arms_for_exactly_one_more(self):
+        num = self.make_ready()
+        self.age(num, 5.0)
+        self.app.sweep_stuck()
+        self.assertEqual(len(self.stuck_events(num)), 1)
+
+        # A bounce with notes, then the worker re-submits: a new ready episode.
+        self.bounce(num)
+        self.make_ready(num)
+        self.assertEqual(self.state_of(num), "ready")
+
+        self.age(num, 5.0)
+        self.app.sweep_stuck()
+        events = self.stuck_events(num)
+        self.assertEqual(len(events), 2, "the bounce + re-ready re-arms one more nag")
+
+        # ...and the second episode also gets exactly one, not a repeat cadence.
+        for _ in range(4):
+            self.age(num, 5.0)
+            self.app.sweep_stuck()
+        self.assertEqual(len(self.stuck_events(num)), 2)
+
+    def test_needs_you_cadence_is_unchanged(self):
+        """Regression: ready's cap must not change needs_you's own (already
+        zero-repeat, per #67) cadence."""
+        num, _qid = self.ask()
+        self.age(num, 5.0)
+        self.assertEqual(self.app.sweep_stuck(), 1)
+        self.age(num, 5.0)
+        self.assertEqual(self.app.sweep_stuck(), 0)
+        self.assertEqual(len(self.stuck_events(num)), 1, "needs_you still caps at one")
+
+    def test_queued_cadence_is_unchanged(self):
+        """Regression: the shared sweep_max_reminders / backoff still govern a
+        state this change was not supposed to touch."""
+        num = self.new_card("nobody is on it")["num"]
+        self.age(num, 5.0)
+        self.assertEqual(self.app.sweep_stuck(), 1)
+        # Inside the (shortened) backoff gap: no second reminder yet.
+        self.assertEqual(self.app.sweep_stuck(), 0)
+        self.assertEqual(len(self.stuck_events(num)), 1)
+        # Past the backoff gap: queued still repeats, unlike ready.
+        self.age(num, 1.0)
+        self.assertEqual(self.app.sweep_stuck(), 1)
+        events = self.stuck_events(num)
+        self.assertEqual(len(events), 2, "queued keeps its old cadence")
+        self.assertEqual(events[1]["payload"]["reminder"], 1)
+
+
 class TestBlockedByDocs(Base):
     """The orchestrator sets the link instead of writing a sentence about it."""
 

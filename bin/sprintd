@@ -356,6 +356,18 @@ DEFAULT_SWEEP_MAX_REMINDERS = 3
 # writes a new `state` event, which moves `_episode_seq` forward.
 NEEDS_YOU_MAX_REMINDERS = 0
 
+# `ready` is the same shape of problem (#74): with a dozen-plus cards sitting
+# in review overnight, the repeat cadence dripped "ready for review 1d --
+# waiting on a verdict" per card, every 10/30/90 minutes, on a column the
+# session cannot act on -- the review column and the card's own green square
+# already carry "this is unreviewed" continuously, for as long as it sits
+# there. Same fix, same mechanism as `needs_you`, not a parallel one: one
+# notice per episode, then quiet, and the episode re-arms the same way every
+# other state does -- a bounce (ready -> in_progress) or a re-`sprint-ready`
+# (in_progress -> ready) writes a new `state` event, which moves
+# `_episode_seq` forward.
+READY_MAX_REMINDERS = 0
+
 # What each state's one-liner says. Plain English, no jargon, names the owed
 # action -- the session reads these straight off the tail.
 STUCK_TEXT = {
@@ -4286,10 +4298,18 @@ class App:
         priors = self._stuck_events_since(num, self._episode_seq(num))
         # One opening notice plus at most `sweep_max_reminders` repeats, then
         # this episode goes quiet for good. Nagging a card the user has decided
-        # to leave alone is how a signal turns back into noise. `needs_you` is
-        # capped at zero repeats -- see NEEDS_YOU_MAX_REMINDERS above -- because
-        # a repeat nag there has no one who can act on it.
-        max_reminders = NEEDS_YOU_MAX_REMINDERS if state == "needs_you" else self.sweep_max_reminders
+        # to leave alone is how a signal turns back into noise. `needs_you` and
+        # `ready` are each capped at zero repeats -- see NEEDS_YOU_MAX_REMINDERS
+        # and READY_MAX_REMINDERS above -- because both are parked on someone
+        # who already sees the signal continuously (the human on `needs_you`,
+        # the review column and green square on `ready`), so a repeat nag has
+        # no one who can act on it.
+        if state == "needs_you":
+            max_reminders = NEEDS_YOU_MAX_REMINDERS
+        elif state == "ready":
+            max_reminders = READY_MAX_REMINDERS
+        else:
+            max_reminders = self.sweep_max_reminders
         if len(priors) > max_reminders:
             return None
         if priors:
