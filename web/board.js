@@ -23,6 +23,7 @@ import { phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
 import { renderMeter } from './meter.js';
 import { shortAgent, conversationBlock } from './list.js';
+import { navCursor } from './keys.js';
 import { reviewBlock } from './review.js';
 import { completeList } from './done.js';
 
@@ -46,6 +47,33 @@ export function renderFold(root, app) {
   root.appendChild(elsewhereStrip(app));
 }
 
+/**
+ * Which columns are drawn as a sliver instead of a column (card #73).
+ *
+ * User, verbatim: "When a lane is empty let's move its header to be vertical so
+ * that we have more room for the other lanes to get wider." An empty lane is
+ * still information — it says "no agent is running" — but it does not need a
+ * quarter of the screen to say it, and the lane next to it usually does.
+ *
+ * Three things decide it, and all three are here rather than in CSS because CSS
+ * cannot see how many cards are in a column:
+ *
+ * 1. **Empty means nothing is DRAWN in it**, not "no cards in its buckets". The
+ *    Needs-you column draws live threads as its own lower section (card #48), so
+ *    a column holding only conversations has content and stays a column. This is
+ *    the same test that decides whether to print "Nothing needs you."
+ * 2. **Never collapse everything.** On a board where all four are empty there is
+ *    nothing to give the width to, and four slivers is a worse way to say "this
+ *    sprint is done" than four columns saying it in words.
+ * 3. **The keyboard holds a lane open.** Pressing its number is an explicit ask
+ *    for that lane, so while the cursor is standing in it, it stays a column —
+ *    see focusColumn() in keys.js.
+ */
+export function collapsePlan(lanes, cursorCol) {
+  const anyOccupied = lanes.some((l) => !l.empty);
+  return lanes.map((l) => l.empty && anyOccupied && l.key !== cursorCol);
+}
+
 function boardGrid(app, { fold }) {
   const grid = h('div', { class: fold ? 'fold-cols' : 'board' });
   // On the Fold the waiting pile becomes the Elsewhere strip; everything that is
@@ -54,15 +82,40 @@ function boardGrid(app, { fold }) {
     ? ['in_motion', 'needs_you', 'review']
     : ['waiting', 'in_motion', 'needs_you', 'review'];
 
-  for (const col of boardColumns()) {
-    if (!wanted.includes(col.key)) continue;
+  // Build every column's contents first: whether one collapses depends on what
+  // the OTHERS hold, so nothing can be laid out until all of them are known.
+  const built = boardColumns()
+    .filter((col) => wanted.includes(col.key))
+    .map((col) => {
+      // The Needs-you column's lower section: ongoing threads, below the
+      // questions, in the same place the List puts them.
+      const convo = col.key === 'needs_you' ? conversationBlock(app, { compact: true }) : null;
+      return { col, key: col.key, convo, empty: !col.count && !convo };
+    });
+  const cursor = navCursor();
+  const plan = collapsePlan(built, cursor ? cursor.col : null);
+  built.forEach((b, i) => { b.collapsed = plan[i]; });
+
+  // The track list is the whole layout change: a sliver takes its 44px and the
+  // columns that have work in them split what is left. Written as vars so the
+  // two grids keep their own idea of a full-width column (the Board's has a
+  // 220px floor, the Fold's does not) and this line does not have to know which.
+  grid.style.gridTemplateColumns = built
+    .map((b) => (b.collapsed ? 'var(--col-sliver)' : 'var(--col-track)'))
+    .join(' ');
+
+  for (const { col, convo, collapsed } of built) {
+    // A sliver is its header and nothing else — there is no body to draw, no
+    // scroll position to remember, and nothing in it for the cursor to land on.
+    if (collapsed) {
+      grid.appendChild(h('section.col', { class: `col col-${col.key} is-collapsed` },
+        columnHead(col, { collapsed: true })));
+      continue;
+    }
     // remember where each column was scrolled to across re-renders
     const prev = scrollMemo.get(col.key);
 
     const body = h('div.col-body', { 'data-col': col.key });
-    // The Needs-you column's lower section: ongoing threads, below the
-    // questions, in the same place the List puts them.
-    const convo = col.key === 'needs_you' ? conversationBlock(app, { compact: true }) : null;
     if (!col.count && !convo) body.appendChild(h('p.col-empty', col.empty));
     // Sections appear only when they have something in them — an empty "Held"
     // heading is a promise of a pile that isn't there.
@@ -102,14 +155,39 @@ function boardGrid(app, { fold }) {
     body.addEventListener('scroll', () => scrollMemo.set(col.key, body.scrollTop), { passive: true });
 
     grid.appendChild(h('section.col', { class: `col col-${col.key}` },
-      h('div.col-head',
-        h('span.col-dot', { style: { background: col.dot } }),
-        h('span.col-name', col.board),
-        h('span.grow'),
-        h('span.col-count', String(col.count))),
+      columnHead(col, { collapsed: false }),
       body));
   }
   return grid;
+}
+
+/**
+ * A column's header — the same four things in the same order whether the column
+ * is full width or a 44px sliver. Only CSS knows the difference: collapsed, the
+ * head becomes the whole column and `.col-name` turns on `writing-mode`, which
+ * keeps the type on the browser's own text rasteriser. A `transform: rotate()`
+ * would composite the layer and soften the edges, and Chaos's label face is a
+ * pixel type where soft edges are the one thing you cannot have.
+ *
+ * The count rides along on the sliver on the user's ask, so a lane that is empty
+ * still says so with a number rather than only by being thin. It keeps its
+ * ordinary horizontal reading, because a two-digit number stacked on its side is
+ * a puzzle.
+ *
+ * `tabindex="-1"` is what lets the keyboard stand on a lane with no cards in it:
+ * the highlight IS focus everywhere else on this board, and an empty lane you
+ * asked for by number should not be the one place that rule stops being true.
+ */
+function columnHead(col, { collapsed }) {
+  return h('div.col-head', {
+    'data-col': col.key,
+    tabindex: -1,
+    title: collapsed ? `${col.board} — ${col.empty}` : null,
+  },
+    h('span.col-dot', { style: { background: col.dot } }),
+    h('span.col-name', col.board),
+    h('span.grow'),
+    h('span.col-count', String(col.count)));
 }
 
 // ---- card face -----------------------------------------------------------

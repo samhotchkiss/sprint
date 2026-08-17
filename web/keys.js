@@ -39,8 +39,6 @@ const NAV_SEL = '.card[data-num], .row[data-num], .review-item[data-num], .unit-
 
 /** The four numbered columns, in the order the Board draws them. */
 export const COLUMN_KEYS = BOARD_COLUMNS.map((c) => c.key);
-const COLUMN_LABEL = {};
-for (const c of BOARD_COLUMNS) COLUMN_LABEL[c.key] = c.board;
 
 /** card state → which numbered column it belongs to. */
 const COL_OF_STATE = {};
@@ -70,7 +68,13 @@ function columnDrawnIn(card) {
 // Deliberately a card NUMBER and not a node: the board repaints constantly, and
 // the one thing that survives a node being replaced is the identity of the thing
 // it was drawn for (exactly the reasoning behind the caret's `id` in app.js).
-let nav = null;      // {col, num} | null
+//
+// `num` is null when the cursor is on the COLUMN and not on a card in it, which
+// is what happens when you press the number of a lane that has nothing in it
+// (card #73). That is a real place to stand, not a broken cursor: the lane is
+// held open while you are there, and the moment a card lands in it the cursor
+// steps onto that card.
+let nav = null;      // {col, num|null} | null
 
 let app = null;
 let keysWrap = null;
@@ -116,7 +120,20 @@ export function navCursor() { return nav; }
 
 /** Is this the node the cursor is sitting on (or could sit on)? */
 export function isNavNode(node) {
-  return !!(node && node.matches && node.matches(NAV_SEL));
+  if (!node || !node.matches) return false;
+  if (node.matches(NAV_SEL)) return true;
+  // A column header counts, but only the one the cursor is actually standing on
+  // (card #73's empty lane). Without this, app.js's captureFocus would call it
+  // ordinary chrome, drop the focus on the next repaint, and the lane would fold
+  // up under the keyboard. Without the second half, any header you happened to
+  // click would start claiming to be the cursor.
+  return !!(nav && nav.num == null && node.matches(`.col-head[data-col="${nav.col}"]`));
+}
+
+/** The header of one numbered column, which is where an empty lane's cursor sits. */
+function columnHeadNode(col) {
+  const main = document.getElementById('main');
+  return main ? main.querySelector(`.col-head[data-col="${col}"]`) : null;
 }
 
 /**
@@ -157,6 +174,22 @@ export function paintNav({ refocus } = {}) {
   for (const n of document.querySelectorAll('.is-cursor')) n.classList.remove('is-cursor');
   for (const n of document.querySelectorAll('.is-col-cursor')) n.classList.remove('is-col-cursor');
   if (!nav) return;
+
+  // Standing on an empty lane (card #73). If something has arrived in it since
+  // the last paint, step onto it — that is the whole reason you asked for this
+  // lane by number. Focus only follows if focus is what the cursor had, so a
+  // card landing here can never steal the caret out of the reply box (#46).
+  if (nav.num == null) {
+    const arrived = navNodes(nav.col);
+    if (!arrived.length) {
+      const head = columnHeadNode(nav.col);
+      if (!head) { nav = null; return; }
+      head.closest('.col').classList.add('is-col-cursor');
+      if (refocus && document.activeElement !== head) head.focus({ preventScroll: true });
+      return;
+    }
+    nav = { col: nav.col, num: arrived[0].num };
+  }
 
   let entry = navNodes(nav.col).find((e) => e.num === nav.num);
   if (!entry) {
@@ -200,6 +233,12 @@ export function paintNav({ refocus } = {}) {
  */
 export function focusNavCursor() {
   if (!nav) return false;
+  if (nav.num == null) {
+    const head = columnHeadNode(nav.col);
+    if (!head) return false;
+    head.focus({ preventScroll: true });
+    return true;
+  }
   const entry = navNodes(nav.col).find((e) => e.num === nav.num);
   if (!entry) return false;
   entry.node.focus({ preventScroll: true });
@@ -240,14 +279,34 @@ function select(entry, { preview = true } = {}) {
   }
 }
 
-/** 1–4: take the column and highlight its first card (which previews it). */
+/**
+ * 1–4: take the column and highlight its first card (which previews it).
+ *
+ * An EMPTY lane is now a 44px sliver (card #73), and pressing its number opens
+ * it back up and stands the cursor in it. Two calls are being made here, both
+ * deliberate:
+ *
+ * - **The numbers never renumber.** 1/2/3/4 mean Waiting / In progress / Needs
+ *   you / Review whatever the board is holding, exactly as card #57 settled it.
+ *   Skipping the collapsed lanes would make the mapping depend on what is on
+ *   screen this second, and a shortcut you have to look up is not a shortcut.
+ * - **The lane opens rather than the press being refused.** You asked for it by
+ *   name; the honest answer is to show it to you, with its own words in it
+ *   ("Nothing waiting.") instead of a toast that says the same thing somewhere
+ *   else. It folds back the moment the cursor leaves — press another number, or
+ *   Escape.
+ */
 export function focusColumn(index) {
   const col = COLUMN_KEYS[index];
   if (!col) return false;
   if (app.pageOpen()) { app.toast('Close the report first — the board is behind it.'); return true; }
   const nodes = navNodes(col);
   if (!nodes.length) {
-    app.toast(`${COLUMN_LABEL[col]} is empty.`);
+    nav = { col, num: null };
+    // The sliver expands on THIS paint, and the focus lands one frame later so
+    // it lands on the header the paint drew, not the one it replaced.
+    app.render();
+    requestAnimationFrame(() => focusNavCursor());
     return true;
   }
   select(nodes[0]);
@@ -258,6 +317,11 @@ export function focusColumn(index) {
 export function moveNav(delta) {
   if (!nav) return false;
   const nodes = navNodes(nav.col);
+  // Standing on an empty lane, the arrows have nowhere to go — and must not
+  // answer by dropping the cursor, which would fold the lane up mid-keystroke.
+  // Card #73: the highlight is never left inside a sliver, because the lane the
+  // cursor is in is never drawn as one.
+  if (!nodes.length && nav.num == null) return true;
   if (!nodes.length) { clearNav(); return false; }
   const at = nodes.findIndex((e) => e.num === nav.num);
   const next = at < 0 ? 0 : Math.min(nodes.length - 1, Math.max(0, at + delta));
@@ -268,6 +332,9 @@ export function moveNav(delta) {
 /** Enter: hand the card to the rail and put the caret in its reply box (#46). */
 function openCursor() {
   if (!nav) return false;
+  // An empty lane has nothing to open. Swallow the key rather than opening
+  // whatever the rail happened to be showing.
+  if (nav.num == null) return true;
   const entry = navNodes(nav.col).find((e) => e.num === nav.num);
   if (entry && entry.node.classList.contains('unit-card')) {
     // A unit opens its outline; there is no single reply box to aim at, because

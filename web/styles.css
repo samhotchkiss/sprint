@@ -703,8 +703,13 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
    -------------------------------------------------------------------------- */
 
 .board {
+  /* --col-track is one full-width column and --col-sliver is a collapsed one;
+     board.js writes the actual track list, because whether a lane is empty is
+     not a thing CSS can see (card #73). */
+  --col-track: minmax(220px, 1fr);
+  --col-sliver: 44px;
   display: grid;
-  grid-template-columns: repeat(4, minmax(220px, 1fr));
+  grid-template-columns: repeat(4, var(--col-track));
   gap: 14px;
   padding-bottom: 40px;
   align-items: start;
@@ -719,6 +724,8 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
   border-radius: var(--radius);
   background: var(--panel);
 }
+.col-head:focus { outline: none; }
+.col-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .col-dot { width: 6px; height: 6px; border-radius: var(--radius-pill); display: block; }
 .col-name {
   font-family: var(--font-label);
@@ -738,6 +745,36 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
 .col-waiting .col-head { background: #121316; border-color: #25272c; }
 .col-review .col-head { background: #12161a; border-color: #262b2b; }
 .col-review .col-name, .col-review .col-count { color: var(--good); }
+
+/* ---- an empty lane, on its side (card #73) -------------------------------
+   User, verbatim: "When a lane is empty let's move its header to be vertical so
+   that we have more room for the other lanes to get wider."
+
+   The header becomes the whole column: same dot, same words, same count, turned
+   a quarter turn. `writing-mode` does the turning rather than `transform`,
+   because a rotated layer is resampled and Chaos's label face is pixel type —
+   the one kind of type that cannot survive being softened. Nothing here is a
+   second component: it is the same markup board.js draws either way. */
+.col.is-collapsed { overflow: hidden; }
+.col.is-collapsed .col-head {
+  flex: 1 1 auto;
+  min-height: 128px;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 0;
+}
+.col.is-collapsed .col-name {
+  writing-mode: vertical-rl;
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* the number reads the ordinary way round — a two-digit count on its side is a
+   puzzle, and this one is usually 0 */
+.col.is-collapsed .col-count { writing-mode: horizontal-tb; }
 
 /* a column that holds more than one kind of waiting says which is which */
 .col-sec {
@@ -1370,14 +1407,23 @@ html.skin-chaos .verdicts.is-bouncing .icon-btn.attach {
 
   /* the list layout is desktop reading; the Fold is always columns */
   .fold-cols {
+    /* Card #73 applies here too: 980px across three lanes is exactly where a
+       lane that is holding nothing is most expensive. The Fold's full-width
+       track has no 220px floor — two lanes sharing 980px are wide either way,
+       and the floor would only fight the 1px rules. */
+    --col-track: 1fr;
+    --col-sliver: 44px;
     flex: 1;
     min-height: 0;
     overflow: hidden;
     display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-columns: var(--col-track) var(--col-track) var(--col-track);
     gap: 1px;
     background: var(--rule);
   }
+  /* the sliver's head IS the column here, so it keeps the grid's own rules
+     rather than the rounded panel the desktop board draws */
+  .fold-cols .col.is-collapsed .col-head { border-bottom: none; }
   .fold-cols .col {
     min-width: 0;
     /* without this a tall column stretches the grid row and spills over the
@@ -1479,6 +1525,11 @@ html.skin-chaos .verdicts.is-bouncing .icon-btn.attach {
   .fold-cols .col { display: block; }
   .fold-cols .col-body { display: block; padding: 0; overflow: visible; }
   .fold-cols .col-head { position: sticky; top: 0; z-index: 2; }
+  /* Card #73 turns an empty lane on its side to give its width to a busy one.
+     Stacked one under another there is no width to give, so the header goes
+     back to reading across. */
+  .fold-cols .col.is-collapsed .col-head { flex-direction: row; align-items: center; min-height: 0; padding: 9px 12px; }
+  .fold-cols .col.is-collapsed .col-name { writing-mode: horizontal-tb; }
 
   /* needs-you keeps full rows with tappable chips; the rest compresses */
   .phone-needs .needs-row {
