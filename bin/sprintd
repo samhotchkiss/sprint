@@ -125,6 +125,14 @@ DEFAULT_RESTART_DRAIN_SECONDS = 10.0            # how long to wait for in-flight
 # `sprintd tail` -- the quiet ingress. It never exits on its own, so every
 # knob here is about how loudly it fails, not whether it gives up.
 TAIL_TEXT_MAX = 120            # chars of `payload.text` on a tail line
+# Card #77: a session read a clipped tail line as if it were the whole
+# message and replied "what are they?" to a complete 364-char submission.
+# The line WAS clipped -- the failure was that nothing on it said so. Any
+# line that lost content (too long, or extra lines dropped) gets this
+# appended, unmistakably, with the seq the reader needs to go fetch the
+# rest. An un-truncated line never gets it, so its absence is itself a
+# signal: no marker means you are already looking at the whole thing.
+TAIL_TRUNCATION_MARKER = " [truncated — full text is %d chars, seq %s; GET the event/card]"
 TAIL_BACKOFF_MIN = 0.25        # first reconnect delay after a drop
 TAIL_BACKOFF_MAX = 5.0         # ...doubling up to here, forever
 TAIL_READ_TIMEOUT = 45.0       # 3 missed 15s heartbeats == this stream is dead
@@ -9066,6 +9074,26 @@ def cmd_wait(args) -> int:
         time.sleep(min(poll, remaining))
 
 
+def clip_tail_text(raw, limit: int = TAIL_TEXT_MAX):
+    """Collapse to one line and clip to `limit` -- but unlike `one_line`,
+    also report whether anything was actually lost, and how long the full
+    (collapsed, still-multiline-joined-by-newline) text was, so a caller
+    can mark the cut instead of leaving it invisible.
+
+    Returns (clipped_text, was_cut, full_length).
+    """
+    full = str("" if raw is None else raw).strip()
+    first = full.split("\n")[0].strip()
+    if len(first) > limit:
+        clipped = first[: limit - 1].rstrip() + "…"
+    else:
+        clipped = first
+    # Cut if the length clip fired, OR extra lines got dropped -- both lose
+    # content the reader can't see is missing.
+    was_cut = clipped != full
+    return clipped, was_cut, len(full)
+
+
 def tail_line(ev: dict, limit: int = TAIL_TEXT_MAX) -> dict:
     """One event -> the one compact line a monitor reads.
 
@@ -9073,18 +9101,27 @@ def tail_line(ev: dict, limit: int = TAIL_TEXT_MAX) -> dict:
     watching this stream should be able to read a field without first
     checking whether it exists. `reply_to` is the whole point of the line
     for the session -- present means a human said this and is waiting.
+
+    When the text is cut -- too long, or extra lines dropped -- the line
+    carries an unmistakable marker naming the full length and this event's
+    seq (card #77: a session mistook a clipped line for the whole message).
+    An un-truncated line carries no marker at all.
     """
     payload = ev.get("payload")
     if not isinstance(payload, dict):
         payload = {}
     reply_to = payload.get("reply_to")
+    seq = ev.get("seq")
+    text, was_cut, full_len = clip_tail_text(payload.get("text") or "", limit)
+    if was_cut:
+        text = text + (TAIL_TRUNCATION_MARKER % (full_len, seq))
     return {
-        "seq": ev.get("seq"),
+        "seq": seq,
         "card": ev.get("card_num"),
         "actor": ev.get("actor"),
         "kind": ev.get("kind"),
         "reply_to": reply_to if isinstance(reply_to, str) else None,
-        "text": one_line(payload.get("text") or "", limit),
+        "text": text,
     }
 
 

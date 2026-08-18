@@ -3256,18 +3256,65 @@ class TestTailLine(unittest.TestCase):
         line = sprintd.tail_line({"seq": 1, "card_num": 1, "actor": "user",
                                   "kind": "chat",
                                   "payload": {"text": "x" * 400}})
-        self.assertEqual(len(line["text"]), sprintd.TAIL_TEXT_MAX)
-        self.assertTrue(line["text"].endswith("…"))
+        self.assertTrue(line["text"].startswith("x" * (sprintd.TAIL_TEXT_MAX - 1) + "…"))
         line = sprintd.tail_line({"seq": 2, "card_num": 1, "actor": "user",
                                   "kind": "chat",
                                   "payload": {"text": "first\nsecond\nthird"}})
-        self.assertEqual(line["text"], "first", "one event is one line, always")
+        self.assertTrue(line["text"].startswith("first"),
+                        "one event is one line, always")
 
     def test_a_forged_reply_to_is_still_only_a_string(self):
         line = sprintd.tail_line({"seq": 9, "card_num": 1, "actor": "worker",
                                   "kind": "note",
                                   "payload": {"text": "hi", "reply_to": {"a": 1}}})
         self.assertIsNone(line["reply_to"])
+
+
+class TestTailTruncationMarker(unittest.TestCase):
+    """Card #77: a session read a clipped tail line as if it were the whole
+    message and replied "what are they?" to a complete 364-char submission
+    the board had actually stored in full. The message was never lost --
+    the failure was that the clipped line gave no sign it was clipped. A
+    cut line must say so, unmistakably, naming the seq and the full length;
+    an un-cut line must carry nothing extra at all."""
+
+    def test_a_long_line_carries_the_marker_with_seq_and_length(self):
+        full_text = ("problem one: the button is misaligned on mobile. "
+                     "problem two: the save action silently no-ops when "
+                     "the network drops mid-request and never retries.")
+        self.assertGreater(len(full_text), sprintd.TAIL_TEXT_MAX)
+        line = sprintd.tail_line({"seq": 48, "card_num": 5, "actor": "user",
+                                  "kind": "chat", "payload": {"text": full_text}})
+        marker = sprintd.TAIL_TRUNCATION_MARKER % (len(full_text), 48)
+        self.assertTrue(line["text"].endswith(marker),
+                        "marker must name this event's own seq and the full "
+                        "character count, not a vague notice")
+        self.assertIn("truncated", line["text"])
+
+    def test_a_short_line_carries_no_marker_at_all(self):
+        line = sprintd.tail_line({"seq": 7, "card_num": 5, "actor": "user",
+                                  "kind": "chat", "payload": {"text": "short and complete"}})
+        self.assertEqual(line["text"], "short and complete")
+        self.assertNotIn("truncated", line["text"])
+        self.assertNotIn("[", line["text"])
+
+    def test_extra_lines_dropped_by_the_one_line_collapse_also_count_as_cut(self):
+        """Losing "second" and "third" to the first-line-only rule is just as
+        silent a loss as a length clip -- it gets the same marker."""
+        full_text = "first\nsecond\nthird"
+        line = sprintd.tail_line({"seq": 2, "card_num": 1, "actor": "user",
+                                  "kind": "chat", "payload": {"text": full_text}})
+        expected = sprintd.TAIL_TRUNCATION_MARKER % (len(full_text), 2)
+        self.assertTrue(line["text"].endswith(expected))
+        self.assertTrue(line["text"].startswith("first"))
+
+    def test_mutation_removing_the_marker_would_fail_this(self):
+        """A falsification check: if `tail_line` ever stops appending the
+        marker on a cut line, this assertion is what turns red."""
+        line = sprintd.tail_line({"seq": 99, "card_num": 1, "actor": "user",
+                                  "kind": "chat", "payload": {"text": "y" * 300}})
+        self.assertRegex(line["text"], r"\[truncated — full text is \d+ chars, seq 99; "
+                                       r"GET the event/card\]$")
 
 
 class TestTail(unittest.TestCase):
