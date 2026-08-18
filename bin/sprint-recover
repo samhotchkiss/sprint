@@ -42,6 +42,15 @@ TIMELINE_LINES = 10
 # it just means the count is unknown and we say so.
 BASES = ("origin/main", "main", "origin/master", "master")
 
+EVENT_TEXT_MAX = 110            # chars of an event's text on one timeline line
+# Card #77: a session read a clipped tail line as the whole message and
+# replied "what are they?" to a complete submission. This brief clips
+# timeline text the same way `sprintd tail` does, so it gets the same
+# unmistakable marker on any line that lost content -- naming the seq and
+# the full length -- so the new agent knows to GET the event instead of
+# treating what's printed here as the whole thing.
+TRUNCATION_MARKER = " [truncated — full text is %d chars, seq %s; GET the event/card]"
+
 
 def die(msg, code=2):
     print("sprint-recover: " + msg, file=sys.stderr)
@@ -90,9 +99,19 @@ def git(worktree, *args):
     return out.stdout.decode("utf-8", "replace").rstrip("\n")
 
 
-def one_line(text, limit=110):
+def one_line(text, limit=EVENT_TEXT_MAX):
     text = " ".join(str(text or "").split())
     return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def clipped_with_marker(text, seq, limit=EVENT_TEXT_MAX):
+    """`one_line`, but a cut line says so -- see EVENT_TEXT_MAX above.
+    An un-truncated line gets no marker at all."""
+    full = " ".join(str(text or "").split())
+    if len(full) <= limit:
+        return full
+    clipped = full[:limit - 1] + "…"
+    return clipped + (TRUNCATION_MARKER % (len(full), seq))
 
 
 def attachment_paths(payload):
@@ -120,7 +139,7 @@ def event_line(ev):
     if not text and payload.get("phase"):
         text = "phase: %s" % payload["phase"]
     lines = ["  %-6s %-9s %s" % (ev.get("actor", "?"), ev.get("kind", "?"),
-                                 one_line(text))]
+                                 clipped_with_marker(text, ev.get("seq")))]
     # Indented to land under the text of the line it belongs to. card_report
     # prefixes the FIRST line with two more spaces, so these carry their own.
     for path in attachment_paths(payload):

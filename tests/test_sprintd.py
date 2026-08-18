@@ -6866,6 +6866,34 @@ class TestSprintRecover(Base):
         self.assertIn("401", r.stderr.decode())
         self.assertNotIn("Traceback", r.stderr.decode())
 
+    def test_a_long_event_carries_the_truncation_marker(self):
+        """Card #77: same failure class as sprintd tail -- a clipped timeline
+        line with no sign it was clipped gets mistaken for the whole message.
+        A cut line here must name its own seq and the real character count."""
+        num = self.dead_card(self.seeded_worktree("wt-f"), "wt-f")
+        full_text = ("problem one: the button is misaligned on mobile. "
+                     "problem two: the save action silently no-ops when "
+                     "the network drops mid-request and never retries.")
+        self.assertGreater(len(full_text), 110)
+        status, res = self.post("/api/cards/%d/events" % num,
+                                {"kind": "progress", "payload": {"text": full_text}})
+        self.assertEqual(status, 201, res)
+        seq = res["event"]["seq"]
+        out = self.run_recover(num).stdout.decode()
+        self.assertIn("truncated", out)
+        self.assertIn("full text is %d chars" % len(full_text), out)
+        self.assertIn("seq %d" % seq, out)
+
+    def test_a_short_event_carries_no_marker(self):
+        num = self.dead_card(self.seeded_worktree("wt-g"), "wt-g")
+        status, res = self.post("/api/cards/%d/events" % num,
+                                {"kind": "progress",
+                                 "payload": {"text": "short and complete, nothing lost here"}})
+        self.assertEqual(status, 201, res)
+        out = self.run_recover(num).stdout.decode()
+        self.assertIn("short and complete, nothing lost here", out)
+        self.assertNotIn("truncated", out)
+
 
 # --------------------------------------------------------------------------
 # Ops batch (#36-#40): bulk import, actor attribution, ops cards, external
