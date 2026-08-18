@@ -197,6 +197,15 @@ went green, the overlapping card landed, the dependency shipped).
 
 ## 2. The drain loop — the one invariant that must never break
 
+**Tail lines are WAKE SIGNALS, not messages (card #77).** A tail line's
+`text` is clipped for the terminal, never the whole message — before
+acting on ANY user event (chat, card submission, bounce, answer), `GET`
+the full event or card over the API and act on that, never on the tail
+line's text. Incident: a session read only a clipped tail line and replied
+"what are they?" to a complete 364-char message with two numbered
+problems the board had stored in full — the failure was the reading
+procedure, not the storage.
+
 **Reply where the user is (learned live, 2026-08-15).** The terminal is a
 log, not a reply channel. The user watches the BOARD. Before ending any
 wakeup: a sidebar message gets its complete answer POSTed to
@@ -275,7 +284,9 @@ exit — it tells you sooner than a dumb poll would and nothing more. The
 cursor and the event log are the actual truth: **always drain from the
 cursor on every wakeup**, and never act on the contents of a wakeup
 notification instead of draining (the line you were handed is a summary,
-clipped to 120 characters, with no attachments and no detail). Treat
+clipped to 120 characters — marked `[truncated — full text is N chars,
+seq …; GET the event/card]` when it lost content, unmarked when it
+didn't — with no attachments and no detail). Treat
 every drain as at-least-once delivery: dedupe by `seq` (you already are,
 by only ever acting on events strictly after your persisted cursor), and
 never assume an event you're about to act on hasn't already been acted
