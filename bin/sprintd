@@ -3438,6 +3438,17 @@ class App:
         decision, and NOTHING is dispatched until the user releases them. Hold
         is the preview. And it is all-or-nothing: a half-landed import is the
         same flood-then-clean-up problem in a smaller size.
+
+        Same carve-out `create_card` already has, per item: an item whose
+        `kind` is `"conversation"` is NOT held, regardless of this call's
+        `hold` or the sprint's hold_mode. A second incident showed why --
+        a session bulk-imported 13 pure "Q for Sam" questions with no work
+        component, and because bulk always holds, all 13 sat invisible in
+        `held` for up to 16 hours; the user never saw them. Hold is a brake
+        on DISPATCH, and a conversation has no dispatch step, so the brake
+        does not apply to it -- same reasoning as the single-card path. An
+        explicit `hold=True` on a WORK item in the same batch still holds
+        it normally; this only exempts `conversation` items.
         """
         if not isinstance(items, list) or not items:
             raise ApiError(400, "missing_field",
@@ -3470,31 +3481,43 @@ class App:
             if not text and not images:
                 raise ApiError(400, "empty_submission",
                                "items[%d] needs text or images" % i, index=i)
-            prepared.append((text, self.store_images(images, "items[%d].images" % i)))
+            kind = (item.get("kind") or "work").strip().lower()
+            if kind not in CARD_KINDS:
+                raise ApiError(400, "bad_kind",
+                               "items[%d].kind must be one of %s"
+                               % (i, ", ".join(CARD_KINDS)),
+                               index=i, field="kind")
+            prepared.append((text, self.store_images(images, "items[%d].images" % i), kind))
 
         nums = []
         ts = now()
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
-                for text, attachments in prepared:
+                for text, attachments, kind in prepared:
+                    # The carve-out: a conversation item ignores the batch's
+                    # hold state entirely and opens where a human sees it.
+                    item_state = CONVERSATION_STATE if kind == "conversation" else state
                     cur = self.conn.execute(
-                        "INSERT INTO cards(sprint_id, state, title, body, created_at, updated_at) "
-                        "VALUES(?,?,?,?,?,?)",
-                        (sprint["id"] if sprint else None, state,
-                         first_line_title(text) or "(image only)", text, ts, ts))
+                        "INSERT INTO cards(sprint_id, state, title, body, kind, "
+                        "created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                        (sprint["id"] if sprint else None, item_state,
+                         first_line_title(text) or "(image only)", text, kind, ts, ts))
                     num = int(cur.lastrowid)
                     self._append_event(num, actor, "submitted", {
                         "text": text or image_line(len(attachments)),
                         "attachments": attachments,
                         "images_only": not text,
-                        "hold": held,
+                        "kind": kind,
+                        "hold": held and kind == "work",
                         "bulk": len(prepared)})
                     self._append_event(num, "server", "state", {
-                        "from": None, "to": state,
-                        "reason": ("bulk import — held until you release it"
-                                   if held else "bulk import"),
-                        "text": "new → %s" % state})
+                        "from": None, "to": item_state,
+                        "reason": ("a conversation, not a work item"
+                                   if kind == "conversation"
+                                   else ("bulk import — held until you release it"
+                                         if held else "bulk import")),
+                        "text": "new → %s" % item_state})
                     nums.append(num)
                 self.conn.execute("COMMIT")
             except Exception:

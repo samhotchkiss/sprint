@@ -7052,6 +7052,63 @@ class TestBulkCreate(Base):
         self.assertTrue(submitted[0]["payload"]["hold"])
         self.assertEqual(submitted[0]["payload"]["bulk"], 1)
 
+    def test_a_conversation_item_in_a_bulk_import_is_never_held(self):
+        """The second incident: 13 pure "Q for Sam" questions went through
+        bulk import, which always holds, and sat invisible for 16 hours.
+        Same carve-out as the single-card path, per item: a conversation
+        item ignores the batch's hold entirely, `hold=True` and all."""
+        status, made = self.bulk(
+            [{"text": "Q for Sam: which vendor?", "kind": "conversation"},
+             {"text": "fix the header", "kind": "work"}],
+            hold=True)
+        self.assertEqual(status, 201, made)
+        convo_num, work_num = made["card_nums"]
+        self.assertEqual(self.state_of(convo_num), "conversation")
+        self.assertEqual(self.state_of(work_num), "held")
+        _, board = self.get("/api/board")
+        by_num = {c["num"]: c for c in board["cards"]}
+        self.assertEqual(by_num[convo_num]["column"], "needs_you")
+        self.assertEqual(by_num[work_num]["column"], "held")
+
+    def test_a_conversation_item_is_never_held_under_hold_mode_either(self):
+        self.post("/api/sprint", {"action": "set_hold_mode", "hold_mode": True})
+        status, made = self.bulk(
+            [{"text": "Q for Sam: which vendor?", "kind": "conversation"},
+             "an ordinary work item"])
+        self.assertEqual(status, 201, made)
+        convo_num, work_num = made["card_nums"]
+        self.assertEqual(self.state_of(convo_num), "conversation")
+        self.assertEqual(self.state_of(work_num), "held")
+
+    def test_a_conversation_item_is_unheld_even_when_the_batch_opts_out_of_hold(self):
+        """`hold=False` on the call still has to produce a conversation card,
+        not a `queued` one -- a conversation never enters the work lifecycle
+        at all, regardless of which way the batch's hold flag points."""
+        status, made = self.bulk(
+            [{"text": "Q for Sam: which vendor?", "kind": "conversation"}],
+            hold=False)
+        self.assertEqual(status, 201, made)
+        self.assertEqual(self.state_of(made["card_nums"][0]), "conversation")
+
+    def test_bulk_conversation_item_kind_and_hold_flag_on_the_submitted_event(self):
+        _, made = self.bulk(
+            [{"text": "Q for Sam: which vendor?", "kind": "conversation"}],
+            hold=True)
+        num = made["card_nums"][0]
+        _, detail = self.get("/api/cards/%d" % num)
+        sub = [e for e in detail["timeline"] if e["kind"] == "submitted"][0]
+        self.assertEqual(sub["payload"]["kind"], "conversation")
+        self.assertFalse(sub["payload"]["hold"],
+                         "a conversation is never reported as held")
+
+    def test_a_bad_kind_in_a_bulk_item_is_a_named_400_and_creates_nothing(self):
+        before = len(self.get("/api/board")[1]["cards"])
+        status, body = self.bulk(["fine", {"text": "x", "kind": "sandwich"}])
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "bad_kind")
+        self.assertEqual(body["index"], 1)
+        self.assertEqual(len(self.get("/api/board")[1]["cards"]), before)
+
 
 class TestActorAttribution(Base):
     """Who a card says wrote it.
