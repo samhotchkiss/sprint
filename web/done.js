@@ -11,7 +11,7 @@
 // spec's hard rule) no count anywhere in the chrome that isn't the expander's
 // own sentence about itself.
 import { h, timeEl } from './util.js';
-import { cardState, store, STATE_LABEL } from './state.js';
+import { cardState, store, STATE_LABEL, isOpenInRail } from './state.js';
 
 const MARK = { completed: '✓', rejected: '✕', canceled: '✕', duplicate: '·' };
 
@@ -76,7 +76,7 @@ function doneRow(card, app) {
   const st = cardState(card);
   return h('button.done-row', {
     type: 'button',
-    class: `done-row is-${st}`,
+    class: `done-row is-${st}${isOpenInRail(card) ? ' is-open' : ''}`,
     'data-num': card.num,
     title: STATE_LABEL[st] || st,
     onclick: () => app.openCard(card.num),

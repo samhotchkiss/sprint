@@ -17,7 +17,7 @@ import { h, timeEl, firstLine } from './util.js';
 import {
   boardColumns, cardState, needsKind, motionState, blockedReason, waitingMark,
   meterSegments, sections, isSilent, isStuck, STUCK_HINT, STATE_LABEL,
-  blockedByMark,
+  blockedByMark, isOpenInRail,
 } from './state.js';
 import { phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
@@ -200,7 +200,8 @@ export function renderCardFace(card, app) {
   const face = h('button.card', {
     type: 'button',
     'data-num': card.num,
-    class: `card${col === 'needs_you' ? ' is-needs' : ''}${isSilent(card) ? ' is-quiet' : ''}`,
+    class: `card${col === 'needs_you' ? ' is-needs' : ''}${isSilent(card) ? ' is-quiet' : ''}`
+      + `${isOpenInRail(card) ? ' is-open' : ''}`,
     onclick: () => app.openCard(card.num),
   });
 
@@ -340,7 +341,8 @@ function elsewhereStrip(app) {
     const mark = blocked ? (STATE_LABEL[state] || state).toLowerCase() : waitingMark(card);
     strip.appendChild(h('button.pill', {
       type: 'button',
-      class: `pill${mark === 'held' ? ' is-held' : ''}${blocked ? ' is-blocked' : ''}`,
+      class: `pill${mark === 'held' ? ' is-held' : ''}${blocked ? ' is-blocked' : ''}`
+        + `${isOpenInRail(card) ? ' is-open' : ''}`,
       'data-num': card.num,        // the keyboard's Waiting column, on the Fold
       title: card.title,
       onclick: () => app.openCard(card.num),

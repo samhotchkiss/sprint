@@ -39,7 +39,7 @@
 // be there.
 import { h, timeEl, firstLine, plural, richText } from './util.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
-import { store, cardState, draft, bounceComposing, attachedImages } from './state.js';
+import { store, cardState, draft, bounceComposing, attachedImages, isOpenInRail } from './state.js';
 import { initAttach, paperclip } from './attach.js';
 import { shortAgent, openable } from './list.js';
 import { reviewUnits, unitOf, packetFor, memberPart, ownTitle } from './units.js';
@@ -177,6 +177,7 @@ function unitCard(unit, app, { compact }) {
     // The keyboard walks the Review column by card number (card #57), and a
     // unit's number is its lead card's — the same one the URL uses (#/u/<n>).
     'data-num': unit.lead.num,
+    class: `unit-card${isOpenInRail(unit.lead) ? ' is-open' : ''}`,
     role: 'button',
     tabindex: '0',
     title: 'open the outline — everything that changed, in one page',

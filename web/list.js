@@ -8,7 +8,7 @@ import { h, timeEl, firstLine } from './util.js';
 import {
   sections, meterSegments, cardState, needsKind, needsYouCount, motionState,
   blockedReason, waitingMark, isStuck, BLOCKED_NOTE, blockedByMark,
-  conversations, conversationState, CONVERSATION_HINT,
+  conversations, conversationState, CONVERSATION_HINT, isOpenInRail,
 } from './state.js';
 import { phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
@@ -301,7 +301,7 @@ export function waitingPill(card, app) {
   const mark = waitingMark(card);
   return h('button.pill', {
     type: 'button',
-    class: `pill${mark === 'held' ? ' is-held' : ''}`,
+    class: `pill${mark === 'held' ? ' is-held' : ''}${isOpenInRail(card) ? ' is-open' : ''}`,
     'data-num': card.num,        // the keyboard's Waiting column walks these
     onclick: () => app.openCard(card.num),
   },
@@ -329,8 +329,13 @@ function pendingPill(card, app) {
 export function openable(cls, card, app) {
   // Every List row is built here, so this is the one place the sweep's amber
   // has to be applied: `is-stuck` ambers whatever age text that row carries.
+  // Card #76: same place `is-open` gets applied, so the row for whichever
+  // card the rail is currently showing lights up here for free too.
+  let full = cls;
+  if (isStuck(card)) full += ' is-stuck';
+  if (isOpenInRail(card)) full += ' is-open';
   const el = h('div', {
-    class: isStuck(card) ? cls + ' is-stuck' : cls,
+    class: full,
     'data-num': card.num,
     role: 'button',
     tabindex: '0',
