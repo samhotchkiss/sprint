@@ -63,6 +63,11 @@ html.skin-calm {
   --rail-signoff: #3d5544;
   --seg-blocked: #5c4a4c;
   --seg-queued: #2a2d33;
+  /* card #76: "this tile is what the rail is showing right now" — a hue none
+     of the state colours above already own, so it never doubles as a status. */
+  --open-bg: #16202b;
+  --open-line: #5ea0c9;
+  --rail-card-bg: #181f2c;
 
   /* voices in a thread */
   --you-tint: #8fb4d8;
@@ -165,6 +170,11 @@ html.skin-chaos {
   --rail-signoff: #3fae5a;
   --seg-blocked: #4a3f8e;
   --seg-queued: #2b2470;
+  /* card #76: same "open right now" marker as Calm's, in a Chaos-legible cyan
+     — a hard edge, not a glow, so it does not fight the pixel-art bevels. */
+  --open-bg: #212a5c;
+  --open-line: #6fd3ff;
+  --rail-card-bg: linear-gradient(180deg, #271f5e, #180f3e);
 
   /* voices in a thread */
   --you-tint: #9db4ff;
@@ -840,6 +850,16 @@ body.rail-open #app { grid-template-columns: 1fr 480px; }
   background: var(--aside-bg);
 }
 body.rail-open .rail { display: flex; }
+/* Card #76, user verbatim: "there should be a slightly different background
+   color for the main session chat versus a card chat." `#rail`'s own
+   `data-owner` already says which one is up (rail.js: 'chat', 'card:<n>', or
+   'unit:<key>') — read it here instead of teaching two more files a second
+   copy of that rule. The session channel keeps today's look (`--aside-bg`,
+   set above); a card's own thread — or a work unit's outline, which is the
+   same "not the session" surface — gets a cooler, slightly lighter wash.
+   `.thread` and `.composer` carry no background of their own, so this one
+   change covers the head, the thread AND the composer in one place. */
+#rail[data-owner^="card:"], #rail[data-owner^="unit:"] { background: var(--rail-card-bg); }
 
 .rail-head {
   display: flex;
@@ -3583,6 +3603,36 @@ html.skin-chaos .is-cursor {
   box-shadow: 0 0 0 3px #0a0618;
 }
 html.skin-chaos .col.is-col-cursor .col-head { box-shadow: inset 0 0 0 2px var(--accent); }
+
+/* ---- card #76: the card the rail is currently showing --------------------
+   Whatever `store.detail` (or a work unit's lead) is right now gets its own
+   mark, so the board never leaves you guessing which tile the rail is open
+   to. It has to read as a DIFFERENT thing from the keyboard cursor above —
+   arrowing a card also opens it (the two usually land on the same tile), so
+   this uses a channel `.is-cursor` never touches (background + an inset
+   edge, not the outline/box-shadow the cursor owns) and a colour none of the
+   state tags already carry, so the two rings compose instead of erasing each
+   other. It also has to stay clear of the same class this codebase already
+   uses for an unrelated disclosure toggle (`.done-toggle.is-open`) — scoped
+   to the tile selectors only, never bare `.is-open`. */
+.card.is-open, .row.is-open, .review-item.is-open, .unit-card.is-open,
+.pill.is-open, .done-row.is-open {
+  background: var(--open-bg);       /* wins over .pill.is-held's `none` — source order */
+  box-shadow: inset 0 0 0 2px var(--open-line);
+}
+/* Both rings at once: the cursor's ring stays outside, the open edge stays
+   inside, so a keyboard-selected open card shows both without either being
+   silently dropped by the cascade. */
+.card.is-cursor.is-open, .row.is-cursor.is-open, .review-item.is-cursor.is-open,
+.unit-card.is-cursor.is-open, .pill.is-cursor.is-open, .done-row.is-cursor.is-open {
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 16%, transparent),
+    inset 0 0 0 2px var(--open-line);
+}
+html.skin-chaos .card.is-cursor.is-open, html.skin-chaos .row.is-cursor.is-open,
+html.skin-chaos .review-item.is-cursor.is-open, html.skin-chaos .unit-card.is-cursor.is-open,
+html.skin-chaos .pill.is-cursor.is-open, html.skin-chaos .done-row.is-cursor.is-open {
+  box-shadow: 0 0 0 3px #0a0618, inset 0 0 0 2px var(--open-line);
+}
 
 /* ---- the numbered sprint switcher --------------------------------------- */
 .si-key {

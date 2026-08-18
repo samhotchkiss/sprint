@@ -575,6 +575,25 @@ export function cardState(card) {
   return p ? p.state : card.state;
 }
 
+/**
+ * Card #76: is THIS card the thing the rail is currently showing? A card open
+ * as its own thread (`store.detail`) or as the lead of a work unit's outline
+ * (`store.unit`) both count — either way, the rail is "about" this card right
+ * now. The session chat (`store.chatOpen` with neither of those set) is never
+ * a match: no board tile stands for it.
+ *
+ * One source of truth so the Board face, the List row, and the review tile
+ * (card #55's one-tile-per-unit) all light up and clear together, on the same
+ * frame the rail itself repaints — `openCard`/`closeCard`/`openUnit`/
+ * `closeUnit` all call the full `render()`, so this reads fresh every paint.
+ */
+export function isOpenInRail(card) {
+  if (!card) return false;
+  if (store.detail && store.detail.num === card.num) return true;
+  if (store.unit && store.unit.lead === card.num) return true;
+  return false;
+}
+
 export function isSilent(card, now = Date.now()) {
   const st = cardState(card);
   if (st !== 'in_progress' && st !== 'triaging') return false;

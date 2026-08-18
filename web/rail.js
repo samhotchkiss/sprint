@@ -360,12 +360,15 @@ function composer(card, app) {
     // wording is set on the LIVE node, never by rebuilding it — rebuilding is
     // what used to move your caret when the highlight changed under you.
     const convo = isConversation(c);
+    // Card #76: named the same way the sidebar names the session ("Ask the
+    // session anything…") — the card's own number, right in the placeholder,
+    // so which surface you are typing into is never a guess.
     setText(box, 'textarea', 'placeholder', convo
-      ? 'Say something in this thread…'
+      ? `Say something in #${c.num}'s thread…`
       : answering
-        ? 'Answer in your own words… (paste a screenshot too)'
-        : (state === 'ready' ? 'Reply, or bounce with notes…'
-          : 'Reply to this card — paste a screenshot if it is easier'));
+        ? `Answer #${c.num} in your own words… (paste a screenshot too)`
+        : (state === 'ready' ? `Reply to #${c.num}, or bounce with notes…`
+          : `Reply to card #${c.num} — paste a screenshot if it is easier`));
     setText(box, '.composer-hint', 'textContent', convo
       ? 'An ongoing thread — replying is what clears its highlight.'
       : isSilent(c)
