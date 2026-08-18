@@ -565,6 +565,24 @@ Anything that would be N card POSTs is one call:
   on the board, nothing is dispatched, and the user releases the ones
   they want. Only pass `"hold": false` for work the user has already
   said yes to (a split, a card you were told to file).
+- **A question for the user is not work — never bulk-import it as one.**
+  Bulk-hold is a brake on DISPATCH: it exists so a pile of work doesn't
+  start running before the user has looked at it. A "Q for Sam: …" item
+  has no dispatch step, so that brake buys nothing for it and only costs
+  visibility — a live incident bulk-imported 13 pure questions this way
+  and all 13 sat invisible in `held` for up to 16 hours; the user never
+  saw them. If an item in your batch is really a question, not
+  dispatchable work, give it `"kind": "conversation"` in that item —
+  bulk import carries the same conversation carve-out `POST /api/cards`
+  already has, so that item lands directly in `needs_you`/Needs You
+  regardless of `hold` or hold mode, while the rest of the batch holds
+  normally. If it's a single question rather than part of a batch, skip
+  bulk entirely and file it as its own card,
+  `POST /api/cards {"kind": "conversation", "text": "…", "actor": "session"}`,
+  so it reaches the human directly instead of sitting behind a release.
+  (A worker mid-card that hits the same situation — a question came up
+  that isn't work — uses its own `sprint-ask` instead, which lands the
+  same place, `needs_you`, without going through bulk import at all.)
 - All-or-nothing, and capped at 50 items per call (a bigger import is a
   `413` — split it). One bad item creates nothing.
 - The undo is one call too:
