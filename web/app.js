@@ -7,7 +7,7 @@ import { Live } from './live.js';
 import {
   store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
   sections, headline, countFor, loadView, setView, setChatOpen, bounceComposing,
-  activeLimits, limitLine, accountLimit, autohealNote,
+  activeLimits, limitLine, accountLimit, autohealNote, isConversation,
 } from './state.js';
 import { renderList } from './list.js';
 import { renderBoard, renderFold } from './board.js';
@@ -782,7 +782,12 @@ function clearVerdictError(num) {
 }
 
 async function cardAction(card, action, extra) {
-  const optimistic = { hold: 'held', release: 'queued', cancel: 'canceled', retry: 'queued', reopen: 'queued' }[action];
+  const optimistic = { hold: 'held', release: 'queued', cancel: 'canceled', retry: 'queued',
+    // A reopened THREAD goes back to being the thread it was, never into the
+    // queue — the server says so too, and guessing the other way flickers the
+    // card through Queued on its way home.
+    reopen: isConversation(card) ? 'conversation' : 'queued',
+    resolve: 'resolved' }[action];
   const before = card.state;
   const wasPinned = card.pinned;
   if (optimistic) patch(card.num, optimistic);

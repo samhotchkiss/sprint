@@ -8,12 +8,13 @@ import { h, timeEl, firstLine } from './util.js';
 import {
   sections, meterSegments, cardState, needsKind, needsYouCount, motionState,
   blockedReason, waitingMark, isStuck, BLOCKED_NOTE, blockedByMark,
-  conversations, conversationState, CONVERSATION_HINT, isOpenInRail,
+  conversations, conversationState, conversationAnswered, resolvedConversations,
+  CONVERSATION_HINT, isOpenInRail,
 } from './state.js';
 import { phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
 import { renderMeter } from './meter.js';
-import { renderDone } from './done.js';
+import { renderDone, completeList } from './done.js';
 import { reviewBlock } from './review.js';
 import { reviewUnits } from './units.js';
 
@@ -105,7 +106,8 @@ function needsSection(col, app) {
  */
 export function conversationBlock(app, { compact = false } = {}) {
   const cards = conversations();
-  if (!cards.length) return null;
+  const done = resolvedConversations();
+  if (!cards.length && !done.length) return null;
   const block = h('div', { class: compact ? 'convo-block is-compact' : 'convo-block' });
   block.appendChild(h('div.convo-head',
     h('span.convo-label', 'Conversations'),
@@ -114,21 +116,43 @@ export function conversationBlock(app, { compact = false } = {}) {
   const rows = h('div.rows');
   for (const card of cards) rows.appendChild(conversationRow(card, app));
   block.appendChild(rows);
+  // Card #80: the threads you already finished. Not gone, and not filed in with
+  // the merged branches — a compact list right here, one line each, click to
+  // reread. It is the exact list Complete uses (same file, same expander),
+  // capped shorter because it sits under live work rather than owning a column.
+  if (done.length) {
+    block.appendChild(h('div.convo-sub',
+      h('span.convo-sub-label', 'Resolved'),
+      h('span.grow'),
+      h('span.convo-sub-note', 'finished threads — open one to reread it')));
+    block.appendChild(completeList(done, app,
+      { moreKey: 'convoMore', visible: RESOLVED_VISIBLE }));
+  }
   return block;
 }
+
+/** How many resolved threads show before the rest fold behind the expander. */
+export const RESOLVED_VISIBLE = 5;
 
 const CONVO_MARK = { unseen: 'New message', seen: 'Your turn', clear: 'Up to date' };
 
 export function conversationRow(card, app) {
   const st = conversationState(card);
-  const row = openable(`row convo-row is-${st}`, card, app);
+  // "Answered — resolve?" is its own weight, and it is the whole point of card
+  // #80: a thread whose question you already answered used to read exactly like
+  // one nobody had touched. The row says so; the rail carries the button.
+  const answered = conversationAnswered(card);
+  const mark = answered ? 'is-answered' : `is-${st}`;
+  const row = openable(`row convo-row ${mark}`, card, app);
   row.appendChild(h('span.row-num', '#' + card.num));
   row.appendChild(h('span.row-main',
     h('span.row-title', card.title),
     h('span.row-sub', lastWord(card, app))));
   row.appendChild(h('span.row-right',
-    h('span.row-tag', { class: `row-tag convo-tag is-${st}`, title: CONVERSATION_HINT[st] },
-      CONVO_MARK[st]),
+    h('span.row-tag', {
+      class: `row-tag convo-tag ${mark}`,
+      title: answered ? CONVERSATION_HINT.answered : CONVERSATION_HINT[st],
+    }, answered ? 'Answered — resolve?' : CONVO_MARK[st]),
     h('span.row-meta', timeEl(card.last_activity_at, { suffix: false }))));
   return row;
 }

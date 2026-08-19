@@ -13,7 +13,12 @@
 import { h, timeEl } from './util.js';
 import { cardState, store, STATE_LABEL, isOpenInRail } from './state.js';
 
-const MARK = { completed: '✓', rejected: '✕', canceled: '✕', duplicate: '·' };
+const MARK = {
+  completed: '✓', rejected: '✕', canceled: '✕', duplicate: '·',
+  // A resolved thread ended by agreement, not by being thrown away — it gets
+  // the tick, never the cross.
+  resolved: '✓',
+};
 
 /** How many closed cards are on screen before the rest fold away. */
 export const DONE_VISIBLE = 20;
@@ -41,18 +46,24 @@ export function renderDone(col, app) {
 }
 
 /**
- * The list itself, shared by the List's Done section and the Board's Complete
- * section so the two can never drift on what a finished card looks like.
+ * The list itself, shared by the List's Done section, the Board's Complete
+ * section, and (card #80) the resolved conversations under the live threads, so
+ * none of them can drift on what a finished thing looks like.
  *
  * `cards` arrives newest-first (state.js sorts the done bucket that way), so
- * "the newest 20" is simply the head of it.
+ * "the newest N" is simply the head of it.
+ *
+ * `moreKey` is which store flag holds this list's expanded/collapsed state, and
+ * `visible` how many lines it shows before folding. Both have defaults, so the
+ * two Done surfaces call this exactly as they always did; a second list on the
+ * same screen passes its own key so expanding one never expands the other.
  */
-export function completeList(cards, app) {
+export function completeList(cards, app, { moreKey = 'doneMore', visible = DONE_VISIBLE } = {}) {
   const list = h('div.done-list');
   if (!cards.length) return list;
 
-  const showAll = !!store.doneMore;
-  const shown = showAll ? cards : cards.slice(0, DONE_VISIBLE);
+  const showAll = !!store[moreKey];
+  const shown = showAll ? cards : cards.slice(0, visible);
   const hidden = cards.length - shown.length;
 
   for (const card of shown) list.appendChild(doneRow(card, app));
@@ -60,12 +71,12 @@ export function completeList(cards, app) {
   // One expander, and it is the only thing here that says a number — because
   // the number IS the sentence ("show 31 older"), not a badge on the chrome.
   if (hidden > 0 || showAll) {
-    const older = cards.length - DONE_VISIBLE;
+    const older = cards.length - visible;
     if (older > 0) {
       list.appendChild(h('button.done-more', {
         type: 'button',
         'aria-expanded': showAll ? 'true' : 'false',
-        onclick: () => { store.doneMore = !showAll; app.render(); },
+        onclick: () => { store[moreKey] = !showAll; app.render(); },
       }, showAll ? `hide the ${older} older` : `show ${older} older`));
     }
   }

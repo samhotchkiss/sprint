@@ -61,7 +61,10 @@ export const COLUMNS = [
     key: 'done',
     title: 'Done',
     board: 'Done',
-    states: ['completed', 'rejected', 'duplicate', 'canceled'],
+    // `resolved` is a finished conversation. It is listed here so a resolved
+    // card is never homeless, but a resolved THREAD is drawn in its own compact
+    // list under the live threads instead — see `columns()`.
+    states: ['completed', 'rejected', 'duplicate', 'canceled', 'resolved'],
     collapsed: true,
   },
 ];
@@ -92,7 +95,7 @@ export const STATE_LABEL = {
   needs_you: 'Needs you', blocked: 'Blocked', ready: 'Ready', integrating: 'Merging',
   completed: 'Done',
   rejected: 'Rejected', failed: 'Failed', stale: 'Stale', duplicate: 'Duplicate',
-  canceled: 'Canceled',
+  canceled: 'Canceled', resolved: 'Resolved',
 };
 
 export const store = {
@@ -134,6 +137,10 @@ export const store = {
   // flag for both surfaces: the List's Done and the Board's Complete are never
   // on screen at the same time.
   doneMore: false,
+  // The same flag for the resolved-conversations list, which sits under the
+  // live threads and IS on screen at the same time as Done. Its own key, so
+  // expanding one list never expands the other.
+  convoMore: false,
   loaded: false,
   // How many report documents THIS sprint has. The header's Reports link exists
   // only when this is > 0 — user, verbatim: "link should only appear once
@@ -628,6 +635,16 @@ export function isConversation(card) {
 }
 
 /**
+ * The two states a thread is drawn as a thread in: open, and resolved. Both are
+ * kept out of the four work sections — one home for a conversation, at the
+ * bottom of Needs you, in both layouts. A canceled thread was discarded and is
+ * an ordinary closed card.
+ */
+export function isThreadState(state) {
+  return state === 'conversation' || state === 'resolved';
+}
+
+/**
  * unseen — they spoke after you last looked (strong highlight)
  * seen   — you have looked since, but you have not replied (dimmed)
  * clear  — your own message is the latest (nothing)
@@ -646,7 +663,22 @@ export const CONVERSATION_HINT = {
   unseen: 'a new message you have not opened yet',
   seen: 'you have read it — it is waiting on your reply',
   clear: 'you spoke last — nothing is waiting on you',
+  answered: 'somebody asked, you answered — this one can be resolved',
 };
+
+/**
+ * "Somebody asked, and you answered": the thread that has run its course.
+ *
+ * Card #80, the actual bug: an answered conversation looked exactly like an
+ * unanswered one, so it sat in Needs you forever. This is what the board keys
+ * the resolve offer on — and it is NOT `clear`, because a question you filed
+ * that nobody has replied to yet is also clear, and offering to close that one
+ * would be wrong. Derived server-side; a board that never heard of it says no.
+ */
+export function conversationAnswered(card) {
+  const c = card && card.conversation;
+  return !!(c && c.answered);
+}
 
 /** Every open conversation, loudest first, then by most recent word. */
 export function conversations() {
@@ -661,12 +693,33 @@ export function conversations() {
   return out;
 }
 
+/**
+ * Every thread the user has RESOLVED, newest first.
+ *
+ * Resolved is not canceled: canceled means "discard, this did not happen" and
+ * belongs with the closed pile, resolved means "we finished this and I am
+ * keeping it". So it is drawn as a compact list under the live threads —
+ * one line each, click to reread — rather than in with the merged branches.
+ */
+export function resolvedConversations() {
+  const out = [];
+  for (const card of store.cards.values()) {
+    if (isConversation(card) && cardState(card) === 'resolved') out.push(card);
+  }
+  out.sort((a, b) => ((ms(b.updated_at || b.last_activity_at) || 0)
+    - (ms(a.updated_at || a.last_activity_at) || 0))
+    || (b.num || 0) - (a.num || 0));
+  return out;
+}
+
 export function columns() {
   const buckets = new Map(COLUMNS.map((c) => [c.key, []]));
   for (const card of store.cards.values()) {
-    // A live conversation has its own section and is in none of these; a
-    // CLOSED one is an ordinary closed card and falls into Done like any other.
-    if (isConversation(card) && cardState(card) === 'conversation') continue;
+    // A live conversation has its own section and is in none of these, and so
+    // is a RESOLVED one — it is kept, in a compact list right under the threads
+    // it belongs with. A canceled one was discarded, so it falls into Done like
+    // any other closed card.
+    if (isConversation(card) && isThreadState(cardState(card))) continue;
     buckets.get(columnOf(cardState(card))).push(card);
   }
   // A card you just dropped is on the board before the server has confirmed it.
@@ -750,7 +803,7 @@ export const BOARD_COLUMNS = [
       {
         key: 'complete',
         label: 'Complete',
-        states: ['completed', 'rejected', 'duplicate', 'canceled'],
+        states: ['completed', 'rejected', 'duplicate', 'canceled', 'resolved'],
         quiet: true,
       },
     ],
@@ -771,9 +824,10 @@ export function boardColumns() {
     buckets.get(at[0] + '/' + at[1]).push(card);
   };
   for (const card of store.cards.values()) {
-    // Live conversations render in their own section under Needs you; a closed
-    // one is an ordinary closed card and goes to Complete like any other.
-    if (isConversation(card) && cardState(card) === 'conversation') continue;
+    // Live and resolved conversations render in their own section under Needs
+    // you; a canceled one was discarded and goes to Complete like any other
+    // closed card.
+    if (isConversation(card) && isThreadState(cardState(card))) continue;
     put(card, cardState(card));
   }
   // A card you just dropped is on the board before the server has confirmed it.

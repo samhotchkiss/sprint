@@ -11652,6 +11652,300 @@ class TestConversationDerivationIsFalsifiable(ConversationBase):
         self.assertEqual(c["latest_user_seq"], yours)
 
 
+class ResolveBase(ConversationBase):
+    """Resolving is the USER's verb, and the server only believes a browser.
+
+    A script holding the bearer token may SAY it is the user (`actor_or` is
+    deliberately that permissive), so every honest resolve in these tests
+    carries a browser marker -- exactly what the board's own fetch sends and
+    what page JavaScript is forbidden to remove.
+    """
+
+    BROWSER = {"Sec-Fetch-Site": "same-origin"}
+
+    def resolve(self, num, headers=None, body=None, expect=200):
+        status, out = self.post("/api/cards/%d/action" % num,
+                                dict(body or {}, action="resolve"),
+                                headers=self.BROWSER if headers is None else headers)
+        if expect is not None:
+            self.assertEqual(status, expect, out)
+        return status, out
+
+    def answered_conversation(self, text="should we split the ingestion card?"):
+        """The card at the heart of #80: they asked, you answered, and now it
+        has nowhere to go."""
+        num = self.new_conversation(text, actor="session")["num"]
+        self.say(num, "yes -- split it, and keep the receipts one separate", "user")
+        return num
+
+
+class TestResolvedIsTheKeptExit(ResolveBase):
+    """A conversation can END without being thrown away.
+
+    From the card, quoting the live incident: the session filed a question as a
+    conversation, the user answered it, and the card had nowhere to go --
+    cancelling would have filed a real exchange under "discarded", and the
+    session may not close a card at all. So the thread sat in Needs You forever
+    looking exactly like an unanswered question.
+    """
+
+    def test_the_transition_table_offers_both_endings(self):
+        self.assertEqual(sprintd.TRANSITIONS["conversation"],
+                         {"canceled", "resolved"})
+
+    def test_the_user_can_resolve_an_answered_conversation(self):
+        num = self.answered_conversation()
+        self.resolve(num)
+        self.assertEqual(self.state_of(num), "resolved")
+
+    def test_a_resolved_thread_is_done_not_needs_you(self):
+        """The compact list's half of the fix: it leaves the column that means
+        "this is on you", because it is not on anybody any more."""
+        num = self.answered_conversation()
+        self.resolve(num)
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["column"], "done")
+        self.assertEqual(detail["column_of"]["resolved"], "done")
+        _, board = self.get("/api/board")
+        card = [c for c in board["cards"] if c["num"] == num][0]
+        self.assertEqual(card["column"], "done")
+        self.assertNotEqual(card["column"], "needs_you")
+
+    def test_it_is_still_a_conversation_and_still_readable(self):
+        """"Kept" is the whole difference from cancel: the thread, its kind and
+        its highlight block all survive, so the compact list can open it."""
+        num = self.answered_conversation()
+        self.resolve(num)
+        _, detail = self.get("/api/cards/%d" % num)
+        self.assertEqual(detail["card"]["kind"], "conversation")
+        self.assertIsNotNone(detail["card"]["conversation"])
+        kinds = [e["kind"] for e in detail["timeline"]]
+        self.assertIn("chat", kinds, "the thread it had is untouched")
+
+    def test_the_state_event_says_it_in_english(self):
+        num = self.answered_conversation()
+        self.resolve(num)
+        _, detail = self.get("/api/cards/%d" % num)
+        ev = [e for e in detail["timeline"] if e["kind"] == "state"][-1]
+        self.assertEqual(ev["payload"]["to"], "resolved")
+        self.assertEqual(ev["actor"], "user")
+        self.assertIn("resolved", ev["payload"]["text"])
+
+    def test_cancel_still_exists_and_still_means_discarded(self):
+        """Two endings, and they are not the same word: canceled is Done in the
+        ordinary closed pile, resolved is the kept thread."""
+        num = self.answered_conversation()
+        status, _ = self.post("/api/cards/%d/action" % num, {"action": "cancel"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "canceled")
+
+
+class TestOnlyTheUserCanResolve(ResolveBase):
+    """The safety property, and the reason this card exists.
+
+    User, verbatim: "you should never move a card to closed. I lost it. you can
+    move it to 'ready' but then I have to be the one to close it." A session
+    that is CERTAIN the question got answered is exactly the confident wrong
+    this refuses -- on any board, with any token, however it asks.
+    """
+
+    def test_a_session_is_refused_by_name(self):
+        num = self.answered_conversation()
+        status, body = self.post("/api/cards/%d/action" % num,
+                                 {"action": "resolve", "actor": "session"})
+        self.assertEqual(status, 403, body)
+        self.assertEqual(body["error"], "only_user_can_resolve")
+        self.assertEqual(self.state_of(num), "conversation")
+
+    def test_a_worker_is_refused_by_name(self):
+        num = self.answered_conversation()
+        status, body = self.post("/api/cards/%d/action" % num,
+                                 {"action": "resolve", "actor": "worker"})
+        self.assertEqual(status, 403, body)
+        self.assertEqual(body["error"], "only_user_can_resolve")
+        self.assertEqual(self.state_of(num), "conversation")
+
+    def test_a_script_claiming_to_be_the_user_is_refused_too(self):
+        """THE hole this would otherwise have. `actor_or` lets a bearer-holding
+        script say `actor: "user"` -- that is deliberate everywhere else -- so an
+        actor check on its own would be one JSON field away from bypass by
+        exactly the caller it is defending against. A browser cannot forge the
+        headers; a session cannot forge a browser."""
+        num = self.answered_conversation()
+        status, body = self.post("/api/cards/%d/action" % num,
+                                 {"action": "resolve", "actor": "user"})
+        self.assertEqual(status, 403, body)
+        self.assertEqual(body["error"], "only_user_can_resolve")
+        self.assertTrue(body.get("needs_browser"))
+        self.assertEqual(self.state_of(num), "conversation")
+
+    def test_every_browser_marker_lets_the_real_user_through(self):
+        """The other half of the same seam: the board's own fetch carries these
+        and page JS cannot remove them, so each one on its own is enough."""
+        for headers in ({"Origin": "http://127.0.0.1:8377"},
+                        {"Sec-Fetch-Site": "same-origin"},
+                        {"Sec-Fetch-Mode": "cors"},
+                        {"Cookie": "sprint_token_8377=test-token"}):
+            with self.subTest(headers=headers):
+                num = self.answered_conversation()
+                self.resolve(num, headers=headers)
+                self.assertEqual(self.state_of(num), "resolved")
+
+    def test_the_state_machine_refuses_it_even_in_process(self):
+        """The gate is on `transition`, not only on the route, so a caller that
+        never touches HTTP -- a sweep, a bulk verb, code nobody has written yet
+        -- is refused by the same rule."""
+        num = self.new_conversation()["num"]
+        for actor in ("session", "worker", "server"):
+            with self.subTest(actor=actor):
+                with self.assertRaises(sprintd.ApiError) as ctx:
+                    self.app.transition(num, "resolved", actor)
+                self.assertEqual(ctx.exception.status, 403)
+                self.assertEqual(ctx.exception.code, "only_user_can_resolve")
+        self.assertEqual(self.state_of(num), "conversation")
+
+    def test_a_refused_resolve_writes_nothing_at_all(self):
+        num = self.answered_conversation()
+        _, before = self.get("/api/cards/%d" % num)
+        self.post("/api/cards/%d/action" % num,
+                  {"action": "resolve", "actor": "session"})
+        _, after = self.get("/api/cards/%d" % num)
+        self.assertEqual(len(after["timeline"]), len(before["timeline"]),
+                         "a refusal is not an event")
+        self.assertEqual(after["card"]["state"], "conversation")
+
+    def test_the_state_route_cannot_write_it_either(self):
+        """Workers and the session drive cards through /state. `resolved` is not
+        in any of its allowed lists, for either of them."""
+        num = self.new_conversation()["num"]
+        for actor in (None, "session", "worker", "user"):
+            with self.subTest(actor=actor):
+                body = {"state": "resolved"}
+                if actor:
+                    body["actor"] = actor
+                status, out = self.post("/api/cards/%d/state" % num, body)
+                self.assertEqual(status, 400, out)
+        self.assertEqual(self.state_of(num), "conversation")
+
+    def test_there_is_no_bulk_resolve(self):
+        """Bulk is the flood-control verbs only. A loop over card numbers is
+        exactly how an over-confident session would close ten threads at once."""
+        self.assertNotIn("resolve", self.app.BULK_ACTIONS)
+        num = self.answered_conversation()
+        status, body = self.post("/api/cards/bulk-action",
+                                 {"card_nums": [num], "action": "resolve"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(self.state_of(num), "conversation")
+
+
+class TestResolvedIsTerminal(ResolveBase):
+    """Nothing moves a resolved thread on. The only door is the user's own undo,
+    exactly the way `completed` works."""
+
+    def test_it_is_a_terminal_state(self):
+        self.assertIn("resolved", sprintd.TERMINAL_STATES)
+
+    def test_nothing_leads_out_of_it_but_the_thread_it_was(self):
+        self.assertEqual(sprintd.TRANSITIONS["resolved"], {"conversation"})
+
+    def test_every_work_state_is_refused_from_resolved(self):
+        num = self.answered_conversation()
+        self.resolve(num)
+        for state in sprintd.STATES:
+            if state in ("resolved", "conversation"):
+                continue
+            with self.subTest(state=state):
+                with self.assertRaises(sprintd.ApiError) as ctx:
+                    self.app.transition(num, state, "user")
+                self.assertIn(ctx.exception.status, (403, 409))
+                self.assertEqual(self.state_of(num), "resolved")
+
+    def test_a_resolved_thread_takes_no_packet_and_no_verdict(self):
+        num = self.answered_conversation()
+        self.resolve(num)
+        status, body = self.post("/api/cards/%d/ready" % num,
+                                 {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 409, body)
+        status, body = self.post("/api/cards/%d/verdict" % num, {"verdict": "approve"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(self.state_of(num), "resolved")
+
+    def test_reopening_puts_the_thread_back_where_it_lived(self):
+        """Closed is not a grave, here either -- and a reopened thread is the
+        thread it was, never a work item in the queue."""
+        num = self.answered_conversation()
+        self.resolve(num)
+        status, _ = self.post("/api/cards/%d/action" % num, {"action": "reopen"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.state_of(num), "conversation")
+
+    def test_it_drops_out_of_what_the_session_re_reads(self):
+        """A finished thread is history. The re-ground brief lists open work,
+        and a resolved conversation is not open."""
+        num = self.answered_conversation()
+        self.assertIn(num, self.app.open_cards_by_state().get("conversation", []))
+        self.resolve(num)
+        self.assertNotIn(num, self.app.open_cards_by_state().get("conversation", []))
+        self.assertNotIn("resolved", self.app.open_cards_by_state())
+
+
+class TestOnlyAThreadCanBeResolved(ResolveBase):
+    """`resolved` belongs to conversations. Work ends with a merged branch."""
+
+    def test_a_work_card_cannot_be_resolved_by_action(self):
+        num = self.new_card("ordinary work")["num"]
+        status, body = self.post("/api/cards/%d/action" % num,
+                                 {"action": "resolve"}, headers=self.BROWSER)
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"], "not_a_conversation")
+        self.assertEqual(self.state_of(num), "queued")
+
+    def test_a_work_card_cannot_be_resolved_in_process_either(self):
+        num = self.new_card("ordinary work")["num"]
+        with self.assertRaises(sprintd.ApiError) as ctx:
+            self.app.transition(num, "resolved", "user")
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(ctx.exception.code, "not_a_conversation")
+
+
+class TestAnsweredIsWhatTheBoardOffers(ResolveBase):
+    """"Answered" is the fourth weight on a thread, and it is NOT `clear`.
+
+    The card, verbatim: "A conversation card whose question was answered should
+    read as 'answered -- tap to resolve' rather than sitting in Needs You
+    looking exactly like an unanswered one." A question YOU filed that nobody
+    has replied to yet is also `clear`, and offering to close that one would be
+    wrong -- so the offer is derived from an exchange, not from silence.
+    """
+
+    def test_a_thread_you_started_alone_is_not_answered(self):
+        num = self.new_conversation("a question for the session")["num"]
+        self.assertEqual(self.conv_state(num), "clear")
+        self.assertFalse(self.convo(num)["answered"],
+                         "nobody has replied -- there is nothing to resolve yet")
+
+    def test_a_thread_waiting_on_you_is_not_answered(self):
+        num = self.new_conversation("they asked", actor="session")["num"]
+        self.assertFalse(self.convo(num)["answered"])
+
+    def test_answering_it_is_what_makes_it_answered(self):
+        num = self.new_conversation("they asked", actor="session")["num"]
+        self.say(num, "here is my answer", "user")
+        c = self.convo(num)
+        self.assertTrue(c["answered"])
+        self.assertEqual(c["state"], "clear")
+
+    def test_them_speaking_again_takes_the_offer_away(self):
+        """It is derived, so it self-heals: a follow-up question re-opens the
+        thread without anybody clearing a flag."""
+        num = self.answered_conversation()
+        self.assertTrue(self.convo(num)["answered"])
+        self.say(num, "one more thing though", "session")
+        self.assertFalse(self.convo(num)["answered"])
+        self.say(num, "fine -- do it that way", "user")
+        self.assertTrue(self.convo(num)["answered"])
+
+
 class TestConversationMigration(unittest.TestCase):
     """An old database gets the column, and every row in it stays work.
 

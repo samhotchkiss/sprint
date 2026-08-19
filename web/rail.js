@@ -17,7 +17,7 @@
 import { h, clear, reconcile, autolink } from './util.js';
 import {
   store, cardState, isSilent, draft, attachedImages, cardComposerKey,
-  isConversation, sessionLabel,
+  isConversation, conversationAnswered, sessionLabel,
 } from './state.js';
 import { phaseOf, phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
@@ -85,12 +85,26 @@ export function renderRail(root, app) {
     // whichever the rail is showing, the decision is in the same place.
     syncOptional(root, 'verdict-bar', card ? verdictBarSig(card) : null,
       () => packetVerdictBar(card, app));
+    // A thread's decision, in the same pinned spot a work card's verdict uses:
+    // whichever the rail is showing, the thing you do about it is in one place.
+    syncOptional(root, 'convo-bar', card ? convoBarSig(card) : null,
+      () => convoBar(card, app));
     // The composer is the ONE thing on this page you may be mid-sentence in, so
     // it is keyed on the card alone and never rebuilt for anything else: a state
     // flip, a silence, a question arriving all *tune* it in place. Rebuilding it
     // is what took the caret away mid-word (card #46).
-    const box = syncPart(root, 'composer', composerKey(card), () => composer(card, app));
-    if (box && box._tune) box._tune(card);
+    //
+    // A RESOLVED thread is the one card with no box at all (card #80): it is
+    // finished and lives in Done, so a message typed into it would land where
+    // nobody is looking. The bar above says to reopen it, which is the honest
+    // way back to a thread you want to keep talking in.
+    if (card && isConversation(card) && cardState(card) === 'resolved') {
+      const old = root.querySelector('.composer');
+      if (old) root.removeChild(old);
+    } else {
+      const box = syncPart(root, 'composer', composerKey(card), () => composer(card, app));
+      if (box && box._tune) box._tune(card);
+    }
   } else {
     // The name is part of the key: an introduction has to repaint the head,
     // and nothing else about the head changes often enough to care.
@@ -280,21 +294,85 @@ function cardHead(detail, card, app) {
   return head;
 }
 
+// ---- the conversation bar (card #80) --------------------------------------
+//
+// The bug this fixes, in one sentence: a thread whose question you had already
+// ANSWERED sat in Needs you looking exactly like one nobody had touched,
+// because the only exit a conversation had was `cancel` — and cancel means
+// "discard, this did not happen", which no session may write on a card anyway.
+//
+// So the rail says which of the three a thread is, out loud:
+//
+//   answered  you replied and it is finished → the Resolve button, right here
+//   waiting   somebody is still owed an answer → says so, and offers nothing
+//   resolved  you ended it → says so, and offers the undo
+//
+// Resolve is a BUTTON and not a menu item on purpose: the user has to be able
+// to notice that a thread has become resolvable without going looking for it.
+
+function convoBarSig(card) {
+  if (!card || !isConversation(card)) return null;
+  const state = cardState(card);
+  if (state !== 'conversation' && state !== 'resolved') return null;
+  return [card.num, state, conversationAnswered(card) ? 'answered' : 'open'].join('|');
+}
+
+function convoBar(card, app) {
+  const state = cardState(card);
+  const bar = h('div.review-bar.is-convo');
+
+  if (state === 'resolved') {
+    bar.appendChild(h('p.convo-bar-line',
+      'Resolved — you ended this thread. It is kept, and you can read it any time.'));
+    bar.appendChild(h('div.convo-bar-acts',
+      h('button.btn', {
+        type: 'button', onclick: () => app.cardAction(card, 'reopen'),
+      }, 'Reopen this conversation')));
+    return bar;
+  }
+
+  if (!conversationAnswered(card)) {
+    // Deliberately no button: nothing is finished, so there is nothing to
+    // agree is finished. This line exists so the answered one reads as
+    // different at a glance rather than as the same card in a different mood.
+    bar.classList.add('is-waiting');
+    bar.appendChild(h('p.convo-bar-line',
+      'Still needs your answer — reply below and this thread is done.'));
+    return bar;
+  }
+
+  bar.classList.add('is-answered');
+  bar.appendChild(h('p.convo-bar-line',
+    'Answered — you had the last word here. Resolve it to close it out and keep it.'));
+  bar.appendChild(h('div.convo-bar-acts',
+    h('button.btn.resolve', {
+      type: 'button', onclick: () => app.cardAction(card, 'resolve'),
+    }, 'Resolve — keep this thread'),
+    h('span.convo-bar-note', 'Only you can do this. Nothing on the board resolves a thread for you.')));
+  return bar;
+}
+
 function cardMenu(card, state, app) {
   const menu = h('div.menu', { hidden: true });
   // A closed card is closed, not buried: the only thing on offer is getting it
   // back. Closing is the user's verb, and so is undoing it.
-  const closed = ['completed', 'rejected', 'duplicate', 'canceled'].includes(state);
+  const closed = ['completed', 'rejected', 'duplicate', 'canceled', 'resolved'].includes(state);
   // A conversation has no queue, no agent and no branch, so none of the verbs
   // that push work around mean anything on one. What is left is keeping it at
   // the top and ending it — and ending it is the user's word for "this
   // discussion is done", never a work state.
   const actions = isConversation(card) ? [
     { label: card.pinned ? 'Unpin' : 'Pin to the top', run: () => app.cardAction(card, card.pinned ? 'unpin' : 'pin') },
+    // Two endings, and the words say which is which: resolving KEEPS the
+    // thread, discarding says it never happened. Resolve is in the bar as a
+    // button too — this is the copy of it for a thread you want to end early.
     closed
       ? { label: 'Reopen this conversation', run: () => app.cardAction(card, 'reopen') }
-      : { label: 'Close this conversation', run: () => app.cardAction(card, 'cancel'), danger: true },
-  ] : closed ? [
+      : { label: 'Resolve — the discussion is done', run: () => app.cardAction(card, 'resolve') },
+    closed
+      ? null
+      : { label: 'Discard this conversation', run: () => app.cardAction(card, 'cancel'), danger: true },
+  ].filter(Boolean) : closed ? [
     { label: 'Reopen — back to the queue', run: () => app.cardAction(card, 'reopen') },
     { label: card.pinned ? 'Unpin' : 'Pin to the top', run: () => app.cardAction(card, card.pinned ? 'unpin' : 'pin') },
   ] : [

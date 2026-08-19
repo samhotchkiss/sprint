@@ -198,6 +198,21 @@ WORK_KINDS = ("code", "ops")
 # to remember to update.
 CARD_KINDS = ("work", "conversation")
 CONVERSATION_STATE = "conversation"
+# The OTHER way a conversation ends, and the reason this state exists at all.
+#
+# A conversation used to have exactly one exit -- `canceled` -- and cancel means
+# "discard, this did not happen". So a thread whose question was actually
+# ANSWERED had nowhere to go: the session cannot close a card (user, verbatim:
+# "you should never move a card to closed. I lost it. you can move it to 'ready'
+# but then I have to be the one to close it"), and cancelling an answered
+# question would file a real exchange under "discarded". The card sat in Needs
+# You forever, looking exactly like a question nobody had answered yet.
+#
+# `resolved` is the kept exit: the discussion concluded and the thread stays
+# readable, the same way `completed` is to work what `rejected` is not. It is
+# the USER's verb and only the user's -- see `transition` and the `resolve`
+# action, which refuse it to every other actor by name.
+RESOLVED_STATE = "resolved"
 
 # Which events are a MESSAGE in a conversation, as opposed to telemetry. A
 # progress line is an agent narrating itself; a chat/question/note/error is
@@ -643,8 +658,12 @@ STATES = (
     "duplicate", "canceled",
     # A conversation card, for as long as the conversation is open. It is not a
     # step in the work lifecycle and nothing moves it along -- only the user
-    # ends it, with `cancel`, meaning "this discussion is done".
+    # ends it, one of two ways: `cancel` (discard it) or `resolve` (keep it).
     "conversation",
+    # A conversation the user ended by agreeing it was done. Terminal, kept, and
+    # readable: it shows in a compact list under the live threads, never in
+    # Needs you. Only the user can write it.
+    "resolved",
 )
 
 # Legal transitions. `ready` is never reachable here from a plain state POST --
@@ -679,12 +698,18 @@ TRANSITIONS = {
     # refuses the wrong one of these per card kind, so the pair here is not a
     # hole: it is both halves of one door.
     "canceled": {"queued", "conversation"},
-    # A conversation never becomes work and never merges. The ONLY way out is
-    # the user closing it.
-    "conversation": {"canceled"},
+    # A conversation never becomes work and never merges. The only ways out are
+    # the user ending it: `canceled` (discard it) or `resolved` (keep it). Both
+    # are the user's own verb -- nothing else on this board can write either one
+    # on a thread, and `resolved` says so with its own 403.
+    "conversation": {"canceled", "resolved"},
+    # Terminal, exactly the way `completed` is: the one door out is the user's
+    # own undo (the `reopen` action), and it leads back to the conversation it
+    # always was, never into the work queue.
+    "resolved": {"conversation"},
 }
 
-TERMINAL_STATES = {"completed", "rejected", "duplicate", "canceled"}
+TERMINAL_STATES = {"completed", "rejected", "duplicate", "canceled", "resolved"}
 
 # Card faces show the transition reason verbatim, so these are English.
 VERDICT_REASON = {"approve": "approved -- merging", "bounce": "bounced back with your notes",
@@ -701,6 +726,10 @@ COLUMN_OF = {
     # Conversations live at the bottom of Needs you, in their own section --
     # they are the other shape of "this one is on me".
     "conversation": "needs_you",
+    # A resolved thread is finished, so it is Done as far as the state machine
+    # is concerned. The board draws it as a compact list under the live threads
+    # rather than in with the merged branches -- kept, not filed away.
+    "resolved": "done",
 }
 
 SCHEMA = """
@@ -3405,6 +3434,13 @@ class App:
             # One word for "does this want your eyes", so a face never has to
             # re-derive the rule from three numbers.
             "unread": state != "clear",
+            # "Somebody asked, and you answered" -- the thread that has run its
+            # course and is sitting there with nothing left to do. This is the
+            # card the board now offers to resolve, and it is NOT the same as
+            # `clear`: a question you filed that nobody has replied to yet is
+            # also clear, and offering to close that one would be wrong.
+            # Derived, like everything else here, so it self-heals.
+            "answered": bool(theirs and yours > theirs),
         }
 
     @staticmethod
@@ -4036,6 +4072,18 @@ class App:
                    extra: dict = None, _conn_open: bool = False) -> dict:
         if to_state not in STATES:
             raise ApiError(400, "bad_state", "unknown state %r" % to_state)
+        # THE actor gate, and it is here rather than in the action handler
+        # because this is the one place every path to a state runs through:
+        # the `resolve` verb, a bulk action, a future caller nobody has written
+        # yet. Ending a discussion is the user's word, the same way closing a
+        # card is -- a session that is certain the question got answered is
+        # exactly the confident wrong that this refusal exists to stop.
+        if to_state == RESOLVED_STATE and actor != "user":
+            raise ApiError(
+                403, "only_user_can_resolve",
+                "only the user can resolve a conversation -- #%s stays open "
+                "until they say the discussion is done" % num,
+                card_num=num, to_state=RESOLVED_STATE, actor=actor)
         with self.lock:
             row = self.conn.execute("SELECT * FROM cards WHERE num=?", (num,)).fetchone()
             if row is None:
@@ -4051,20 +4099,25 @@ class App:
             # place that says which of the two doors out of `canceled` is
             # yours.
             kind = self.card_kind(row)
-            if kind == "conversation" and to_state not in (CONVERSATION_STATE, "canceled"):
+            conversation_states = (CONVERSATION_STATE, "canceled", RESOLVED_STATE)
+            if kind == "conversation" and to_state not in conversation_states:
                 raise ApiError(
                     409, "not_a_work_card",
                     "#%s is a conversation, not a work card -- it has no "
-                    "%s step. Cancel it when the discussion is done."
-                    % (num, to_state),
+                    "%s step. Resolve it when the discussion is done, or "
+                    "cancel it to discard it." % (num, to_state),
                     from_state=frm, to_state=to_state, card_kind=kind,
-                    allowed=[CONVERSATION_STATE, "canceled"])
-            if kind != "conversation" and to_state == CONVERSATION_STATE:
-                raise ApiError(
-                    409, "not_a_conversation",
+                    allowed=list(conversation_states))
+            if kind != "conversation" and to_state in (CONVERSATION_STATE, RESOLVED_STATE):
+                # `resolved` is a thread's ending, not a work card's: work ends
+                # with a merged branch (completed) or a verdict, and letting a
+                # work card wear "resolved" would put an unmerged card in Done.
+                msg = ("#%s is a work card; only a conversation can be resolved"
+                       % num) if to_state == RESOLVED_STATE else (
                     "#%s is a work card; use the make_conversation action to "
-                    "turn it into one" % num,
-                    from_state=frm, to_state=to_state, card_kind=kind)
+                    "turn it into one" % num)
+                raise ApiError(409, "not_a_conversation", msg,
+                               from_state=frm, to_state=to_state, card_kind=kind)
             if to_state not in TRANSITIONS.get(frm, set()):
                 raise ApiError(
                     409, "illegal_transition",
@@ -6706,9 +6759,10 @@ class App:
         return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
 
     # A conversation has no queue and no agent, so the verbs that push work
-    # around are meaningless on one. What is left is the two things you can
-    # honestly do to a thread: keep it at the top, and end it.
-    CONVERSATION_ACTIONS = ("pin", "unpin", "cancel", "reopen")
+    # around are meaningless on one. What is left is the things you can honestly
+    # do to a thread: keep it at the top, end it (two ways -- `resolve` keeps
+    # it, `cancel` discards it), and undo that.
+    CONVERSATION_ACTIONS = ("pin", "unpin", "cancel", "resolve", "reopen")
     # -- blocked by -------------------------------------------------------
     #
     # User, verbatim: "when one card is blocked by another, show that in the
@@ -6958,6 +7012,30 @@ class App:
             self.notify()
         elif action == "cancel":
             self.transition(num, "canceled", actor, reason=body.get("reason"))
+        elif action == "resolve":
+            # "This discussion is done, and I am keeping it." The second half of
+            # the gate the state machine already carries, and it is the half a
+            # token can't talk its way past: `actor_or` lets a script SAY it is
+            # the user, so an actor check alone would be one JSON field from
+            # bypass by exactly the caller it is defending against. A browser
+            # cannot forge Cookie/Origin/Sec-Fetch-*, so requiring one is the
+            # same enforcement seam `session_only` uses, pointed the other way.
+            if not self.is_conversation(row):
+                raise ApiError(409, "not_a_conversation",
+                               "#%s is a work card -- resolving is how a "
+                               "conversation ends" % num,
+                               card_kind=self.card_kind(row),
+                               to_state=RESOLVED_STATE)
+            if not from_browser:
+                raise ApiError(
+                    403, "only_user_can_resolve",
+                    "only the user can resolve a conversation -- this has to "
+                    "come from the board, not from a script holding the token",
+                    card_num=num, to_state=RESOLVED_STATE,
+                    needs_browser=True)
+            self.transition(num, RESOLVED_STATE, actor,
+                            reason=body.get("reason")
+                            or "resolved — the discussion is done, and kept")
         elif action == "hold":
             self.transition(num, "held", actor, reason="hold")
         elif action == "release":
@@ -7036,8 +7114,8 @@ class App:
                                 extra={"reopened_from": row["state"]})
         else:
             raise ApiError(400, "bad_action",
-                           "action must be pin, unpin, cancel, hold, release, "
-                           "duplicate_of, blocked_by, retry, reopen, "
+                           "action must be pin, unpin, cancel, resolve, hold, "
+                           "release, duplicate_of, blocked_by, retry, reopen, "
                            "make_conversation, "
                            "long_running or external_agent")
         return {"ok": True, "card": self.card_json(self.card_row(num), brief=True)}
