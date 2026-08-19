@@ -125,6 +125,9 @@ recovery must be easy. The user always runs claude inside tmux.
 `held → queued → triaging → in_progress ⇄ needs_you | blocked → ready → integrating → completed`
 plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 
+Conversation cards (`kind: "conversation"`) are not work and have their own two states:
+`conversation → resolved | canceled`. See "Conversation cards" below.
+
 - **integrating**: user approved; the session is doing the real git work (rebase → gate → merge →
   prune). User verbatim: *"Why do these cards stay in 'needs you' once they're already
   approved?"* — so an approved card LEAVES Needs you / Awaiting review the moment the verdict
@@ -157,6 +160,53 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
 - State transitions are server-validated (illegal transition → 409). Every transition appends a
   `state` event; history is free.
 
+### Conversation cards — the other card kind (SHIPPED)
+
+`cards.kind ∈ {work, conversation}`. A conversation is a thread, not a job: no queue, no agent, no
+evidence packet, no verdict, no merge. It lives in its own state so every timer, sweep and gate in
+the server — all written against the work states — excludes it by construction. It renders at the
+bottom of Needs you in both layouts, with the three-weight highlight from #48 (`unseen` → `seen` →
+`clear`), all of it derived from the log plus one read receipt.
+
+**Two endings, and they are not the same word.**
+
+- **`canceled`** — discarded. This did not happen; it goes to Done with the other closed cards.
+- **`resolved`** — kept. The discussion concluded, and the thread stays readable in a compact list
+  under the live threads (the same list Complete uses: click a line to reread it, capped with one
+  expander). Terminal, exactly the way `completed` is: `TRANSITIONS["resolved"] == {"conversation"}`,
+  i.e. the only door out is the user's own `reopen`, and it leads back to the thread it always was.
+
+Why `resolved` exists at all, from the live incident on card #80: a session filed a question as a
+conversation, the user answered it, and the card had **nowhere to go**. Cancelling would have filed a
+real exchange under "discarded" — and no session may close a card anyway (user, verbatim: *"you
+should never move a card to closed. I lost it. you can move it to 'ready' but then I have to be the
+one to close it."*). So the thread sat in Needs You indefinitely, indistinguishable from a question
+nobody had answered.
+
+**The actor gate — `resolved` is the user's verb and nothing else can write it.** Two refusals, both
+named `only_user_can_resolve`, because one of them alone is not enough:
+
+1. **`App.transition` refuses any actor but `user`** (403). This is the choke point every path runs
+   through — the `resolve` verb, a future caller, anything in-process — so the rule cannot be
+   sidestepped by finding another door.
+2. **`POST /api/cards/:num/action {"action":"resolve"}` refuses a caller that is not a browser**
+   (403, `needs_browser: true`). `actor_or` deliberately lets a bearer-holding script *say* it is the
+   user, so an actor check on its own would be one JSON field away from bypass by exactly the caller
+   it defends against. Cookie/Origin/Sec-Fetch-* cannot be forged by page JS or set by a script that
+   is pretending to be one — the same enforcement seam `session_only` uses, pointed the other way.
+
+There is no other route in: `resolved` is not in any allowed list on `POST /api/cards/:num/state`
+(400), and `resolve` is not a bulk action. A work card cannot be resolved at all (409
+`not_a_conversation`) — work ends with a merged branch.
+
+**`conversation.answered`** rides along on every conversation card: true when somebody spoke to you
+AND your own message is newer — an exchange that has run its course. It is NOT the same as the
+`clear` highlight (a question you filed that nobody has answered yet is also clear), and it is what
+the board keys the offer on: an answered thread reads **"Answered — resolve?"** in the list and gets
+a **Resolve button in the rail**, distinct from a thread that still needs your answer, which says so
+and offers nothing. Derived at read time like the rest of the highlight, so it self-heals — a
+follow-up question takes the offer away again.
+
 ## HTTP API (JSON; all POSTs idempotent via optional `Idempotency-Key` header)
 
 - `GET /` + static `web/` assets. `GET /healthz` (no auth) — carries `generation`, one id per server
@@ -187,9 +237,13 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
   screenshots exactly like a chat line does, and they ride the answer event's own
   `payload.attachments`; an answer that is ONLY a picture is a complete answer.
 - `POST /api/cards/:num/action`
-  `{action: pin|unpin|cancel|hold|release|duplicate_of|retry|reopen|long_running|external_agent}`.
-  The last two are **session-only** (`403 session_only` from a browser — both turn the silence timer
-  off, and the user has no way to know whether an agent is legitimately quiet); each takes
+  `{action: pin|unpin|cancel|resolve|hold|release|duplicate_of|retry|reopen|make_conversation|
+  long_running|external_agent}`.
+  `resolve` is **user-only and browser-only** (`403 only_user_can_resolve` otherwise) and applies to
+  a conversation card alone — see "Conversation cards" above.
+  `long_running`/`external_agent` are **session-only** (`403 session_only` from a browser — both turn
+  the silence timer off, and the user has no way to know whether an agent is legitimately quiet);
+  each takes
   `{value?: bool (default true), note?: str}`. `long_running` is a stretch; `external_agent` marks an
   assignee that emits no worker telemetry at all, so `agent_silent` never runs on that card and the
   session owns checking it.

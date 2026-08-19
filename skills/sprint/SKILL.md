@@ -682,6 +682,15 @@ Anything that would be N card POSTs is one call:
   (A worker mid-card that hits the same situation — a question came up
   that isn't work — uses its own `sprint-ask` instead, which lands the
   same place, `needs_you`, without going through bulk import at all.)
+- **When the user answers a conversation, do nothing to the card.** A
+  thread ends two ways and both of them are the user's: `resolve` keeps
+  it, `cancel` discards it. The server refuses `resolve` to you by name
+  (`403 only_user_can_resolve`) no matter how certain you are that the
+  question is settled, and it refuses it to a script claiming to be the
+  user too — only the board itself can write it. You don't need to do
+  anything: an answered thread now reads "Answered — resolve?" on the
+  board and carries its own Resolve button, so the user sees it. Answer,
+  act on whatever was agreed, and leave the card where it is.
 - All-or-nothing, and capped at 50 items per call (a bigger import is a
   `413` — split it). One bad item creates nothing.
 - The undo is one call too:
