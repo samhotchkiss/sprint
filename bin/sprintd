@@ -586,6 +586,57 @@ TMUX_WINDOW_MAX = 80
 # the door rather than quoted at the call site.
 TMUX_WINDOW_RE = re.compile(r"^[A-Za-z0-9%][A-Za-z0-9._:@/-]{0,79}$")
 
+# --------------------------------------------------------------------------
+# Re-grounding (card #79)
+#
+# The incident: a session tending dozens of cards degraded until the user
+# called it "fully retarded" and cleared its context by hand. Nothing here can
+# tune Claude Code's own compaction -- a summary of a long conversation is
+# lossy and that is the whole of it. What CAN be fixed is the other side: if
+# the board is complete enough, a session that remembers nothing is as good as
+# one that remembers everything, and a context wipe stops being a leap of
+# faith.
+#
+# #68 already built that read for a DEAD session -- the wake-up brief is
+# composed entirely out of board state, with zero reliance on memory. The only
+# thing wrong with it was its framing: it said "you died", so nothing else
+# could use it. So the brief builder is now ONE procedure with a `reason`, and
+# the reason changes the words around the facts, never which facts are
+# gathered:
+#
+#   revival      -- #68's wake-up, typed into a tmux window by the hub.
+#   boot         -- a cold start, or a resume, reading itself into the work.
+#   manual_reset -- the user cleared the context on purpose.
+#   periodic     -- the cadence rule: re-ground on a clock, not on a feeling.
+#
+# Every reason gathers the same thing: who you are, what the board is called,
+# where the cursor is, every card that is not finished, and the last few lines
+# of the sidebar. A session that reads it holds the whole working state again.
+REGROUND_REASONS = ("revival", "boot", "manual_reset", "periodic")
+# The tail of the manager channel the brief carries. Ten lines is about one
+# screen of conversation -- enough to know what was last agreed, short enough
+# that a wake-up stays a message and not a transcript.
+REGROUND_SIDEBAR_LINES = 10
+# Each of those lines, flattened and capped. The revival brief is TYPED into a
+# tmux window, so an un-capped paste of a long sidebar line is a real hazard.
+REGROUND_SIDEBAR_LINE_CHARS = 160
+# The cadence rule, in one place so the docs and the server cannot drift.
+# 50 tool calls is roughly one full drain cycle plus a couple of dispatches --
+# often enough that a whole batch of verdicts cannot pass through a degrading
+# session unchecked, rare enough that the board is re-read less often than it
+# changes. 30 minutes is the board's OWN "somebody has ignored this too long"
+# clock (the stuck sweep's threshold), so the session re-checks itself on the
+# same beat the board uses to notice neglect.
+REGROUND_EVERY_TOOL_CALLS = 50
+REGROUND_EVERY_MINUTES = 30
+# Every state that is not finished, in the order a re-grounding session should
+# read them: what it owes first, what the user owes last. The first three are
+# #68's original stranded list, in #68's original order, because the wake-up
+# brief still renders exactly those three lines first.
+REGROUND_CARD_ORDER = ("integrating", "in_progress", "queued", "triaging",
+                       "failed", "stale", "held", "needs_you", "conversation",
+                       "blocked", "ready")
+
 STATES = (
     "held", "queued", "triaging", "in_progress", "needs_you", "blocked",
     "ready", "integrating", "completed", "rejected", "failed", "stale",
@@ -5234,7 +5285,7 @@ class App:
         return board_url(host, port, self.token) if port else ""
 
     def revive_brief(self, at: float = None, dead=None, attempt: int = 1) -> str:
-        """The wake-up, built from this board's own state.
+        """#68's wake-up: the re-ground procedure, run for reason `revival`.
 
         Same shape as the one a human typed into the russ session by hand, for
         the reason that one worked: it opens with the verdict, gives the
@@ -5246,47 +5297,213 @@ class App:
         did not own that board started posting to it before it was retracted.
         Registration mostly kills the guessing; naming the project root in the
         message kills the rest, cheaply.
+
+        Every word of that survives (#79 kept it line for line); what changed
+        is that it is no longer the only caller of the builder.
+        """
+        return self.reground_brief("revival", at=at, dead=dead, attempt=attempt)
+
+    # -- re-grounding, one procedure with four reasons (#79) ----------------
+
+    def open_cards_by_state(self) -> dict:
+        """Every card that is not finished, by state. The whole board, minus
+        history -- this is what "what was I doing" actually resolves to."""
+        marks = ",".join("?" for _ in TERMINAL_STATES)
+        rows = self.q("SELECT num, state FROM cards WHERE state NOT IN (%s) "
+                      "ORDER BY num" % marks, tuple(sorted(TERMINAL_STATES)))
+        out = {}
+        for r in rows:
+            out.setdefault(r["state"], []).append(r["num"])
+        return out
+
+    def reground_sidebar_lines(self, limit: int = REGROUND_SIDEBAR_LINES) -> list:
+        """The tail of the manager channel, flattened for a one-message brief.
+
+        Newlines are collapsed and every line is capped: this text can be TYPED
+        into a tmux window by the hub, so a pasted essay in the sidebar must
+        not become a wake-up nobody can read.
+        """
+        out = []
+        for ev in self.sidebar_thread(limit=limit):
+            text = ((ev.get("payload") or {}).get("text") or "").strip()
+            if not text:
+                continue
+            text = " ".join(text.split())
+            if len(text) > REGROUND_SIDEBAR_LINE_CHARS:
+                text = text[:REGROUND_SIDEBAR_LINE_CHARS - 1].rstrip() + "…"
+            out.append({"seq": ev.get("seq"), "actor": ev.get("actor"),
+                        "text": text})
+        return out
+
+    def reground_state(self, at: float = None, dead=None) -> dict:
+        """Everything a re-ground stands on. Gathered ONCE, for every reason.
+
+        The reason a session is re-grounding changes what it is told about
+        these facts; it never changes which facts it gets. That is the whole
+        point of #79 -- a session that was wiped on purpose is owed exactly as
+        complete a picture as one that died.
         """
         at = now() if at is None else at
         ds = dead if dead is not None else self.session_dead_state(at)
-        owed = ds["owed"]
+        st = self.settings()
+        cards = self.open_cards_by_state()
+        return {
+            "board": self.sprint_name() or "sprint",
+            "project_root": self.project_root,
+            "port": self.port or None,
+            "url": self.board_self_url(),
+            "agent_name": (st.get("agent_name") or "").strip(),
+            "standing_instructions": (st.get("special_instructions") or "").strip(),
+            "cursor": ds["cursor"],
+            "head": ds["head"],
+            "pending": ds["pending"],
+            "quiet_for_seconds": ds["quiet_for_seconds"],
+            "owed": ds["owed"],
+            "owed_count": ds["owed_count"],
+            "cards": cards,
+            "open_count": sum(len(v) for v in cards.values()),
+            "sidebar": self.reground_sidebar_lines(),
+            "cadence": {"tool_calls": REGROUND_EVERY_TOOL_CALLS,
+                        "minutes": REGROUND_EVERY_MINUTES},
+        }
+
+    # The framing, per reason. Words only -- every one of these renders over
+    # the same gathered state. `in_progress` gets its own line per reason
+    # because "your agent is probably dead" is true at a wake-up and false
+    # during a routine check, and a brief that says the wrong one gets cards
+    # re-dispatched on top of agents that are still working.
+    REGROUND_FRAMING = {
+        "revival": {
+            "cards_heading": "Stranded right now:",
+            "in_progress": "in motion, agent probably dead",
+            "steps_heading": "Then do these in order, and do NOT dispatch anything first:",
+        },
+        "boot": {
+            "cards_heading": "Where the board stands right now:",
+            "in_progress": "in motion, agent probably dead",
+            "steps_heading": "Then do these in order, and do NOT dispatch anything first:",
+        },
+        "manual_reset": {
+            "cards_heading": "Where the board stands right now:",
+            "in_progress": "in motion — your agents went with your context",
+            "steps_heading": "Then do these in order, and do NOT dispatch anything first:",
+        },
+        "periodic": {
+            "cards_heading": "Where the board stands right now:",
+            "in_progress": "in motion right now",
+            "steps_heading": "Then re-sync, and change nothing you do not have to:",
+        },
+    }
+
+    # The label each state carries in the card block. Shared across reasons --
+    # these describe the state, not the session's situation.
+    REGROUND_CARD_LABELS = {
+        "integrating": "approved by the user but never merged",
+        "in_progress": "in motion",
+        "triaging": "just picked up",
+        "failed": "failed — the user can retry them",
+        "stale": "gone stale",
+        "held": "held — nothing goes out until the user says go",
+        "needs_you": "waiting on the user's answer",
+        "conversation": "open conversations, waiting on the user",
+        "blocked": "blocked on something off the board",
+        "ready": "waiting on the user's verdict",
+    }
+
+    def reground_opening(self, reason: str, state: dict) -> str:
+        if reason == "revival":
+            return ("Your sprint board thinks this session died — nothing it "
+                    "can see has moved for %s."
+                    % human_span(state["quiet_for_seconds"]))
+        if reason == "manual_reset":
+            return ("Your context was cleared on purpose. Everything you were "
+                    "holding is below, read off the board — none of it came "
+                    "from memory.")
+        if reason == "periodic":
+            return ("Routine re-ground. Read this against what you think is "
+                    "true right now; where they disagree, the board is right.")
+        return ("Re-grounding this sprint board from scratch. Everything below "
+                "is board state, not memory.")
+
+    def reground_brief(self, reason: str = "boot", at: float = None, dead=None,
+                       attempt: int = 1, state: dict = None) -> str:
+        """The re-ground, built from this board's own state.
+
+        One builder, four reasons (`REGROUND_REASONS`). The reason picks the
+        opening line, a handful of labels and the closing line; everything in
+        between is the same gathered state rendered the same way, because a
+        session's grounding should not be better or worse depending on how it
+        lost its grip.
+        """
+        if reason not in self.REGROUND_FRAMING:
+            reason = "boot"
+        at = now() if at is None else at
+        st = state if state is not None else self.reground_state(at, dead=dead)
+        frame = self.REGROUND_FRAMING[reason]
+        owed = st["owed"]
+        cards = st["cards"]
         lines = []
-        lines.append("Your sprint board thinks this session died — nothing it "
-                     "can see has moved for %s." % human_span(ds["quiet_for_seconds"]))
+        lines.append(self.reground_opening(reason, st))
         lines.append("")
-        lines.append("board: %s" % (self.sprint_name() or "sprint"))
-        lines.append("project: %s (port %s)" % (self.project_root, self.port or "?"))
-        url = self.board_self_url()
-        if url:
-            lines.append("url: %s" % url)
+        lines.append("board: %s" % st["board"])
+        lines.append("project: %s (port %s)" % (st["project_root"],
+                                                st["port"] or "?"))
+        if st["url"]:
+            lines.append("url: %s" % st["url"])
+        if st["agent_name"]:
+            lines.append("you are: %s — every line you write on this board is "
+                         "signed with that name." % st["agent_name"])
         lines.append("cursor: %d of %d — %d events you never read"
-                     % (ds["cursor"], ds["head"], ds["pending"]))
+                     % (st["cursor"], st["head"], st["pending"]))
         lines.append("")
-        lines.append("FIRST, check this is your board. If %s is not the project "
-                     "this session runs, reply “wrong session”, touch nothing, "
-                     "and stop." % self.project_root)
-        lines.append("")
-        if ds["owed_count"]:
-            lines.append("Stranded right now:")
-            if owed.get("integrating"):
-                lines.append("- approved by the user but never merged: %s"
-                             % self._card_list(owed["integrating"],
-                                               self.AUTOHEAL_CARD_LIST_MAX))
-            if owed.get("in_progress"):
-                lines.append("- in motion, agent probably dead: %s"
-                             % self._card_list(owed["in_progress"],
-                                               self.AUTOHEAL_CARD_LIST_MAX))
-            if owed.get("queued"):
-                lines.append("- queued and never dispatched: %d card%s (%s)"
-                             % (len(owed["queued"]),
-                                "" if len(owed["queued"]) == 1 else "s",
-                                self._card_list(owed["queued"],
-                                                self.AUTOHEAL_CARD_LIST_MAX)))
+        if reason == "revival":
+            # Only a wake-up can land in the wrong window: the session asks for
+            # every other reason itself, on a board it already holds.
+            lines.append("FIRST, check this is your board. If %s is not the "
+                         "project this session runs, reply “wrong session”, "
+                         "touch nothing, and stop." % st["project_root"])
             lines.append("")
-        lines.append("Then do these in order, and do NOT dispatch anything first:")
+        if st["standing_instructions"]:
+            lines.append("%s:" % STANDING_HEADING)
+            for line in st["standing_instructions"].splitlines():
+                lines.append(line.rstrip())
+            lines.append("")
+        if st["open_count"]:
+            lines.append(frame["cards_heading"])
+            for state_name in REGROUND_CARD_ORDER:
+                nums = cards.get(state_name)
+                if not nums:
+                    continue
+                if state_name == "queued":
+                    lines.append("- queued and never dispatched: %d card%s (%s)"
+                                 % (len(nums), "" if len(nums) == 1 else "s",
+                                    self._card_list(nums,
+                                                    self.AUTOHEAL_CARD_LIST_MAX)))
+                    continue
+                label = (frame["in_progress"] if state_name == "in_progress"
+                         else self.REGROUND_CARD_LABELS[state_name])
+                lines.append("- %s: %s"
+                             % (label, self._card_list(
+                                 nums, self.AUTOHEAL_CARD_LIST_MAX)))
+            lines.append("")
+        if st["sidebar"]:
+            lines.append("The last %d line%s of the sidebar, oldest first:"
+                         % (len(st["sidebar"]),
+                            "" if len(st["sidebar"]) == 1 else "s"))
+            for line in st["sidebar"]:
+                who = "the user" if line["actor"] == "user" else "you"
+                lines.append("- %s: %s" % (who, line["text"]))
+            lines.append("")
+        lines.append(frame["steps_heading"])
         lines.append("1. Read the event log from seq %d to the head and catch "
-                     "your cursor up." % ds["cursor"])
-        if owed.get("integrating"):
+                     "your cursor up." % st["cursor"])
+        if reason == "periodic":
+            lines.append("2. Check every card above against what you think is "
+                         "happening, and fix your picture, not the board.")
+            lines.append("3. Do NOT re-dispatch anything that is already "
+                         "running — a live agent looks exactly like a dead one "
+                         "from here.")
+        elif owed.get("integrating"):
             lines.append("2. Land the approved branches one at a time, gating "
                          "each: %s." % self._card_list(
                              owed["integrating"], self.AUTOHEAL_CARD_LIST_MAX))
@@ -5296,9 +5513,32 @@ class App:
             lines.append("2. Re-dispatch what is in motion and what is queued, "
                          "reading each card's timeline for where it got to.")
         lines.append("")
-        lines.append("(sprint autoheal, attempt %d of %d — nobody typed this)"
-                     % (attempt, self.revive_max_burst))
+        if reason == "revival":
+            lines.append("(sprint autoheal, attempt %d of %d — nobody typed this)"
+                         % (attempt, self.revive_max_burst))
+        else:
+            lines.append("(sprint re-ground, reason %s — every line above came "
+                         "off the board, not out of memory)" % reason)
         return "\n".join(lines)
+
+    def reground_json(self, reason: str = "boot", at: float = None) -> dict:
+        """`GET /api/reground?reason=...` — the brief AND what it was built
+        from, so a session can read the prose or the fields, whichever suits."""
+        reason = (reason or "boot").strip() or "boot"
+        if reason not in REGROUND_REASONS:
+            raise ApiError(400, "bad_reason",
+                           "reason must be one of %s"
+                           % ", ".join(REGROUND_REASONS), field="reason")
+        at = now() if at is None else at
+        dead = self.session_dead_state(at)
+        st = self.reground_state(at, dead=dead)
+        out = dict(st)
+        out["reason"] = reason
+        out["reasons"] = list(REGROUND_REASONS)
+        out["brief"] = self.reground_brief(
+            reason, at=at, dead=dead, state=st,
+            attempt=self.revive_state(at, dead=dead)["attempts_this_episode"] + 1)
+        return out
 
     def autoheal_json(self, at: float = None) -> dict:
         """What `/api/board` carries: enough for the hub to decide and for the
@@ -7423,6 +7663,15 @@ def make_handler(app: App):
                         dead=dead,
                         attempt=app.revive_state(dead=dead)["attempts_this_episode"] + 1)
                 return self.json_out(200, out)
+            if path == "/api/reground":
+                # The re-ground procedure (#79), one call. Same facts #68's
+                # wake-up is built from -- who you are, the standing
+                # instructions, the cursor, every unfinished card, the tail of
+                # the sidebar -- with `?reason=` choosing only how they are
+                # framed. This is what the skill's boot, post-reset and
+                # cadence paths all call instead of assembling their own reads.
+                reason = (query.get("reason") or ["boot"])[0]
+                return self.json_out(200, app.reground_json(reason))
             if path == "/api/sprints":
                 rows = app.q("SELECT * FROM sprints ORDER BY id DESC")
                 return self.json_out(200, {"sprints": [app.sprint_json(r) for r in rows]})
