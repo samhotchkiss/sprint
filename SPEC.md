@@ -394,6 +394,14 @@ root; several run at once in different tmux windows.
   to that board's signed URL in the same tab, on the host you are already using. The title carries a
   dot when any OTHER sprint needs you; this board's own needs-you pile is already on the page behind
   it. One live board and the title stays the plain `<h1>` it is today. Polled every 30s; no SSE.
+  **Keyboard (card #57, round 3).** The switcher always opens with row 1 highlighted — the top of the
+  list, regardless of which board you are currently on. A session proposed opening on the current
+  board's own row instead, with arrows moving from there; the user's ruling, verbatim: **"Open on TOP
+  row instead, arrows from there."** So: open always highlights row 1, `ArrowUp`/`ArrowDown` move the
+  highlight from there and wrap at both ends, `Enter` navigates to the highlighted row, the digit keys
+  still jump straight to a row by its printed number, and `Esc` closes the switcher. The highlight is
+  real DOM focus on the row's own `<button>` — same rule as the board cursor (see `keys.js`'s header
+  comment) — so nothing here invents a second selection model.
 
 ## Phases (what an agent is DOING, not what it last said)
 

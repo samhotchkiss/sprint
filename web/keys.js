@@ -23,7 +23,9 @@
 //    sit, in reading order. So the shortcut map does not change under you when
 //    you flip the layout toggle.
 import { store, cardState, isConversation, BOARD_COLUMNS } from './state.js';
-import { siblingMenuOpen, openSiblingMenu, closeSiblingMenu, siblingCount, gotoSibling } from './siblings.js';
+import {
+  siblingMenuOpen, openSiblingMenu, closeSiblingMenu, siblingCount, gotoSibling, nextMenuIndex,
+} from './siblings.js';
 
 /**
  * Everything on the board you can put the cursor on, in DOM order.
@@ -434,6 +436,24 @@ export function handleKey(e, { isTyping, emptyTextTarget }) {
       closeSiblingMenu();
       gotoSibling(digit - 1);
       app.render();
+      return true;
+    }
+    // Round 3: arrow keys move the highlight from wherever it opened (row 1,
+    // top of the list — see nextMenuIndex's doc comment) and wrap at both
+    // ends. "The highlight IS focus" (this file's own rule, see the header)
+    // applies here exactly as it does on the board: no synthetic selection
+    // model, just moving `document.activeElement` among the real
+    // `.menu-item` buttons. Enter needs nothing here — a focused native
+    // <button> already activates on Enter, which fires its own `onclick`
+    // and navigates; nothing upstream calls preventDefault on that key while
+    // the switcher is open, so the browser's default action runs as normal.
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const rows = document.querySelectorAll('.sprint-menu .menu-item');
+      if (!rows.length) return true;
+      const cur = Array.prototype.indexOf.call(rows, document.activeElement);
+      const next = nextMenuIndex(cur, e.key === 'ArrowDown' ? 1 : -1, rows.length);
+      rows[next].focus();
       return true;
     }
     return false;

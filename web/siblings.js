@@ -274,6 +274,24 @@ export function openSiblingMenu() {
   return true;
 }
 
+/**
+ * Round 3 of card #57. The switcher always OPENS on row 1 — the top of the
+ * list, never "wherever the current board happens to sit" — and arrow keys
+ * move the highlight from there, wrapping at both ends.
+ *
+ * User's ruling, verbatim, when asked to confirm "open on current board,
+ * arrows move with wrap": **"Open on TOP row instead, arrows from there."**
+ * So `openSiblingMenu`/the title click still focus `.menu-item` #0 (that part
+ * was already correct — see the two `first.focus()` call sites), and this is
+ * only the missing half: plain wrap-around arithmetic for ArrowUp/ArrowDown,
+ * kept here as a pure function so it is testable without a DOM.
+ */
+export function nextMenuIndex(current, delta, count) {
+  if (count <= 0) return 0;
+  const base = current < 0 || current >= count ? 0 : current;
+  return (base + delta + count) % count;
+}
+
 /** Go to the nth sprint (0-based, the order the menu draws). Own board = stay. */
 export function gotoSibling(i) {
   const s = state.sprints[i];
