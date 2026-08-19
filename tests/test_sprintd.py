@@ -12671,9 +12671,11 @@ class TestRegroundDocs(Base):
     from."""
 
     def read_repo_file(self, *parts):
+        """Flattened: these docs are hard-wrapped, so a sentence the reader
+        sees as one line is three lines on disk."""
         path = os.path.join(os.path.dirname(HERE), *parts)
         with open(path, encoding="utf-8") as fh:
-            return fh.read()
+            return " ".join(fh.read().split())
 
     def test_the_skill_boots_by_calling_the_one_procedure(self):
         doc = self.read_repo_file("skills", "sprint", "SKILL.md")

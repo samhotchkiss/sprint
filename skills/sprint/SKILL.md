@@ -185,15 +185,78 @@ went green, the overlapping card landed, the dependency shipped).
 6. `POST $SPRINT_SERVER/api/sprint {"action":"open"}` if there's no open
    sprint yet (check `GET /api/board` first — if a sprint is already
    open, e.g. this is a resume, don't open a second one).
-7. Read the persisted cursor: `cursors` row named `orchestrator`
-   (exposed via the board/events read path — if it's your first ever
-   boot for this project there is none yet; treat that as cursor `0`).
+7. **Re-ground: `GET $SPRINT_SERVER/api/reground?reason=boot`.** One
+   call, and it is the whole of "where am I" — the persisted
+   `orchestrator` cursor, every card that is not finished, your name,
+   the user's standing instructions and the tail of the sidebar, plus a
+   written brief that puts them in the order to act on. This replaces
+   the three separate reads that used to live here. See **step 1b**
+   below; do it before you dispatch anything.
 8. Reap orphaned worktrees (see step 3's reap procedure) — cheap
    insurance even on a clean boot.
 9. Arm your ingress (step 2's `sprintd tail` under Monitor) and enter the
    drain loop (step 2). This is where boot and resume converge into the
    same loop — from here on there is no difference between "just
    started" and "been running for days."
+
+## 1b. Re-ground — the one call that tells you where you are
+
+```
+GET $SPRINT_SERVER/api/reground?reason=boot
+```
+
+**The board, not your memory, is where working state lives.** Every card
+state, every ruling anyone wrote down, the cursor, the sidebar — all of
+it is durable, and none of it depends on you remembering. This one call
+hands it all back, so a session that remembers nothing can be as
+grounded as one that remembers everything. That is the point: a context
+wipe should be a normal maintenance action, not a disaster.
+
+What comes back: the brief in `brief` (read this — it is the same shape
+as the autoheal wake-up, and it puts the facts in the order to act on),
+and the same facts as fields if you would rather read those:
+`agent_name`, `standing_instructions`, `cursor`/`head`/`pending`,
+`cards` (every non-terminal card, grouped by state), `sidebar` (the last
+10 lines), `board`/`project_root`/`url`, and `cadence`.
+
+`reason` changes only the words around the facts, never which facts you
+get. Use the one that is true:
+
+| `reason` | when |
+|---|---|
+| `reason=boot` | cold start, or a resume after a crash (step 1 and step 7). |
+| `reason=revival` | you were woken by autoheal (step 8) — the wake-up in your window already IS this brief; call it again if you need it back. |
+| `reason=manual_reset` | the user cleared your context. **Run this as your very first action**, before answering anything else. |
+| `reason=periodic` | the cadence below. It is the only one that tells you NOT to re-dispatch, because your agents are still alive. |
+
+Then work the brief in the order it gives: catch your cursor up first,
+land what the user already approved, and only then dispatch. Never
+dispatch before the cursor is current — a fresh agent on top of an
+un-drained cursor re-does work that already landed.
+
+### The cadence — re-ground on a clock, not on a feeling
+
+**Re-ground every 50 tool calls, or every 30 minutes of continuous
+work, whichever comes first** (`reason=periodic`). Not when you feel
+foggy — you will not feel it. The session this rule came from was
+confidently wrong for a while before anyone noticed, and the user had to
+be the one who noticed.
+
+Why those two numbers: 50 tool calls is roughly one full drain cycle
+plus a couple of dispatches, so a whole batch of verdicts cannot pass
+through a degrading session unchecked, and it is still rarer than the
+board actually changes. 30 minutes is the board's own "somebody has
+ignored this too long" clock (the stuck sweep), so you re-check yourself
+on the same beat the board uses to notice neglect. Both numbers are
+served in the `cadence` field, so read them from there rather than
+trusting this paragraph.
+
+It costs one GET and a few seconds: read the brief, fix your picture
+where it disagrees with the board (the board wins), and carry on.
+Nothing to record anywhere — just keep your own count of "tool calls
+since I last re-grounded" and reset it when you do. This is advisory,
+nobody enforces it, and skipping it silently is exactly how the bad
+night happened.
 
 ## 2. The drain loop — the one invariant that must never break
 
@@ -390,6 +453,42 @@ Workers cannot forge it; the server strips it from anything they send.
 The reaction table below is the *what to do*; `reply_to` is the *where
 to say it*. When they appear to disagree, `reply_to` wins — it is data
 and the table is prose.
+
+### Durable by default — write it down the moment you decide it
+
+Same family of rules as "reply where the user is", and it is a **hard
+rule, not a preference**: **every decision, finding or ruling that
+matters goes onto the board the moment it is made — never held only in
+your own memory to be recalled later.**
+
+The night this rule came from: a session tending dozens of cards
+degraded until the user said it had gone "fully retarded" and cleared
+its context by hand. Everything that session was carrying in its head —
+what it had ruled, what it had noticed, what it had promised — went with
+it. Everything it had written down survived, because the board's event
+log is the only durable thing in this system. Your conversation is not
+storage. It is lossy, it is summarized behind your back as it grows, and
+it can be emptied without warning.
+
+So, in practice:
+
+- The user rules on something → post it where it applies (the card, or
+  the sidebar) **in his words**, before you act on it.
+- You decide something a future session would have to re-derive — why a
+  card was batched this way, why an approach was rejected, what a bounce
+  actually meant — → `sprint-post`-equivalent `note` on the card, one
+  line plus `detail`.
+- You notice something about a card that is not yet in its timeline →
+  put it there, even if you are about to act on it in the next breath.
+- Standing policy the user states in passing → `PUT /api/settings
+  {"special_instructions": "..."}`, so every future brief carries it
+  instead of you remembering to repeat it.
+
+The test is simple: **if you were wiped right now, would the next
+session know this?** If the answer is no, you have not finished writing
+it down. Writing it down is cheap; the board is right there. Rebuilding
+a lost ruling costs the user his own time, and he is the scarcest thing
+here.
 
 ### Event reaction table
 
@@ -1602,11 +1701,12 @@ tmux worker" in step 3.
    comes back nameless is a board the user cannot find in the switcher.
    Passing the same name it already has is a no-op.
 2. Read `server.json`, set `SPRINT_SERVER`/`SPRINT_TOKEN`.
-3. Read the persisted `orchestrator` cursor and go straight into the
-   drain loop (step 2) from there — do not special-case "resume" beyond
-   this; the drain loop IS the resume mechanism.
-4. `GET /api/board` to see every non-terminal card and its
-   `agent_name`/`worktree`. For each one still showing a live agent,
+3. **Re-ground** — `GET /api/reground?reason=boot` (step 1b). It carries
+   the persisted `orchestrator` cursor; go straight into the drain loop
+   (step 2) from there. Do not special-case "resume" beyond this; the
+   drain loop IS the resume mechanism.
+4. The re-ground already listed every non-terminal card; `GET /api/board`
+   for the `agent_name`/`worktree` on each. For each one still showing a live agent,
    reattach by `SendMessage`ing that name. **Explicitly tell every
    reattached agent to re-verify its worktree state before continuing**
    — a power cut mid-write leaves a half-finished file that looks
@@ -1651,6 +1751,11 @@ hypothetical: the first hand-run recovery guessed the wrong tmux window,
 and a session that did not own the board started posting to it before
 it was caught. One check kills the whole class.
 
+That brief is the re-ground procedure (step 1b) run with
+`reason=revival` — the same facts every other entry point gets, framed
+as a wake-up. If it scrolled away or you want it fresh, `GET
+/api/reground?reason=revival` gives it back.
+
 Once you have confirmed it is yours, work the brief in the order it
 gives, which is the order that worked by hand:
 
@@ -1682,6 +1787,32 @@ window (boot step 5), or you registered a stale one. Both are silent
 failures by design — the board says "no tmux window was registered, so
 nothing can wake it" on its own timeline and on the hub row. Re-register
 every boot and this does not happen.
+
+---
+
+## 8b. Your context was just cleared — what to do first
+
+The user can empty your context at any time, and one night he did:
+a session had degraded far enough that he called it "fully retarded" and
+wiped it by hand. You will not remember that this happened. What you
+will see is a conversation that starts in the middle of a running
+sprint.
+
+**First action, before you answer anything: `GET
+/api/reground?reason=manual_reset`** (step 1b). It gives you your name,
+the standing instructions, the cursor gap, every unfinished card and the
+last of the sidebar — the whole working state, none of it from memory.
+Read the brief, catch your cursor up, and pick the work back up from
+where the cards say it is, not from where the conversation seems to be.
+
+Then say one line in the sidebar that you are back and re-grounded. Do
+not apologise at length and do not re-litigate what went wrong; the user
+cleared the context to get moving again.
+
+This is meant to be cheap. If clearing your context ever feels like a
+last resort rather than routine maintenance, something is being held in
+conversation that should have been written to the board — see "Durable
+by default".
 
 ---
 
