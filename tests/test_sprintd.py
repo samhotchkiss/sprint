@@ -12380,6 +12380,327 @@ class TestReviveBrief(AutohealBase):
         self.assertIn("more)", text)
 
 
+# --------------------------------------------------------------------------
+# Re-grounding (card #79)
+#
+# The incident: a session tending dozens of cards degraded until the user
+# cleared its context by hand. #68's wake-up brief already proved a session can
+# be rebuilt out of board state alone -- it just said "you died" on the way in,
+# so nothing else could use it. These tests hold the two halves apart: that the
+# procedure is now callable for any reason, and that the reason it was
+# originally written for still reads exactly as it did.
+# --------------------------------------------------------------------------
+
+
+class RegroundBase(AutohealBase):
+    def reground(self, reason=None, expect=200):
+        path = "/api/reground" if reason is None else "/api/reground?reason=%s" % reason
+        status, body = self.get(path)
+        self.assertEqual(status, expect, body)
+        return body
+
+    def name_and_instruct(self, name="Wren", instructions="Never merge on a red suite."):
+        status, body = self.req("PUT", "/api/settings",
+                                {"agent_name": name, "special_instructions": instructions,
+                                 "actor": "session"})
+        self.assertEqual(status, 200, body)
+
+    def say_in_sidebar(self, text, actor="user"):
+        status, body = self.post("/api/sidebar", {"text": text, "actor": actor})
+        self.assertIn(status, (200, 201), body)
+        return body
+
+    def blocked_card(self):
+        num = self.new_card("waiting on CI")["num"]
+        self.to_in_progress(num)
+        status, body = self.post("/api/cards/%d/state" % num,
+                                 {"state": "blocked", "reason": "CI is red"})
+        self.assertEqual(status, 200, body)
+        return num
+
+    def ready_card(self):
+        num = self.new_card("done, waiting on a verdict")["num"]
+        self.to_in_progress(num)
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200, body)
+        return num
+
+
+class TestRegroundEndpoint(RegroundBase):
+    """One call gives a session everything it needs to hold the board again."""
+
+    def test_boot_returns_the_settings_the_cursor_and_every_open_card(self):
+        self.name_and_instruct()
+        q = self.owed_card("queued")
+        p = self.owed_card("in_progress")
+        i = self.owed_card("integrating")
+        r = self.ready_card()
+        b = self.blocked_card()
+        out = self.reground("boot")
+        self.assertEqual(out["reason"], "boot")
+        self.assertEqual(out["agent_name"], "Wren")
+        self.assertEqual(out["standing_instructions"], "Never merge on a red suite.")
+        self.assertEqual(out["cursor"], self.app.cursor_seq())
+        self.assertEqual(out["head"], self.app.max_seq())
+        self.assertEqual(out["cards"]["queued"], [q])
+        self.assertEqual(out["cards"]["in_progress"], [p])
+        self.assertEqual(out["cards"]["integrating"], [i])
+        self.assertEqual(out["cards"]["ready"], [r])
+        self.assertEqual(out["cards"]["blocked"], [b])
+        self.assertEqual(out["open_count"], 5)
+
+    def test_a_finished_card_is_not_in_the_picture(self):
+        num = self.owed_card("integrating")
+        status, body = self.post("/api/cards/%d/integrated" % num, {"ok": True})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(num), "completed")
+        out = self.reground("boot")
+        self.assertEqual(out["open_count"], 0)
+        self.assertNotIn("#%d" % num, out["brief"])
+
+    def test_the_brief_carries_the_name_and_the_standing_instructions(self):
+        self.name_and_instruct()
+        text = self.reground("boot")["brief"]
+        self.assertIn("you are: Wren", text)
+        self.assertIn(sprintd.STANDING_HEADING, text)
+        self.assertIn("Never merge on a red suite.", text)
+
+    def test_cards_the_user_owes_are_in_the_picture_too(self):
+        """#68's wake-up only ever named the three states the SESSION owes.
+        A session re-grounding itself also has to know what is parked on the
+        user, or it re-does work that is sitting in Ready."""
+        r = self.ready_card()
+        b = self.blocked_card()
+        text = self.reground("boot")["brief"]
+        self.assertIn("waiting on the user's verdict: #%d" % r, text)
+        self.assertIn("blocked on something off the board: #%d" % b, text)
+
+    def test_the_last_sidebar_lines_come_along_flattened_and_capped(self):
+        self.say_in_sidebar("first thing")
+        self.say_in_sidebar("a decision\nspread over\nthree lines")
+        self.say_in_sidebar("x" * 400)
+        out = self.reground("boot")
+        texts = [line["text"] for line in out["sidebar"]]
+        self.assertIn("a decision spread over three lines", texts)
+        self.assertTrue(any(len(t) == sprintd.REGROUND_SIDEBAR_LINE_CHARS
+                            and t.endswith("…") for t in texts), texts)
+        self.assertIn("- the user: first thing", out["brief"])
+
+    def test_only_the_tail_of_a_long_sidebar_comes_along(self):
+        for i in range(sprintd.REGROUND_SIDEBAR_LINES + 5):
+            self.say_in_sidebar("line %d" % i)
+        out = self.reground("boot")
+        self.assertEqual(len(out["sidebar"]), sprintd.REGROUND_SIDEBAR_LINES)
+        self.assertEqual(out["sidebar"][-1]["text"],
+                         "line %d" % (sprintd.REGROUND_SIDEBAR_LINES + 4))
+        self.assertNotIn("- the user: line 0\n", out["brief"])
+
+    def test_no_reason_means_boot(self):
+        self.assertEqual(self.reground()["reason"], "boot")
+
+    def test_an_unknown_reason_is_refused_by_name(self):
+        status, body = self.get("/api/reground?reason=vibes")
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "reason")
+        for reason in sprintd.REGROUND_REASONS:
+            self.assertIn(reason, body["message"])
+
+    def test_the_cadence_is_served_not_guessed(self):
+        """The skill's every-N-tool-calls rule reads its numbers from here, so
+        the doc and the server cannot drift apart."""
+        cadence = self.reground("periodic")["cadence"]
+        self.assertEqual(cadence["tool_calls"], sprintd.REGROUND_EVERY_TOOL_CALLS)
+        self.assertEqual(cadence["minutes"], sprintd.REGROUND_EVERY_MINUTES)
+
+
+class TestRegroundReasonsChangeOnlyTheFraming(RegroundBase):
+    """The whole design rests on this: a session that was wiped on purpose is
+    owed exactly as complete a picture as one that died."""
+
+    def setUp(self):
+        super().setUp()
+        self.name_and_instruct()
+        self.q = self.owed_card("queued")
+        self.p = self.owed_card("in_progress")
+        self.i = self.owed_card("integrating")
+        self.r = self.ready_card()
+        self.say_in_sidebar("do #%d before anything else" % self.i)
+
+    def facts(self, reason):
+        out = self.reground(reason)
+        out.pop("brief")
+        out.pop("reason")
+        return out
+
+    def test_every_reason_gathers_the_same_facts(self):
+        first = self.facts(sprintd.REGROUND_REASONS[0])
+        for reason in sprintd.REGROUND_REASONS[1:]:
+            self.assertEqual(self.facts(reason), first, reason)
+
+    def test_every_reason_names_every_open_card(self):
+        for reason in sprintd.REGROUND_REASONS:
+            text = self.reground(reason)["brief"]
+            for num in (self.q, self.p, self.i, self.r):
+                self.assertIn("#%d" % num, text, "%s missed #%d" % (reason, num))
+            self.assertIn("do #%d before anything else" % self.i, text, reason)
+            self.assertIn("you are: Wren", text, reason)
+            self.assertIn("Never merge on a red suite.", text, reason)
+
+    def test_each_reason_opens_by_saying_why_you_are_reading_this(self):
+        opens = {r: self.reground(r)["brief"].splitlines()[0]
+                 for r in sprintd.REGROUND_REASONS}
+        self.assertEqual(len(set(opens.values())), len(sprintd.REGROUND_REASONS), opens)
+        self.assertIn("thinks this session died", opens["revival"])
+        self.assertIn("cleared on purpose", opens["manual_reset"])
+        self.assertIn("Routine re-ground", opens["periodic"])
+        self.assertIn("from scratch", opens["boot"])
+
+    def test_a_routine_re_ground_never_tells_you_to_re_dispatch(self):
+        """The one place a wrong framing is expensive: a live agent looks
+        exactly like a dead one from the board."""
+        text = self.reground("periodic")["brief"]
+        self.assertIn("Do NOT re-dispatch anything that is already running", text)
+        self.assertNotIn("agent probably dead", text)
+        self.assertIn("in motion right now: #%d" % self.p, text)
+
+    def test_a_wake_up_still_says_the_agents_are_probably_dead(self):
+        self.assertIn("in motion, agent probably dead: #%d" % self.p,
+                      self.reground("revival")["brief"])
+
+    def test_only_a_wake_up_asks_you_to_prove_you_own_the_board(self):
+        """A session that CALLED this is already on its own board; a wake-up
+        typed into a window might not be."""
+        self.assertIn("FIRST, check this is your board",
+                      self.reground("revival")["brief"])
+        for reason in ("boot", "manual_reset", "periodic"):
+            self.assertNotIn("FIRST, check this is your board",
+                             self.reground(reason)["brief"], reason)
+
+    def test_the_closing_line_says_which_procedure_ran(self):
+        self.assertIn("(sprint autoheal, attempt", self.reground("revival")["brief"])
+        for reason in ("boot", "manual_reset", "periodic"):
+            self.assertIn("(sprint re-ground, reason %s" % reason,
+                          self.reground(reason)["brief"], reason)
+
+    def test_every_open_state_has_a_line_to_render(self):
+        """A new card state must not be able to vanish from a re-ground."""
+        open_states = set(sprintd.STATES) - set(sprintd.TERMINAL_STATES)
+        self.assertEqual(set(sprintd.REGROUND_CARD_ORDER), open_states)
+        labelled = set(sprintd.App.REGROUND_CARD_LABELS) | {"queued"}
+        self.assertEqual(labelled, open_states)
+
+
+class TestRevivalIsUnchangedByTheRefactor(AutohealBase):
+    """#68's wake-up, line for line. This is the regression guard on the
+    extraction: the brief may gain shared context, but nothing it already said
+    is allowed to change wording or order."""
+
+    def brief(self):
+        status, body = self.get("/api/autoheal?brief=1")
+        self.assertEqual(status, 200, body)
+        return body["brief"]
+
+    def test_the_wake_up_still_reads_exactly_as_it_did(self):
+        i = self.owed_card("integrating")
+        p = self.owed_card("in_progress")
+        q = self.owed_card("queued")
+        self.go_quiet()
+        text = self.brief()
+        expected = [
+            "Your sprint board thinks this session died — nothing it can see has moved for",
+            "board: ",
+            "project: %s (port " % self.app.project_root,
+            "cursor: %d of %d — " % (self.app.cursor_seq(), self.app.max_seq()),
+            "FIRST, check this is your board. If %s is not the project this "
+            "session runs, reply “wrong session”, touch nothing, and stop."
+            % self.app.project_root,
+            "Stranded right now:",
+            "- approved by the user but never merged: #%d" % i,
+            "- in motion, agent probably dead: #%d" % p,
+            "- queued and never dispatched: 1 card (#%d)" % q,
+            "Then do these in order, and do NOT dispatch anything first:",
+            "1. Read the event log from seq %d to the head and catch your "
+            "cursor up." % self.app.cursor_seq(),
+            "2. Land the approved branches one at a time, gating each: #%d." % i,
+            "3. Re-dispatch what is in motion and what is queued, reading each "
+            "card's timeline for where it got to.",
+            "(sprint autoheal, attempt 1 of 3 — nobody typed this)",
+        ]
+        at = -1
+        for want in expected:
+            found = text.find(want, at + 1)
+            self.assertNotEqual(found, -1, "missing from the wake-up: %r" % want)
+            self.assertGreater(found, at, "out of order: %r" % want)
+            at = found
+
+    def test_the_wake_up_is_the_re_ground_procedure_not_a_copy_of_it(self):
+        self.owed_card("integrating")
+        self.go_quiet()
+        self.assertEqual(self.app.revive_brief(),
+                         self.app.reground_brief("revival"))
+
+    def test_the_hub_still_gets_the_wake_up_it_always_got(self):
+        self.owed_card("integrating")
+        self.go_quiet()
+        status, body = self.post("/api/autoheal/revive", {"by": "hub"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["brief"].startswith(
+            "Your sprint board thinks this session died"))
+        self.assertIn("attempt 1 of 3", body["brief"])
+        self.assertEqual(len(self.events_of("revive_attempted")), 1)
+
+    def test_a_board_with_nothing_owed_is_still_not_dead(self):
+        """The refactor widened what the BRIEF lists to every open card. It
+        must not widen what counts as a dead session."""
+        self.ready_only_card()
+        self.go_quiet()
+        self.assertFalse(self.app.session_dead_state()["dead"])
+        self.assertEqual(self.app.session_dead_state()["reason"], "no_work")
+
+    def ready_only_card(self):
+        num = self.new_card("waiting on the user")["num"]
+        self.to_in_progress(num)
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200, body)
+        return num
+
+
+class TestRegroundDocs(Base):
+    """The procedure is a server call; the DISCIPLINE is in SKILL.md, and the
+    discipline is the half that actually failed on the night this card came
+    from."""
+
+    def read_repo_file(self, *parts):
+        """Flattened: these docs are hard-wrapped, so a sentence the reader
+        sees as one line is three lines on disk."""
+        path = os.path.join(os.path.dirname(HERE), *parts)
+        with open(path, encoding="utf-8") as fh:
+            return " ".join(fh.read().split())
+
+    def test_the_skill_boots_by_calling_the_one_procedure(self):
+        doc = self.read_repo_file("skills", "sprint", "SKILL.md")
+        self.assertIn("/api/reground", doc)
+        for reason in sprintd.REGROUND_REASONS:
+            self.assertIn("reason=%s" % reason, doc, reason)
+
+    def test_the_skill_states_the_durable_by_default_rule(self):
+        doc = self.read_repo_file("skills", "sprint", "SKILL.md")
+        self.assertIn("Durable by default", doc)
+        self.assertIn("never held only in your own memory", doc)
+
+    def test_the_skill_and_the_server_agree_on_the_cadence(self):
+        doc = self.read_repo_file("skills", "sprint", "SKILL.md")
+        self.assertIn("every %d tool calls" % sprintd.REGROUND_EVERY_TOOL_CALLS, doc)
+        self.assertIn("%d minutes" % sprintd.REGROUND_EVERY_MINUTES, doc)
+
+    def test_the_spec_records_the_procedure(self):
+        spec = self.read_repo_file("SPEC.md")
+        self.assertIn("## Re-grounding", spec)
+        for word in ("/api/reground", "revival", "manual_reset", "periodic",
+                     "Durable by default"):
+            self.assertIn(word, spec, word)
+
+
 class TestTmuxWindowRegistration(Base):
     """Piece one: the session says where it can be reached."""
 

@@ -224,7 +224,9 @@ plus `rejected`, `failed`, `stale`, `duplicate`, `canceled`.
   queued→triaging in the same transaction (state event reads "assigned to sprint-card-N — picking
   it up"); assigning a card in any other state only records the agent and never regresses state;
   `POST /api/sprint` `{action: open|close|set_hold_mode, ...}`; `POST /api/cursors/orchestrator` `{seq}`;
-  `GET /api/settings` + `PUT /api/settings` (dispatch policy — see Settings & executors).
+  `GET /api/settings` + `PUT /api/settings` (dispatch policy — see Settings & executors);
+  `GET /api/reground?reason=revival|boot|manual_reset|periodic` — the whole working state in one
+  read (see Re-grounding).
 - `GET /api/events?after=SEQ&limit=N` — the drain endpoint. `GET /api/stream` — SSE (browser),
   heartbeat comment every 15s, browsers auto-reconnect with Last-Event-ID. The stream opens with a
   named `hello` frame (`generation`, `started_at`, `cursor`, `head`) and every `cursor` frame carries
@@ -1167,7 +1169,9 @@ itself, and its board must not spawn processes.
   naming the `project_root` (*"if this is not the project this session runs, reply “wrong session”,
   touch nothing, and stop"*), and an ORDER whose first instruction is **do not dispatch anything
   first**: catch the cursor up, land the approved branches one at a time gating each, then
-  re-dispatch from card timelines. `GET /api/autoheal?brief=1` renders it without sending it.
+  re-dispatch from card timelines. `GET /api/autoheal?brief=1` renders it without sending it. Since
+  #79 the brief is the **re-grounding** procedure run with `reason=revival` (see below) — same
+  builder, same gathered state, wake-up framing.
 - **Crash-loop guard**, mirrored from self-restart (#62) — same three questions, same bias toward
   doing nothing: never twice inside `SPRINT_REVIVE_MIN_INTERVAL` (default 600 / 10 min) per board, at
   most `SPRINT_REVIVE_MAX_BURST` (3) inside `SPRINT_REVIVE_BURST_WINDOW` (3600), then one
@@ -1189,6 +1193,51 @@ itself, and its board must not spawn processes.
   else moves. The hub page carries the same line on that board's row in amber, which is the only
   place a person actually finds out: the board it happened on has no session left to tell anyone,
   which is the whole reason a landing page that outlives them exists.
+
+## Re-grounding — when the SESSION degrades or is reset (SHIPPED)
+
+The other half of the same problem autoheal solves, from the live end. A session tending dozens of
+cards degraded until the user said it had gone "fully retarded" and cleared its context by hand.
+Nothing here can tune Claude Code's own compaction — a summary of a long conversation is lossy, and
+that is the whole of it. What can be fixed is the board: if the board is complete enough, a session
+that remembers nothing is as good as one that remembers everything, and a context wipe stops being a
+leap of faith.
+
+#68's wake-up brief already proved the read works — it rebuilds a session out of board state with
+zero reliance on memory. Its only flaw was its framing: it said *"you died"*, so nothing else could
+use it. So it is now **one procedure with a reason**, and the reason changes the words around the
+facts, never which facts are gathered.
+
+- **`GET /api/reground?reason=revival|boot|manual_reset|periodic`** (default `boot`; anything else is
+  a `400 bad_reason` naming `field: "reason"`). Returns the composed `brief` plus the state it was
+  built from as fields: `agent_name`, `standing_instructions`, `cursor`/`head`/`pending`, `cards`
+  (**every non-terminal card**, grouped by state — not just the three the session owes),
+  `sidebar` (last 10 lines, newlines collapsed and each capped at 160 chars because a revival brief
+  is TYPED into a tmux window), `board`/`project_root`/`url`/`port`, and `cadence`.
+- **One builder.** `reground_state()` gathers; `reground_brief(reason)` frames; `revive_brief()` is
+  the `revival` caller and nothing else. A reason may change the opening line, the `in_progress`
+  label (*"agent probably dead"* at a wake-up, *"in motion right now"* on a routine check — the one
+  place a wrong framing gets live agents re-dispatched on top of), the ownership header (only a
+  wake-up can land in the wrong window), the step list, and the closing line. It may never change
+  what is gathered.
+- **The wake-up is unchanged.** Every line #68's brief said, it still says, word for word and in the
+  same order; it gained the shared context (name, standing instructions, the cards parked on the
+  user, the sidebar tail) that every other reason gets. Regression-tested line by line.
+- **Entry points, all the same call** (SKILL.md step 1b): cold boot and resume (`boot`), a session
+  woken by autoheal (`revival`), a session whose context the user cleared (`manual_reset`, run as its
+  very first action), and the cadence (`periodic`).
+- **Cadence rule.** The session re-grounds **every `REGROUND_EVERY_TOOL_CALLS` (50) tool calls or
+  `REGROUND_EVERY_MINUTES` (30) minutes of continuous work, whichever comes first**, regardless of
+  felt fatigue — degradation is not felt from the inside. 50 tool calls is about one drain cycle plus
+  a couple of dispatches; 30 minutes is the staleness sweep's own threshold, so the session re-checks
+  itself on the beat the board already uses to notice neglect. Advisory and unenforced: the numbers
+  are served in `cadence` so the skill and the server cannot drift, and the session keeps its own
+  count — no DB column, nothing to sweep.
+- **Durable by default** (SKILL.md, the "reply where the user is" family). Every decision, finding or
+  ruling that matters goes onto the board the moment it is made, never held only in conversational
+  memory. The test: *if you were wiped right now, would the next session know this?* This is the half
+  that actually failed on the night the card came from — the procedure above can only hand back what
+  somebody wrote down.
 
 ## Non-goals (v1)
 
