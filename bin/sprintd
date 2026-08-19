@@ -7033,9 +7033,11 @@ class App:
                     "come from the board, not from a script holding the token",
                     card_num=num, to_state=RESOLVED_STATE,
                     needs_browser=True)
+            # The card face renders "<from> → <to> — <reason>", so the reason
+            # says what it MEANT, not the state's own name again.
             self.transition(num, RESOLVED_STATE, actor,
                             reason=body.get("reason")
-                            or "resolved — the discussion is done, and kept")
+                            or "the discussion is done, and kept")
         elif action == "hold":
             self.transition(num, "held", actor, reason="hold")
         elif action == "release":
