@@ -303,12 +303,24 @@ function cardHead(detail, card, app) {
 //
 // So the rail says which of the three a thread is, out loud:
 //
-//   answered  you replied and it is finished → the Resolve button, right here
-//   waiting   somebody is still owed an answer → says so, and offers nothing
+//   answered  you replied and it is finished → the Resolve button, and a line
+//             saying so
+//   waiting   somebody is still owed an answer → the SAME Resolve button —
+//             it is still your thread, and #81 is the fix for the bug where
+//             this line used to withhold it — plus a line saying nobody is
+//             waiting on you for it
 //   resolved  you ended it → says so, and offers the undo
 //
+// Card #81, the second bug: #80 made Resolve appear only once `answered` was
+// true ("somebody asked AND you spoke last"). That is a fine thing to show as
+// a HINT, but it is the user's thread and the user decides when it is done,
+// regardless of who spoke last or whether anyone has spoken at all — so the
+// button itself is never gated on it. The server never gated it either (see
+// `action()`'s `resolve` case in bin/sprintd): the only real gate, `resolve`
+// only writing from the browser as `actor: "user"`, is untouched.
+//
 // Resolve is a BUTTON and not a menu item on purpose: the user has to be able
-// to notice that a thread has become resolvable without going looking for it.
+// to notice a thread can be ended without going looking for it.
 
 function convoBarSig(card) {
   if (!card || !isConversation(card)) return null;
@@ -331,19 +343,15 @@ function convoBar(card, app) {
     return bar;
   }
 
-  if (!conversationAnswered(card)) {
-    // Deliberately no button: nothing is finished, so there is nothing to
-    // agree is finished. This line exists so the answered one reads as
-    // different at a glance rather than as the same card in a different mood.
-    bar.classList.add('is-waiting');
-    bar.appendChild(h('p.convo-bar-line',
-      'Still needs your answer — reply below and this thread is done.'));
-    return bar;
-  }
-
-  bar.classList.add('is-answered');
-  bar.appendChild(h('p.convo-bar-line',
-    'Answered — you had the last word here. Resolve it to close it out and keep it.'));
+  // The hint line is the only thing `answered` still decides — cheap to keep,
+  // because it tells the user which mood the thread is in. The button below
+  // it is NOT conditional on it: this is the user's thread, and resolving it
+  // is the user's call at any time, answered or not.
+  const answered = conversationAnswered(card);
+  bar.classList.add(answered ? 'is-answered' : 'is-waiting');
+  bar.appendChild(h('p.convo-bar-line', answered
+    ? 'Answered — you had the last word here. Resolve it to close it out and keep it.'
+    : 'Open — resolve it whenever you are done, whether or not anyone has replied.'));
   bar.appendChild(h('div.convo-bar-acts',
     h('button.btn.resolve', {
       type: 'button', onclick: () => app.cardAction(card, 'resolve'),

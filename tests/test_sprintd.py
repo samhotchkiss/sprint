@@ -11946,6 +11946,54 @@ class TestAnsweredIsWhatTheBoardOffers(ResolveBase):
         self.assertTrue(self.convo(num)["answered"])
 
 
+class TestResolveIsNeverGatedOnAnswered(ResolveBase):
+    """Card #81: "I should be able to resolve a conversation thread at any
+    time. Currently, I can only resolve it after I send a message."
+
+    #80 built `answered` ("somebody asked AND you spoke last") as what the
+    board OFFERS to resolve -- a hint, not a lock. It never actually reached
+    into `action()`'s `resolve` case or into `transition()`, so the server
+    side of this bug never existed; these tests pin that down so it stays
+    that way. The one real gate -- only the user, only from a browser -- is
+    untouched and is proven right below in `TestOnlyTheUserCanResolve`, which
+    these tests do not relax.
+    """
+
+    def test_resolve_works_on_a_brand_new_conversation_nobody_has_spoken_in(self):
+        num = self.new_conversation("a thread with zero replies")["num"]
+        self.assertFalse(self.convo(num)["answered"],
+                         "a thread nobody has spoken in must not read as answered")
+        self.resolve(num)
+        self.assertEqual(self.state_of(num), "resolved")
+
+    def test_resolve_works_while_still_waiting_on_the_user(self):
+        """They asked, and the user has not replied yet -- exactly the case the
+        card complained about."""
+        num = self.new_conversation("they asked", actor="session")["num"]
+        self.assertFalse(self.convo(num)["answered"])
+        self.resolve(num)
+        self.assertEqual(self.state_of(num), "resolved")
+
+    def test_resolve_works_when_the_session_spoke_last(self):
+        """`answered` is who-spoke-last, and the user's ruling is that who
+        spoke last must not matter at all."""
+        num = self.answered_conversation()
+        self.assertTrue(self.convo(num)["answered"])
+        self.say(num, "one more thing though", "session")
+        self.assertFalse(self.convo(num)["answered"],
+                         "the session speaking last must flip this back off")
+        self.resolve(num)
+        self.assertEqual(self.state_of(num), "resolved")
+
+    def test_resolve_still_works_on_the_answered_case_too(self):
+        """The gate is gone, not the feature: an answered thread still
+        resolves exactly as #80 built it."""
+        num = self.answered_conversation()
+        self.assertTrue(self.convo(num)["answered"])
+        self.resolve(num)
+        self.assertEqual(self.state_of(num), "resolved")
+
+
 class TestConversationMigration(unittest.TestCase):
     """An old database gets the column, and every row in it stays work.
 

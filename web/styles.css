@@ -1673,6 +1673,14 @@ html.skin-chaos .btn.ghost { background: none; box-shadow: none; border-color: t
 html.skin-chaos .btn.ghost:hover { border-color: var(--border-chip); }
 html.skin-chaos .btn.send { background: var(--send-bg); box-shadow: inset 1px 1px 0 #fff3c4, inset -1px -1px 0 #8a6510, 0 3px 0 #0a0618; }
 html.skin-chaos .btn.approve { background: linear-gradient(180deg, #9df0a8, #3fae5a); color: #06210f; box-shadow: inset 1px 1px 0 #d6ffdd, inset -1px -1px 0 #1c6b31, 0 3px 0 #0a0618; }
+/* card #81: .btn.resolve carried the same --approve/--send-fg pair .btn.approve
+   uses, but only .btn.approve got a Chaos override. In Chaos, the generic
+   `html.skin-chaos .btn` rule (a dark purple gradient) outranks the shared
+   `.btn.resolve` rule by specificity and clobbers its background, while the
+   text stays --send-fg (near-black) — dark-on-dark, measured at ~1.26:1.
+   Same fix as approve, same colours, so the two "confirm" buttons keep
+   matching: 6.0:1 at the gradient's darkest point, 12.5:1 at its lightest. */
+html.skin-chaos .btn.resolve { background: linear-gradient(180deg, #9df0a8, #3fae5a); color: #06210f; box-shadow: inset 1px 1px 0 #d6ffdd, inset -1px -1px 0 #1c6b31, 0 3px 0 #0a0618; }
 html.skin-chaos .btn.bounce { background: linear-gradient(180deg, #2b2470, #1a1450); }
 html.skin-chaos .btn.reject { background: none; box-shadow: none; }
 
