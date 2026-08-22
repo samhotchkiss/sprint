@@ -4640,6 +4640,60 @@ class TestSwitcherOrderIsStable(HubBase):
                          "the other boards simply cannot see it")
 
 
+class TestSwitcherSurfacesDegradedBoards(HubBase):
+    """Card #82: a board whose data directory disappears out from under it
+    loses its token file WITH it -- `.sprint/token` lives right beside the db
+    that just vanished -- while the process itself is still alive and still
+    answering `/healthz`. Before this fix, `siblings_snapshot` treated "no
+    token" identically to "dead": `not row.get("reachable")` was true either
+    way, so the row was silently dropped and the board just disappeared from
+    the switcher with zero signal."""
+
+    def test_a_healthz_reachable_board_whose_data_dir_vanished_is_not_dropped(self):
+        alive = self.board("alive")
+        orphaned = self.board("orphaned")
+        # The exact failure this fix targets: the process stays up, the
+        # directory backing it does not.
+        shutil.rmtree(orphaned["data_dir"], ignore_errors=True)
+
+        snap = sprintd.siblings_snapshot(alive["app"])
+        names = [s["name"] for s in snap["sprints"]]
+        self.assertIn("orphaned", names,
+                      "a healthz-reachable board must not silently vanish")
+        row = [s for s in snap["sprints"] if s["name"] == "orphaned"][0]
+        self.assertEqual(row["status"], "no_token")
+        self.assertTrue(row["data_dir_orphaned"])
+        # It must NOT masquerade as a normal, fully-working board.
+        self.assertFalse(row["alive"])
+
+    def test_a_board_that_simply_never_got_a_token_is_also_kept(self):
+        """Same admission rule, different cause: `/healthz` still answers as
+        this project, the token is just missing. Not every "no_token" board
+        is an orphan -- this one's directory is fine."""
+        alive = self.board("alive")
+        tokenless = self.board("tokenless", write_token=False)
+        row = [s for s in sprintd.siblings_snapshot(alive["app"])["sprints"]
+              if s["name"] == "tokenless"][0]
+        self.assertEqual(row["status"], "no_token")
+        self.assertFalse(row["data_dir_orphaned"])
+
+    def test_a_genuinely_dead_board_is_still_dropped(self):
+        """The line this fix draws: `/healthz` answering with no token is
+        kept; nothing answering at all is still noise, and still dropped --
+        this must not regress into keeping every unreachable row."""
+        alive = self.board("alive")
+        dead_root = os.path.join(self.tmp, "dead")
+        os.makedirs(dead_root, exist_ok=True)
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        closed_port = s.getsockname()[1]
+        s.close()
+        sprintd.registry_register(sprintd.registry_entry(
+            dead_root, closed_port, "127.0.0.1"))
+        snap = sprintd.siblings_snapshot(alive["app"])
+        self.assertNotIn("dead", [s["name"] for s in snap["sprints"]])
+
+
 class TestRegistryOrdinals(RegistryBase):
     """The number itself: handed out once, on first sight, and never edited."""
 
@@ -10639,6 +10693,97 @@ class TestSelfRestartCrashLoopGuard(SelfRestartBase):
         for _ in range(6):
             self.app.check_code_update()
         self.assertEqual(len(self.code_notes()), 1)
+
+
+# --------------------------------------------------------------------------
+# Card #82 -- a data dir deleted out from under a live board must never be
+# self-restarted away. Unix keeps an unlinked file's data alive as long as a
+# process holds it open; `execv` closes every fd in that process image, so a
+# self-restart the instant after the data dir vanishes destroys it forever.
+# --------------------------------------------------------------------------
+
+class TestDataDirOrphaned(Base):
+    """`data_dir_orphaned()` in isolation, before it is ever wired into a
+    restart decision."""
+
+    def test_a_fresh_data_dir_is_not_orphaned(self):
+        self.assertFalse(self.app.data_dir_orphaned())
+
+    def test_a_deleted_data_dir_is_orphaned(self):
+        shutil.rmtree(self.app.data_dir, ignore_errors=True)
+        self.assertTrue(self.app.data_dir_orphaned())
+
+    def test_a_fresh_empty_dir_recreated_at_the_same_path_is_still_orphaned(self):
+        """The case that matters most: a `mkdir -p` at the same path looks
+        fine by name, but it is a DIFFERENT directory -- a different inode --
+        and every fd this process already holds (db, wal, shm, log) is still
+        pinned to the vanished original, not this new empty one."""
+        shutil.rmtree(self.app.data_dir, ignore_errors=True)
+        os.makedirs(self.app.data_dir)
+        self.assertTrue(self.app.data_dir_orphaned())
+
+    def test_no_startup_snapshot_means_no_orphan_claim(self):
+        """Can't-tell is not the same as "yes" -- a false orphan claim would
+        wedge a board that was never in any danger."""
+        self.app._data_dir_ino = None
+        self.assertFalse(self.app.data_dir_orphaned())
+
+
+class TestSelfRestartOrphanGuard(SelfRestartBase):
+    """The guard as wired into `check_code_update` -- refuses to restart, no
+    matter how eligible the on-disk code otherwise looks."""
+
+    def test_an_orphaned_data_dir_refuses_to_restart_even_though_the_code_changed(self):
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.app.check_code_update(), "settling")
+        shutil.rmtree(self.app.data_dir, ignore_errors=True)
+        # Genuinely eligible code now (settled, compiles, no crash-loop hold)
+        # -- the ONLY thing standing between this and a restart is the guard.
+        self.assertEqual(self.app.check_code_update(), "orphaned")
+        self.assertEqual(self.execs, [], "must never exec once orphaned")
+
+    def test_recreating_an_empty_dir_at_the_same_path_still_refuses(self):
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        shutil.rmtree(self.app.data_dir, ignore_errors=True)
+        os.makedirs(self.app.data_dir)
+        self.assertEqual(self.app.check_code_update(), "orphaned")
+        self.assertEqual(self.execs, [])
+
+    def test_orphaned_fires_on_every_tick_not_just_once(self):
+        """Unlike an ordinary code note, the sha never changes while orphaned
+        -- so the (kind, sha) dedupe that keeps "held" quiet after one line
+        would otherwise silence this forever after the first tick. A human
+        needs to keep seeing it."""
+        self.app.orphan_note_interval = 0.0
+        shutil.rmtree(self.app.data_dir, ignore_errors=True)
+        for _ in range(3):
+            self.assertEqual(self.app.check_code_update(), "orphaned")
+        notes = [n for n in self.code_notes()
+                if n["payload"]["restart_kind"] == "orphaned"]
+        self.assertEqual(len(notes), 3)
+
+    def test_the_orphan_note_is_throttled_not_spammed(self):
+        shutil.rmtree(self.app.data_dir, ignore_errors=True)
+        for _ in range(5):
+            self.app.check_code_update()
+        notes = [n for n in self.code_notes()
+                if n["payload"]["restart_kind"] == "orphaned"]
+        self.assertEqual(len(notes), 1,
+                         "one line per orphan_note_interval, not one per tick")
+
+    def test_the_orphan_note_says_a_human_must_resolve_it(self):
+        shutil.rmtree(self.app.data_dir, ignore_errors=True)
+        self.app.check_code_update()
+        notes = [n for n in self.code_notes()
+                if n["payload"]["restart_kind"] == "orphaned"]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("disappeared out from under it", notes[0]["payload"]["text"])
+        self.assertTrue(notes[0]["payload"]["restart_pending"])
+
+    def test_healthz_reports_the_same_orphan_state(self):
+        self.assertFalse(self.get("/healthz", token=None)[1]["data_dir_orphaned"])
+        shutil.rmtree(self.app.data_dir, ignore_errors=True)
+        self.assertTrue(self.get("/healthz", token=None)[1]["data_dir_orphaned"])
 
 
 class TestSelfRestartWaitsForIdle(SelfRestartBase):

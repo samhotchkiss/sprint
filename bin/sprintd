@@ -121,6 +121,14 @@ DEFAULT_SELFRESTART_MIN_INTERVAL = 60.0         # never two self-restarts closer
 DEFAULT_SELFRESTART_MAX_BURST = 3               # ...and never more than this many
 DEFAULT_SELFRESTART_BURST_WINDOW = 600.0        # ...inside this window
 DEFAULT_RESTART_DRAIN_SECONDS = 10.0            # how long to wait for in-flight requests
+# A data dir that vanishes out from under a live process (deleted on disk while
+# the board still holds its db/wal/shm/log fds open) must never self-restart:
+# execv drops those fds and the trapped data is gone forever. Once orphaned,
+# this is not a one-time note -- the sha stops changing, so the ordinary
+# (kind, sha) dedupe would say it once and go silent -- so it repeats on this
+# cadence instead, loud enough for a human to keep noticing, not so loud it is
+# pure log spam.
+DEFAULT_ORPHAN_NOTE_INTERVAL = 300.0
 
 # `sprintd tail` -- the quiet ingress. It never exits on its own, so every
 # knob here is about how loudly it fails, not whether it gives up.
@@ -2196,6 +2204,24 @@ class App:
         self.data_dir = os.path.realpath(data_dir or os.path.join(self.project_root, DATA_DIRNAME))
         self.attach_dir = os.path.join(self.data_dir, ATTACH_DIRNAME)
         os.makedirs(self.attach_dir, exist_ok=True)
+        # Orphan guard: remember which directory we actually opened, by
+        # identity (dev, ino) and not just by path. A path can be deleted out
+        # from under a running board and a fresh, empty directory later
+        # created at that very same path -- that is a DIFFERENT directory (a
+        # different inode), and treating it as "back to normal" would be
+        # wrong: every file this process still has open (db, wal, shm, log)
+        # is pinned to the vanished original, not the new one.
+        try:
+            _st = os.stat(self.data_dir)
+            self._data_dir_ino = (_st.st_dev, _st.st_ino)
+        except OSError as exc:
+            # Unreachable in practice -- makedirs() just above either created
+            # this path or confirmed it exists -- but a constructor must never
+            # die over a guard. No snapshot means no orphan check is possible.
+            sys.stderr.write(
+                "sprintd: could not snapshot data dir identity for the orphan "
+                "guard (%s) -- self-restart orphan checks disabled\n" % exc)
+            self._data_dir_ino = None
         self.db_path = os.path.join(self.data_dir, DB_FILENAME)
         # Per-project settings (model policy, executors, concurrency). A file
         # beside the DB, deliberately: hand-editable, survives `stop`, diffable.
@@ -2341,6 +2367,8 @@ class App:
             "SPRINT_SELFRESTART_BURST_WINDOW", DEFAULT_SELFRESTART_BURST_WINDOW)
         self.restart_drain_seconds = env_float("SPRINT_RESTART_DRAIN_SECONDS",
                                                DEFAULT_RESTART_DRAIN_SECONDS)
+        self.orphan_note_interval = env_float("SPRINT_ORPHAN_NOTE_INTERVAL",
+                                              DEFAULT_ORPHAN_NOTE_INTERVAL)
         # Only a real `sprintd start` may re-exec itself: an App built by a test
         # or imported by a helper has no argv worth exec'ing and no servers to
         # drain. `cmd_start` turns both of these on once it is really serving.
@@ -2352,6 +2380,7 @@ class App:
         self._code_thread = None
         self._code_seen = None                  # a changed sha waiting to settle
         self._code_told = set()                 # shas we have already spoken about
+        self._orphan_told_at = 0.0              # last time we repeated the orphan note
         # In-flight, non-streaming requests. A restart waits for this to reach
         # zero so nobody's POST dies in the middle of a write.
         self._inflight = 0
@@ -2784,11 +2813,32 @@ class App:
         self.notify()
         return seq
 
+    def data_dir_orphaned(self) -> bool:
+        """True if the directory this board opened at startup is gone.
+
+        Checked by identity (dev, ino), not just by path: a path can be
+        deleted and a fresh, empty directory recreated at the very same spot,
+        and that is NOT the directory we opened -- every fd this process
+        still holds (db, wal, shm, log) is pinned to the vanished original,
+        not the new one. Treating a same-path-different-inode directory as
+        "fine" is exactly the mistake this guard exists to prevent.
+        """
+        if self._data_dir_ino is None:
+            # No snapshot was possible at startup -- we cannot tell either
+            # way, so we do not claim orphaned (a false "yes" here would wedge
+            # a board that was never in danger).
+            return False
+        try:
+            st = os.stat(self.data_dir)
+        except OSError:
+            return True
+        return (st.st_dev, st.st_ino) != self._data_dir_ino
+
     def check_code_update(self, at: float = None) -> str:
         """Look at our own source once. Returns what happened, for the tests.
 
         One of: "off", "unreadable", "unchanged", "settling", "broken",
-        "held", "busy", "restarting", "failed".
+        "held", "busy", "restarting", "failed", "orphaned".
         """
         at = now() if at is None else at
         if not self.code_sha:
@@ -2798,6 +2848,30 @@ class App:
             # A source file that vanished is not a reason to do anything: a
             # `git checkout` between two commits does this for a moment.
             return "unreadable"
+        if self.data_dir_orphaned():
+            # Our data directory is gone (or replaced by a different one at
+            # the same path) while we are still holding it open. Self-restart
+            # would execv into a process that can never reach the data
+            # trapped in this one's open file descriptors -- destroying it
+            # forever the instant those fds close. Refuse, unconditionally,
+            # before any of the restart machinery below even looks at whether
+            # the code is eligible. This is checked on every tick regardless
+            # of whether the code changed, because the danger does not go
+            # away just because nobody edited a file today.
+            if (at - self._orphan_told_at) >= self.orphan_note_interval:
+                self._orphan_told_at = at
+                self.code_note(
+                    "this board's data directory has disappeared out from "
+                    "under it -- self-restart is refused until this is "
+                    "resolved by a human",
+                    snap["sha"], "orphaned", once=False,
+                    detail="%s no longer resolves to the directory this "
+                           "board opened at startup. A self-restart would "
+                           "exec into a process that can never reach the "
+                           "data trapped in this one's open file "
+                           "descriptors -- so it stays put instead."
+                           % self.data_dir)
+            return "orphaned"
         if snap["sha"] == self.code_sha:
             self._code_seen = None
             return "unchanged"
@@ -7659,6 +7733,15 @@ def make_handler(app: App):
                         # ...and who is already running it, so a re-launch can
                         # see it already has a name and keep it.
                         "agent_name": app.agent_name(),
+                        # True the instant this board's data dir disappears
+                        # (or is replaced) out from under it. The board itself
+                        # already refuses to self-restart over this (see
+                        # `data_dir_orphaned`/`check_code_update`); this is
+                        # what lets something OUTSIDE the process -- the hub,
+                        # a sibling board's switcher, a human running `curl`
+                        # -- see the same thing instead of the board just
+                        # going quiet.
+                        "data_dir_orphaned": app.data_dir_orphaned(),
                         "seq": app.max_seq()})
 
                 if not self.authed(query):
@@ -9879,6 +9962,10 @@ def hub_summarize(entry: dict, timeout: float = 2.5) -> dict:
         "autoheal": None,
         "url": None,
         "detail": None,
+        # None until `/healthz` actually answers: unknown, not "no". Once it
+        # does, this is the board's own word on whether the directory it
+        # opened at startup is still the one on disk.
+        "data_dir_orphaned": None,
     }
     if not port:
         row["detail"] = "no port recorded"
@@ -9898,11 +9985,20 @@ def hub_summarize(entry: dict, timeout: float = 2.5) -> dict:
         # Something else grabbed the port after this board died.
         row["detail"] = "port taken by another project"
         return row
+    row["data_dir_orphaned"] = bool(health.get("data_dir_orphaned"))
 
     token = board_token_for(entry)
     if not token:
-        row.update(status="no_token",
-                   detail="no token on disk for this project (.sprint/token)")
+        # A live, healthy-looking board with no readable token is not the
+        # same failure as a board that just never got a token: if IT is
+        # telling us its own data directory is gone, say that instead of the
+        # generic message, because that is the actionable fact.
+        detail = "no token on disk for this project (.sprint/token)"
+        if row["data_dir_orphaned"]:
+            detail = ("this board's data directory has disappeared out from "
+                       "under it -- self-restart is refused until this is "
+                       "resolved by a human")
+        row.update(status="no_token", detail=detail)
         return row
     try:
         status, raw = http_get("127.0.0.1", port, "/api/board", token, timeout=timeout)
@@ -9993,6 +10089,12 @@ def sibling_row(row: dict, is_self: bool = False) -> dict:
         "session": row.get("session"),
         "sprint_title": row.get("sprint_title"),
         "stuck_seconds": row.get("stuck_seconds"),
+        # "live" for a board answering normally, "no_token" (etc) for one that
+        # is up but degraded -- see `siblings_snapshot`'s admission rule and
+        # `countsText` in siblings.js, which turns this into visible text
+        # instead of a row that just quietly says "nothing waiting".
+        "status": row.get("status"),
+        "data_dir_orphaned": row.get("data_dir_orphaned"),
     }
 
 
@@ -10032,7 +10134,14 @@ def siblings_snapshot(app, registry: str = None, timeout: float = 1.5) -> dict:
             saw_self = True
             continue
         row = hub_summarize(entry, timeout=timeout)
-        if not row.get("reachable"):
+        if not row.get("reachable") and row.get("status") != "no_token":
+            # A truly dead board (nothing answers, or something else answers
+            # as a different project) is noise: a row that navigates nowhere.
+            # But "no_token" means `/healthz` DID answer, as THIS project --
+            # the board is up, it just cannot be reached for its counts. That
+            # is worth a row (status carried through by `sibling_row`, turned
+            # into visible text by the switcher) rather than the board simply
+            # vanishing from the list with zero signal.
             continue
         ranked.append((order, sibling_row(row)))
     if not saw_self:
@@ -10082,6 +10191,10 @@ def self_sibling_row(app, entry: dict = None) -> dict:
         "project_root": root,
         "port": port,
         "reachable": True,
+        "status": "live",
+        # Straight off our own process -- no round trip needed, we ARE the
+        # board `/healthz` would otherwise be asked about.
+        "data_dir_orphaned": app.data_dir_orphaned(),
         "url": board_url(hosts[0], port, app.token) if port else None,
     })
     return sibling_row(row, is_self=True)

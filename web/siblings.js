@@ -132,8 +132,20 @@ function signature() {
   ]);
 }
 
-/** "2 need you · 1 ready · 3 in motion" — zero counts are simply not said. */
-function countsText(s) {
+/**
+ * "2 need you · 1 ready · 3 in motion" — zero counts are simply not said.
+ *
+ * A board can be `alive: false` for two very different reasons: nothing is
+ * answering at all (dead — dropped before this ever runs, see
+ * `siblings_snapshot`'s admission rule), or something IS answering, as this
+ * very project, but its counts could not be read (today: no token on disk,
+ * which is also what a board that has refused to self-restart over a missing
+ * data directory looks like from over here). That second case must never
+ * read as "nothing waiting" — an all-quiet healthy board and a board a human
+ * needs to go fix would otherwise be pixel-for-pixel identical, and the whole
+ * point of carrying `status` through is that they are not.
+ */
+export function countsText(s) {
   const parts = [];
   if (s.needs_you) parts.push(`${s.needs_you} need${s.needs_you === 1 ? 's' : ''} you`);
   if (s.ready) parts.push(`${s.ready} ready`);
@@ -142,7 +154,9 @@ function countsText(s) {
       : `${s.chat_unread} new from the session`);
   }
   if (s.in_motion) parts.push(`${s.in_motion} in motion`);
-  return parts.length ? parts.join(' · ') : 'nothing waiting';
+  if (parts.length) return parts.join(' · ');
+  if (s.status === 'no_token') return 'needs attention';
+  return 'nothing waiting';
 }
 
 /**
