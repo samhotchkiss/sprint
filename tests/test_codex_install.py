@@ -60,6 +60,7 @@ class TestCodexInstall(unittest.TestCase):
         self.assertIn("collaboration.spawn_agent", text)
         self.assertIn("yield_control", text)
         self.assertIn("gpt-5.6-luna", text)
+        self.assertIn("namespace worker branches with the board slug", text)
         self.assertTrue((ADAPTER / "agents" / "openai.yaml").is_file())
 
 

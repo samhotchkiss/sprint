@@ -42,6 +42,12 @@ worktree as the new board's project root. Do not point a second data directory
 at the same project root: the machine registry is keyed by project root, so the
 two boards would overwrite each other's registry identity.
 
+Linked worktrees still share one Git branch namespace. On a second board,
+namespace worker branches with the board slug (for example,
+`design-sync/card-3`) instead of reusing the canonical `sprint-card-3` branch
+name. Keep `sprint-card-3` as the board-facing agent name and worktree folder;
+only the Git branch needs the extra namespace.
+
 Register this session's exact tmux target only after Codex owns the board.
 Never overwrite another live session's target. The signed launch URL is meant
 for the user and should be shared when the board starts; do not put its bearer
