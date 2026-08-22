@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SPRINT_REPO="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+SOURCE_DIR="$SPRINT_REPO/codex/skills/sprint"
+CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
+TARGET_DIR="$CODEX_ROOT/skills/sprint"
+
+if [[ ! -f "$SOURCE_DIR/SKILL.md" ]]; then
+  echo "error: Codex Sprint adapter is missing at $SOURCE_DIR" >&2
+  exit 1
+fi
+
+if [[ -L "$TARGET_DIR" ]]; then
+  RESOLVED_TARGET="$(cd "$TARGET_DIR" && pwd -P)"
+  if [[ "$RESOLVED_TARGET" == "$SOURCE_DIR" ]]; then
+    echo "Codex Sprint skill already installed: $TARGET_DIR -> $SOURCE_DIR"
+    exit 0
+  fi
+fi
+
+if [[ -e "$TARGET_DIR" || -L "$TARGET_DIR" ]]; then
+  echo "error: $TARGET_DIR already exists; leaving it untouched" >&2
+  echo "move it aside yourself, then run this installer again" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$TARGET_DIR")"
+ln -s "$SOURCE_DIR" "$TARGET_DIR"
+echo "Installed Codex Sprint skill: $TARGET_DIR -> $SOURCE_DIR"
+echo "Restart Codex, then say: start a sprint"

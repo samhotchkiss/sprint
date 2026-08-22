@@ -1,0 +1,7 @@
+interface:
+  display_name: "Sprint"
+  short_description: "Run Sprint boards with Codex"
+  default_prompt: "Use $sprint to start or resume the Sprint board for this project."
+
+policy:
+  allow_implicit_invocation: true

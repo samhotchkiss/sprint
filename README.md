@@ -1,6 +1,6 @@
 # sprint
 
-A kanban board that sits on top of a live Claude Code session: dump
+A kanban board that sits on top of a live Claude Code or Codex session: dump
 feedback or work items at a tailnet URL, the session dispatches
 subagents to work them, and every interaction you make on the board —
 answering a question, approving a card, dropping a note in the sidebar
@@ -10,6 +10,8 @@ The board holds state; the session is the only brain. It's called
 a proper project sprint.
 
 ## Install
+
+### Claude Code
 
 For local development/testing, point Claude Code at this repo directly:
 
@@ -27,6 +29,24 @@ Either way, once loaded, say **"start a sprint"** (or "resume the
 sprint", "feedback session", "open the board") in a Claude Code session
 running inside the project you want a board for.
 
+### Codex
+
+Install the tracked Codex adapter as a symlink into your Codex skills folder:
+
+```
+bin/sprint-codex-install
+```
+
+The installer is idempotent and never replaces an existing skill. Restart
+Codex after the first install, then say **"start a sprint"** in the project
+you want the board for. The adapter reads the canonical Sprint contract from
+this checkout, maps its agent and monitor operations onto Codex collaboration
+tools, and declares Codex as the executor on boards it owns.
+
+One board owns one project root. To run two boards against the same repository,
+use a separate git worktree as the second board's project root; the Codex
+adapter does this automatically rather than renaming or racing a live board.
+
 ## Dependencies
 
 - Python 3.9+ (stdlib only — no `pip install` anywhere in this plugin)
@@ -37,7 +57,7 @@ running inside the project you want a board for.
 
 ## Quickstart
 
-1. `cd` into the project you want a board for, inside a `claude` session
+1. `cd` into the project you want a board for, inside a Claude Code or Codex session
    running in tmux (see "Power-outage recovery" for why tmux matters).
 2. Say **"start a sprint."** The skill runs `sprintd doctor`, starts the
    server, and prints a URL like `http://100.x.x.x:8377/?t=<token>`.
