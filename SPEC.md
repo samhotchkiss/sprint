@@ -688,11 +688,12 @@ still owes screenshots. The kind is taken from the packet, else from the card
 (`assign {work_kind: "ops"}`), and an accepted packet stamps it onto the card so a second packet
 after a bounce is judged by the same rules. Ops cards need no worktree and no branch, and `assign`
 may omit them.
-- `ui_change: true` → `screenshots` REQUIRED (before/after, light+dark, from the worker's OWN
-  worktree preview, never a shared dev server) and `live_url` strongly encouraged: the worker starts
-  its preview bound to the tailnet IP (loopback fallback) on a deterministic port
-  (`8400 + card_num % 100`; batches use batch id) and keeps it alive until the verdict; the card's
-  "See it live" button links there; the session kills the preview and prunes on terminal state.
+- `ui_change: true` → `screenshots` and `live_url` REQUIRED (before/after, light+dark, from the
+  worker's OWN worktree preview, never a shared dev server). The worker starts it through
+  `bin/sprint-preview`, which reserves a board-namespaced port under the machine-wide preview lock,
+  rejects exact-address and wildcard listener collisions, and records the child PID identity. The
+  ready helper proves the advertised host reaches that owned listener. The session uses the same
+  ownership record to stop only that process on terminal state; it never kills by port.
 - Non-UI changes → `validate` carries the burden: an exact observable check (a command whose
   before/after output differs, a URL to hit, a behavior to try) — never "read the diff". For batches: `per_card` required, one entry per member card;
 ready flips all members together; verdicts can approve the batch wholesale or bounce individual

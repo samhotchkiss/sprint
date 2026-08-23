@@ -55,6 +55,12 @@ adapter does this automatically rather than renaming or racing a live board.
   it's reachable from your phone/other machines; if absent, it degrades
   to loopback-only and says so loudly)
 
+UI previews use `bin/sprint-preview`. It gives each board a stable port
+namespace, reserves the actual port across all boards on the machine, verifies
+that the advertised URL reaches the process it started, and records enough PID
+identity to stop only that process after a verdict. An existing exact-address
+or wildcard listener is a collision, even if the OS would allow both binds.
+
 ## Quickstart
 
 1. `cd` into the project you want a board for, inside a Claude Code or Codex session

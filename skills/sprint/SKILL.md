@@ -1681,14 +1681,16 @@ the worktree, post a closing note.
 
 ### Preview server cleanup
 
-Any card/batch whose evidence packet had `ui_change: true` has a worker
-preview server still running on `8400 + (card_num % 100)` (batch: batch
-id) — the worker was told to leave it up until the verdict. **On any
-terminal state** (`completed`, `rejected`, `failed`, `canceled`,
-`duplicate`) kill that process: the deterministic port makes it findable
-even if you don't have the PID handy (`lsof -ti :<port> | xargs kill`,
-or whatever's appropriate on the box), then proceed with the worktree
-prune. Don't kill it while the card is merely `bounced` back to
+Any card/batch whose evidence packet had `ui_change: true` has a preview
+started and recorded by `bin/sprint-preview` — the worker was told to leave it
+up until the verdict. **On any terminal state** (`completed`, `rejected`,
+`failed`, `canceled`, `duplicate`) run `bin/sprint-preview stop <card_num>`
+with this board's `SPRINT_SERVER`/`SPRINT_TOKEN`, then proceed with the worktree
+prune. For a batch, any member number resolves to the shared batch record. The
+helper checks the saved PID start identity and the board's machine-wide lease
+before signaling that process group. It never kills whichever unrelated
+process happens to share or later inherit a port. Do not replace this with
+`lsof ... | kill`. Don't stop it while the card is merely `bounced` back to
 `in_progress` or failed integration — the worker may still need it to
 re-verify the fix.
 

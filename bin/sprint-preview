@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""Start, verify, and stop an ownership-tracked Sprint preview server.
+
+The preview port is namespaced by the board project root, then reserved in a
+machine-wide registry.  `start` retries if any exact-address or wildcard
+listener already owns the candidate.  `stop` uses the recorded process start
+identity; it never kills whichever process happens to be listening on a port.
+
+Examples:
+  sprint-preview start 42 --worktree "$PWD" -- npm run dev -- --host {host} --port {port}
+  sprint-preview verify 42 --url http://100.x.x.x:23142/
+  sprint-preview stop 42
+
+SPRINT_PREVIEW_HOST and SPRINT_PREVIEW_PORT are also set for the child.
+"""
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+import pathlib
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+
+PORT_MIN = 20000
+PORT_SLOTS = 300
+PORTS_PER_SLOT = 100
+STARTING_TTL = 60
+
+
+class PreviewError(RuntimeError):
+    pass
+
+
+def parse_args(argv):
+    command = []
+    if "--" in argv:
+        separator = argv.index("--")
+        command = argv[separator + 1:]
+        argv = argv[:separator]
+    parser = argparse.ArgumentParser(prog="sprint-preview")
+    parser.add_argument("--registry", default=os.environ.get("SPRINT_PREVIEW_REGISTRY"),
+                        help="machine-wide preview registry (tests/advanced use)")
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    def common(cmd):
+        cmd.add_argument("card", type=int, help="card number (batch members resolve to their batch id)")
+        cmd.add_argument("--project-root", help="board project root; normally read from SPRINT_SERVER")
+        cmd.add_argument("--server", default=os.environ.get("SPRINT_SERVER"))
+        cmd.add_argument("--token", default=os.environ.get("SPRINT_TOKEN"))
+
+    start = sub.add_parser("start", help="reserve a port and start the preview")
+    common(start)
+    start.add_argument("--worktree", required=True, help="working directory for the preview command")
+    start.add_argument("--host", help="advertised bind host; defaults to tailnet IPv4, then loopback")
+    start.add_argument("--path", default="/", help="URL path used for readiness and live_url")
+    start.add_argument("--timeout", type=float, default=30.0)
+    start.add_argument("--log", help="preview log path (default: board .sprint/previews/<unit>.log)")
+
+    verify = sub.add_parser("verify", help="prove the recorded preview still owns its live URL")
+    common(verify)
+    verify.add_argument("--url", help="require this exact live URL")
+
+    stop = sub.add_parser("stop", help="stop only the recorded owning process")
+    common(stop)
+    stop.add_argument("--timeout", type=float, default=5.0)
+    args = parser.parse_args(argv)
+    args.command = command
+    return args
+
+
+def registry_path(override=None):
+    if override:
+        return os.path.realpath(override)
+    board_registry = os.environ.get("SPRINT_REGISTRY")
+    if board_registry:
+        return os.path.join(os.path.dirname(os.path.realpath(board_registry)),
+                            "preview-registry.json")
+    return os.path.realpath(os.path.expanduser("~/.sprint/preview-registry.json"))
+
+
+@contextlib.contextmanager
+def locked_registry(path):
+    pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path + ".lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                with open(path, "r", encoding="utf-8") as src:
+                    data = json.load(src)
+                if not isinstance(data, dict):
+                    data = {}
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                data = {}
+            yield data
+            tmp = "%s.%s.tmp" % (path, os.getpid())
+            with open(tmp, "w", encoding="utf-8") as dst:
+                json.dump(data, dst, indent=2, sort_keys=True)
+                dst.write("\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def get_json(url, token=None, timeout=3):
+    headers = {"Authorization": "Bearer " + token} if token else {}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
+        raise PreviewError("could not read %s: %s" % (url, exc)) from exc
+
+
+def resolve_project_root(explicit, server):
+    if explicit:
+        return os.path.realpath(explicit)
+    env_root = os.environ.get("SPRINT_PROJECT_ROOT")
+    if env_root:
+        return os.path.realpath(env_root)
+    if server:
+        health = get_json(server.rstrip("/") + "/healthz")
+        root = health.get("project_root")
+        if root:
+            return os.path.realpath(root)
+    raise PreviewError("project root is unknown; pass --project-root or set SPRINT_SERVER")
+
+
+def resolve_unit(card, server, token):
+    if server and token:
+        payload = get_json("%s/api/cards/%d" % (server.rstrip("/"), card), token)
+        info = payload.get("card") or {}
+        batch = info.get("batch_id")
+        if batch is not None:
+            return "batch-%s" % batch, int(batch)
+    return "card-%d" % card, card
+
+
+def default_host():
+    try:
+        proc = subprocess.run(["tailscale", "ip", "-4"], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=3, check=False)
+        host = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+        if host:
+            socket.inet_aton(host)
+            return host
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        pass
+    return "127.0.0.1"
+
+
+def preferred_port(project_root, unit_number):
+    digest = hashlib.sha256(os.path.realpath(project_root).encode("utf-8")).digest()
+    slot = int.from_bytes(digest[:4], "big") % PORT_SLOTS
+    return PORT_MIN + slot * PORTS_PER_SLOT + (unit_number % PORTS_PER_SLOT)
+
+
+def candidate_ports(project_root, unit_number):
+    first = preferred_port(project_root, unit_number)
+    first_slot = (first - PORT_MIN) // PORTS_PER_SLOT
+    suffix = unit_number % PORTS_PER_SLOT
+    for offset in range(PORT_SLOTS):
+        slot = (first_slot + offset) % PORT_SLOTS
+        yield PORT_MIN + slot * PORTS_PER_SLOT + suffix
+
+
+def port_is_clear(port):
+    """Conservatively reject any IPv4/IPv6 exact or wildcard listener."""
+    sockets = []
+    specs = [(socket.AF_INET, ("0.0.0.0", port))]
+    if socket.has_ipv6:
+        specs.append((socket.AF_INET6, ("::", port)))
+    try:
+        for family, address in specs:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sockets.append(sock)
+            if family == socket.AF_INET6:
+                with contextlib.suppress(OSError):
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.bind(address)
+        return True
+    except OSError:
+        return False
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
+def pid_identity(pid):
+    try:
+        proc = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout.strip()
+
+
+def descendants(root_pid):
+    try:
+        proc = subprocess.run(["ps", "-axo", "pid=,ppid="], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return {root_pid}
+    children = {}
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and all(field.isdigit() for field in fields):
+            pid, ppid = map(int, fields)
+            children.setdefault(ppid, set()).add(pid)
+    found = {root_pid}
+    stack = [root_pid]
+    while stack:
+        parent = stack.pop()
+        for child in children.get(parent, ()):
+            if child not in found:
+                found.add(child)
+                stack.append(child)
+    return found
+
+
+def listener_rows(port):
+    try:
+        proc = subprocess.run(
+            ["lsof", "-nP", "-a", "-iTCP:%d" % port, "-sTCP:LISTEN", "-Fpn"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=3, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PreviewError("lsof is required to verify preview ownership: %s" % exc) from exc
+    rows = []
+    current_pid = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            current_pid = int(line[1:])
+        elif line.startswith("n") and current_pid is not None:
+            rows.append((current_pid, line[1:]))
+    return rows
+
+
+def address_matches(name, host, port):
+    endpoint = name.rsplit("->", 1)[0]
+    if not endpoint.endswith(":" + str(port)):
+        return False
+    bound = endpoint[:-(len(str(port)) + 1)].strip("[]")
+    return bound in (host, "*", "0.0.0.0", "::", "::0")
+
+
+def listener_owned(record):
+    owned = descendants(int(record["pid"]))
+    matching = [(pid, name) for pid, name in listener_rows(int(record["port"]))
+                if address_matches(name, record["host"], int(record["port"]))]
+    return bool(matching) and all(pid in owned for pid, _ in matching)
+
+
+def http_reachable(host, port, path, timeout=1):
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.request("GET", path or "/")
+        response = conn.getresponse()
+        response.read(1)
+        conn.close()
+        return True
+    except (OSError, http.client.HTTPException):
+        return False
+
+
+def record_alive(record, require_http=False):
+    pid = int(record.get("pid") or 0)
+    identity = record.get("pid_identity") or ""
+    if not pid or not identity or pid_identity(pid) != identity:
+        return False
+    try:
+        if not listener_owned(record):
+            return False
+    except PreviewError:
+        return False
+    return not require_http or http_reachable(
+        record["host"], int(record["port"]), record.get("path") or "/")
+
+
+def record_path(project_root, unit):
+    return os.path.join(project_root, ".sprint", "previews", unit + ".json")
+
+
+def read_record(path):
+    try:
+        with open(path, "r", encoding="utf-8") as src:
+            value = json.load(src)
+        return value if isinstance(value, dict) else None
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def write_record(path, record):
+    pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+    tmp = "%s.%s.tmp" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as dst:
+        json.dump(record, dst, indent=2, sort_keys=True)
+        dst.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def public_record(record, reused=False):
+    return {
+        "project_root": record["project_root"],
+        "unit": record["unit"],
+        "host": record["host"],
+        "port": record["port"],
+        "live_url": record["live_url"],
+        "pid": record["pid"],
+        "record": record["record_path"],
+        "reused": reused,
+    }
+
+
+def prune_registry(data):
+    now = time.time()
+    for key, entry in list(data.items()):
+        if not isinstance(entry, dict):
+            data.pop(key, None)
+            continue
+        if entry.get("status") == "starting":
+            if now - float(entry.get("reserved_at") or 0) > STARTING_TTL:
+                data.pop(key, None)
+        elif not record_alive(entry):
+            data.pop(key, None)
+
+
+def reserve(registry, project_root, unit, unit_number, host):
+    key = project_root + "\0" + unit
+    with locked_registry(registry) as data:
+        prune_registry(data)
+        existing = data.get(key)
+        if existing and existing.get("status") == "running" and record_alive(existing, True):
+            return existing, True
+        used = {int(entry.get("port")) for entry in data.values()
+                if isinstance(entry, dict) and entry.get("port")}
+        for port in candidate_ports(project_root, unit_number):
+            if port in used or not port_is_clear(port):
+                continue
+            lease = {
+                "lease": uuid.uuid4().hex,
+                "project_root": project_root,
+                "unit": unit,
+                "host": host,
+                "port": port,
+                "status": "starting",
+                "reserved_at": time.time(),
+            }
+            data[key] = lease
+            return lease, False
+    raise PreviewError("no collision-free preview port is available")
+
+
+def release_lease(registry, record):
+    key = record["project_root"] + "\0" + record["unit"]
+    with locked_registry(registry) as data:
+        current = data.get(key)
+        if isinstance(current, dict) and current.get("lease") == record.get("lease"):
+            data.pop(key, None)
+
+
+def publish_lease(registry, record):
+    key = record["project_root"] + "\0" + record["unit"]
+    with locked_registry(registry) as data:
+        current = data.get(key)
+        if not isinstance(current, dict) or current.get("lease") != record.get("lease"):
+            raise PreviewError("preview reservation was lost before the server became ready")
+        data[key] = record
+
+
+def terminate_record(record, timeout=5):
+    pid = int(record.get("pid") or 0)
+    current_identity = pid_identity(pid) if pid else ""
+    if not current_identity:
+        return
+    if current_identity != record.get("pid_identity"):
+        raise PreviewError("refusing cleanup: recorded preview PID identity no longer matches")
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return
+    if pgid != pid:
+        raise PreviewError("refusing cleanup: recorded preview no longer leads its process group")
+    os.killpg(pgid, signal.SIGTERM)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not pid_identity(pid):
+            return
+        time.sleep(0.05)
+    if pid_identity(pid) == record.get("pid_identity"):
+        os.killpg(pgid, signal.SIGKILL)
+
+
+def child_command(command, host, port, live_url):
+    if not command:
+        raise PreviewError("start requires a command after --")
+    replacements = {"{host}": host, "{port}": str(port), "{url}": live_url}
+    return [replacements.get(part, part) for part in command]
+
+
+def command_start(args, project_root, unit, unit_number, registry):
+    worktree = os.path.realpath(args.worktree)
+    if not os.path.isdir(worktree):
+        raise PreviewError("worktree is not a directory: %s" % worktree)
+    host = args.host or default_host()
+    path = args.path if args.path.startswith("/") else "/" + args.path
+    attempts = 0
+    while attempts < PORT_SLOTS:
+        attempts += 1
+        lease, reused = reserve(registry, project_root, unit, unit_number, host)
+        if reused:
+            print(json.dumps(public_record(lease, reused=True), sort_keys=True))
+            return 0
+        port = int(lease["port"])
+        live_url = "http://%s:%d%s" % (host, port, path)
+        record_file = record_path(project_root, unit)
+        log_path = os.path.realpath(args.log or os.path.join(
+            project_root, ".sprint", "previews", unit + ".log"))
+        pathlib.Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        command = child_command(args.command, host, port, live_url)
+        env = os.environ.copy()
+        env.update({"SPRINT_PREVIEW_HOST": host,
+                    "SPRINT_PREVIEW_PORT": str(port),
+                    "SPRINT_PREVIEW_URL": live_url})
+        with open(log_path, "ab", buffering=0) as log:
+            child = subprocess.Popen(command, cwd=worktree, env=env,
+                                     stdin=subprocess.DEVNULL, stdout=log,
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+        identity = pid_identity(child.pid)
+        if not identity:
+            with contextlib.suppress(ProcessLookupError):
+                child.terminate()
+            release_lease(registry, lease)
+            raise PreviewError("could not record the preview process identity")
+        record = dict(lease)
+        record.update({
+            "status": "running",
+            "pid": child.pid,
+            "pid_identity": identity,
+            "worktree": worktree,
+            "command": command,
+            "path": path,
+            "live_url": live_url,
+            "log": log_path,
+            "record_path": record_file,
+            "started_at": time.time(),
+        })
+        deadline = time.time() + args.timeout
+        ready = False
+        while time.time() < deadline:
+            if child.poll() is not None:
+                break
+            if listener_owned(record) and http_reachable(host, port, path):
+                ready = True
+                break
+            time.sleep(0.1)
+        if ready:
+            write_record(record_file, record)
+            publish_lease(registry, record)
+            print(json.dumps(public_record(record), sort_keys=True))
+            return 0
+        with contextlib.suppress(PreviewError, ProcessLookupError):
+            terminate_record(record, timeout=1)
+        release_lease(registry, record)
+        # A listener race or a child bind failure is recoverable on another
+        # reserved port. Other startup failures are surfaced after a few tries.
+        if attempts >= 3:
+            raise PreviewError("preview did not become an owned HTTP listener; see %s" % log_path)
+    raise PreviewError("preview could not start on any reserved port")
+
+
+def command_verify(args, project_root, unit, registry):
+    path = record_path(project_root, unit)
+    record = read_record(path)
+    if not record:
+        raise PreviewError("no preview ownership record for %s" % unit)
+    key = project_root + "\0" + unit
+    with locked_registry(registry) as data:
+        current = data.get(key)
+        if not isinstance(current, dict) or current.get("lease") != record.get("lease"):
+            raise PreviewError("preview is not the machine registry owner")
+    if args.url and args.url.rstrip("/") != record.get("live_url", "").rstrip("/"):
+        raise PreviewError("live_url does not match the owned preview: %s" % record.get("live_url"))
+    if not record_alive(record, require_http=True):
+        raise PreviewError("preview URL is not served by its recorded process")
+    print(json.dumps(public_record(record, reused=True), sort_keys=True))
+    return 0
+
+
+def command_stop(args, project_root, unit, registry):
+    path = record_path(project_root, unit)
+    record = read_record(path)
+    if not record:
+        print(json.dumps({"project_root": project_root, "unit": unit,
+                          "stopped": False, "reason": "not running"}, sort_keys=True))
+        return 0
+    key = project_root + "\0" + unit
+    with locked_registry(registry) as data:
+        current = data.get(key)
+        if not isinstance(current, dict) or current.get("lease") != record.get("lease"):
+            raise PreviewError("refusing cleanup: board no longer owns this preview lease")
+    terminate_record(record, timeout=args.timeout)
+    release_lease(registry, record)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+    print(json.dumps({"project_root": project_root, "unit": unit,
+                      "port": record.get("port"), "pid": record.get("pid"),
+                      "stopped": True}, sort_keys=True))
+    return 0
+
+
+def main(argv):
+    args = parse_args(argv)
+    try:
+        project_root = resolve_project_root(args.project_root, args.server)
+        unit, unit_number = resolve_unit(args.card, args.server, args.token)
+        registry = registry_path(args.registry)
+        if args.action == "start":
+            return command_start(args, project_root, unit, unit_number, registry)
+        if args.action == "verify":
+            return command_verify(args, project_root, unit, registry)
+        return command_stop(args, project_root, unit, registry)
+    except PreviewError as exc:
+        print("sprint-preview: %s" % exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

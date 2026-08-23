@@ -59,14 +59,13 @@ never through the gate. This command prints an advisory notice on stderr
   before/after output differs, a URL to hit, a behavior to try), never
   "read the diff". Pass it as a JSON array of 1-3 strings, or a single
   non-empty string.
-- screenshots are required (non-empty) when ui_change is true — capture
+- screenshots and live_url are required when ui_change is true — capture
   before/after, light AND dark, from YOUR OWN worktree's preview, never
-  a shared dev server. live_url is strongly encouraged for ui_change:
-  point it at your worktree's own preview server, bound to the tailnet
-  IP (loopback fallback), on the deterministic port
-  8400 + (card_num % 100) (batches: 8400 + (batch_id % 100)), and leave
-  it running until the verdict lands — the card's "See it live" button
-  links there.
+  a shared dev server. Start it with `bin/sprint-preview` and copy the exact
+  live_url from that helper's JSON output. This command verifies that the URL
+  is reachable through its advertised host and that the listener belongs to
+  the process recorded for this board/card. Leave it running until the verdict
+  lands — the card's "See it live" button links there.
 - reports is OPTIONAL: absolute paths to documents your work produced (a
   findings write-up, a comparison table). Prefer .md — markdown renders
   with the board's own typography; .html is supported for documents that
@@ -88,6 +87,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -227,6 +227,8 @@ def validate_packet(packet):
     live_url = packet.get("live_url")
     if live_url is not None and not isinstance(live_url, str):
         fail("live_url", "must be a string")
+    if ui_change and not (isinstance(live_url, str) and live_url.strip()):
+        fail("live_url", "required when ui_change is true — use sprint-preview so the URL has a verified owner")
 
     per_card = packet.get("per_card")
     if per_card is not None:
@@ -247,6 +249,23 @@ def validate_packet(packet):
 
 def warn(message):
     print("sprint-ready: " + message, file=sys.stderr)
+
+
+def verify_owned_preview(num, packet, server, token):
+    """A UI packet may advertise only the URL owned by this board/card."""
+    if not packet.get("ui_change"):
+        return
+    helper = os.path.join(os.path.dirname(os.path.realpath(__file__)), "sprint-preview")
+    env = os.environ.copy()
+    env["SPRINT_SERVER"] = server
+    env["SPRINT_TOKEN"] = token
+    proc = subprocess.run(
+        [helper, "verify", str(num), "--url", packet["live_url"]],
+        env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=15, check=False)
+    if proc.returncode:
+        detail = proc.stderr.strip() or "ownership check failed"
+        fail("live_url", "%s; start it with sprint-preview and use the returned URL" % detail)
 
 
 def decision_smells(packet):
@@ -324,6 +343,8 @@ def main(argv):
         fail("server", "pass --server or set SPRINT_SERVER")
     if not args.token:
         fail("token", "pass --token or set SPRINT_TOKEN")
+
+    verify_owned_preview(num, packet, args.server.rstrip("/"), args.token)
 
     body = json.dumps({"packet": packet}).encode("utf-8")
     server = args.server.rstrip("/")

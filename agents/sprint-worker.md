@@ -355,17 +355,25 @@ check on you.
 5. If the diff touches anything under a frontend/UI path, treat this as
    `ui_change: true` in your evidence packet (see below) — no exceptions
    for "just a copy change."
-6. For `ui_change: true` work, start your OWN preview server (whatever
-   this repo uses — `npm run dev`, etc.) from inside your worktree,
-   bound to the machine's tailnet IP if one exists (`tailscale ip -4`),
-   falling back to loopback if it doesn't, on the **deterministic port**
-   `8400 + (card_num % 100)` — for a batch, use the batch id instead of
-   the card num in that formula. Put that URL in `live_url`. **Leave it
-   running** — don't stop it after taking screenshots. It stays up until
-   a verdict lands; the card's "See it live" button on the board points
-   straight at it. The session kills it for you once the card reaches a
-   terminal state (approved-and-merged, rejected, failed, canceled) —
-   that's not your job.
+6. For `ui_change: true` work, start your OWN preview server through
+   `bin/sprint-preview` from inside your worktree. It derives a stable port
+   namespace from the board project root, reserves that port across every
+   Sprint board on the machine, and retries if any exact-address or wildcard
+   listener already owns it. Pass `{host}` and `{port}` as whole command
+   arguments; the helper replaces them and also sets `SPRINT_PREVIEW_HOST`,
+   `SPRINT_PREVIEW_PORT`, and `SPRINT_PREVIEW_URL` for servers that read env:
+
+   ```
+   /path/to/sprint/bin/sprint-preview start <card_num> --worktree "$PWD" -- \
+     npm run dev -- --host {host} --port {port}
+   ```
+
+   For a batch, pass any member card; the helper resolves the batch id from
+   the board. Use the exact `live_url` in its JSON output. `sprint-ready`
+   verifies that URL is reachable through the advertised host and that its
+   listener belongs to the recorded child process. **Leave it running** — the
+   session calls `sprint-preview stop <card_num>` only after a terminal
+   verdict. Never choose or kill a process by port yourself.
 
 ## Nothing to do? That's still a `ready`, never a close
 
@@ -429,11 +437,10 @@ worktree root — not committed) shaped like:
   (see "Doing the work" step 6), never a shared/serving dev server
   (that's someone else's live session; touching it breaks their view of
   the app). It also requires `live_url` pointed at that same preview
-  server — start it bound to the tailnet IP (loopback fallback) on port
-  `8400 + (card_num % 100)` (batch: batch id) and leave it running; the
-  card's "See it live" button on the board links straight to it. Don't
-  stop the server yourself — the session kills it once the card reaches
-  a terminal state.
+  server — start it with `bin/sprint-preview` and use the exact URL the
+  helper returns. The ready helper verifies the advertised host reaches the
+  recorded owning process. Don't stop the server yourself — the session calls
+  the ownership-safe stop after the card reaches a terminal state.
   Pass screenshots as **absolute file paths**. The board copies each one
   into its own attachment store when it accepts your packet and serves it
   back to the user's browser — you don't upload anything, and a file you

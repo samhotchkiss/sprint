@@ -5985,8 +5985,11 @@ class App:
         if not isinstance(ui, bool):
             if kind != "ops":
                 missing.append("ui_change")
-        elif ui and not (packet.get("screenshots") or []):
-            missing.append("screenshots")
+        elif ui:
+            if not (packet.get("screenshots") or []):
+                missing.append("screenshots")
+            if blank("live_url"):
+                missing.append("live_url")
 
         if not isinstance(ui, bool) and kind != "ops":
             diff = packet.get("diffstat")

@@ -420,14 +420,18 @@ class TestEvidenceGate(Base):
         self.assertEqual(status, 422, body)
         self.assertEqual(body["missing"], ["test_result"])
 
-    def test_ui_change_requires_screenshots(self):
+    def test_ui_change_requires_screenshots_and_a_live_url(self):
         num = self.new_card()["num"]
         self.to_in_progress(num)
         packet = dict(GOOD_PACKET, ui_change=True)
         status, body = self.post("/api/cards/%d/ready" % num, {"packet": packet})
         self.assertEqual(status, 422, body)
-        self.assertEqual(body["missing"], ["screenshots"])
+        self.assertEqual(body["missing"], ["screenshots", "live_url"])
         packet["screenshots"] = ["deadbeef"]
+        status, body = self.post("/api/cards/%d/ready" % num, {"packet": packet})
+        self.assertEqual(status, 422, body)
+        self.assertEqual(body["missing"], ["live_url"])
+        packet["live_url"] = "http://127.0.0.1:24001/"
         status, body = self.post("/api/cards/%d/ready" % num, {"packet": packet})
         self.assertEqual(status, 200, body)
         self.assertEqual(self.state_of(num), "ready")
@@ -2202,7 +2206,8 @@ class TestAttachmentUrls(Base):
             fh.write(base64.b64decode(PNG_B64))
         num = self.new_card("ui work")["num"]
         self.to_in_progress(num)
-        packet = dict(GOOD_PACKET, ui_change=True, screenshots=[shot])
+        packet = dict(GOOD_PACKET, ui_change=True, screenshots=[shot],
+                      live_url="http://127.0.0.1:24002/")
         status, body = self.post("/api/cards/%d/ready" % num, {"packet": packet})
         self.assertEqual(status, 200, body)
         _, detail = self.get("/api/cards/%d" % num)
@@ -2222,7 +2227,8 @@ class TestAttachmentUrls(Base):
                                    "branch": "sprint/batch-1"})
         for n in nums:
             self.to_in_progress(n)
-        packet = dict(GOOD_PACKET, ui_change=True, screenshots=[shot], per_card=[
+        packet = dict(GOOD_PACKET, ui_change=True, screenshots=[shot],
+                      live_url="http://127.0.0.1:24003/", per_card=[
             {"card_num": nums[0], "claim": "one", "screenshots": [shot]},
             {"card_num": nums[1], "claim": "two"},
         ])
@@ -2236,6 +2242,7 @@ class TestAttachmentUrls(Base):
         num = self.new_card("no such file")["num"]
         self.to_in_progress(num)
         packet = dict(GOOD_PACKET, ui_change=True,
+                      live_url="http://127.0.0.1:24004/",
                       screenshots=["/nope/does-not-exist.png"])
         status, _ = self.post("/api/cards/%d/ready" % num, {"packet": packet})
         self.assertEqual(status, 200)
@@ -7353,7 +7360,7 @@ class TestOpsCards(Base):
         num = self.ready_card()
         status, body = self.submit(num, dict(self.OPS_PACKET, ui_change=True))
         self.assertEqual(status, 422, body)
-        self.assertEqual(body["missing"], ["screenshots"])
+        self.assertEqual(body["missing"], ["screenshots", "live_url"])
 
     def test_a_code_card_may_not_skip_the_code_fields(self):
         """The gate is swapped, not weakened: default work still owes it all."""
