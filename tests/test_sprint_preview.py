@@ -790,6 +790,88 @@ class SprintPreviewTest(unittest.TestCase):
             self.cleanup_tracked_helpers()
         self.assert_pid_gone(child_pid)
 
+    def test_sigkill_before_publication_self_cleans_and_retry_is_unique(self):
+        for offset, ps_mode in enumerate(("unavailable_after",)):
+            with self.subTest(ps_mode=ps_mode):
+                card = 121 + offset
+                project, worktree = self.board("sigkill-launch-%s" % ps_mode)
+                child_pid_file = self.root / ("sigkill-%s.pid" % ps_mode)
+                extra = ["--worktree", worktree, "--host", "127.0.0.1",
+                         "--timeout", "20", "--", sys.executable,
+                         self.wrapper_script, self.server_script, "{host}", "{port}",
+                         child_pid_file]
+                env = self.delayed_lsof_env(10)
+                helper = subprocess.Popen(self.command("start", card, project, extra),
+                                          text=True, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, env=env)
+                self.track_helper(helper, child_pid_file)
+                deadline = time.monotonic() + 8
+                while not child_pid_file.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(child_pid_file.exists())
+                first_child = int(child_pid_file.read_text(encoding="utf-8"))
+                if ps_mode == "unavailable_after":
+                    self.fake_bin.joinpath("ps").unlink()
+                helper.kill()
+                helper.communicate(timeout=5)
+                self.assert_pid_gone(first_child)
+                key = os.path.realpath(project) + "\0card-%d" % card
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    registry = json.loads(self.registry.read_text(encoding="utf-8"))
+                    if key not in registry:
+                        break
+                    time.sleep(0.05)
+                self.assertNotIn(key, registry)
+                self.assertEqual(list((project / ".sprint" / "previews").glob(
+                    "card-%d.json.*.supervisor*" % card)), [])
+                retry = self.start_preview(card, project, worktree, "retry")
+                self.assertEqual(self.read_url(retry["live_url"]), "retry")
+
+    def test_supervisor_artifacts_never_persist_environment_secrets(self):
+        project, worktree = self.board("supervisor-secret")
+        card = 123
+        sentinel = "SENTINEL_SECRET_DO_NOT_PERSIST_7a9c"
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
+                 "--", sys.executable, self.server_script, "{host}", "{port}", "secret"]
+        env = os.environ.copy()
+        env["UNRELATED_SECRET_TOKEN"] = sentinel
+        env["SPRINT_PREVIEW_TEST_POST_PUBLISH_DELAY"] = "2"
+        helper = subprocess.Popen(self.command("start", card, project, extra), text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.track_helper(helper)
+        record_path = project / ".sprint" / "previews" / "card-123.json"
+        deadline = time.monotonic() + 8
+        while not record_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(record_path.exists())
+        record = self.register_started(
+            card, project, json.loads(record_path.read_text(encoding="utf-8")))
+        artifacts = list((project / ".sprint" / "previews").glob("card-123*"))
+        self.assertTrue(artifacts)
+        for artifact in artifacts:
+            self.assertNotIn(sentinel, artifact.read_text(encoding="utf-8", errors="replace"))
+        stdout, stderr = helper.communicate(timeout=8)
+        self.assertEqual(helper.returncode, 0, stderr)
+        self.assertEqual(json.loads(stdout)["pid"], record["pid"])
+
+    def test_reaped_supervisor_never_signals_recycled_numeric_pgid(self):
+        code = """
+import importlib.machinery, importlib.util, subprocess
+loader = importlib.machinery.SourceFileLoader('preview', %r)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec); loader.exec_module(module)
+child = subprocess.Popen(['/usr/bin/true'], start_new_session=True)
+pgid = child.pid; child.wait()
+called = []
+module.os.killpg = lambda *args: called.append(args)
+module.terminate_launched_group(child, pgid)
+assert called == [], called
+""" % str(PREVIEW)
+        proc = subprocess.run([sys.executable, "-c", code], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

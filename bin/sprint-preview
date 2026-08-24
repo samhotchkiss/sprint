@@ -22,6 +22,7 @@ import http.client
 import json
 import os
 import pathlib
+import select
 import signal
 import socket
 import subprocess
@@ -644,6 +645,12 @@ def terminate_launched_group(child, pgid, timeout=1):
                 raise PreviewError("refusing startup cleanup: child process group changed")
         except ProcessLookupError:
             child.poll()
+    else:
+        # The persistent supervisor never exits while an owned group member is
+        # alive. Once its Popen handle is reaped, the numeric PGID is no longer
+        # ownership evidence and must never be signalled.
+        child.wait(timeout=1)
+        return
     with contextlib.suppress(ProcessLookupError):
         os.killpg(pgid, signal.SIGTERM)
     deadline = time.time() + timeout
@@ -668,6 +675,101 @@ def child_command(command, host, port, live_url):
     return [replacements.get(part, part) for part in command]
 
 
+def _supervisor_parent_alive(pid, identity):
+    if not pid_exists(pid):
+        return False
+    try:
+        proc = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(pid)],
+                              text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return proc.returncode == 0 and proc.stdout.strip() == identity
+
+
+def run_supervisor(spec_path, parent_fd):
+    """Own the preview session until publication or exact group teardown.
+
+    The supervisor is the permanent session leader. It never exits before its
+    command group, so numeric PGID reuse cannot authorize a later signal. If
+    the launching helper dies before creating the commit marker, the
+    supervisor tears down its own group and releases only its exact lease.
+    """
+    with open(spec_path, encoding="utf-8") as src:
+        spec = json.load(src)
+    shutdown = {"requested": False}
+
+    def request_shutdown(_signum, _frame):
+        shutdown["requested"] = True
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, request_shutdown)
+    with open(spec["log"], "ab", buffering=0) as log:
+        try:
+            command = subprocess.Popen(spec["command"], cwd=spec["worktree"],
+                                       env=os.environ.copy(), stdin=subprocess.DEVNULL,
+                                       stdout=log, stderr=subprocess.STDOUT)
+        except OSError as exc:
+            pathlib.Path(spec["ready"]).write_text(
+                json.dumps({"error": str(exc)}), encoding="utf-8")
+            return 127
+    pathlib.Path(spec["ready"]).write_text(
+        json.dumps({"command_pid": command.pid}), encoding="utf-8")
+    parent_lost = False
+    while True:
+        committed = os.path.exists(spec["commit"])
+        parent_pipe_closed = bool(select.select([parent_fd], [], [], 0)[0])
+        if parent_pipe_closed:
+            try:
+                parent_pipe_closed = os.read(parent_fd, 1) == b""
+            except OSError:
+                parent_pipe_closed = True
+        launch_expired = time.monotonic() >= float(spec["launch_deadline"])
+        if not committed and (parent_pipe_closed or launch_expired):
+            parent_lost = True
+            shutdown["requested"] = True
+        if shutdown["requested"]:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgrp(), signal.SIGTERM)
+            deadline = time.monotonic() + 1
+            while command.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if parent_lost:
+                release_lease(spec["registry"], spec["lease"])
+                remove_record_for_lease(spec["record_path"], spec["lease"])
+                for artifact in (spec_path, spec["ready"], spec["commit"]):
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(artifact)
+                # The supervisor is still the live group leader at this exact
+                # signal. SIGKILL is delivered to the whole owned session.
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+            if command.poll() is not None:
+                return command.returncode or 0
+        elif command.poll() is not None and not _supervisor_group_has_members():
+            return command.returncode or 0
+        time.sleep(0.05)
+
+
+def _supervisor_group_has_members():
+    """True when this owned supervisor group still has a non-zombie peer."""
+    try:
+        proc = subprocess.run(["/bin/ps", "-axo", "pid=,pgid=,stat="], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if proc.returncode != 0:
+        return True
+    own_pid, own_pgid = os.getpid(), os.getpgrp()
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if (len(fields) >= 3 and fields[0].isdigit() and fields[1].isdigit()
+                and int(fields[0]) != own_pid and int(fields[1]) == own_pgid
+                and not fields[2].startswith("Z")):
+            return True
+    return False
+
+
 def command_start(args, project_root, unit, unit_number, registry):
     worktree = os.path.realpath(args.worktree)
     if not os.path.isdir(worktree):
@@ -681,6 +783,10 @@ def command_start(args, project_root, unit, unit_number, registry):
             lease = None
             child = None
             pgid = None
+            control = None
+            ready_path = None
+            commit_path = None
+            parent_write_fd = None
             keep_running = False
             record_file = record_path(project_root, unit)
             try:
@@ -703,17 +809,34 @@ def command_start(args, project_root, unit, unit_number, registry):
                 env.update({"SPRINT_PREVIEW_HOST": host,
                             "SPRINT_PREVIEW_PORT": str(port),
                             "SPRINT_PREVIEW_URL": live_url})
-                with open(log_path, "ab", buffering=0) as log:
-                    try:
-                        child = subprocess.Popen(command, cwd=worktree, env=env,
-                                                 stdin=subprocess.DEVNULL, stdout=log,
-                                                 stderr=subprocess.STDOUT,
-                                                 start_new_session=True,
-                                                 preexec_fn=lambda: signal.pthread_sigmask(
-                                                     signal.SIG_SETMASK,
-                                                     signal_state["child_signal_mask"]))
-                    except OSError as exc:
-                        raise PreviewError("could not launch preview command: %s" % exc) from exc
+                control = "%s.%s.supervisor" % (record_file, lease["lease"])
+                ready_path = control + ".ready"
+                commit_path = control + ".commit"
+                supervisor_spec = {
+                    "command": command, "worktree": worktree,
+                    "log": log_path, "ready": ready_path, "commit": commit_path,
+                    "parent_pid": os.getpid(),
+                    "parent_identity": pid_identity(os.getpid()),
+                    "launch_deadline": time.monotonic() + 60,
+                    "registry": registry, "lease": lease,
+                    "record_path": record_file,
+                }
+                write_record(control, supervisor_spec)
+                parent_read_fd, parent_write_fd = os.pipe()
+                try:
+                    child = subprocess.Popen(
+                        [sys.executable, os.path.realpath(__file__),
+                         "--supervise", control, str(parent_read_fd)],
+                        cwd=worktree, env=env,
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, start_new_session=True,
+                        pass_fds=(parent_read_fd,),
+                        preexec_fn=lambda: signal.pthread_sigmask(
+                            signal.SIG_SETMASK, signal_state["child_signal_mask"]))
+                except OSError as exc:
+                    raise PreviewError("could not launch preview supervisor: %s" % exc) from exc
+                finally:
+                    os.close(parent_read_fd)
                 # start_new_session=True establishes this contract in the
                 # child before exec. Capture the candidate synchronously from
                 # our Popen handle so cleanup remains possible even when a
@@ -730,6 +853,14 @@ def command_start(args, project_root, unit, unit_number, registry):
                 if observed_pgid is not None and observed_pgid != pgid:
                     raise PreviewError("preview child did not establish its own process group")
                 raise_if_startup_interrupted()
+                supervisor_deadline = time.monotonic() + 5
+                while not os.path.exists(ready_path) and time.monotonic() < supervisor_deadline:
+                    if child.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                supervisor_ready = read_record(ready_path)
+                if not supervisor_ready or supervisor_ready.get("error"):
+                    raise PreviewError("preview supervisor could not launch the command")
                 identity = pid_identity(child.pid)
                 if not identity:
                     raise PreviewError("could not record the preview process identity")
@@ -750,6 +881,9 @@ def command_start(args, project_root, unit, unit_number, registry):
                     "pid_executable": launched_executable,
                     "worktree": worktree,
                     "command": command,
+                    "command_pid": supervisor_ready.get("command_pid"),
+                    "supervisor_control": control,
+                    "supervisor_commit": commit_path,
                     "path": path,
                     "live_url": live_url,
                     "log": log_path,
@@ -772,6 +906,9 @@ def command_start(args, project_root, unit, unit_number, registry):
                     write_record(record_file, record)
                     raise_if_startup_interrupted()
                     publish_lease(registry, record)
+                    pathlib.Path(commit_path).touch(mode=0o600, exist_ok=True)
+                    os.close(parent_write_fd)
+                    parent_write_fd = None
                     signal_state["committed"] = True
                     post_publish_delay = float(os.environ.get(
                         "SPRINT_PREVIEW_TEST_POST_PUBLISH_DELAY", "0"))
@@ -790,6 +927,13 @@ def command_start(args, project_root, unit, unit_number, registry):
                         if lease is not None:
                             release_lease(registry, lease)
                             remove_record_for_lease(record_file, lease)
+                        for cleanup_path in (control, ready_path, commit_path):
+                            if cleanup_path:
+                                with contextlib.suppress(FileNotFoundError):
+                                    os.unlink(cleanup_path)
+                        if parent_write_fd is not None:
+                            with contextlib.suppress(OSError):
+                                os.close(parent_write_fd)
         # A listener race or a child bind failure is recoverable on another
         # reserved port. Other startup failures are surfaced after a few tries.
         if attempts >= 3:
@@ -832,6 +976,12 @@ def command_stop(args, project_root, unit, registry):
         terminate_record(record, timeout=args.timeout)
         release_lease(registry, record)
         remove_record_for_lease(path, record)
+        for cleanup_path in (record.get("supervisor_control"),
+                             (record.get("supervisor_control") or "") + ".ready",
+                             record.get("supervisor_commit")):
+            if cleanup_path:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(cleanup_path)
         signal_state["committed"] = True
         print(json.dumps({"project_root": project_root, "unit": unit,
                           "port": record.get("port"), "pid": record.get("pid"),
@@ -841,6 +991,8 @@ def command_stop(args, project_root, unit, registry):
 
 
 def main(argv):
+    if len(argv) == 3 and argv[0] == "--supervise":
+        return run_supervisor(argv[1], int(argv[2]))
     args = parse_args(argv)
     try:
         project_root = resolve_project_root(args.project_root, args.server)
