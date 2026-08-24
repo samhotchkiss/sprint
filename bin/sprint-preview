@@ -612,6 +612,11 @@ def record_state(record, require_http=False):
     if not observed_identity:
         return "unknown"
     if observed_identity != identity:
+        # cleanup_required may carry durable descendant authority. A reused
+        # numeric leader PID is not proof that the old owned group is empty,
+        # so only an exact stop/recovery may resolve this state.
+        if record.get("status") == "cleanup_required":
+            return "unknown"
         return "dead"
     try:
         if not listener_owned(record):
@@ -715,13 +720,25 @@ def reserve(registry, project_root, unit, unit_number, host):
     with locked_registry(registry) as data:
         prune_registry(data)
         existing = data.get(key)
-        if existing and existing.get("status") == "running":
-            state = record_state(existing, True)
-            if state == "live":
-                return existing, True
-            if state == "unknown":
+        if existing:
+            status = existing.get("status")
+            if status == "running":
+                state = record_state(existing, True)
+                if state == "live":
+                    return existing, True
+                if state == "unknown":
+                    raise PreviewError(
+                        "could not verify the existing preview; preserving its lease")
+            elif status == "cleanup_required":
+                # prune_registry already removed only an exactly dead owner
+                # and raised for uncertainty. A surviving cleanup lease is
+                # live and must remain the sole recovery authority.
                 raise PreviewError(
-                    "could not verify the existing preview; preserving its lease")
+                    "existing preview requires exact cleanup; preserving its lease")
+            else:
+                # Includes a concurrent, unexpired starting reservation.
+                raise PreviewError(
+                    "preview reservation is already in progress; preserving its lease")
         used = {int(entry.get("port")) for entry in data.values()
                 if isinstance(entry, dict) and entry.get("port")}
         for port in candidate_ports(project_root, unit_number):

@@ -1458,6 +1458,69 @@ assert signals==[signal.SIGTERM],signals
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_cleanup_required_reserve_transition_is_fail_closed(self):
+        code = """
+import importlib.machinery, importlib.util, json, pathlib, tempfile
+loader=importlib.machinery.SourceFileLoader('preview', %r)
+spec=importlib.util.spec_from_loader(loader.name, loader)
+m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+with tempfile.TemporaryDirectory() as root:
+ registry=str(pathlib.Path(root)/'registry.json'); key=root+'\\0card-99'
+ m.candidate_ports=lambda *args:[24099]
+ m.port_is_clear=lambda port:True
+ probe={'status':'cleanup_required','pid':41000,'pgid':41000,
+        'pid_identity':'original','host':'127.0.0.1','port':24098}
+ m.pid_exists=lambda pid:True; m.pid_identity=lambda pid:'reused'
+ assert m.record_state(probe)=='unknown'
+ m.pid_exists=lambda pid:False
+ m.recorded_listeners_still_own_group=lambda record,pgid:False
+ m.process_group_alive=lambda pgid:False
+ assert m.record_state(probe)=='dead'
+ for mode in ('live','ps-missing','ps-timeout','ps-nonzero','ps-error',
+              'lsof-timeout','lsof-nonzero','identity-reused'):
+  old={'lease':'old-'+mode,'project_root':root,'unit':'card-99','host':'127.0.0.1',
+       'port':24098,'status':'cleanup_required','pid':41000,
+       'pid_identity':'original'}
+  with m.locked_registry(registry) as data:data[key]=old
+  m.record_state=lambda record,require_http=False: 'live' if mode=='live' else 'unknown'
+  try:m.reserve(registry,root,'card-99',99,'127.0.0.1')
+  except m.PreviewError:pass
+  else:raise AssertionError(mode+' replaced cleanup authority')
+  assert json.loads(pathlib.Path(registry).read_text())[key]['lease']==old['lease']
+ # Only a proven-dead record may be pruned and replaced.
+ dead=dict(old,lease='dead');
+ with m.locked_registry(registry) as data:data[key]=dead
+ m.record_state=lambda record,require_http=False:'dead'
+ fresh,reused=m.reserve(registry,root,'card-99',99,'127.0.0.1')
+ assert not reused and fresh['lease']!='dead' and fresh['status']=='starting'
+""" % str(PREVIEW)
+        proc = subprocess.run([sys.executable, "-c", code], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_concurrent_reservations_keep_one_exact_starting_lease(self):
+        code = """
+import importlib.machinery, importlib.util, pathlib, tempfile, threading
+loader=importlib.machinery.SourceFileLoader('preview', %r)
+spec=importlib.util.spec_from_loader(loader.name, loader)
+m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+with tempfile.TemporaryDirectory() as root:
+ registry=str(pathlib.Path(root)/'registry.json')
+ m.candidate_ports=lambda *args:[24199]
+ m.port_is_clear=lambda port:True
+ barrier=threading.Barrier(2); results=[]
+ def run():
+  barrier.wait()
+  try: results.append(('ok',m.reserve(registry,root,'card-99',99,'127.0.0.1')[0]['lease']))
+  except m.PreviewError: results.append(('blocked',None))
+ threads=[threading.Thread(target=run) for _ in range(2)]
+ [t.start() for t in threads]; [t.join() for t in threads]
+ assert sorted(kind for kind,_ in results)==['blocked','ok'],results
+""" % str(PREVIEW)
+        proc = subprocess.run([sys.executable, "-c", code], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
