@@ -529,7 +529,7 @@ class SprintPreviewTest(unittest.TestCase):
         env = os.environ.copy()
         env["PATH"] = str(self.fake_bin) + os.pathsep + env.get("PATH", "")
         env["TEST_PS_COUNT_FILE"] = str(count_file)
-        env["TEST_PS_SWAP_AFTER"] = "3"
+        env["TEST_PS_SWAP_AFTER"] = "2"
         stopped = self.run_preview("stop", 105, project, check=False, env=env)
         self.assertNotEqual(stopped.returncode, 0)
         self.assertIn("changed during verification", stopped.stderr)

@@ -255,7 +255,9 @@ def pid_identity(pid):
 
 def pid_command(pid):
     try:
-        proc = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], text=True,
+        # `command=` can rewrite from "node /path/npm ..." to "npm ..."
+        # after startup. `comm=` is the stable executable identity.
+        proc = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                               timeout=2, check=False)
     except (OSError, subprocess.TimeoutExpired):
@@ -263,6 +265,22 @@ def pid_command(pid):
     if proc.returncode != 0:
         return ""
     return proc.stdout.strip()
+
+
+def pid_executable(pid):
+    try:
+        proc = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "txt", "-Fn"],
+                              text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL,
+                              timeout=OWNERSHIP_LOOKUP_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    for line in proc.stdout.splitlines():
+        if line.startswith("n/"):
+            return os.path.realpath(line[1:])
+    return ""
 
 
 def descendants(root_pid):
@@ -490,8 +508,8 @@ def terminate_record(record, timeout=5, child=None):
     recorded_pgid = int(record.get("pgid") or pid)
     if pgid != pid or recorded_pgid != pid:
         raise PreviewError("refusing cleanup: recorded preview no longer leads its process group")
-    command_line = pid_command(pid)
-    if not command_line or command_line != record.get("pid_command"):
+    executable = pid_executable(pid)
+    if not executable or executable != record.get("pid_executable"):
         raise PreviewError("refusing cleanup: recorded preview command no longer matches")
     if not listener_owned(record):
         raise PreviewError("refusing cleanup: recorded preview no longer owns its listener")
@@ -619,6 +637,9 @@ def command_start(args, project_root, unit, unit_number, registry):
                 launched_command = pid_command(child.pid)
                 if not launched_command:
                     raise PreviewError("could not record the preview process command")
+                launched_executable = pid_executable(child.pid)
+                if not launched_executable:
+                    raise PreviewError("could not record the preview process executable")
                 raise_if_startup_interrupted()
                 record = dict(lease)
                 record.update({
@@ -627,6 +648,7 @@ def command_start(args, project_root, unit, unit_number, registry):
                     "pgid": pgid,
                     "pid_identity": identity,
                     "pid_command": launched_command,
+                    "pid_executable": launched_executable,
                     "worktree": worktree,
                     "command": command,
                     "path": path,
