@@ -71,6 +71,13 @@ def preferred_port(project_root, card):
     return 20000 + slot * 100 + (card % 100)
 
 
+def pid_exists_for_test(pid):
+    status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], text=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL).stdout.strip()
+    return bool(status and not status.startswith("Z"))
+
+
 class SprintPreviewTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="sprint-preview-test-")
@@ -89,7 +96,11 @@ class SprintPreviewTest(unittest.TestCase):
             self.skipTest("lsof is required")
         fake_lsof = self.fake_bin / "lsof"
         fake_lsof.write_text(
-            "#!/bin/sh\nsleep \"${TEST_LSOF_DELAY:-0}\"\nexec %s \"$@\"\n" % real_lsof,
+            "#!/bin/sh\nsleep \"${TEST_LSOF_DELAY:-0}\"\n"
+            "if [ \"${TEST_LSOF_MODE:-real}\" = fail ]; then exit 7; fi\n"
+            "if [ \"${TEST_LSOF_MODE:-real}\" = nonzero_stdout ]; then "
+            "echo 'p99999'; echo 'n127.0.0.1:1'; exit 7; fi\n"
+            "exec %s \"$@\"\n" % real_lsof,
             encoding="utf-8")
         fake_lsof.chmod(0o755)
         real_ps = shutil.which("ps")
@@ -537,6 +548,108 @@ class SprintPreviewTest(unittest.TestCase):
         self.assertEqual(self.read_url(preview["live_url"]), "identity-swap")
         self.run_preview("stop", 105, project)
         self.started.remove((105, project))
+
+    def test_reused_start_preserves_lease_when_ownership_tools_fail(self):
+        modes = ("ps-missing", "ps-timeout", "ps-nonzero",
+                 "lsof-missing", "lsof-timeout", "lsof-nonzero")
+        for offset, mode in enumerate(modes):
+            with self.subTest(mode=mode):
+                card = 106 + offset
+                project, worktree = self.board("reuse-tool-%s" % mode)
+                preview = self.start_preview(card, project, worktree, mode)
+                record_path = project / ".sprint" / "previews" / ("card-%d.json" % card)
+                env = os.environ.copy()
+                if mode.endswith("missing"):
+                    tool_dir = self.root / ("tool-dir-%d" % card)
+                    tool_dir.mkdir()
+                    keep = "lsof" if mode.startswith("ps") else "ps"
+                    os.symlink(shutil.which(keep), tool_dir / keep)
+                    env["PATH"] = str(tool_dir)
+                else:
+                    env["PATH"] = str(self.fake_bin) + os.pathsep + env.get("PATH", "")
+                    if mode == "ps-timeout":
+                        env["TEST_PS_DELAY"] = "3"
+                    elif mode == "ps-nonzero":
+                        env["TEST_PS_MODE"] = "nonzero_stdout"
+                    elif mode == "lsof-timeout":
+                        env["TEST_LSOF_DELAY"] = "1"
+                        env["SPRINT_PREVIEW_OWNERSHIP_TIMEOUT"] = "0.2"
+                    else:
+                        env["TEST_LSOF_MODE"] = "nonzero_stdout"
+                extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "5",
+                         "--", sys.executable, self.server_script,
+                         "{host}", "{port}", "unused"]
+                retried = self.run_preview("start", card, project, extra,
+                                           check=False, env=env)
+                self.assertNotEqual(retried.returncode, 0)
+                self.assertTrue(record_path.exists())
+                registry = json.loads(self.registry.read_text(encoding="utf-8"))
+                key = os.path.realpath(project) + "\0card-%d" % card
+                self.assertEqual(registry[key]["lease"],
+                                 json.loads(record_path.read_text(encoding="utf-8"))["lease"])
+                self.assertEqual(self.read_url(preview["live_url"]), mode)
+                verified = self.run_preview("verify", card, project,
+                                            ["--url", preview["live_url"]])
+                self.assertEqual(json.loads(verified.stdout)["pid"], preview["pid"])
+                self.run_preview("stop", card, project)
+                self.started.remove((card, project))
+
+    def test_stop_signals_cannot_escape_stubborn_group_cleanup(self):
+        for offset, signum in enumerate((signal.SIGINT, signal.SIGTERM, signal.SIGHUP)):
+            with self.subTest(signal=signum):
+                card = 112 + offset
+                project, worktree = self.board("stop-signal-%d" % signum)
+                child_pid_file = self.root / ("stop-signal-%d.pid" % signum)
+                extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
+                         "--", sys.executable, self.wrapper_script, self.server_script,
+                         "{host}", "{port}", child_pid_file]
+                started = self.run_preview("start", card, project, extra)
+                record = json.loads(started.stdout)
+                self.started.append((card, project))
+                env = os.environ.copy()
+                env["SPRINT_PREVIEW_TEST_POST_STOP_TERM_DELAY"] = "2"
+                stopper = subprocess.Popen(self.command("stop", card, project), text=True,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+                deadline = time.monotonic() + 5
+                while pid_exists_for_test(record["pid"]) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                os.kill(stopper.pid, signum)
+                os.kill(stopper.pid, signum)
+                stdout, stderr = stopper.communicate(timeout=10)
+                self.assertEqual(stopper.returncode, 0, stderr)
+                self.assertTrue(json.loads(stdout)["stopped"])
+                self.assert_pid_gone(int(child_pid_file.read_text(encoding="utf-8")))
+                self.started.remove((card, project))
+
+    def test_retry_stop_recovers_dead_leader_with_proven_listener(self):
+        project, worktree = self.board("dead-leader-recovery")
+        child_pid_file = self.root / "dead-leader-child.pid"
+        card = 115
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
+                 "--", sys.executable, self.wrapper_script, self.server_script,
+                 "{host}", "{port}", child_pid_file]
+        started = self.run_preview("start", card, project, extra)
+        preview = json.loads(started.stdout)
+        self.started.append((card, project))
+        env = os.environ.copy()
+        env["SPRINT_PREVIEW_TEST_POST_STOP_TERM_DELAY"] = "10"
+        stopper = subprocess.Popen(self.command("stop", card, project), text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        deadline = time.monotonic() + 5
+        while pid_exists_for_test(preview["pid"]) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(pid_exists_for_test(preview["pid"]), "leader did not exit after TERM")
+        stopper.kill()
+        stopper.communicate(timeout=5)
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        self.assertTrue(pid_exists_for_test(child_pid))
+        record_path = project / ".sprint" / "previews" / "card-115.json"
+        self.assertTrue(record_path.exists())
+        recovered = self.run_preview("stop", card, project)
+        self.assertTrue(json.loads(recovered.stdout)["stopped"])
+        self.assert_pid_gone(child_pid)
+        self.assertFalse(record_path.exists())
+        self.started.remove((card, project))
 
 
 if __name__ == "__main__":

@@ -253,6 +253,16 @@ def pid_identity(pid):
     return proc.stdout.strip()
 
 
+def pid_exists(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def pid_command(pid):
     try:
         # `command=` can rewrite from "node /path/npm ..." to "npm ..."
@@ -322,6 +332,10 @@ def listener_rows(port):
             check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PreviewError("lsof is required to verify preview ownership: %s" % exc) from exc
+    if proc.returncode == 1 and not proc.stdout.strip():
+        return []
+    if proc.returncode != 0:
+        raise PreviewError("lsof could not verify preview ownership")
     rows = []
     current_pid = None
     for line in proc.stdout.splitlines():
@@ -347,6 +361,40 @@ def listener_owned(record):
     return bool(matching) and all(pid in owned for pid, _ in matching)
 
 
+def matching_listener_pids(record):
+    return {pid for pid, name in listener_rows(int(record["port"]))
+            if address_matches(name, record["host"], int(record["port"]))}
+
+
+def capture_listener_proofs(record):
+    owned = descendants(int(record["pid"]))
+    pids = matching_listener_pids(record)
+    if not pids or not pids.issubset(owned):
+        raise PreviewError("could not capture exact preview listener ownership")
+    proofs = []
+    for pid in sorted(pids):
+        identity = pid_identity(pid)
+        if not identity:
+            raise PreviewError("could not capture preview listener identity")
+        proofs.append({"pid": pid, "pid_identity": identity,
+                       "pgid": os.getpgid(pid)})
+    return proofs
+
+
+def recorded_listeners_still_own_group(record, pgid):
+    proofs = {int(item["pid"]): item for item in record.get("listener_proofs") or []}
+    current = matching_listener_pids(record)
+    if not current or not current.issubset(proofs):
+        return False
+    for pid in current:
+        proof = proofs[pid]
+        if (not pid_exists(pid) or pid_identity(pid) != proof.get("pid_identity")
+                or os.getpgid(pid) != int(proof.get("pgid") or 0)
+                or int(proof.get("pgid") or 0) != pgid):
+            return False
+    return True
+
+
 def http_reachable(host, port, path, timeout=1):
     try:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
@@ -359,18 +407,31 @@ def http_reachable(host, port, path, timeout=1):
         return False
 
 
-def record_alive(record, require_http=False):
+def record_state(record, require_http=False):
     pid = int(record.get("pid") or 0)
     identity = record.get("pid_identity") or ""
-    if not pid or not identity or pid_identity(pid) != identity:
-        return False
+    if not pid or not identity:
+        return "dead"
+    if not pid_exists(pid):
+        return "dead"
+    observed_identity = pid_identity(pid)
+    if not observed_identity:
+        return "unknown"
+    if observed_identity != identity:
+        return "dead"
     try:
         if not listener_owned(record):
-            return False
+            return "dead"
     except PreviewError:
-        return False
-    return not require_http or http_reachable(
-        record["host"], int(record["port"]), record.get("path") or "/")
+        return "unknown"
+    if require_http and not http_reachable(
+            record["host"], int(record["port"]), record.get("path") or "/"):
+        return "unknown"
+    return "live"
+
+
+def record_alive(record, require_http=False):
+    return record_state(record, require_http) == "live"
 
 
 def record_path(project_root, unit):
@@ -428,8 +489,13 @@ def prune_registry(data):
         if entry.get("status") == "starting":
             if now - float(entry.get("reserved_at") or 0) > STARTING_TTL:
                 data.pop(key, None)
-        elif not record_alive(entry):
-            data.pop(key, None)
+        else:
+            state = record_state(entry)
+            if state == "dead":
+                data.pop(key, None)
+            elif state == "unknown":
+                raise PreviewError(
+                    "could not prove whether an existing preview is alive; preserving its lease")
 
 
 def reserve(registry, project_root, unit, unit_number, host):
@@ -437,8 +503,13 @@ def reserve(registry, project_root, unit, unit_number, host):
     with locked_registry(registry) as data:
         prune_registry(data)
         existing = data.get(key)
-        if existing and existing.get("status") == "running" and record_alive(existing, True):
-            return existing, True
+        if existing and existing.get("status") == "running":
+            state = record_state(existing, True)
+            if state == "live":
+                return existing, True
+            if state == "unknown":
+                raise PreviewError(
+                    "could not verify the existing preview; preserving its lease")
         used = {int(entry.get("port")) for entry in data.values()
                 if isinstance(entry, dict) and entry.get("port")}
         for port in candidate_ports(project_root, unit_number):
@@ -495,44 +566,46 @@ def process_group_alive(pgid):
 
 def terminate_record(record, timeout=5, child=None):
     pid = int(record.get("pid") or 0)
-    current_identity = pid_identity(pid) if pid else ""
-    if not current_identity:
-        raise PreviewError(
-            "refusing cleanup: could not prove the recorded preview PID identity")
-    if current_identity != record.get("pid_identity"):
-        raise PreviewError("refusing cleanup: recorded preview PID identity no longer matches")
-    try:
-        pgid = os.getpgid(pid)
-    except ProcessLookupError:
-        return
     recorded_pgid = int(record.get("pgid") or pid)
-    if pgid != pid or recorded_pgid != pid:
+    if not pid or recorded_pgid != pid:
         raise PreviewError("refusing cleanup: recorded preview no longer leads its process group")
-    executable = pid_executable(pid)
-    if not executable or executable != record.get("pid_executable"):
-        raise PreviewError("refusing cleanup: recorded preview command no longer matches")
-    if not listener_owned(record):
-        raise PreviewError("refusing cleanup: recorded preview no longer owns its listener")
-    # Recheck the time identity and PGID immediately before the first signal;
-    # this closes the inspection-to-kill window on a recycled same-second PID.
-    if pid_identity(pid) != record.get("pid_identity") or os.getpgid(pid) != recorded_pgid:
+    leader_alive = pid_exists(pid)
+    if leader_alive:
+        current_identity = pid_identity(pid)
+        if not current_identity:
+            raise PreviewError(
+                "refusing cleanup: could not prove the recorded preview PID identity")
+        if current_identity != record.get("pid_identity"):
+            raise PreviewError("refusing cleanup: recorded preview PID identity no longer matches")
+        if os.getpgid(pid) != recorded_pgid:
+            raise PreviewError("refusing cleanup: recorded preview process group changed")
+        executable = pid_executable(pid)
+        if not executable or executable != record.get("pid_executable"):
+            raise PreviewError("refusing cleanup: recorded preview command no longer matches")
+    if not recorded_listeners_still_own_group(record, recorded_pgid):
+        raise PreviewError("refusing cleanup: recorded listener identity no longer matches")
+    if leader_alive and (pid_identity(pid) != record.get("pid_identity")
+                         or os.getpgid(pid) != recorded_pgid):
         raise PreviewError("refusing cleanup: preview identity changed during verification")
-    os.killpg(pgid, signal.SIGTERM)
+    os.killpg(recorded_pgid, signal.SIGTERM)
+    test_delay = float(os.environ.get("SPRINT_PREVIEW_TEST_POST_STOP_TERM_DELAY", "0"))
+    if test_delay > 0:
+        time.sleep(test_delay)
     deadline = time.time() + timeout
     while time.time() < deadline:
         if child is not None:
             child.poll()
-        if not process_group_alive(pgid):
+        if not process_group_alive(recorded_pgid):
             if child is not None:
                 child.wait(timeout=1)
             return
         time.sleep(0.05)
-    if process_group_alive(pgid):
-        os.killpg(pgid, signal.SIGKILL)
+    if process_group_alive(recorded_pgid):
+        os.killpg(recorded_pgid, signal.SIGKILL)
         kill_deadline = time.time() + 2
-        while time.time() < kill_deadline and process_group_alive(pgid):
+        while time.time() < kill_deadline and process_group_alive(recorded_pgid):
             time.sleep(0.05)
-        if process_group_alive(pgid):
+        if process_group_alive(recorded_pgid):
             raise PreviewError("preview process group survived SIGKILL")
     if child is not None:
         child.wait(timeout=1)
@@ -669,6 +742,7 @@ def command_start(args, project_root, unit, unit_number, registry):
                     time.sleep(0.1)
                 if ready:
                     raise_if_startup_interrupted()
+                    record["listener_proofs"] = capture_listener_proofs(record)
                     write_record(record_file, record)
                     raise_if_startup_interrupted()
                     publish_lease(registry, record)
@@ -716,25 +790,28 @@ def command_verify(args, project_root, unit, registry):
 
 
 def command_stop(args, project_root, unit, registry):
-    path = record_path(project_root, unit)
-    record = read_record(path)
-    if not record:
+    with startup_signal_guard() as signal_state:
+        path = record_path(project_root, unit)
+        record = read_record(path)
+        if not record:
+            signal_state["committed"] = True
+            print(json.dumps({"project_root": project_root, "unit": unit,
+                              "stopped": False, "reason": "not running"}, sort_keys=True))
+            return 0
+        key = project_root + "\0" + unit
+        with locked_registry(registry) as data:
+            current = data.get(key)
+            if not isinstance(current, dict) or current.get("lease") != record.get("lease"):
+                raise PreviewError("refusing cleanup: board no longer owns this preview lease")
+        terminate_record(record, timeout=args.timeout)
+        release_lease(registry, record)
+        remove_record_for_lease(path, record)
+        signal_state["committed"] = True
         print(json.dumps({"project_root": project_root, "unit": unit,
-                          "stopped": False, "reason": "not running"}, sort_keys=True))
+                          "port": record.get("port"), "pid": record.get("pid"),
+                          "stopped": True}, sort_keys=True))
+        sys.stdout.flush()
         return 0
-    key = project_root + "\0" + unit
-    with locked_registry(registry) as data:
-        current = data.get(key)
-        if not isinstance(current, dict) or current.get("lease") != record.get("lease"):
-            raise PreviewError("refusing cleanup: board no longer owns this preview lease")
-    terminate_record(record, timeout=args.timeout)
-    release_lease(registry, record)
-    with contextlib.suppress(FileNotFoundError):
-        os.unlink(path)
-    print(json.dumps({"project_root": project_root, "unit": unit,
-                      "port": record.get("port"), "pid": record.get("pid"),
-                      "stopped": True}, sort_keys=True))
-    return 0
 
 
 def main(argv):
