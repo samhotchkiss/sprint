@@ -38,6 +38,19 @@ server = http.server.ThreadingHTTPServer((host, port), Handler)
 server.serve_forever()
 """
 
+TIMED_HTTP_SERVER = r"""
+import http.server, os, sys, threading
+host, port, marker, delay, code = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4]), int(sys.argv[5])
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = marker.encode(); self.send_response(200)
+        self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *args): pass
+server = http.server.ThreadingHTTPServer((host, port), Handler)
+threading.Timer(delay, lambda: os._exit(code)).start()
+server.serve_forever()
+"""
+
 BLOCKER = r"""
 import socket, sys, time
 family, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -91,6 +104,8 @@ class SprintPreviewTest(unittest.TestCase):
         self.registry = self.root / "preview-registry.json"
         self.server_script = self.root / "http_server.py"
         self.server_script.write_text(HTTP_SERVER, encoding="utf-8")
+        self.timed_server_script = self.root / "timed_http_server.py"
+        self.timed_server_script.write_text(TIMED_HTTP_SERVER, encoding="utf-8")
         self.blocker_script = self.root / "blocker.py"
         self.blocker_script.write_text(BLOCKER, encoding="utf-8")
         self.wrapper_script = self.root / "wrapper.py"
@@ -692,7 +707,8 @@ class SprintPreviewTest(unittest.TestCase):
         deadline = time.monotonic() + 5
         while pid_exists_for_test(preview["pid"]) and time.monotonic() < deadline:
             time.sleep(0.02)
-        self.assertFalse(pid_exists_for_test(preview["pid"]), "leader did not exit after TERM")
+        self.assertTrue(pid_exists_for_test(preview["pid"]),
+                        "persistent supervisor exited before its stubborn descendant")
         stopper.kill()
         stopper.communicate(timeout=5)
         child_pid = int(child_pid_file.read_text(encoding="utf-8"))
@@ -722,7 +738,8 @@ class SprintPreviewTest(unittest.TestCase):
         deadline = time.monotonic() + 5
         while pid_exists_for_test(preview["pid"]) and time.monotonic() < deadline:
             time.sleep(0.02)
-        self.assertFalse(pid_exists_for_test(preview["pid"]))
+        self.assertTrue(pid_exists_for_test(preview["pid"]),
+                        "persistent supervisor abandoned its owned group")
         stopper.kill()
         stopper.communicate(timeout=5)
         child_pid = int(child_pid_file.read_text(encoding="utf-8"))
@@ -871,6 +888,65 @@ assert called == [], called
         proc = subprocess.run([sys.executable, "-c", code], text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def assert_preview_state_removed(self, card, project, timeout=8):
+        key = os.path.realpath(project) + "\0card-%d" % card
+        record_path = project / ".sprint" / "previews" / ("card-%d.json" % card)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            registry = json.loads(self.registry.read_text(encoding="utf-8"))
+            artifacts = list(record_path.parent.glob(record_path.name + ".*supervisor*"))
+            if key not in registry and not record_path.exists() and not artifacts:
+                return
+            time.sleep(0.05)
+        self.fail("natural exit left preview ownership state")
+
+    def test_natural_exit_before_publication_cleans_and_allows_retry(self):
+        project, worktree = self.board("natural-exit-before-publish")
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "5",
+                 "--", sys.executable, "-c", "raise SystemExit(0)"]
+        proc = self.run_preview("start", 124, project, extra, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assert_preview_state_removed(124, project)
+        retry = self.start_preview(124, project, worktree, "retry-before")
+        self.assertEqual(self.read_url(retry["live_url"]), "retry-before")
+
+    def test_natural_and_nonzero_exit_after_publication_clean_state(self):
+        for offset, code in enumerate((0, 7)):
+            with self.subTest(code=code):
+                card = 125 + offset
+                project, worktree = self.board("natural-exit-%d" % code)
+                extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
+                         "--", sys.executable, self.timed_server_script, "{host}", "{port}",
+                         "timed", "1.5", str(code)]
+                started = self.run_preview("start", card, project, extra)
+                preview = self.register_started(card, project, json.loads(started.stdout))
+                self.assertEqual(self.read_url(preview["live_url"]), "timed")
+                self.assert_preview_state_removed(card, project)
+                self.started.remove((card, project))
+                retry = self.start_preview(card, project, worktree, "retry-after")
+                self.assertEqual(self.read_url(retry["live_url"]), "retry-after")
+
+    def test_inspection_failure_is_bounded_and_later_lifecycle_recovers(self):
+        for offset, mode in enumerate(("fail", "timeout")):
+            with self.subTest(mode=mode):
+                card = 127 + offset
+                project, worktree = self.board("inspection-%s" % mode)
+                extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
+                         "--", sys.executable, self.timed_server_script, "{host}", "{port}",
+                         "inspect", "1.2", "0"]
+                env = os.environ.copy()
+                env["SPRINT_PREVIEW_TEST_GROUP_INSPECTION"] = mode
+                started = self.run_preview("start", card, project, extra, env=env)
+                preview = json.loads(started.stdout)
+                self.assertEqual(self.read_url(preview["live_url"]), "inspect")
+                self.assert_preview_state_removed(card, project, timeout=10)
+                retry = self.start_preview(card, project, worktree, "inspection-retry")
+                verified = self.run_preview("verify", card, project,
+                                            ["--url", retry["live_url"]])
+                self.assertEqual(json.loads(verified.stdout)["pid"], retry["pid"])
+                self.run_preview("stop", card, project)
+                self.started.remove((card, project))
 
 
 if __name__ == "__main__":

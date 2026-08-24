@@ -437,6 +437,12 @@ def record_state(record, require_http=False):
         return "dead"
     try:
         if not listener_owned(record):
+            if recorded_listeners_still_own_group(record, pgid):
+                if require_http and not http_reachable(
+                        record["host"], int(record["port"]),
+                        record.get("path") or "/"):
+                    return "unknown"
+                return "live"
             # lsof can transiently return rc=1/no rows for a healthy socket.
             # The still-matching leader proves this record is not stale, but
             # absence of one listener sample cannot prove it live either.
@@ -716,6 +722,15 @@ def run_supervisor(spec_path, parent_fd):
     pathlib.Path(spec["ready"]).write_text(
         json.dumps({"command_pid": command.pid}), encoding="utf-8")
     parent_lost = False
+    inspection_failed_at = None
+
+    def remove_owned_state():
+        release_lease(spec["registry"], spec["lease"])
+        remove_record_for_lease(spec["record_path"], spec["lease"])
+        for artifact in (spec_path, spec["ready"], spec["commit"]):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(artifact)
+
     while True:
         committed = os.path.exists(spec["commit"])
         parent_pipe_closed = bool(select.select([parent_fd], [], [], 0)[0])
@@ -735,39 +750,62 @@ def run_supervisor(spec_path, parent_fd):
             while command.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.05)
             if parent_lost:
-                release_lease(spec["registry"], spec["lease"])
-                remove_record_for_lease(spec["record_path"], spec["lease"])
-                for artifact in (spec_path, spec["ready"], spec["commit"]):
-                    with contextlib.suppress(FileNotFoundError):
-                        os.unlink(artifact)
+                remove_owned_state()
                 # The supervisor is still the live group leader at this exact
                 # signal. SIGKILL is delivered to the whole owned session.
                 os.killpg(os.getpgrp(), signal.SIGKILL)
             if command.poll() is not None:
+                state = _supervisor_group_state()
+                if state == "empty":
+                    remove_owned_state()
+                    return command.returncode or 0
+        elif command.poll() is not None:
+            state = _supervisor_group_state()
+            if state == "empty":
+                remove_owned_state()
                 return command.returncode or 0
-        elif command.poll() is not None and not _supervisor_group_has_members():
-            return command.returncode or 0
+            if state == "unknown":
+                inspection_failed_at = inspection_failed_at or time.monotonic()
+                if time.monotonic() - inspection_failed_at >= 2:
+                    # The still-live supervisor proves exact group ownership.
+                    # Bound tool failure by removing only our lease then
+                    # atomically killing the entire owned session.
+                    remove_owned_state()
+                    os.killpg(os.getpgrp(), signal.SIGKILL)
+            else:
+                inspection_failed_at = None
         time.sleep(0.05)
 
 
-def _supervisor_group_has_members():
-    """True when this owned supervisor group still has a non-zombie peer."""
+def _supervisor_group_state():
+    """Return live/empty/unknown for peers in this owned supervisor group."""
+    test_mode = os.environ.get("SPRINT_PREVIEW_TEST_GROUP_INSPECTION")
+    if test_mode == "fail":
+        return "unknown"
+    if test_mode == "timeout":
+        time.sleep(2.1)
+        return "unknown"
     try:
-        proc = subprocess.run(["/bin/ps", "-axo", "pid=,pgid=,stat="], text=True,
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              timeout=2, check=False)
+        proc = subprocess.Popen(["/bin/ps", "-axo", "pid=,pgid=,stat="], text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        inspector_pid = proc.pid
+        stdout, _ = proc.communicate(timeout=2)
     except (OSError, subprocess.TimeoutExpired):
-        return True
+        with contextlib.suppress(NameError, ProcessLookupError):
+            proc.kill()
+            proc.wait(timeout=1)
+        return "unknown"
     if proc.returncode != 0:
-        return True
+        return "unknown"
     own_pid, own_pgid = os.getpid(), os.getpgrp()
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         fields = line.split()
         if (len(fields) >= 3 and fields[0].isdigit() and fields[1].isdigit()
-                and int(fields[0]) != own_pid and int(fields[1]) == own_pgid
+                and int(fields[0]) not in (own_pid, inspector_pid)
+                and int(fields[1]) == own_pgid
                 and not fields[2].startswith("Z")):
-            return True
-    return False
+            return "live"
+    return "empty"
 
 
 def command_start(args, project_root, unit, unit_number, registry):
