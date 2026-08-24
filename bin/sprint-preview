@@ -43,6 +43,23 @@ class PreviewError(RuntimeError):
     pass
 
 
+@contextlib.contextmanager
+def startup_signal_guard():
+    """Turn terminal interrupts into exceptions so startup finally blocks run."""
+    previous = {}
+
+    def interrupted(signum, _frame):
+        raise PreviewError("preview startup interrupted by signal %d" % signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        previous[signum] = signal.signal(signum, interrupted)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
 def parse_args(argv):
     command = []
     if "--" in argv:
@@ -398,6 +415,8 @@ def process_group_alive(pgid):
     except (OSError, subprocess.TimeoutExpired):
         # Failure to prove the group empty must remain fail-closed.
         return True
+    if proc.returncode != 0:
+        return True
     for line in proc.stdout.splitlines():
         fields = line.split()
         if len(fields) >= 2 and fields[0].isdigit() and int(fields[0]) == pgid:
@@ -435,6 +454,38 @@ def terminate_record(record, timeout=5, child=None):
         child.wait(timeout=1)
 
 
+def terminate_launched_group(child, pgid, timeout=1):
+    """Reap the exact session created by our still-owned Popen handle.
+
+    Unlike record cleanup, this path deliberately does not depend on ps: the
+    parent proves the new session's PGID directly from the kernel immediately
+    after Popen, before any ownership lookup can fail or be interrupted.
+    """
+    if pgid != child.pid:
+        raise PreviewError("refusing startup cleanup: child did not lead its process group")
+    if child.poll() is None:
+        try:
+            if os.getpgid(child.pid) != pgid:
+                raise PreviewError("refusing startup cleanup: child process group changed")
+        except ProcessLookupError:
+            child.poll()
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pgid, signal.SIGTERM)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        child.poll()
+        if not process_group_alive(pgid):
+            break
+        time.sleep(0.05)
+    if process_group_alive(pgid):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
+    try:
+        child.wait(timeout=2)
+    except subprocess.TimeoutExpired as exc:
+        raise PreviewError("could not reap the launched preview process") from exc
+
+
 def child_command(command, host, port, live_url):
     if not command:
         raise PreviewError("start requires a command after --")
@@ -466,52 +517,65 @@ def command_start(args, project_root, unit, unit_number, registry):
         env.update({"SPRINT_PREVIEW_HOST": host,
                     "SPRINT_PREVIEW_PORT": str(port),
                     "SPRINT_PREVIEW_URL": live_url})
-        with open(log_path, "ab", buffering=0) as log:
-            child = subprocess.Popen(command, cwd=worktree, env=env,
-                                     stdin=subprocess.DEVNULL, stdout=log,
-                                     stderr=subprocess.STDOUT, start_new_session=True)
-        identity = pid_identity(child.pid)
-        if not identity:
-            with contextlib.suppress(ProcessLookupError):
-                child.terminate()
-            release_lease(registry, lease)
-            raise PreviewError("could not record the preview process identity")
-        record = dict(lease)
-        record.update({
-            "status": "running",
-            "pid": child.pid,
-            "pid_identity": identity,
-            "worktree": worktree,
-            "command": command,
-            "path": path,
-            "live_url": live_url,
-            "log": log_path,
-            "record_path": record_file,
-            "started_at": time.time(),
-        })
-        deadline = time.time() + args.timeout
-        ready = False
-        verification_error = None
+        child = None
+        pgid = None
+        keep_running = False
+        record_written = False
         try:
-            while time.time() < deadline:
-                if child.poll() is not None:
-                    break
-                if listener_owned(record) and http_reachable(host, port, path):
-                    ready = True
-                    break
-                time.sleep(0.1)
-        except PreviewError as exc:
-            verification_error = exc
-        if ready:
-            write_record(record_file, record)
-            publish_lease(registry, record)
-            print(json.dumps(public_record(record), sort_keys=True))
-            return 0
-        with contextlib.suppress(PreviewError, ProcessLookupError):
-            terminate_record(record, timeout=1, child=child)
-        release_lease(registry, record)
-        if verification_error is not None:
-            raise verification_error
+            with startup_signal_guard():
+                with open(log_path, "ab", buffering=0) as log:
+                    try:
+                        child = subprocess.Popen(command, cwd=worktree, env=env,
+                                                 stdin=subprocess.DEVNULL, stdout=log,
+                                                 stderr=subprocess.STDOUT,
+                                                 start_new_session=True)
+                    except OSError as exc:
+                        raise PreviewError("could not launch preview command: %s" % exc) from exc
+                pgid = os.getpgid(child.pid)
+                if pgid != child.pid:
+                    raise PreviewError("preview child did not establish its own process group")
+                identity = pid_identity(child.pid)
+                if not identity:
+                    raise PreviewError("could not record the preview process identity")
+                record = dict(lease)
+                record.update({
+                    "status": "running",
+                    "pid": child.pid,
+                    "pid_identity": identity,
+                    "worktree": worktree,
+                    "command": command,
+                    "path": path,
+                    "live_url": live_url,
+                    "log": log_path,
+                    "record_path": record_file,
+                    "started_at": time.time(),
+                })
+                deadline = time.time() + args.timeout
+                ready = False
+                while time.time() < deadline:
+                    if child.poll() is not None:
+                        break
+                    if listener_owned(record) and http_reachable(host, port, path):
+                        ready = True
+                        break
+                    time.sleep(0.1)
+                if ready:
+                    write_record(record_file, record)
+                    record_written = True
+                    publish_lease(registry, record)
+                    keep_running = True
+                    print(json.dumps(public_record(record), sort_keys=True))
+                    return 0
+        finally:
+            if not keep_running:
+                try:
+                    if child is not None:
+                        terminate_launched_group(child, pgid, timeout=1)
+                finally:
+                    release_lease(registry, lease)
+                    if record_written:
+                        with contextlib.suppress(FileNotFoundError):
+                            os.unlink(record_file)
         # A listener race or a child bind failure is recoverable on another
         # reserved port. Other startup failures are surfaced after a few tries.
         if attempts >= 3:

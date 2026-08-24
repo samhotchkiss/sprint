@@ -90,6 +90,22 @@ class SprintPreviewTest(unittest.TestCase):
             "#!/bin/sh\nsleep \"${TEST_LSOF_DELAY:-0}\"\nexec %s \"$@\"\n" % real_lsof,
             encoding="utf-8")
         fake_lsof.chmod(0o755)
+        real_ps = shutil.which("ps")
+        fake_ps = self.fake_bin / "ps"
+        fake_ps.write_text(
+            "#!/bin/sh\n"
+            "count_file=\"${TEST_PS_COUNT_FILE:-/dev/null}\"\n"
+            "count=0\n"
+            "[ ! -f \"$count_file\" ] || count=$(cat \"$count_file\")\n"
+            "count=$((count + 1))\n"
+            "[ \"$count_file\" = /dev/null ] || echo \"$count\" > \"$count_file\"\n"
+            "sleep \"${TEST_PS_DELAY:-0}\"\n"
+            "if [ \"${TEST_PS_MODE:-real}\" = fail ]; then exit 127; fi\n"
+            "if [ -n \"${TEST_PS_FAIL_AFTER:-}\" ] && "
+            "[ \"$count\" -gt \"$TEST_PS_FAIL_AFTER\" ]; then exit 127; fi\n"
+            "exec %s \"$@\"\n" % real_ps,
+            encoding="utf-8")
+        fake_ps.chmod(0o755)
         self.started = []
         self.blockers = []
 
@@ -139,6 +155,17 @@ class SprintPreviewTest(unittest.TestCase):
         if timeout is not None:
             env["SPRINT_PREVIEW_OWNERSHIP_TIMEOUT"] = str(timeout)
         return env
+
+    def assert_pid_gone(self, pid):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                    text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL).stdout.strip()
+            if not status or status.startswith("Z"):
+                return
+            time.sleep(0.05)
+        self.fail("preview process %d survived cleanup" % pid)
 
     def start_preview(self, card, project, worktree, marker):
         extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8", "--",
@@ -235,16 +262,88 @@ class SprintPreviewTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("timed out", proc.stderr)
         child_pid = int(child_pid_file.read_text(encoding="utf-8"))
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.05)
-        else:
-            self.fail("ownership timeout left the wrapper's server child alive")
+        self.assert_pid_gone(child_pid)
         self.assertFalse((project / ".sprint" / "previews" / "card-88.json").exists())
+
+    def test_sigterm_during_slow_lookup_reaps_exact_process_group(self):
+        project, worktree = self.board("signal-cleanup-board")
+        child_pid_file = self.root / "signal-child.pid"
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "20", "--",
+                 sys.executable, self.wrapper_script, self.server_script,
+                 "{host}", "{port}", child_pid_file]
+        env = self.delayed_lsof_env(10)
+        helper = subprocess.Popen(self.command("start", 89, project, extra), text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        deadline = time.monotonic() + 5
+        while not child_pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(child_pid_file.exists(), "wrapper child never launched")
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        time.sleep(0.2)
+        helper.terminate()
+        stdout, stderr = helper.communicate(timeout=5)
+        self.assertNotEqual(helper.returncode, 0, stdout)
+        self.assertIn("interrupted by signal", stderr)
+        self.assert_pid_gone(child_pid)
+        self.assertFalse((project / ".sprint" / "previews" / "card-89.json").exists())
+
+    def test_missing_ps_identity_still_reaps_launched_group(self):
+        project, worktree = self.board("missing-ps-board")
+        child_pid_file = self.root / "missing-ps-child.pid"
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "5", "--",
+                 sys.executable, self.wrapper_script, self.server_script,
+                 "{host}", "{port}", child_pid_file]
+        env = self.delayed_lsof_env(0)
+        env["TEST_PS_MODE"] = "fail"
+        env["TEST_PS_DELAY"] = "0.3"
+        proc = self.run_preview("start", 90, project, extra, check=False, env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("could not record", proc.stderr)
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        self.assert_pid_gone(child_pid)
+        self.assertFalse((project / ".sprint" / "previews" / "card-90.json").exists())
+
+    def test_cleanup_fails_closed_when_ps_breaks_after_identity(self):
+        project, worktree = self.board("cleanup-ps-failure-board")
+        child_pid_file = self.root / "cleanup-ps-child.pid"
+        count_file = self.root / "ps-count"
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "5", "--",
+                 sys.executable, self.wrapper_script, self.server_script,
+                 "{host}", "{port}", child_pid_file]
+        env = self.delayed_lsof_env(1, timeout=0.2)
+        env["TEST_PS_COUNT_FILE"] = str(count_file)
+        env["TEST_PS_FAIL_AFTER"] = "2"
+        proc = self.run_preview("start", 91, project, extra, check=False, env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        self.assert_pid_gone(child_pid)
+        self.assertFalse((project / ".sprint" / "previews" / "card-91.json").exists())
+
+    def test_ps_timeout_during_identity_still_reaps_launched_group(self):
+        project, worktree = self.board("ps-timeout-board")
+        child_pid_file = self.root / "ps-timeout-child.pid"
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "5", "--",
+                 sys.executable, self.wrapper_script, self.server_script,
+                 "{host}", "{port}", child_pid_file]
+        env = self.delayed_lsof_env(0)
+        env["TEST_PS_DELAY"] = "3"
+        proc = self.run_preview("start", 92, project, extra, check=False, env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("could not record", proc.stderr)
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        self.assert_pid_gone(child_pid)
+        self.assertFalse((project / ".sprint" / "previews" / "card-92.json").exists())
+
+    def test_launch_exception_releases_starting_lease(self):
+        project, worktree = self.board("launch-exception-board")
+        missing = self.root / "command-that-does-not-exist"
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "5", "--",
+                 missing, "{host}", "{port}"]
+        proc = self.run_preview("start", 93, project, extra, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        registry = json.loads(self.registry.read_text(encoding="utf-8"))
+        key = os.path.realpath(project) + "\0card-93"
+        self.assertNotIn(key, registry)
 
 
 if __name__ == "__main__":
