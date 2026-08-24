@@ -387,7 +387,11 @@ def capture_listener_proofs(record):
             raise PreviewError("preview listener escaped the owned process group")
         if pid not in owned:
             raise PreviewError("could not capture exact preview listener ownership")
+        listener_executable = pid_executable(pid)
+        if not listener_executable:
+            raise PreviewError("could not capture preview listener executable")
         proofs.append({"pid": pid, "pid_identity": identity,
+                       "pid_executable": listener_executable,
                        "pgid": listener_pgid})
     return proofs
 
@@ -422,7 +426,9 @@ def recorded_listeners_still_own_group(record, pgid):
         proof = proofs[pid]
         if (not pid_exists(pid) or pid_identity(pid) != proof.get("pid_identity")
                 or os.getpgid(pid) != int(proof.get("pgid") or 0)
-                or int(proof.get("pgid") or 0) != pgid):
+                or int(proof.get("pgid") or 0) != pgid
+                or not proof.get("pid_executable")
+                or pid_executable(pid) != proof.get("pid_executable")):
             return False
     return True
 
@@ -663,8 +669,21 @@ def terminate_record(record, timeout=5, child=None):
         time.sleep(0.05)
     if process_group_alive(recorded_pgid):
         if not pid_exists(pid):
-            # The persistent supervisor never exits with an owned live peer;
-            # a numeric PGID observed afterward is not authorization.
+            # A SIGKILLed supervisor can leave a proven listener member. Its
+            # live PID prevents PGID reuse, but every durable predicate must
+            # be rechecked immediately before escalation.
+            if not recorded_listeners_still_own_group(record, recorded_pgid):
+                raise PreviewError(
+                    "refusing escalation: supervisor is gone and listener proof changed")
+            if not recorded_listeners_still_own_group(record, recorded_pgid):
+                raise PreviewError(
+                    "refusing escalation: listener identity changed before SIGKILL")
+            os.killpg(recorded_pgid, signal.SIGKILL)
+            kill_deadline = time.time() + 2
+            while time.time() < kill_deadline and process_group_alive(recorded_pgid):
+                time.sleep(0.05)
+            if process_group_alive(recorded_pgid):
+                raise PreviewError("preview process group survived SIGKILL")
             return
         try:
             escalation_pgid = os.getpgid(pid)

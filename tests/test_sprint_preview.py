@@ -957,7 +957,7 @@ assert called == [], called
                 project, worktree = self.board("inspection-%s" % mode)
                 extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
                          "--", sys.executable, self.timed_server_script, "{host}", "{port}",
-                         "inspect", "1.2", "0"]
+                         "inspect", "5", "0"]
                 env = os.environ.copy()
                 env["SPRINT_PREVIEW_TEST_GROUP_INSPECTION"] = mode
                 started = self.run_preview("start", card, project, extra, env=env)
@@ -1145,6 +1145,51 @@ m.pid_identity=lambda pid: next(identities)
 m.pid_executable=lambda pid: '/exact/listener'
 try: m.cleanup_detached_listener(42421, 42421, 'original')
 except m.PreviewError: pass
+assert signals == [signal.SIGTERM], signals
+""" % str(PREVIEW)
+        proc = subprocess.run([sys.executable, "-c", code], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_dead_supervisor_stubborn_listener_escalates_from_exact_proof(self):
+        project, worktree = self.board("dead-supervisor-stubborn")
+        child_pid_file = self.root / "dead-supervisor-stubborn.pid"
+        card = 135
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
+                 "--", sys.executable, self.wrapper_script, self.server_script,
+                 "{host}", "{port}", child_pid_file]
+        started = self.run_preview("start", card, project, extra)
+        preview = self.register_started(card, project, json.loads(started.stdout))
+        listener_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        os.kill(preview["pid"], signal.SIGKILL)
+        self.assert_pid_gone(preview["pid"])
+        self.assertTrue(pid_exists_for_test(listener_pid))
+        stopped = self.run_preview("stop", card, project, ["--timeout", "0.2"])
+        self.assertTrue(json.loads(stopped.stdout)["stopped"])
+        self.assert_pid_gone(listener_pid)
+        self.assertFalse((project / ".sprint" / "previews" / "card-135.json").exists())
+        self.started.remove((card, project))
+
+    def test_dead_supervisor_listener_flip_preserves_state_without_kill(self):
+        code = """
+import importlib.machinery, importlib.util, signal
+loader=importlib.machinery.SourceFileLoader('preview', %r)
+spec=importlib.util.spec_from_loader(loader.name, loader)
+m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+record={'pid':50000,'pgid':50000,'pid_identity':'supervisor','pid_executable':'/supervisor',
+ 'port':25000,'host':'127.0.0.1','listener_proofs':[{'pid':50001,
+ 'pid_identity':'listener','pid_executable':'/listener','pgid':50000}]}
+identities=iter(['listener','flipped'])
+m.pid_exists=lambda pid: pid == 50001
+m.pid_identity=lambda pid: next(identities)
+m.pid_executable=lambda pid: '/listener'
+m.os.getpgid=lambda pid: 50000
+m.matching_listener_pids=lambda record: {50001}
+m.process_group_alive=lambda pgid: True
+signals=[]; m.os.killpg=lambda pgid,sig: signals.append(sig)
+try: m.terminate_record(record, timeout=0)
+except m.PreviewError: pass
+else: raise AssertionError('identity flip authorized escalation')
 assert signals == [signal.SIGTERM], signals
 """ % str(PREVIEW)
         proc = subprocess.run([sys.executable, "-c", code], text=True,
