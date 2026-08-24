@@ -64,6 +64,12 @@ while True:
     time.sleep(60)
 """
 
+FORK_AND_EXIT = r"""
+import subprocess, sys
+child = subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2], sys.argv[3], 'forked'])
+open(sys.argv[4], 'w').write(str(child.pid))
+"""
+
 
 def preferred_port(project_root, card):
     digest = hashlib.sha256(os.path.realpath(project_root).encode("utf-8")).digest()
@@ -89,6 +95,8 @@ class SprintPreviewTest(unittest.TestCase):
         self.blocker_script.write_text(BLOCKER, encoding="utf-8")
         self.wrapper_script = self.root / "wrapper.py"
         self.wrapper_script.write_text(WRAPPER, encoding="utf-8")
+        self.fork_exit_script = self.root / "fork_and_exit.py"
+        self.fork_exit_script.write_text(FORK_AND_EXIT, encoding="utf-8")
         self.fake_bin = self.root / "fake-bin"
         self.fake_bin.mkdir()
         real_lsof = shutil.which("lsof")
@@ -98,6 +106,7 @@ class SprintPreviewTest(unittest.TestCase):
         fake_lsof.write_text(
             "#!/bin/sh\nsleep \"${TEST_LSOF_DELAY:-0}\"\n"
             "if [ \"${TEST_LSOF_MODE:-real}\" = fail ]; then exit 7; fi\n"
+            "if [ \"${TEST_LSOF_MODE:-real}\" = empty ]; then exit 1; fi\n"
             "if [ \"${TEST_LSOF_MODE:-real}\" = nonzero_stdout ]; then "
             "echo 'p99999'; echo 'n127.0.0.1:1'; exit 7; fi\n"
             "exec %s \"$@\"\n" % real_lsof,
@@ -126,8 +135,10 @@ class SprintPreviewTest(unittest.TestCase):
         fake_ps.chmod(0o755)
         self.started = []
         self.blockers = []
+        self.helpers = []
 
     def tearDown(self):
+        self.cleanup_tracked_helpers()
         for card, project in reversed(self.started):
             record_path = project / ".sprint" / "previews" / ("card-%d.json" % card)
             record = None
@@ -153,6 +164,31 @@ class SprintPreviewTest(unittest.TestCase):
             if proc.stderr:
                 proc.stderr.close()
         self.temp.cleanup()
+
+    def cleanup_tracked_helpers(self):
+        for helper, child_pid_file in reversed(self.helpers):
+            if helper.poll() is None:
+                helper.terminate()
+                try:
+                    # Startup deliberately defers signals across its bounded
+                    # ownership lookup and exact-group cleanup (15s + reap).
+                    helper.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    helper.kill()
+                    helper.wait(timeout=2)
+            if child_pid_file and child_pid_file.exists():
+                child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+                command = subprocess.run(
+                    ["ps", "-o", "command=", "-p", str(child_pid)], text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+                if str(self.root) in command:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(os.getpgid(child_pid), signal.SIGKILL)
+            if helper.stdout:
+                helper.stdout.close()
+            if helper.stderr:
+                helper.stderr.close()
+        self.helpers.clear()
 
     def board(self, name):
         project = self.root / name
@@ -202,6 +238,16 @@ class SprintPreviewTest(unittest.TestCase):
         record = json.loads(proc.stdout)
         self.started.append((card, project))
         return record
+
+    def register_started(self, card, project, record):
+        """Register exact cleanup before a test makes any assertions."""
+        self.started.append((card, project))
+        return record
+
+    def track_helper(self, helper, child_pid_file=None):
+        """Install teardown before any wait/assertion can fail."""
+        self.helpers.append((helper, child_pid_file))
+        return helper
 
     def read_url(self, url):
         with urllib.request.urlopen(url, timeout=2) as response:
@@ -273,9 +319,9 @@ class SprintPreviewTest(unittest.TestCase):
         started = time.monotonic()
         proc = self.run_preview("start", 87, project, extra,
                                 env=self.delayed_lsof_env(3.5))
-        self.assertGreaterEqual(time.monotonic() - started, 3.4)
         preview = json.loads(proc.stdout)
         self.started.append((87, project))
+        self.assertGreaterEqual(time.monotonic() - started, 3.4)
         self.assertEqual(self.read_url(preview["live_url"]), "slow-owned")
 
     def test_ownership_timeout_reaps_wrapper_and_stubborn_child(self):
@@ -302,6 +348,7 @@ class SprintPreviewTest(unittest.TestCase):
         env = self.delayed_lsof_env(10)
         helper = subprocess.Popen(self.command("start", 89, project, extra), text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.track_helper(helper, child_pid_file)
         deadline = time.monotonic() + 5
         while not child_pid_file.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -388,6 +435,7 @@ class SprintPreviewTest(unittest.TestCase):
                 helper = subprocess.Popen(self.command("start", card, project, extra),
                                           text=True, stdout=subprocess.PIPE,
                                           stderr=subprocess.PIPE, env=env)
+                self.track_helper(helper)
                 record_path = project / ".sprint" / "previews" / ("card-%d.json" % card)
                 deadline = time.monotonic() + 5
                 while not record_path.exists() and time.monotonic() < deadline:
@@ -415,6 +463,7 @@ class SprintPreviewTest(unittest.TestCase):
         env["SPRINT_PREVIEW_TEST_POST_POPEN_DELAY"] = "2"
         helper = subprocess.Popen(self.command("start", 100, project, extra), text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.track_helper(helper, child_pid_file)
         deadline = time.monotonic() + 5
         while not child_pid_file.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -435,6 +484,7 @@ class SprintPreviewTest(unittest.TestCase):
         env = self.delayed_lsof_env(10)
         helper = subprocess.Popen(self.command("start", 101, project, extra), text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.track_helper(helper, child_pid_file)
         deadline = time.monotonic() + 5
         while not child_pid_file.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -455,6 +505,7 @@ class SprintPreviewTest(unittest.TestCase):
         env["SPRINT_PREVIEW_TEST_POST_REPLACE_DELAY"] = "5"
         helper = subprocess.Popen(self.command("start", 102, project, extra), text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.track_helper(helper)
         record_path = project / ".sprint" / "previews" / "card-102.json"
         deadline = time.monotonic() + 8
         while not record_path.exists() and time.monotonic() < deadline:
@@ -477,6 +528,7 @@ class SprintPreviewTest(unittest.TestCase):
         env = self.delayed_lsof_env(5)
         helper = subprocess.Popen(self.command("start", 103, project, extra), text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.track_helper(helper)
         time.sleep(0.3)
         helper.terminate()
         stdout, stderr = helper.communicate(timeout=15)
@@ -610,6 +662,7 @@ class SprintPreviewTest(unittest.TestCase):
                 env["SPRINT_PREVIEW_TEST_POST_STOP_TERM_DELAY"] = "2"
                 stopper = subprocess.Popen(self.command("stop", card, project), text=True,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+                self.track_helper(stopper, child_pid_file)
                 deadline = time.monotonic() + 5
                 while pid_exists_for_test(record["pid"]) and time.monotonic() < deadline:
                     time.sleep(0.02)
@@ -635,6 +688,7 @@ class SprintPreviewTest(unittest.TestCase):
         env["SPRINT_PREVIEW_TEST_POST_STOP_TERM_DELAY"] = "10"
         stopper = subprocess.Popen(self.command("stop", card, project), text=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.track_helper(stopper, child_pid_file)
         deadline = time.monotonic() + 5
         while pid_exists_for_test(preview["pid"]) and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -650,6 +704,91 @@ class SprintPreviewTest(unittest.TestCase):
         self.assert_pid_gone(child_pid)
         self.assertFalse(record_path.exists())
         self.started.remove((card, project))
+
+    def test_dead_leader_live_listener_survives_unrelated_reserve(self):
+        project, worktree = self.board("dead-leader-reserve")
+        child_pid_file = self.root / "dead-leader-reserve-child.pid"
+        card = 116
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
+                 "--", sys.executable, self.wrapper_script, self.server_script,
+                 "{host}", "{port}", child_pid_file]
+        started = self.run_preview("start", card, project, extra)
+        preview = self.register_started(card, project, json.loads(started.stdout))
+        env = os.environ.copy()
+        env["SPRINT_PREVIEW_TEST_POST_STOP_TERM_DELAY"] = "10"
+        stopper = subprocess.Popen(self.command("stop", card, project), text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.track_helper(stopper, child_pid_file)
+        deadline = time.monotonic() + 5
+        while pid_exists_for_test(preview["pid"]) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(pid_exists_for_test(preview["pid"]))
+        stopper.kill()
+        stopper.communicate(timeout=5)
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        other_project, other_worktree = self.board("unrelated-reserve")
+        other = self.start_preview(117, other_project, other_worktree, "unrelated")
+        self.assertTrue(pid_exists_for_test(child_pid))
+        self.assertEqual(self.read_url(preview["live_url"]), "stubborn")
+        recovered = self.run_preview("stop", card, project)
+        self.assertTrue(json.loads(recovered.stdout)["stopped"])
+        self.assert_pid_gone(child_pid)
+        self.started.remove((card, project))
+        self.assertEqual(self.read_url(other["live_url"]), "unrelated")
+
+    def test_rc1_empty_lsof_preserves_healthy_reused_preview(self):
+        project, worktree = self.board("reuse-empty-lsof")
+        card = 118
+        preview = self.start_preview(card, project, worktree, "empty-lsof")
+        env = os.environ.copy()
+        env["PATH"] = str(self.fake_bin) + os.pathsep + env.get("PATH", "")
+        env["TEST_LSOF_MODE"] = "empty"
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "5",
+                 "--", sys.executable, self.server_script, "{host}", "{port}", "unused"]
+        retried = self.run_preview("start", card, project, extra, check=False, env=env)
+        self.assertNotEqual(retried.returncode, 0)
+        record_path = project / ".sprint" / "previews" / "card-118.json"
+        self.assertTrue(record_path.exists())
+        self.assertEqual(self.read_url(preview["live_url"]), "empty-lsof")
+        verified = self.run_preview("verify", card, project, ["--url", preview["live_url"]])
+        self.assertEqual(json.loads(verified.stdout)["pid"], preview["pid"])
+        self.run_preview("stop", card, project)
+        self.started.remove((card, project))
+
+    def test_fork_exit_before_getpgid_reaps_candidate_session(self):
+        project, worktree = self.board("fork-exit-before-getpgid")
+        child_pid_file = self.root / "fork-exit-child.pid"
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "5",
+                 "--", sys.executable, self.fork_exit_script, self.server_script,
+                 "{host}", "{port}", child_pid_file]
+        env = os.environ.copy()
+        env["SPRINT_PREVIEW_TEST_POST_POPEN_DELAY"] = "1"
+        proc = self.run_preview("start", 119, project, extra, check=False, env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        self.assert_pid_gone(child_pid)
+        self.assertFalse((project / ".sprint" / "previews" / "card-119.json").exists())
+
+    def test_forced_assertion_path_runs_exact_test_teardown(self):
+        project, worktree = self.board("forced-failure-teardown")
+        child_pid_file = self.root / "forced-failure-child.pid"
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "20",
+                 "--", sys.executable, self.wrapper_script, self.server_script,
+                 "{host}", "{port}", child_pid_file]
+        env = self.delayed_lsof_env(10)
+        helper = subprocess.Popen(self.command("start", 120, project, extra), text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.track_helper(helper, child_pid_file)
+        deadline = time.monotonic() + 5
+        while not child_pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(child_pid_file.exists())
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        try:
+            self.assertTrue(False, "synthetic assertion failure")
+        except AssertionError:
+            self.cleanup_tracked_helpers()
+        self.assert_pid_gone(child_pid)
 
 
 if __name__ == "__main__":

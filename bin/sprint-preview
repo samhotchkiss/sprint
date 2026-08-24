@@ -412,7 +412,22 @@ def record_state(record, require_http=False):
     identity = record.get("pid_identity") or ""
     if not pid or not identity:
         return "dead"
+    pgid = int(record.get("pgid") or pid)
     if not pid_exists(pid):
+        # A session leader may exit while its recorded listener descendant
+        # remains.  Preserve that durable cleanup authority; an empty lsof
+        # sample is not proof that the process group is gone.
+        try:
+            if recorded_listeners_still_own_group(record, pgid):
+                if require_http and not http_reachable(
+                        record["host"], int(record["port"]),
+                        record.get("path") or "/"):
+                    return "unknown"
+                return "live"
+        except (PreviewError, OSError):
+            return "unknown"
+        if process_group_alive(pgid):
+            return "unknown"
         return "dead"
     observed_identity = pid_identity(pid)
     if not observed_identity:
@@ -421,7 +436,10 @@ def record_state(record, require_http=False):
         return "dead"
     try:
         if not listener_owned(record):
-            return "dead"
+            # lsof can transiently return rc=1/no rows for a healthy socket.
+            # The still-matching leader proves this record is not stale, but
+            # absence of one listener sample cannot prove it live either.
+            return "unknown"
     except PreviewError:
         return "unknown"
     if require_http and not http_reachable(
@@ -696,12 +714,20 @@ def command_start(args, project_root, unit, unit_number, registry):
                                                      signal_state["child_signal_mask"]))
                     except OSError as exc:
                         raise PreviewError("could not launch preview command: %s" % exc) from exc
+                # start_new_session=True establishes this contract in the
+                # child before exec. Capture the candidate synchronously from
+                # our Popen handle so cleanup remains possible even when a
+                # fast wrapper forks the listener and exits before getpgid.
+                pgid = child.pid
                 post_popen_delay = float(os.environ.get(
                     "SPRINT_PREVIEW_TEST_POST_POPEN_DELAY", "0"))
                 if post_popen_delay > 0:
                     time.sleep(post_popen_delay)
-                pgid = os.getpgid(child.pid)
-                if pgid != child.pid:
+                try:
+                    observed_pgid = os.getpgid(child.pid)
+                except ProcessLookupError:
+                    observed_pgid = None
+                if observed_pgid is not None and observed_pgid != pgid:
                     raise PreviewError("preview child did not establish its own process group")
                 raise_if_startup_interrupted()
                 identity = pid_identity(child.pid)
