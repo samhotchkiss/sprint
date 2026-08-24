@@ -103,6 +103,19 @@ subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2], sys.argv[3], 'detach
 while True: time.sleep(60)
 """
 
+SIBLING_GROUP_WRAPPER = r"""
+import os, signal, subprocess, sys, time
+if sys.argv[1] == 'leader':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    child=subprocess.Popen([sys.executable, sys.argv[2], sys.argv[3], sys.argv[4], 'sibling'],
+                           preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_IGN))
+    open(sys.argv[5], 'w').write('%d,%d' % (os.getpid(), child.pid))
+    while True: time.sleep(60)
+subprocess.Popen([sys.executable, sys.argv[0], 'leader', *sys.argv[1:]],
+                 start_new_session=True)
+while True: time.sleep(60)
+"""
+
 
 def preferred_port(project_root, card):
     digest = hashlib.sha256(os.path.realpath(project_root).encode("utf-8")).digest()
@@ -136,6 +149,8 @@ class SprintPreviewTest(unittest.TestCase):
         self.fork_exit_script.write_text(FORK_AND_EXIT, encoding="utf-8")
         self.detached_wrapper_script = self.root / "detached_wrapper.py"
         self.detached_wrapper_script.write_text(DETACHED_WRAPPER, encoding="utf-8")
+        self.sibling_group_script = self.root / "sibling_group.py"
+        self.sibling_group_script.write_text(SIBLING_GROUP_WRAPPER, encoding="utf-8")
         self.fake_bin = self.root / "fake-bin"
         self.fake_bin.mkdir()
         real_lsof = shutil.which("lsof")
@@ -1138,12 +1153,15 @@ m.pid_executable=lambda pid: '/exact/python'
 try: m.terminate_launched_group(Child(), 42420, timeout=0, control='proof')
 except m.PreviewError: pass
 assert signals == [signal.SIGTERM], signals
-signals.clear(); identities=iter(['original','original','flipped'])
+signals.clear(); identities=iter(['original','original','original','flipped'])
 m.os.getpgid=lambda pid: pid
 m.pid_exists=lambda pid: True
 m.pid_identity=lambda pid: next(identities)
 m.pid_executable=lambda pid: '/exact/listener'
-try: m.cleanup_detached_listener(42421, 42421, 'original')
+m.process_group_member_pids=lambda pgid: {42421}
+m.matching_listener_pids=lambda record: {42421}
+try: m.cleanup_detached_listener({'host':'127.0.0.1','port':1},
+                                 42421, 42421, 'original', {42421})
 except m.PreviewError: pass
 assert signals == [signal.SIGTERM], signals
 """ % str(PREVIEW)
@@ -1195,6 +1213,77 @@ assert signals == [signal.SIGTERM], signals
         proc = subprocess.run([sys.executable, "-c", code], text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_sibling_led_escaped_listener_group_is_exactly_cleaned(self):
+        project, worktree = self.board("sibling-led-escape")
+        pid_file = self.root / "sibling-led.pid"
+        card = 136
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
+                 "--", sys.executable, self.sibling_group_script,
+                 self.server_script, "{host}", "{port}", pid_file]
+        proc = self.run_preview("start", card, project, extra, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("escaped the owned process group", proc.stderr)
+        leader_pid, listener_pid = map(
+            int, pid_file.read_text(encoding="utf-8").split(","))
+        self.assertNotEqual(leader_pid, listener_pid)
+        self.assert_pid_gone(leader_pid)
+        self.assert_pid_gone(listener_pid)
+        self.assert_preview_state_removed(card, project)
+
+    def test_detached_group_member_flip_never_escalates(self):
+        code = """
+import importlib.machinery, importlib.util, signal
+loader=importlib.machinery.SourceFileLoader('preview', %r)
+spec=importlib.util.spec_from_loader(loader.name, loader)
+m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+record={'host':'127.0.0.1','port':25000}; calls=[0]
+def members(_pgid):
+ calls[0]+=1
+ return {51000,51001} if calls[0] < 4 else {51000,51001,59999}
+m.process_group_member_pids=members
+m.matching_listener_pids=lambda record: {51001}
+m.pid_exists=lambda pid: True
+m.pid_identity=lambda pid: 'id-'+str(pid)
+m.pid_executable=lambda pid: '/exe-'+str(pid)
+m.os.getpgid=lambda pid: 51000
+m.process_group_alive=lambda pgid: True
+signals=[]; m.os.killpg=lambda pgid,sig: signals.append(sig)
+try: m.cleanup_detached_listener(record,51001,51000,'id-51001',{51000,51001})
+except m.PreviewError: pass
+else: raise AssertionError('new group member authorized escalation')
+assert signals == [signal.SIGTERM], signals
+""" % str(PREVIEW)
+        proc = subprocess.run([sys.executable, "-c", code], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_sibling_group_flip_preserves_actionable_state_for_retry_stop(self):
+        project, worktree = self.board("sibling-flip-state")
+        pid_file = self.root / "sibling-flip.pid"
+        count_file = self.root / "sibling-member-count"
+        card = 137
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
+                 "--", sys.executable, self.sibling_group_script,
+                 self.server_script, "{host}", "{port}", pid_file]
+        env = os.environ.copy()
+        env["SPRINT_PREVIEW_TEST_GROUP_MEMBER_COUNT"] = str(count_file)
+        env["SPRINT_PREVIEW_TEST_GROUP_MEMBER_FLIP_AFTER"] = "3"
+        proc = self.run_preview("start", card, project, extra, check=False, env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        record_path = project / ".sprint" / "previews" / "card-137.json"
+        self.assertTrue(record_path.exists(), "cleanup mismatch discarded ownership state")
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "cleanup_required")
+        self.assertIn("escaped_group", record)
+        leader_pid, listener_pid = map(int, pid_file.read_text(encoding="utf-8").split(","))
+        self.assertTrue(pid_exists_for_test(leader_pid))
+        self.assertTrue(pid_exists_for_test(listener_pid))
+        stopped = self.run_preview("stop", card, project)
+        self.assertTrue(json.loads(stopped.stdout)["stopped"])
+        self.assert_pid_gone(leader_pid)
+        self.assert_pid_gone(listener_pid)
+        self.assertFalse(record_path.exists())
 
 
 if __name__ == "__main__":

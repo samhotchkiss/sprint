@@ -44,6 +44,12 @@ class PreviewError(RuntimeError):
     pass
 
 
+class DetachedCleanupError(PreviewError):
+    def __init__(self, message, escaped=None):
+        super().__init__(message)
+        self.escaped = escaped
+
+
 @contextlib.contextmanager
 def startup_signal_guard():
     """Block terminal signals across launch/publication/cleanup as one unit."""
@@ -383,7 +389,7 @@ def capture_listener_proofs(record):
             if pid not in owned:
                 raise PreviewError(
                     "refusing cleanup of an unrelated detached listener")
-            cleanup_detached_listener(pid, listener_pgid, identity)
+            cleanup_detached_listener(record, pid, listener_pgid, identity, owned)
             raise PreviewError("preview listener escaped the owned process group")
         if pid not in owned:
             raise PreviewError("could not capture exact preview listener ownership")
@@ -396,25 +402,82 @@ def capture_listener_proofs(record):
     return proofs
 
 
-def cleanup_detached_listener(pid, pgid, identity):
-    """Clean only a proven detached listener that leads its own new session."""
-    executable = pid_executable(pid)
-    if (pgid != pid or not executable or not pid_exists(pid)
-            or pid_identity(pid) != identity or os.getpgid(pid) != pgid
-            or pid_executable(pid) != executable):
-        raise PreviewError("refusing cleanup of detached preview listener")
+def process_group_member_pids(pgid):
+    count_file = os.environ.get("SPRINT_PREVIEW_TEST_GROUP_MEMBER_COUNT")
+    count = 0
+    if count_file:
+        try:
+            count = int(pathlib.Path(count_file).read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError):
+            count = 0
+        count += 1
+        pathlib.Path(count_file).write_text(str(count), encoding="utf-8")
+    try:
+        proc = subprocess.run(["ps", "-axo", "pid=,pgid=,stat="], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PreviewError("could not prove detached group membership") from exc
+    if proc.returncode != 0:
+        raise PreviewError("could not prove detached group membership")
+    members = {int(fields[0]) for line in proc.stdout.splitlines()
+            if len(fields := line.split()) >= 3 and fields[0].isdigit()
+            and fields[1].isdigit() and int(fields[1]) == pgid
+            and not fields[2].startswith("Z")}
+    flip_after = int(os.environ.get("SPRINT_PREVIEW_TEST_GROUP_MEMBER_FLIP_AFTER", "0"))
+    if flip_after and count > flip_after:
+        members.add(99999)
+    return members
+
+
+def detached_group_still_matches(record, listener_pid, pgid, proofs):
+    members = process_group_member_pids(pgid)
+    if not members or not members.issubset(proofs) or pgid not in members:
+        return False
+    if listener_pid not in members or listener_pid not in matching_listener_pids(record):
+        return False
+    for member in members:
+        proof = proofs[member]
+        if (not pid_exists(member) or pid_identity(member) != proof["pid_identity"]
+                or pid_executable(member) != proof["pid_executable"]
+                or os.getpgid(member) != pgid):
+            return False
+    return os.getpgid(pgid) == pgid
+
+
+def cleanup_detached_listener(record, pid, pgid, identity, owned):
+    """Clean a fully proven escaped group containing the owned listener."""
+    members = process_group_member_pids(pgid)
+    if not members or pgid not in members or pid not in members or not members.issubset(owned):
+        raise DetachedCleanupError("refusing cleanup of detached preview listener")
+    proofs = {}
+    for member in members:
+        member_identity = pid_identity(member)
+        member_executable = pid_executable(member)
+        if not member_identity or not member_executable:
+            raise DetachedCleanupError("refusing cleanup of detached preview listener")
+        proofs[member] = {"pid_identity": member_identity,
+                          "pid_executable": member_executable}
+    if proofs[pid]["pid_identity"] != identity or not detached_group_still_matches(
+            record, pid, pgid, proofs):
+        raise DetachedCleanupError("refusing cleanup of detached preview listener",
+                                   {"listener_pid": pid, "pgid": pgid,
+                                    "listener_identity": identity, "proofs": proofs})
+    if not detached_group_still_matches(record, pid, pgid, proofs):
+        raise DetachedCleanupError("refusing cleanup of detached preview listener",
+                                   {"listener_pid": pid, "pgid": pgid,
+                                    "listener_identity": identity, "proofs": proofs})
     os.killpg(pgid, signal.SIGTERM)
     deadline = time.monotonic() + 1
     while pid_exists(pid) and time.monotonic() < deadline:
         time.sleep(0.05)
-    if pid_exists(pid) and pid_identity(pid) == identity:
-        try:
-            still_pgid = os.getpgid(pid)
-        except ProcessLookupError:
-            still_pgid = None
-        if (still_pgid == pgid and pid_executable(pid) == executable
-                and pid_identity(pid) == identity):
-            os.killpg(pgid, signal.SIGKILL)
+    if not process_group_alive(pgid):
+        return
+    if not detached_group_still_matches(record, pid, pgid, proofs):
+        raise DetachedCleanupError("refusing detached escalation: group proof changed",
+                                   {"listener_pid": pid, "pgid": pgid,
+                                    "listener_identity": identity, "proofs": proofs})
+    os.killpg(pgid, signal.SIGKILL)
 
 
 def recorded_listeners_still_own_group(record, pgid):
@@ -969,6 +1032,7 @@ def command_start(args, project_root, unit, unit_number, registry):
             ready_path = None
             commit_path = None
             parent_write_fd = None
+            record = None
             keep_running = False
             record_file = record_path(project_root, unit)
             try:
@@ -1121,6 +1185,18 @@ def command_start(args, project_root, unit, unit_number, registry):
                     sys.stdout.flush()
                     keep_running = True
                     return 0
+            except DetachedCleanupError as exc:
+                if record is not None and exc.escaped:
+                    record["status"] = "cleanup_required"
+                    record["escaped_group"] = exc.escaped
+                    write_record(record_file, record)
+                    publish_lease(registry, record)
+                    pathlib.Path(commit_path).touch(mode=0o600, exist_ok=True)
+                    if parent_write_fd is not None:
+                        os.close(parent_write_fd)
+                        parent_write_fd = None
+                    keep_running = True
+                raise
             finally:
                 if not keep_running:
                     if parent_write_fd is not None:
@@ -1175,6 +1251,11 @@ def command_stop(args, project_root, unit, registry):
             current = data.get(key)
             if not isinstance(current, dict) or current.get("lease") != record.get("lease"):
                 raise PreviewError("refusing cleanup: board no longer owns this preview lease")
+        escaped = record.get("escaped_group")
+        if escaped:
+            cleanup_detached_listener(
+                record, int(escaped["listener_pid"]), int(escaped["pgid"]),
+                escaped["listener_identity"], descendants(int(record["pid"])))
         terminate_record(record, timeout=args.timeout)
         release_lease(registry, record)
         remove_record_for_lease(path, record)
