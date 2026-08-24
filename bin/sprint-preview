@@ -36,6 +36,7 @@ PORT_MIN = 20000
 PORT_SLOTS = 300
 PORTS_PER_SLOT = 100
 STARTING_TTL = 60
+OWNERSHIP_LOOKUP_TIMEOUT = 15.0
 
 
 class PreviewError(RuntimeError):
@@ -238,7 +239,12 @@ def listener_rows(port):
         proc = subprocess.run(
             ["lsof", "-nP", "-a", "-iTCP:%d" % port, "-sTCP:LISTEN", "-Fpn"],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=3, check=False)
+            # lsof can take several seconds on a busy macOS host. Fifteen
+            # seconds is bounded but leaves useful headroom over the observed
+            # nine-second lookup without weakening the ownership predicate.
+            timeout=float(os.environ.get(
+                "SPRINT_PREVIEW_OWNERSHIP_TIMEOUT", OWNERSHIP_LOOKUP_TIMEOUT)),
+            check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PreviewError("lsof is required to verify preview ownership: %s" % exc) from exc
     rows = []
@@ -384,7 +390,23 @@ def publish_lease(registry, record):
         data[key] = record
 
 
-def terminate_record(record, timeout=5):
+def process_group_alive(pgid):
+    try:
+        proc = subprocess.run(["ps", "-axo", "pgid=,stat="], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        # Failure to prove the group empty must remain fail-closed.
+        return True
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].isdigit() and int(fields[0]) == pgid:
+            if not fields[1].startswith("Z"):
+                return True
+    return False
+
+
+def terminate_record(record, timeout=5, child=None):
     pid = int(record.get("pid") or 0)
     current_identity = pid_identity(pid) if pid else ""
     if not current_identity:
@@ -400,11 +422,17 @@ def terminate_record(record, timeout=5):
     os.killpg(pgid, signal.SIGTERM)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if not pid_identity(pid):
+        if child is not None:
+            child.poll()
+        if not process_group_alive(pgid):
+            if child is not None:
+                child.wait(timeout=1)
             return
         time.sleep(0.05)
-    if pid_identity(pid) == record.get("pid_identity"):
+    if process_group_alive(pgid):
         os.killpg(pgid, signal.SIGKILL)
+    if child is not None:
+        child.wait(timeout=1)
 
 
 def child_command(command, host, port, live_url):
@@ -463,21 +491,27 @@ def command_start(args, project_root, unit, unit_number, registry):
         })
         deadline = time.time() + args.timeout
         ready = False
-        while time.time() < deadline:
-            if child.poll() is not None:
-                break
-            if listener_owned(record) and http_reachable(host, port, path):
-                ready = True
-                break
-            time.sleep(0.1)
+        verification_error = None
+        try:
+            while time.time() < deadline:
+                if child.poll() is not None:
+                    break
+                if listener_owned(record) and http_reachable(host, port, path):
+                    ready = True
+                    break
+                time.sleep(0.1)
+        except PreviewError as exc:
+            verification_error = exc
         if ready:
             write_record(record_file, record)
             publish_lease(registry, record)
             print(json.dumps(public_record(record), sort_keys=True))
             return 0
         with contextlib.suppress(PreviewError, ProcessLookupError):
-            terminate_record(record, timeout=1)
+            terminate_record(record, timeout=1, child=child)
         release_lease(registry, record)
+        if verification_error is not None:
+            raise verification_error
         # A listener race or a child bind failure is recoverable on another
         # reserved port. Other startup failures are surfaced after a few tries.
         if attempts >= 3:
