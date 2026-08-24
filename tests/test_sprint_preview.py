@@ -51,6 +51,19 @@ threading.Timer(delay, lambda: os._exit(code)).start()
 server.serve_forever()
 """
 
+CLOSING_HTTP_SERVER = r"""
+import http.server, sys, threading, time
+host, port = sys.argv[1], int(sys.argv[2])
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body=b'closing'; self.send_response(200); self.send_header('Content-Length', '7')
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *args): pass
+server=http.server.ThreadingHTTPServer((host, port), Handler)
+threading.Timer(1.5, server.shutdown).start()
+server.serve_forever(); server.server_close(); time.sleep(60)
+"""
+
 BLOCKER = r"""
 import socket, sys, time
 family, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -113,6 +126,8 @@ class SprintPreviewTest(unittest.TestCase):
         self.server_script.write_text(HTTP_SERVER, encoding="utf-8")
         self.timed_server_script = self.root / "timed_http_server.py"
         self.timed_server_script.write_text(TIMED_HTTP_SERVER, encoding="utf-8")
+        self.closing_server_script = self.root / "closing_http_server.py"
+        self.closing_server_script.write_text(CLOSING_HTTP_SERVER, encoding="utf-8")
         self.blocker_script = self.root / "blocker.py"
         self.blocker_script.write_text(BLOCKER, encoding="utf-8")
         self.wrapper_script = self.root / "wrapper.py"
@@ -618,7 +633,7 @@ class SprintPreviewTest(unittest.TestCase):
         env = os.environ.copy()
         env["PATH"] = str(self.fake_bin) + os.pathsep + env.get("PATH", "")
         env["TEST_PS_COUNT_FILE"] = str(count_file)
-        env["TEST_PS_SWAP_AFTER"] = "2"
+        env["TEST_PS_SWAP_AFTER"] = "1"
         stopped = self.run_preview("stop", 105, project, check=False, env=env)
         self.assertNotEqual(stopped.returncode, 0)
         self.assertIn("changed during verification", stopped.stderr)
@@ -1015,6 +1030,67 @@ assert called == [], called
         retry = self.start_preview(card, project, worktree, "detached-retry")
         verified = self.run_preview("verify", card, project, ["--url", retry["live_url"]])
         self.assertEqual(json.loads(verified.stdout)["pid"], retry["pid"])
+
+    def test_unrelated_detached_listener_is_never_signalled(self):
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        spawn = """
+import subprocess, sys
+p=subprocess.Popen([sys.executable, %r, 'v4', '127.0.0.1', %r],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   start_new_session=True)
+print(p.pid)
+""" % (str(self.blocker_script), str(port))
+        blocker_pid = int(subprocess.check_output(
+            [sys.executable, "-c", spawn], text=True).strip())
+        self.addCleanup(lambda: os.kill(blocker_pid, signal.SIGKILL)
+                        if pid_exists_for_test(blocker_pid) else None)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                connection = socket.create_connection(("127.0.0.1", port), timeout=.1)
+                connection.close()
+                break
+            except OSError:
+                time.sleep(.05)
+        code = """
+import importlib.machinery, importlib.util, os
+loader=importlib.machinery.SourceFileLoader('preview', %r)
+spec=importlib.util.spec_from_loader(loader.name, loader)
+m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+r={'pid':os.getpid(),'pgid':os.getpgrp(),'host':'127.0.0.1','port':%d}
+try: m.capture_listener_proofs(r)
+except m.PreviewError as e:
+ assert 'unrelated detached listener' in str(e), e
+else: raise AssertionError('unrelated listener accepted')
+""" % (str(PREVIEW), port)
+        checked = subprocess.run([sys.executable, "-c", code], text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertTrue(pid_exists_for_test(blocker_pid),
+                        "ownership check killed unrelated listener")
+
+    def test_stop_live_supervisor_after_listener_closes(self):
+        project, worktree = self.board("listener-closes")
+        card = 133
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
+                 "--", sys.executable, self.closing_server_script, "{host}", "{port}"]
+        started = self.run_preview("start", card, project, extra)
+        preview = self.register_started(card, project, json.loads(started.stdout))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                self.read_url(preview["live_url"])
+            except (urllib.error.URLError, OSError):
+                break
+            time.sleep(.1)
+        self.assertTrue(pid_exists_for_test(preview["pid"]))
+        stopped = self.run_preview("stop", card, project)
+        self.assertTrue(json.loads(stopped.stdout)["stopped"])
+        self.assert_pid_gone(preview["pid"])
+        self.started.remove((card, project))
 
 
 if __name__ == "__main__":

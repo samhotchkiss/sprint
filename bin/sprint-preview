@@ -380,6 +380,9 @@ def capture_listener_proofs(record):
         listener_pgid = os.getpgid(pid)
         expected_pgid = int(record.get("pgid") or record["pid"])
         if listener_pgid != expected_pgid:
+            if pid not in owned:
+                raise PreviewError(
+                    "refusing cleanup of an unrelated detached listener")
             cleanup_detached_listener(pid, listener_pgid, identity)
             raise PreviewError("preview listener escaped the owned process group")
         if pid not in owned:
@@ -635,11 +638,13 @@ def terminate_record(record, timeout=5, child=None):
         executable = pid_executable(pid)
         if not executable or executable != record.get("pid_executable"):
             raise PreviewError("refusing cleanup: recorded preview command no longer matches")
-    if not recorded_listeners_still_own_group(record, recorded_pgid):
+    if not leader_alive and not recorded_listeners_still_own_group(record, recorded_pgid):
         raise PreviewError("refusing cleanup: recorded listener identity no longer matches")
-    if leader_alive and (pid_identity(pid) != record.get("pid_identity")
-                         or os.getpgid(pid) != recorded_pgid):
-        raise PreviewError("refusing cleanup: preview identity changed during verification")
+    if leader_alive:
+        if (pid_identity(pid) != record.get("pid_identity")
+                or os.getpgid(pid) != recorded_pgid
+                or pid_executable(pid) != record.get("pid_executable")):
+            raise PreviewError("refusing cleanup: preview identity changed during verification")
     os.killpg(recorded_pgid, signal.SIGTERM)
     test_delay = float(os.environ.get("SPRINT_PREVIEW_TEST_POST_STOP_TERM_DELAY", "0"))
     if test_delay > 0:
