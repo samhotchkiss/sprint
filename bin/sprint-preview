@@ -389,7 +389,16 @@ def capture_listener_proofs(record):
             if pid not in owned:
                 raise PreviewError(
                     "refusing cleanup of an unrelated detached listener")
-            cleanup_detached_listener(record, pid, listener_pgid, identity, owned)
+            escaped = {"listener_pid": pid, "pgid": listener_pgid,
+                       "listener_identity": identity}
+            persist_escaped_cleanup_state(record, escaped)
+            try:
+                cleanup_detached_listener(record, pid, listener_pgid, identity, owned)
+            except Exception as exc:
+                if isinstance(exc, DetachedCleanupError) and exc.escaped:
+                    escaped = exc.escaped
+                raise DetachedCleanupError(
+                    "escaped preview cleanup proof failed: %s" % exc, escaped) from exc
             raise PreviewError("preview listener escaped the owned process group")
         if pid not in owned:
             raise PreviewError("could not capture exact preview listener ownership")
@@ -436,6 +445,9 @@ def detached_group_still_matches(record, listener_pid, pgid, proofs):
         return False
     if listener_pid not in members or listener_pid not in matching_listener_pids(record):
         return False
+    current_owned = descendants(int(record["pid"]))
+    if not members.issubset(current_owned):
+        return False
     for member in members:
         proof = proofs[member]
         if (not pid_exists(member) or pid_identity(member) != proof["pid_identity"]
@@ -443,6 +455,15 @@ def detached_group_still_matches(record, listener_pid, pgid, proofs):
                 or os.getpgid(member) != pgid):
             return False
     return os.getpgid(pgid) == pgid
+
+
+def persist_escaped_cleanup_state(record, escaped):
+    """Durably retain authority as soon as an escaped listener is observed."""
+    record["status"] = "cleanup_required"
+    record["escaped_group"] = escaped
+    write_record(record["record_path"], record)
+    publish_lease(record["registry"], record)
+    pathlib.Path(record["supervisor_commit"]).touch(mode=0o600, exist_ok=True)
 
 
 def cleanup_detached_listener(record, pid, pgid, identity, owned):
@@ -1134,6 +1155,7 @@ def command_start(args, project_root, unit, unit_number, registry):
                     "live_url": live_url,
                     "log": log_path,
                     "record_path": record_file,
+                    "registry": registry,
                     "started_at": time.time(),
                 })
                 deadline = time.time() + args.timeout

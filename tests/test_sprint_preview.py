@@ -190,9 +190,23 @@ class SprintPreviewTest(unittest.TestCase):
         self.started = []
         self.blockers = []
         self.helpers = []
+        self.test_group_pid_files = []
 
     def tearDown(self):
         self.cleanup_tracked_helpers()
+        for pid_file in self.test_group_pid_files:
+            if not pid_file.exists():
+                continue
+            pids = [int(value) for value in
+                    pid_file.read_text(encoding="utf-8").split(",") if value]
+            for pid in pids:
+                command = subprocess.run(
+                    ["ps", "-o", "command=", "-p", str(pid)], text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+                if str(self.root) not in command:
+                    continue
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
         for card, project in reversed(self.started):
             record_path = project / ".sprint" / "previews" / ("card-%d.json" % card)
             record = None
@@ -1160,7 +1174,8 @@ m.pid_identity=lambda pid: next(identities)
 m.pid_executable=lambda pid: '/exact/listener'
 m.process_group_member_pids=lambda pgid: {42421}
 m.matching_listener_pids=lambda record: {42421}
-try: m.cleanup_detached_listener({'host':'127.0.0.1','port':1},
+m.descendants=lambda root:{42421}
+try: m.cleanup_detached_listener({'pid':1,'host':'127.0.0.1','port':1},
                                  42421, 42421, 'original', {42421})
 except m.PreviewError: pass
 assert signals == [signal.SIGTERM], signals
@@ -1217,6 +1232,7 @@ assert signals == [signal.SIGTERM], signals
     def test_sibling_led_escaped_listener_group_is_exactly_cleaned(self):
         project, worktree = self.board("sibling-led-escape")
         pid_file = self.root / "sibling-led.pid"
+        self.test_group_pid_files.append(pid_file)
         card = 136
         extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
                  "--", sys.executable, self.sibling_group_script,
@@ -1237,11 +1253,12 @@ import importlib.machinery, importlib.util, signal
 loader=importlib.machinery.SourceFileLoader('preview', %r)
 spec=importlib.util.spec_from_loader(loader.name, loader)
 m=importlib.util.module_from_spec(spec); loader.exec_module(m)
-record={'host':'127.0.0.1','port':25000}; calls=[0]
+record={'pid':1,'host':'127.0.0.1','port':25000}; calls=[0]
 def members(_pgid):
  calls[0]+=1
  return {51000,51001} if calls[0] < 4 else {51000,51001,59999}
 m.process_group_member_pids=members
+m.descendants=lambda root:{51000,51001}
 m.matching_listener_pids=lambda record: {51001}
 m.pid_exists=lambda pid: True
 m.pid_identity=lambda pid: 'id-'+str(pid)
@@ -1261,6 +1278,7 @@ assert signals == [signal.SIGTERM], signals
     def test_sibling_group_flip_preserves_actionable_state_for_retry_stop(self):
         project, worktree = self.board("sibling-flip-state")
         pid_file = self.root / "sibling-flip.pid"
+        self.test_group_pid_files.append(pid_file)
         count_file = self.root / "sibling-member-count"
         card = 137
         extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
@@ -1284,6 +1302,57 @@ assert signals == [signal.SIGTERM], signals
         self.assert_pid_gone(leader_pid)
         self.assert_pid_gone(listener_pid)
         self.assertFalse(record_path.exists())
+
+    def test_detached_reparent_rechecked_before_each_signal(self):
+        code = """
+import importlib.machinery, importlib.util, signal
+loader=importlib.machinery.SourceFileLoader('preview', %r)
+spec=importlib.util.spec_from_loader(loader.name, loader)
+m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+record={'pid':1,'host':'127.0.0.1','port':25000}
+m.process_group_member_pids=lambda pgid:{52000,52001}
+m.matching_listener_pids=lambda record:{52001}
+m.pid_exists=lambda pid:True
+m.pid_identity=lambda pid:'id-'+str(pid)
+m.pid_executable=lambda pid:'/exe-'+str(pid)
+m.os.getpgid=lambda pid:52000
+m.process_group_alive=lambda pgid:True
+for ancestry, expected in [([set()], []),
+                           ([{52000,52001},{52000,52001},set()], [signal.SIGTERM])]:
+ calls=list(ancestry); m.descendants=lambda root: calls.pop(0) if calls else set()
+ signals=[]; m.os.killpg=lambda pgid,sig:signals.append(sig)
+ try: m.cleanup_detached_listener(record,52001,52000,'id-52001',{52000,52001})
+ except m.PreviewError: pass
+ else: raise AssertionError('reparented group authorized')
+ assert signals == expected, (signals, expected)
+""" % str(PREVIEW)
+        proc = subprocess.run([sys.executable, "-c", code], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_first_escaped_observation_persists_all_tool_failures(self):
+        code = """
+import importlib.machinery, importlib.util
+loader=importlib.machinery.SourceFileLoader('preview', %r)
+spec=importlib.util.spec_from_loader(loader.name, loader)
+m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+for failure in ('ps missing','ps timeout','ps nonzero','lsof missing','lsof timeout','lsof nonzero'):
+ persisted=[]
+ m.descendants=lambda root:{53001}
+ m.matching_listener_pids=lambda record:{53001}
+ m.pid_identity=lambda pid:'listener-id'
+ m.os.getpgid=lambda pid:53000
+ m.persist_escaped_cleanup_state=lambda record,escaped:persisted.append(dict(escaped))
+ m.cleanup_detached_listener=lambda *args: (_ for _ in ()).throw(m.PreviewError(failure))
+ try: m.capture_listener_proofs({'pid':1,'pgid':1,'host':'127.0.0.1','port':1})
+ except m.DetachedCleanupError as exc:
+  assert exc.escaped['listener_pid']==53001
+ else: raise AssertionError('tool failure lost escaped authority')
+ assert persisted and persisted[0]['pgid']==53000
+""" % str(PREVIEW)
+        proc = subprocess.run([sys.executable, "-c", code], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 if __name__ == "__main__":
