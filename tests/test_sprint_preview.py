@@ -1166,6 +1166,7 @@ signals=[]
 m.os.getpgid=lambda pid: 42420
 m.os.killpg=lambda pgid, sig: signals.append(sig)
 m.process_group_alive=lambda pgid: True
+m.supervisor_still_matches=lambda record: True
 m.read_record=lambda path: {'supervisor_pid':42420,'supervisor_pgid':42420,
  'supervisor_identity':'original','supervisor_executable':'/exact/python'}
 m._system_pid_identity=lambda pid: 'flipped'
@@ -1225,6 +1226,7 @@ m.pid_executable=lambda pid: '/listener'
 m.os.getpgid=lambda pid: 50000
 m.matching_listener_pids=lambda record: {50001}
 m.process_group_alive=lambda pgid: True
+m.supervisor_still_matches=lambda record: True
 signals=[]; m.os.killpg=lambda pgid,sig: signals.append(sig)
 try: m.terminate_record(record, timeout=0)
 except m.PreviewError: pass
@@ -1271,6 +1273,7 @@ m.pid_identity=lambda pid: 'id-'+str(pid)
 m.pid_executable=lambda pid: '/exe-'+str(pid)
 m.os.getpgid=lambda pid: 51000
 m.process_group_alive=lambda pgid: True
+m.supervisor_still_matches=lambda record: True
 signals=[]; m.os.killpg=lambda pgid,sig: signals.append(sig)
 try: m.cleanup_detached_listener(record,51001,51000,'id-51001',{51000,51001})
 except m.PreviewError: pass
@@ -1323,6 +1326,7 @@ m.pid_identity=lambda pid:'id-'+str(pid)
 m.pid_executable=lambda pid:'/exe-'+str(pid)
 m.os.getpgid=lambda pid:52000
 m.process_group_alive=lambda pgid:True
+m.supervisor_still_matches=lambda record:True
 for ancestry, expected in [([set()], []),
                            ([{52000,52001},{52000,52001},set()], [signal.SIGTERM])]:
  calls=list(ancestry); m.descendants=lambda root: calls.pop(0) if calls else set()
@@ -1361,6 +1365,94 @@ for failure in ('ps missing','ps timeout','ps nonzero','ps error',
  else: raise AssertionError('tool failure lost escaped authority')
  assert persisted and persisted[0]['listener_pid']==53001
  assert persisted[0].get('pgid') is None
+""" % str(PREVIEW)
+        proc = subprocess.run([sys.executable, "-c", code], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_stale_helper_cannot_clobber_or_delete_newer_lease_record(self):
+        code = """
+import importlib.machinery, importlib.util, json, pathlib, tempfile
+loader=importlib.machinery.SourceFileLoader('preview', %r)
+spec=importlib.util.spec_from_loader(loader.name, loader)
+m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+with tempfile.TemporaryDirectory() as root:
+ registry=str(pathlib.Path(root)/'registry.json')
+ record_path=str(pathlib.Path(root)/'card-99.json')
+ key=root+'\\0card-99'
+ base={'project_root':root,'unit':'card-99','registry':registry,
+       'record_path':record_path,'supervisor_commit':str(pathlib.Path(root)/'commit')}
+ old=dict(base,lease='old',pid=41001,pgid=41001)
+ new=dict(base,lease='new',pid=41002,pgid=41002,status='running')
+ with m.locked_registry(registry) as data: data[key]=new
+ m.write_record(record_path,new,delay_hook=False)
+ escaped={'listener_pid':42001,'pgid':42001}
+ try: m.persist_escaped_cleanup_state(old,escaped)
+ except m.DetachedCleanupError: pass
+ else: raise AssertionError('stale lease persisted evidence')
+ # Model the stale start finalizer as well: it cannot remove either artifact.
+ assert not m.release_owned_state(registry,old,record_path)
+ assert json.loads(pathlib.Path(record_path).read_text())['lease']=='new'
+ assert json.loads(pathlib.Path(registry).read_text())[key]['lease']=='new'
+""" % str(PREVIEW)
+        proc = subprocess.run([sys.executable, "-c", code], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_escaped_resume_requires_exact_current_supervisor_identity(self):
+        code = """
+import importlib.machinery, importlib.util
+loader=importlib.machinery.SourceFileLoader('preview', %r)
+spec=importlib.util.spec_from_loader(loader.name, loader)
+m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+record={'pid':61000,'pgid':61000,'pid_identity':'original',
+ 'pid_executable':'/exact/supervisor','host':'127.0.0.1','port':25000}
+escaped={'listener_pid':61001,'pgid':61001,'pid_identity':'listener'}
+for mode in ('reused','missing','timeout','nonzero','error','executable'):
+ signals=[]
+ m.cleanup_detached_listener=lambda *args: signals.append('signal')
+ m.pid_exists=lambda pid: mode!='missing'
+ def identity(pid):
+  if mode=='error': raise OSError('ps unavailable')
+  if mode in ('timeout','nonzero'): return ''
+  return 'reused' if mode=='reused' else 'original'
+ m.pid_identity=identity
+ m.pid_executable=lambda pid: '/other' if mode=='executable' else '/exact/supervisor'
+ m.os.getpgid=lambda pid:61000
+ m.matching_listener_pids=lambda record:{61001}
+ try: m.resume_escaped_cleanup(record,escaped)
+ except m.DetachedCleanupError as exc: assert exc.escaped is escaped
+ else: raise AssertionError(mode+' authorized reused/unknown supervisor')
+ assert signals==[], (mode,signals)
+ assert escaped=={'listener_pid':61001,'pgid':61001,'pid_identity':'listener'}
+""" % str(PREVIEW)
+        proc = subprocess.run([sys.executable, "-c", code], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_detached_escalation_rechecks_supervisor_before_kill(self):
+        code = """
+import importlib.machinery, importlib.util, signal
+loader=importlib.machinery.SourceFileLoader('preview', %r)
+spec=importlib.util.spec_from_loader(loader.name, loader)
+m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+record={'pid':62000,'pgid':62000,'pid_identity':'root',
+ 'pid_executable':'/root','host':'127.0.0.1','port':25000}
+m.process_group_member_pids=lambda pgid:{62010}
+m.descendants=lambda root:{62010}
+m.matching_listener_pids=lambda record:{62010}
+m.pid_exists=lambda pid:True
+m.pid_identity=lambda pid:'listener'
+m.pid_executable=lambda pid:'/listener'
+m.os.getpgid=lambda pid:62010
+m.process_group_alive=lambda pgid:True
+checks=iter([True,True,False])
+m.supervisor_still_matches=lambda record:next(checks)
+signals=[]; m.os.killpg=lambda pgid,sig:signals.append(sig)
+try: m.cleanup_detached_listener(record,62010,62010,'listener',{62010})
+except m.PreviewError: pass
+else: raise AssertionError('root identity flip authorized KILL')
+assert signals==[signal.SIGTERM],signals
 """ % str(PREVIEW)
         proc = subprocess.run([sys.executable, "-c", code], text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)

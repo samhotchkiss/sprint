@@ -422,8 +422,8 @@ def capture_listener_proofs(record):
             "escaped preview cleanup proof failed: %s" % exc, escaped) from exc
     record["status"] = "running"
     record.pop("escaped_group", None)
-    write_record(record["record_path"], record, delay_hook=False)
-    publish_lease(record["registry"], record)
+    publish_owned_record(record["registry"], record, record["record_path"],
+                         delay_hook=False)
     return proofs
 
 
@@ -456,6 +456,8 @@ def process_group_member_pids(pgid):
 
 
 def detached_group_still_matches(record, listener_pid, pgid, proofs):
+    if not supervisor_still_matches(record):
+        return False
     members = process_group_member_pids(pgid)
     if not members or not members.issubset(proofs) or pgid not in members:
         return False
@@ -473,12 +475,27 @@ def detached_group_still_matches(record, listener_pid, pgid, proofs):
     return os.getpgid(pgid) == pgid
 
 
+def supervisor_still_matches(record):
+    pid = int(record.get("pid") or 0)
+    pgid = int(record.get("pgid") or 0)
+    try:
+        return (pid > 0 and pgid == pid and pid_exists(pid)
+                and pid_identity(pid) == record.get("pid_identity")
+                and pid_executable(pid) == record.get("pid_executable")
+                and os.getpgid(pid) == pgid)
+    except (OSError, ProcessLookupError):
+        return False
+
+
 def persist_escaped_cleanup_state(record, escaped):
     """Durably retain authority as soon as an escaped listener is observed."""
     record["status"] = "cleanup_required"
     record["escaped_group"] = escaped
-    write_record(record["record_path"], record, delay_hook=False)
-    publish_lease(record["registry"], record)
+    try:
+        publish_owned_record(record["registry"], record, record["record_path"],
+                             delay_hook=False)
+    except PreviewError as exc:
+        raise DetachedCleanupError(str(exc), escaped) from exc
     pathlib.Path(record["supervisor_commit"]).touch(mode=0o600, exist_ok=True)
 
 
@@ -518,6 +535,9 @@ def cleanup_detached_listener(record, pid, pgid, identity, owned):
 
 
 def resume_escaped_cleanup(record, escaped):
+    if not supervisor_still_matches(record):
+        raise DetachedCleanupError(
+            "recorded supervisor identity is unavailable or changed", escaped)
     pid = int(escaped["listener_pid"])
     if pid not in matching_listener_pids(record):
         raise DetachedCleanupError("escaped listener is no longer exactly observable",
@@ -644,11 +664,19 @@ def write_record(path, record, delay_hook=True):
         time.sleep(test_delay)
 
 
-def remove_record_for_lease(path, lease):
-    current = read_record(path)
-    if current and current.get("lease") == lease.get("lease"):
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(path)
+def release_owned_state(registry, record, path):
+    """Atomically release one exact lease and its matching disk record."""
+    key = record["project_root"] + "\0" + record["unit"]
+    with locked_registry(registry) as data:
+        current = data.get(key)
+        if not isinstance(current, dict) or current.get("lease") != record.get("lease"):
+            return False
+        disk = read_record(path)
+        if isinstance(disk, dict) and disk.get("lease") == record.get("lease"):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+        data.pop(key, None)
+        return True
 
 
 def public_record(record, reused=False):
@@ -721,12 +749,17 @@ def release_lease(registry, record):
             data.pop(key, None)
 
 
-def publish_lease(registry, record):
+def publish_owned_record(registry, record, path, delay_hook=True):
+    """Publish disk and registry state while holding the exact lease."""
     key = record["project_root"] + "\0" + record["unit"]
     with locked_registry(registry) as data:
         current = data.get(key)
         if not isinstance(current, dict) or current.get("lease") != record.get("lease"):
-            raise PreviewError("preview reservation was lost before the server became ready")
+            raise PreviewError("preview reservation changed before record publication")
+        # The registry lock excludes a newer lease until both exact-owner
+        # artifacts have been written. A stale helper can neither overwrite
+        # this record nor remove a newer owner's record in its finalizer.
+        write_record(path, record, delay_hook=delay_hook)
         data[key] = record
 
 
@@ -978,8 +1011,7 @@ def run_supervisor(spec_path, parent_fd):
     inspection_failed_at = None
 
     def remove_owned_state():
-        release_lease(spec["registry"], spec["lease"])
-        remove_record_for_lease(spec["record_path"], spec["lease"])
+        release_owned_state(spec["registry"], spec["lease"], spec["record_path"])
         for artifact in (spec_path, spec["ready"], spec["commit"]):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(artifact)
@@ -1228,9 +1260,8 @@ def command_start(args, project_root, unit, unit_number, registry):
                         raise PreviewError("preview listener was not stable before publication")
                     record["listener_proofs"] = stable_proofs
                     record["published"] = True
-                    write_record(record_file, record)
+                    publish_owned_record(registry, record, record_file)
                     raise_if_startup_interrupted()
-                    publish_lease(registry, record)
                     if record_state(record, require_http=True) != "live":
                         raise PreviewError("preview ownership was not immediately readable")
                     pathlib.Path(commit_path).touch(mode=0o600, exist_ok=True)
@@ -1247,11 +1278,7 @@ def command_start(args, project_root, unit, unit_number, registry):
                     return 0
             except DetachedCleanupError as exc:
                 if record is not None and exc.escaped:
-                    record["status"] = "cleanup_required"
-                    record["escaped_group"] = exc.escaped
-                    write_record(record_file, record)
-                    publish_lease(registry, record)
-                    pathlib.Path(commit_path).touch(mode=0o600, exist_ok=True)
+                    persist_escaped_cleanup_state(record, exc.escaped)
                     if parent_write_fd is not None:
                         os.close(parent_write_fd)
                         parent_write_fd = None
@@ -1266,8 +1293,7 @@ def command_start(args, project_root, unit, unit_number, registry):
                         terminate_launched_group(child, pgid, timeout=1,
                                                  control=control)
                     if lease is not None:
-                        release_lease(registry, lease)
-                        remove_record_for_lease(record_file, lease)
+                        release_owned_state(registry, lease, record_file)
                     for cleanup_path in (control, ready_path, commit_path):
                         if cleanup_path:
                             with contextlib.suppress(FileNotFoundError):
@@ -1315,8 +1341,7 @@ def command_stop(args, project_root, unit, registry):
         if escaped:
             resume_escaped_cleanup(record, escaped)
         terminate_record(record, timeout=args.timeout)
-        release_lease(registry, record)
-        remove_record_for_lease(path, record)
+        release_owned_state(registry, record, path)
         for cleanup_path in (record.get("supervisor_control"),
                              (record.get("supervisor_control") or "") + ".ready",
                              record.get("supervisor_commit")):
