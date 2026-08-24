@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -344,6 +345,65 @@ class SprintPreviewTest(unittest.TestCase):
         registry = json.loads(self.registry.read_text(encoding="utf-8"))
         key = os.path.realpath(project) + "\0card-93"
         self.assertNotIn(key, registry)
+
+    def test_signals_between_publish_and_return_preserve_success(self):
+        for offset, signum in enumerate((signal.SIGINT, signal.SIGTERM, signal.SIGHUP)):
+            with self.subTest(signal=signum):
+                card = 94 + offset
+                project, worktree = self.board("published-signal-%d" % signum)
+                extra = ["--worktree", worktree, "--host", "127.0.0.1",
+                         "--timeout", "8", "--", sys.executable,
+                         self.server_script, "{host}", "{port}", "published"]
+                env = os.environ.copy()
+                env["SPRINT_PREVIEW_TEST_POST_PUBLISH_DELAY"] = "5"
+                helper = subprocess.Popen(self.command("start", card, project, extra),
+                                          text=True, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, env=env)
+                record_path = project / ".sprint" / "previews" / ("card-%d.json" % card)
+                deadline = time.monotonic() + 5
+                while not record_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(record_path.exists(), "preview never published its record")
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                os.kill(helper.pid, signum)
+                stdout, stderr = helper.communicate(timeout=8)
+                self.assertEqual(helper.returncode, 0, stderr)
+                response = json.loads(stdout)
+                self.assertEqual(response["pid"], record["pid"])
+                self.assertEqual(self.read_url(response["live_url"]), "published")
+                cleanup = self.run_preview("stop", card, project)
+                self.assertTrue(json.loads(cleanup.stdout)["stopped"])
+                self.assert_pid_gone(record["pid"])
+                self.assertFalse(record_path.exists())
+
+    def test_stop_preserves_state_when_ps_cannot_prove_identity(self):
+        modes = ("missing", "timeout", "nonzero")
+        for offset, mode in enumerate(modes):
+            with self.subTest(mode=mode):
+                card = 97 + offset
+                project, worktree = self.board("stop-ps-%s" % mode)
+                preview = self.start_preview(card, project, worktree, mode)
+                record_path = project / ".sprint" / "previews" / ("card-%d.json" % card)
+                env = os.environ.copy()
+                if mode == "missing":
+                    empty_bin = self.root / ("empty-bin-%d" % card)
+                    empty_bin.mkdir()
+                    env["PATH"] = str(empty_bin)
+                else:
+                    env["PATH"] = str(self.fake_bin) + os.pathsep + env.get("PATH", "")
+                    if mode == "timeout":
+                        env["TEST_PS_DELAY"] = "3"
+                    else:
+                        env["TEST_PS_MODE"] = "fail"
+                stopped = self.run_preview("stop", card, project, check=False, env=env)
+                self.assertNotEqual(stopped.returncode, 0)
+                self.assertIn("could not prove", stopped.stderr)
+                self.assertTrue(record_path.exists(), "failed stop discarded ownership record")
+                self.assertEqual(self.read_url(preview["live_url"]), mode)
+                cleanup = self.run_preview("stop", card, project)
+                self.assertTrue(json.loads(cleanup.stdout)["stopped"])
+                self.started.remove((card, project))
+                self.assertFalse(record_path.exists())
 
 
 if __name__ == "__main__":

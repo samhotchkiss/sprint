@@ -47,14 +47,20 @@ class PreviewError(RuntimeError):
 def startup_signal_guard():
     """Turn terminal interrupts into exceptions so startup finally blocks run."""
     previous = {}
+    state = {"committed": False}
 
     def interrupted(signum, _frame):
+        # Publication commits startup: from here the durable record is the
+        # caller contract, so terminal signals cannot turn success into a
+        # failed exit while leaving that registered server behind.
+        if state["committed"]:
+            return
         raise PreviewError("preview startup interrupted by signal %d" % signum)
 
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         previous[signum] = signal.signal(signum, interrupted)
     try:
-        yield
+        yield state
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
@@ -429,7 +435,8 @@ def terminate_record(record, timeout=5, child=None):
     pid = int(record.get("pid") or 0)
     current_identity = pid_identity(pid) if pid else ""
     if not current_identity:
-        return
+        raise PreviewError(
+            "refusing cleanup: could not prove the recorded preview PID identity")
     if current_identity != record.get("pid_identity"):
         raise PreviewError("refusing cleanup: recorded preview PID identity no longer matches")
     try:
@@ -522,7 +529,7 @@ def command_start(args, project_root, unit, unit_number, registry):
         keep_running = False
         record_written = False
         try:
-            with startup_signal_guard():
+            with startup_signal_guard() as signal_state:
                 with open(log_path, "ab", buffering=0) as log:
                     try:
                         child = subprocess.Popen(command, cwd=worktree, env=env,
@@ -563,8 +570,14 @@ def command_start(args, project_root, unit, unit_number, registry):
                     write_record(record_file, record)
                     record_written = True
                     publish_lease(registry, record)
-                    keep_running = True
+                    signal_state["committed"] = True
+                    post_publish_delay = float(os.environ.get(
+                        "SPRINT_PREVIEW_TEST_POST_PUBLISH_DELAY", "0"))
+                    if post_publish_delay > 0:
+                        time.sleep(post_publish_delay)
                     print(json.dumps(public_record(record), sort_keys=True))
+                    sys.stdout.flush()
+                    keep_running = True
                     return 0
         finally:
             if not keep_running:
