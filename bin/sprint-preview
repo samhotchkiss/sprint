@@ -408,7 +408,8 @@ def cleanup_detached_listener(pid, pgid, identity):
             still_pgid = os.getpgid(pid)
         except ProcessLookupError:
             still_pgid = None
-        if still_pgid == pgid:
+        if (still_pgid == pgid and pid_executable(pid) == executable
+                and pid_identity(pid) == identity):
             os.killpg(pgid, signal.SIGKILL)
 
 
@@ -603,6 +604,8 @@ def publish_lease(registry, record):
 
 
 def process_group_alive(pgid):
+    if os.environ.get("SPRINT_PREVIEW_TEST_FORCE_GROUP_ALIVE") == "1":
+        return True
     try:
         proc = subprocess.run(["ps", "-axo", "pgid=,stat="], text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -659,6 +662,19 @@ def terminate_record(record, timeout=5, child=None):
             return
         time.sleep(0.05)
     if process_group_alive(recorded_pgid):
+        if not pid_exists(pid):
+            # The persistent supervisor never exits with an owned live peer;
+            # a numeric PGID observed afterward is not authorization.
+            return
+        try:
+            escalation_pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            return
+        if (pid_identity(pid) != record.get("pid_identity")
+                or escalation_pgid != recorded_pgid
+                or pid_executable(pid) != record.get("pid_executable")):
+            raise PreviewError(
+                "refusing escalation: preview identity changed after SIGTERM")
         os.killpg(recorded_pgid, signal.SIGKILL)
         kill_deadline = time.time() + 2
         while time.time() < kill_deadline and process_group_alive(recorded_pgid):
@@ -709,6 +725,21 @@ def terminate_launched_group(child, pgid, timeout=1, control=None):
             break
         time.sleep(0.05)
     if process_group_alive(pgid):
+        if child.poll() is not None:
+            # A reaped persistent supervisor proves no owned peer remains.
+            return
+        proof = read_record(control) if control else None
+        try:
+            escalation_pgid = os.getpgid(child.pid)
+        except ProcessLookupError:
+            return
+        if (not proof or int(proof.get("supervisor_pid") or 0) != child.pid
+                or int(proof.get("supervisor_pgid") or 0) != pgid
+                or _system_pid_identity(child.pid) != proof.get("supervisor_identity")
+                or pid_executable(child.pid) != proof.get("supervisor_executable")
+                or escalation_pgid != pgid):
+            raise PreviewError(
+                "refusing startup escalation: supervisor identity changed after SIGTERM")
         with contextlib.suppress(ProcessLookupError):
             os.killpg(pgid, signal.SIGKILL)
     try:

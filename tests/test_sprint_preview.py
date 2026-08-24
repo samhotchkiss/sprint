@@ -1092,6 +1092,65 @@ else: raise AssertionError('unrelated listener accepted')
         self.assert_pid_gone(preview["pid"])
         self.started.remove((card, project))
 
+    def test_stop_identity_flip_between_term_and_kill_never_escalates(self):
+        project, worktree = self.board("stop-escalation-swap")
+        child_pid_file = self.root / "stop-escalation-child.pid"
+        card = 134
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
+                 "--", sys.executable, self.wrapper_script, self.server_script,
+                 "{host}", "{port}", child_pid_file]
+        started = self.run_preview("start", card, project, extra)
+        preview = self.register_started(card, project, json.loads(started.stdout))
+        unrelated = self.start_blocker("v4", "127.0.0.1", preview["port"] + 1)
+        count_file = self.root / "stop-escalation-count"
+        env = os.environ.copy()
+        env["PATH"] = str(self.fake_bin) + os.pathsep + env.get("PATH", "")
+        env["TEST_PS_COUNT_FILE"] = str(count_file)
+        env["TEST_PS_SWAP_AFTER"] = "2"
+        env["SPRINT_PREVIEW_TEST_FORCE_GROUP_ALIVE"] = "1"
+        stopped = self.run_preview("stop", card, project, check=False, env=env)
+        self.assertNotEqual(stopped.returncode, 0)
+        self.assertIn("refusing escalation", stopped.stderr)
+        self.assertIsNone(unrelated.poll(), "identity flip escalation killed unrelated process")
+        self.assertTrue((project / ".sprint" / "previews" / "card-134.json").exists())
+        recovered = self.run_preview("stop", card, project)
+        self.assertTrue(json.loads(recovered.stdout)["stopped"])
+        self.started.remove((card, project))
+
+    def test_launched_and_detached_identity_flip_never_send_kill(self):
+        code = """
+import importlib.machinery, importlib.util, signal
+loader=importlib.machinery.SourceFileLoader('preview', %r)
+spec=importlib.util.spec_from_loader(loader.name, loader)
+m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+class Child:
+ pid=42420
+ def poll(self): return None
+ def wait(self, timeout=None): return None
+signals=[]
+m.os.getpgid=lambda pid: 42420
+m.os.killpg=lambda pgid, sig: signals.append(sig)
+m.process_group_alive=lambda pgid: True
+m.read_record=lambda path: {'supervisor_pid':42420,'supervisor_pgid':42420,
+ 'supervisor_identity':'original','supervisor_executable':'/exact/python'}
+m._system_pid_identity=lambda pid: 'flipped'
+m.pid_executable=lambda pid: '/exact/python'
+try: m.terminate_launched_group(Child(), 42420, timeout=0, control='proof')
+except m.PreviewError: pass
+assert signals == [signal.SIGTERM], signals
+signals.clear(); identities=iter(['original','original','flipped'])
+m.os.getpgid=lambda pid: pid
+m.pid_exists=lambda pid: True
+m.pid_identity=lambda pid: next(identities)
+m.pid_executable=lambda pid: '/exact/listener'
+try: m.cleanup_detached_listener(42421, 42421, 'original')
+except m.PreviewError: pass
+assert signals == [signal.SIGTERM], signals
+""" % str(PREVIEW)
+        proc = subprocess.run([sys.executable, "-c", code], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
