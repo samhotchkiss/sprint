@@ -508,10 +508,15 @@ class SprintPreviewTest(unittest.TestCase):
                 self.track_helper(helper)
                 record_path = project / ".sprint" / "previews" / ("card-%d.json" % card)
                 deadline = time.monotonic() + 20
-                while not record_path.exists() and time.monotonic() < deadline:
+                while time.monotonic() < deadline:
+                    if record_path.exists():
+                        candidate = json.loads(record_path.read_text(encoding="utf-8"))
+                        if candidate.get("published"):
+                            break
                     time.sleep(0.02)
                 self.assertTrue(record_path.exists(), "preview never published its record")
                 record = json.loads(record_path.read_text(encoding="utf-8"))
+                self.assertTrue(record.get("published"), "record remained provisional")
                 os.kill(helper.pid, signum)
                 stdout, stderr = helper.communicate(timeout=8)
                 self.assertEqual(helper.returncode, 0, stderr)
@@ -1089,6 +1094,7 @@ import importlib.machinery, importlib.util, os
 loader=importlib.machinery.SourceFileLoader('preview', %r)
 spec=importlib.util.spec_from_loader(loader.name, loader)
 m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+m.persist_escaped_cleanup_state=lambda record,escaped:None
 r={'pid':os.getpid(),'pgid':os.getpgrp(),'host':'127.0.0.1','port':%d}
 try: m.capture_listener_proofs(r)
 except m.PreviewError as e:
@@ -1336,19 +1342,25 @@ import importlib.machinery, importlib.util
 loader=importlib.machinery.SourceFileLoader('preview', %r)
 spec=importlib.util.spec_from_loader(loader.name, loader)
 m=importlib.util.module_from_spec(spec); loader.exec_module(m)
-for failure in ('ps missing','ps timeout','ps nonzero','lsof missing','lsof timeout','lsof nonzero'):
+for failure in ('ps missing','ps timeout','ps nonzero','ps error',
+                'lsof missing','lsof timeout','lsof nonzero'):
  persisted=[]
  m.descendants=lambda root:{53001}
  m.matching_listener_pids=lambda record:{53001}
- m.pid_identity=lambda pid:'listener-id'
- m.os.getpgid=lambda pid:53000
  m.persist_escaped_cleanup_state=lambda record,escaped:persisted.append(dict(escaped))
- m.cleanup_detached_listener=lambda *args: (_ for _ in ()).throw(m.PreviewError(failure))
+ if failure.startswith('ps'):
+  m.pid_identity=lambda pid: (_ for _ in ()).throw(OSError(failure)) if failure=='ps error' else ''
+  m.os.getpgid=lambda pid:53000
+ else:
+  m.pid_identity=lambda pid:'listener-id'
+  m.os.getpgid=lambda pid:1
+  m.pid_executable=lambda pid:''
  try: m.capture_listener_proofs({'pid':1,'pgid':1,'host':'127.0.0.1','port':1})
  except m.DetachedCleanupError as exc:
   assert exc.escaped['listener_pid']==53001
  else: raise AssertionError('tool failure lost escaped authority')
- assert persisted and persisted[0]['pgid']==53000
+ assert persisted and persisted[0]['listener_pid']==53001
+ assert persisted[0].get('pgid') is None
 """ % str(PREVIEW)
         proc = subprocess.run([sys.executable, "-c", code], text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)

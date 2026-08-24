@@ -50,6 +50,10 @@ class DetachedCleanupError(PreviewError):
         self.escaped = escaped
 
 
+class EscapedListenerCleaned(PreviewError):
+    pass
+
+
 @contextlib.contextmanager
 def startup_signal_guard():
     """Block terminal signals across launch/publication/cleanup as one unit."""
@@ -374,40 +378,52 @@ def matching_listener_pids(record):
 
 
 def capture_listener_proofs(record):
-    owned = descendants(int(record["pid"]))
     pids = matching_listener_pids(record)
     if not pids:
         raise PreviewError("could not capture exact preview listener ownership")
+    escaped = {"listener_pid": min(pids), "stage": "listener_observed"}
+    persist_escaped_cleanup_state(record, escaped)
     proofs = []
-    for pid in sorted(pids):
-        identity = pid_identity(pid)
-        if not identity:
-            raise PreviewError("could not capture preview listener identity")
-        listener_pgid = os.getpgid(pid)
-        expected_pgid = int(record.get("pgid") or record["pid"])
-        if listener_pgid != expected_pgid:
-            if pid not in owned:
-                raise PreviewError(
-                    "refusing cleanup of an unrelated detached listener")
-            escaped = {"listener_pid": pid, "pgid": listener_pgid,
-                       "listener_identity": identity}
+    try:
+        owned = descendants(int(record["pid"]))
+        for pid in sorted(pids):
+            escaped = {"listener_pid": pid, "stage": "identity_pending"}
             persist_escaped_cleanup_state(record, escaped)
-            try:
+            identity = pid_identity(pid)
+            if not identity:
+                raise PreviewError("could not capture preview listener identity")
+            escaped.update({"listener_identity": identity, "stage": "pgid_pending"})
+            persist_escaped_cleanup_state(record, escaped)
+            listener_pgid = os.getpgid(pid)
+            escaped.update({"pgid": listener_pgid, "stage": "proof_pending"})
+            persist_escaped_cleanup_state(record, escaped)
+            expected_pgid = int(record.get("pgid") or record["pid"])
+            if listener_pgid != expected_pgid:
+                if pid not in owned:
+                    raise PreviewError(
+                        "refusing cleanup of an unrelated detached listener")
                 cleanup_detached_listener(record, pid, listener_pgid, identity, owned)
-            except Exception as exc:
-                if isinstance(exc, DetachedCleanupError) and exc.escaped:
-                    escaped = exc.escaped
-                raise DetachedCleanupError(
-                    "escaped preview cleanup proof failed: %s" % exc, escaped) from exc
-            raise PreviewError("preview listener escaped the owned process group")
-        if pid not in owned:
-            raise PreviewError("could not capture exact preview listener ownership")
-        listener_executable = pid_executable(pid)
-        if not listener_executable:
-            raise PreviewError("could not capture preview listener executable")
-        proofs.append({"pid": pid, "pid_identity": identity,
-                       "pid_executable": listener_executable,
-                       "pgid": listener_pgid})
+                raise EscapedListenerCleaned(
+                    "preview listener escaped the owned process group")
+            if pid not in owned:
+                raise PreviewError("could not capture exact preview listener ownership")
+            listener_executable = pid_executable(pid)
+            if not listener_executable:
+                raise PreviewError("could not capture preview listener executable")
+            proofs.append({"pid": pid, "pid_identity": identity,
+                           "pid_executable": listener_executable,
+                           "pgid": listener_pgid})
+    except Exception as exc:
+        if isinstance(exc, EscapedListenerCleaned):
+            raise
+        if isinstance(exc, DetachedCleanupError) and exc.escaped:
+            escaped = exc.escaped
+        raise DetachedCleanupError(
+            "escaped preview cleanup proof failed: %s" % exc, escaped) from exc
+    record["status"] = "running"
+    record.pop("escaped_group", None)
+    write_record(record["record_path"], record, delay_hook=False)
+    publish_lease(record["registry"], record)
     return proofs
 
 
@@ -461,7 +477,7 @@ def persist_escaped_cleanup_state(record, escaped):
     """Durably retain authority as soon as an escaped listener is observed."""
     record["status"] = "cleanup_required"
     record["escaped_group"] = escaped
-    write_record(record["record_path"], record)
+    write_record(record["record_path"], record, delay_hook=False)
     publish_lease(record["registry"], record)
     pathlib.Path(record["supervisor_commit"]).touch(mode=0o600, exist_ok=True)
 
@@ -499,6 +515,27 @@ def cleanup_detached_listener(record, pid, pgid, identity, owned):
                                    {"listener_pid": pid, "pgid": pgid,
                                     "listener_identity": identity, "proofs": proofs})
     os.killpg(pgid, signal.SIGKILL)
+
+
+def resume_escaped_cleanup(record, escaped):
+    pid = int(escaped["listener_pid"])
+    if pid not in matching_listener_pids(record):
+        raise DetachedCleanupError("escaped listener is no longer exactly observable",
+                                   escaped)
+    identity = pid_identity(pid)
+    if not identity:
+        raise DetachedCleanupError("escaped listener identity is unavailable", escaped)
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError as exc:
+        raise DetachedCleanupError("escaped listener disappeared during proof", escaped) from exc
+    if pgid == int(record.get("pgid") or record["pid"]):
+        return
+    complete = {"listener_pid": pid, "listener_identity": identity,
+                "pgid": pgid, "stage": "proof_pending"}
+    persist_escaped_cleanup_state(record, complete)
+    cleanup_detached_listener(record, pid, pgid, identity,
+                              descendants(int(record["pid"])))
 
 
 def recorded_listeners_still_own_group(record, pgid):
@@ -593,7 +630,7 @@ def read_record(path):
         return None
 
 
-def write_record(path, record):
+def write_record(path, record, delay_hook=True):
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
     tmp = "%s.%s.tmp" % (path, os.getpid())
     with open(tmp, "w", encoding="utf-8") as dst:
@@ -602,7 +639,7 @@ def write_record(path, record):
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
     test_delay = (float(os.environ.get("SPRINT_PREVIEW_TEST_POST_REPLACE_DELAY", "0"))
-                  if ".supervisor" not in path else 0)
+                  if delay_hook and ".supervisor" not in path else 0)
     if test_delay > 0:
         time.sleep(test_delay)
 
@@ -1190,6 +1227,7 @@ def command_start(args, project_root, unit, unit_number, registry):
                     if not stable_proofs:
                         raise PreviewError("preview listener was not stable before publication")
                     record["listener_proofs"] = stable_proofs
+                    record["published"] = True
                     write_record(record_file, record)
                     raise_if_startup_interrupted()
                     publish_lease(registry, record)
@@ -1275,9 +1313,7 @@ def command_stop(args, project_root, unit, registry):
                 raise PreviewError("refusing cleanup: board no longer owns this preview lease")
         escaped = record.get("escaped_group")
         if escaped:
-            cleanup_detached_listener(
-                record, int(escaped["listener_pid"]), int(escaped["pgid"]),
-                escaped["listener_identity"], descendants(int(record["pid"])))
+            resume_escaped_cleanup(record, escaped)
         terminate_record(record, timeout=args.timeout)
         release_lease(registry, record)
         remove_record_for_lease(path, record)
