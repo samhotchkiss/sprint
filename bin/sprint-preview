@@ -45,9 +45,10 @@ class PreviewError(RuntimeError):
 
 @contextlib.contextmanager
 def startup_signal_guard():
-    """Turn terminal interrupts into exceptions so startup finally blocks run."""
+    """Block terminal signals across launch/publication/cleanup as one unit."""
     previous = {}
     state = {"committed": False}
+    guarded = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
 
     def interrupted(signum, _frame):
         # Publication commits startup: from here the durable record is the
@@ -57,13 +58,30 @@ def startup_signal_guard():
             return
         raise PreviewError("preview startup interrupted by signal %d" % signum)
 
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    for signum in guarded:
         previous[signum] = signal.signal(signum, interrupted)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, guarded)
+    state["child_signal_mask"] = old_mask
     try:
         yield state
     finally:
+        # Consume anything that arrived while the exact child/group was in a
+        # transitional state. Before publication this becomes a clean failure;
+        # after publication it is an ignored request against durable success.
+        pending = signal.sigpending().intersection(guarded)
+        while pending:
+            signal.sigwait(pending)
+            pending = signal.sigpending().intersection(guarded)
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         for signum, handler in previous.items():
             signal.signal(signum, handler)
+
+
+def raise_if_startup_interrupted():
+    pending = signal.sigpending().intersection(
+        {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
+    if pending:
+        raise PreviewError("preview startup interrupted by signal %d" % min(pending))
 
 
 def parse_args(argv):
@@ -230,6 +248,20 @@ def pid_identity(pid):
                               timeout=2, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def pid_command(pid):
+    try:
+        proc = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
     return proc.stdout.strip()
 
 
@@ -239,7 +271,9 @@ def descendants(root_pid):
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                               timeout=2, check=False)
     except (OSError, subprocess.TimeoutExpired):
-        return {root_pid}
+        raise PreviewError("ps is required to verify preview descendants")
+    if proc.returncode != 0:
+        raise PreviewError("ps could not verify preview descendants")
     children = {}
     for line in proc.stdout.splitlines():
         fields = line.split()
@@ -342,6 +376,16 @@ def write_record(path, record):
         dst.write("\n")
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+    test_delay = float(os.environ.get("SPRINT_PREVIEW_TEST_POST_REPLACE_DELAY", "0"))
+    if test_delay > 0:
+        time.sleep(test_delay)
+
+
+def remove_record_for_lease(path, lease):
+    current = read_record(path)
+    if current and current.get("lease") == lease.get("lease"):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
 
 
 def public_record(record, reused=False):
@@ -443,8 +487,18 @@ def terminate_record(record, timeout=5, child=None):
         pgid = os.getpgid(pid)
     except ProcessLookupError:
         return
-    if pgid != pid:
+    recorded_pgid = int(record.get("pgid") or pid)
+    if pgid != pid or recorded_pgid != pid:
         raise PreviewError("refusing cleanup: recorded preview no longer leads its process group")
+    command_line = pid_command(pid)
+    if not command_line or command_line != record.get("pid_command"):
+        raise PreviewError("refusing cleanup: recorded preview command no longer matches")
+    if not listener_owned(record):
+        raise PreviewError("refusing cleanup: recorded preview no longer owns its listener")
+    # Recheck the time identity and PGID immediately before the first signal;
+    # this closes the inspection-to-kill window on a recycled same-second PID.
+    if pid_identity(pid) != record.get("pid_identity") or os.getpgid(pid) != recorded_pgid:
+        raise PreviewError("refusing cleanup: preview identity changed during verification")
     os.killpg(pgid, signal.SIGTERM)
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -457,6 +511,11 @@ def terminate_record(record, timeout=5, child=None):
         time.sleep(0.05)
     if process_group_alive(pgid):
         os.killpg(pgid, signal.SIGKILL)
+        kill_deadline = time.time() + 2
+        while time.time() < kill_deadline and process_group_alive(pgid):
+            time.sleep(0.05)
+        if process_group_alive(pgid):
+            raise PreviewError("preview process group survived SIGKILL")
     if child is not None:
         child.wait(timeout=1)
 
@@ -509,46 +568,65 @@ def command_start(args, project_root, unit, unit_number, registry):
     attempts = 0
     while attempts < PORT_SLOTS:
         attempts += 1
-        lease, reused = reserve(registry, project_root, unit, unit_number, host)
-        if reused:
-            print(json.dumps(public_record(lease, reused=True), sort_keys=True))
-            return 0
-        port = int(lease["port"])
-        live_url = "http://%s:%d%s" % (host, port, path)
-        record_file = record_path(project_root, unit)
-        log_path = os.path.realpath(args.log or os.path.join(
-            project_root, ".sprint", "previews", unit + ".log"))
-        pathlib.Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        command = child_command(args.command, host, port, live_url)
-        env = os.environ.copy()
-        env.update({"SPRINT_PREVIEW_HOST": host,
-                    "SPRINT_PREVIEW_PORT": str(port),
-                    "SPRINT_PREVIEW_URL": live_url})
-        child = None
-        pgid = None
-        keep_running = False
-        record_written = False
-        try:
-            with startup_signal_guard() as signal_state:
+        with startup_signal_guard() as signal_state:
+            lease = None
+            child = None
+            pgid = None
+            keep_running = False
+            record_file = record_path(project_root, unit)
+            try:
+                lease, reused = reserve(registry, project_root, unit, unit_number, host)
+                if reused:
+                    # The preview was already durable before this invocation.
+                    signal_state["committed"] = True
+                    print(json.dumps(public_record(lease, reused=True), sort_keys=True))
+                    sys.stdout.flush()
+                    keep_running = True
+                    return 0
+                raise_if_startup_interrupted()
+                port = int(lease["port"])
+                live_url = "http://%s:%d%s" % (host, port, path)
+                log_path = os.path.realpath(args.log or os.path.join(
+                    project_root, ".sprint", "previews", unit + ".log"))
+                pathlib.Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+                command = child_command(args.command, host, port, live_url)
+                env = os.environ.copy()
+                env.update({"SPRINT_PREVIEW_HOST": host,
+                            "SPRINT_PREVIEW_PORT": str(port),
+                            "SPRINT_PREVIEW_URL": live_url})
                 with open(log_path, "ab", buffering=0) as log:
                     try:
                         child = subprocess.Popen(command, cwd=worktree, env=env,
                                                  stdin=subprocess.DEVNULL, stdout=log,
                                                  stderr=subprocess.STDOUT,
-                                                 start_new_session=True)
+                                                 start_new_session=True,
+                                                 preexec_fn=lambda: signal.pthread_sigmask(
+                                                     signal.SIG_SETMASK,
+                                                     signal_state["child_signal_mask"]))
                     except OSError as exc:
                         raise PreviewError("could not launch preview command: %s" % exc) from exc
+                post_popen_delay = float(os.environ.get(
+                    "SPRINT_PREVIEW_TEST_POST_POPEN_DELAY", "0"))
+                if post_popen_delay > 0:
+                    time.sleep(post_popen_delay)
                 pgid = os.getpgid(child.pid)
                 if pgid != child.pid:
                     raise PreviewError("preview child did not establish its own process group")
+                raise_if_startup_interrupted()
                 identity = pid_identity(child.pid)
                 if not identity:
                     raise PreviewError("could not record the preview process identity")
+                launched_command = pid_command(child.pid)
+                if not launched_command:
+                    raise PreviewError("could not record the preview process command")
+                raise_if_startup_interrupted()
                 record = dict(lease)
                 record.update({
                     "status": "running",
                     "pid": child.pid,
+                    "pgid": pgid,
                     "pid_identity": identity,
+                    "pid_command": launched_command,
                     "worktree": worktree,
                     "command": command,
                     "path": path,
@@ -565,10 +643,12 @@ def command_start(args, project_root, unit, unit_number, registry):
                     if listener_owned(record) and http_reachable(host, port, path):
                         ready = True
                         break
+                    raise_if_startup_interrupted()
                     time.sleep(0.1)
                 if ready:
+                    raise_if_startup_interrupted()
                     write_record(record_file, record)
-                    record_written = True
+                    raise_if_startup_interrupted()
                     publish_lease(registry, record)
                     signal_state["committed"] = True
                     post_publish_delay = float(os.environ.get(
@@ -579,16 +659,15 @@ def command_start(args, project_root, unit, unit_number, registry):
                     sys.stdout.flush()
                     keep_running = True
                     return 0
-        finally:
-            if not keep_running:
-                try:
-                    if child is not None:
-                        terminate_launched_group(child, pgid, timeout=1)
-                finally:
-                    release_lease(registry, lease)
-                    if record_written:
-                        with contextlib.suppress(FileNotFoundError):
-                            os.unlink(record_file)
+            finally:
+                if not keep_running:
+                    try:
+                        if child is not None:
+                            terminate_launched_group(child, pgid, timeout=1)
+                    finally:
+                        if lease is not None:
+                            release_lease(registry, lease)
+                            remove_record_for_lease(record_file, lease)
         # A listener race or a child bind failure is recoverable on another
         # reserved port. Other startup failures are surfaced after a few tries.
         if attempts >= 3:

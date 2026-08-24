@@ -2,6 +2,7 @@
 """Concurrency and ownership tests for bin/sprint-preview."""
 
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import os
@@ -102,6 +103,11 @@ class SprintPreviewTest(unittest.TestCase):
             "[ \"$count_file\" = /dev/null ] || echo \"$count\" > \"$count_file\"\n"
             "sleep \"${TEST_PS_DELAY:-0}\"\n"
             "if [ \"${TEST_PS_MODE:-real}\" = fail ]; then exit 127; fi\n"
+            "if [ \"${TEST_PS_MODE:-real}\" = nonzero_stdout ]; then "
+            "echo 'Sun Jan  1 00:00:00 2000'; exit 7; fi\n"
+            "if [ -n \"${TEST_PS_SWAP_AFTER:-}\" ] && "
+            "[ \"$count\" -gt \"$TEST_PS_SWAP_AFTER\" ]; then "
+            "echo 'Mon Jan  2 00:00:00 2000'; exit 0; fi\n"
             "if [ -n \"${TEST_PS_FAIL_AFTER:-}\" ] && "
             "[ \"$count\" -gt \"$TEST_PS_FAIL_AFTER\" ]; then exit 127; fi\n"
             "exec %s \"$@\"\n" % real_ps,
@@ -112,7 +118,17 @@ class SprintPreviewTest(unittest.TestCase):
 
     def tearDown(self):
         for card, project in reversed(self.started):
-            self.run_preview("stop", card, project, check=False)
+            record_path = project / ".sprint" / "previews" / ("card-%d.json" % card)
+            record = None
+            if record_path.exists():
+                with record_path.open(encoding="utf-8") as src:
+                    record = json.load(src)
+            stopped = self.run_preview("stop", card, project, check=False)
+            if stopped.returncode and record:
+                # Test-only last resort: this record was created by this test,
+                # and the exact launch PGID was captured before assertions.
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(int(record.get("pgid") or record["pid"]), signal.SIGKILL)
         for proc in self.blockers:
             if proc.poll() is None:
                 proc.terminate()
@@ -282,7 +298,9 @@ class SprintPreviewTest(unittest.TestCase):
         child_pid = int(child_pid_file.read_text(encoding="utf-8"))
         time.sleep(0.2)
         helper.terminate()
-        stdout, stderr = helper.communicate(timeout=5)
+        # The real ownership query can take ~9 seconds; signals stay blocked
+        # until that bounded lookup returns and exact cleanup completes.
+        stdout, stderr = helper.communicate(timeout=20)
         self.assertNotEqual(helper.returncode, 0, stdout)
         self.assertIn("interrupted by signal", stderr)
         self.assert_pid_gone(child_pid)
@@ -376,6 +394,90 @@ class SprintPreviewTest(unittest.TestCase):
                 self.assert_pid_gone(record["pid"])
                 self.assertFalse(record_path.exists())
 
+    def test_signal_between_popen_and_pgid_still_reaps_group(self):
+        project, worktree = self.board("popen-pgid-signal")
+        child_pid_file = self.root / "popen-pgid-child.pid"
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8", "--",
+                 sys.executable, self.wrapper_script, self.server_script,
+                 "{host}", "{port}", child_pid_file]
+        env = os.environ.copy()
+        env["SPRINT_PREVIEW_TEST_POST_POPEN_DELAY"] = "2"
+        helper = subprocess.Popen(self.command("start", 100, project, extra), text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        deadline = time.monotonic() + 5
+        while not child_pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(child_pid_file.exists())
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        helper.terminate()
+        stdout, stderr = helper.communicate(timeout=10)
+        self.assertNotEqual(helper.returncode, 0, stdout)
+        self.assertIn("interrupted by signal", stderr)
+        self.assert_pid_gone(child_pid)
+
+    def test_repeated_signal_cannot_interrupt_stubborn_cleanup(self):
+        project, worktree = self.board("repeated-signal-cleanup")
+        child_pid_file = self.root / "repeated-signal-child.pid"
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "20", "--",
+                 sys.executable, self.wrapper_script, self.server_script,
+                 "{host}", "{port}", child_pid_file]
+        env = self.delayed_lsof_env(10)
+        helper = subprocess.Popen(self.command("start", 101, project, extra), text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        deadline = time.monotonic() + 5
+        while not child_pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(child_pid_file.exists())
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        helper.terminate()
+        time.sleep(0.3)
+        helper.terminate()
+        stdout, stderr = helper.communicate(timeout=20)
+        self.assertNotEqual(helper.returncode, 0, stdout)
+        self.assert_pid_gone(child_pid)
+
+    def test_signal_after_record_replace_compensates_disk_and_registry(self):
+        project, worktree = self.board("post-replace-signal")
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8", "--",
+                 sys.executable, self.server_script, "{host}", "{port}", "replace"]
+        env = os.environ.copy()
+        env["SPRINT_PREVIEW_TEST_POST_REPLACE_DELAY"] = "5"
+        helper = subprocess.Popen(self.command("start", 102, project, extra), text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        record_path = project / ".sprint" / "previews" / "card-102.json"
+        deadline = time.monotonic() + 8
+        while not record_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(record_path.exists())
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        helper.terminate()
+        helper.communicate(timeout=10)
+        self.assertNotEqual(helper.returncode, 0)
+        self.assert_pid_gone(record["pid"])
+        self.assertFalse(record_path.exists())
+        registry = json.loads(self.registry.read_text(encoding="utf-8"))
+        self.assertNotIn(os.path.realpath(project) + "\0card-102", registry)
+
+    def test_reused_preview_signal_returns_durable_success(self):
+        project, worktree = self.board("reused-signal")
+        preview = self.start_preview(103, project, worktree, "reused")
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8", "--",
+                 sys.executable, self.server_script, "{host}", "{port}", "unused"]
+        env = self.delayed_lsof_env(5)
+        helper = subprocess.Popen(self.command("start", 103, project, extra), text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        time.sleep(0.3)
+        helper.terminate()
+        stdout, stderr = helper.communicate(timeout=15)
+        self.assertEqual(helper.returncode, 0, stderr)
+        reused = json.loads(stdout)
+        self.assertTrue(reused["reused"])
+        self.assertEqual(reused["pid"], preview["pid"])
+        self.assertEqual(self.read_url(reused["live_url"]), "reused")
+        self.run_preview("stop", 103, project)
+        self.assert_pid_gone(preview["pid"])
+        self.started.remove((103, project))
+
     def test_stop_preserves_state_when_ps_cannot_prove_identity(self):
         modes = ("missing", "timeout", "nonzero")
         for offset, mode in enumerate(modes):
@@ -404,6 +506,37 @@ class SprintPreviewTest(unittest.TestCase):
                 self.assertTrue(json.loads(cleanup.stdout)["stopped"])
                 self.started.remove((card, project))
                 self.assertFalse(record_path.exists())
+
+    def test_stop_rejects_ps_nonzero_even_with_identity_stdout(self):
+        project, worktree = self.board("stop-ps-nonzero-stdout")
+        preview = self.start_preview(104, project, worktree, "nonzero-stdout")
+        record_path = project / ".sprint" / "previews" / "card-104.json"
+        env = os.environ.copy()
+        env["PATH"] = str(self.fake_bin) + os.pathsep + env.get("PATH", "")
+        env["TEST_PS_MODE"] = "nonzero_stdout"
+        stopped = self.run_preview("stop", 104, project, check=False, env=env)
+        self.assertNotEqual(stopped.returncode, 0)
+        self.assertTrue(record_path.exists())
+        self.assertEqual(self.read_url(preview["live_url"]), "nonzero-stdout")
+        self.run_preview("stop", 104, project)
+        self.started.remove((104, project))
+
+    def test_identity_swap_before_kill_preserves_unrelated_process(self):
+        project, worktree = self.board("stop-identity-swap")
+        preview = self.start_preview(105, project, worktree, "identity-swap")
+        record_path = project / ".sprint" / "previews" / "card-105.json"
+        count_file = self.root / "identity-swap-count"
+        env = os.environ.copy()
+        env["PATH"] = str(self.fake_bin) + os.pathsep + env.get("PATH", "")
+        env["TEST_PS_COUNT_FILE"] = str(count_file)
+        env["TEST_PS_SWAP_AFTER"] = "3"
+        stopped = self.run_preview("stop", 105, project, check=False, env=env)
+        self.assertNotEqual(stopped.returncode, 0)
+        self.assertIn("changed during verification", stopped.stderr)
+        self.assertTrue(record_path.exists())
+        self.assertEqual(self.read_url(preview["live_url"]), "identity-swap")
+        self.run_preview("stop", 105, project)
+        self.started.remove((105, project))
 
 
 if __name__ == "__main__":
