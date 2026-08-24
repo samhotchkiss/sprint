@@ -697,15 +697,45 @@ def public_record(record, reused=False):
     }
 
 
+def starting_lease_state(entry):
+    """Classify an aged startup without trusting age as ownership proof."""
+    if time.time() - float(entry.get("reserved_at") or 0) <= STARTING_TTL:
+        return "live"
+    launcher_pid = int(entry.get("launcher_pid") or 0)
+    launcher_identity = entry.get("launcher_identity") or ""
+    if not launcher_pid or not launcher_identity:
+        return "unknown"
+    if pid_exists(launcher_pid):
+        observed = pid_identity(launcher_pid)
+        if not observed:
+            return "unknown"
+        if observed == launcher_identity:
+            return "live"
+        # A different identity proves the launcher itself is gone, but a
+        # command it launched may still own the reserved port.
+    port = int(entry.get("port") or 0)
+    if not port:
+        return "unknown"
+    if not port_is_clear(port):
+        try:
+            return "live" if listener_rows(port) else "unknown"
+        except PreviewError:
+            return "unknown"
+    return "dead"
+
+
 def prune_registry(data):
-    now = time.time()
     for key, entry in list(data.items()):
         if not isinstance(entry, dict):
             data.pop(key, None)
             continue
         if entry.get("status") == "starting":
-            if now - float(entry.get("reserved_at") or 0) > STARTING_TTL:
+            state = starting_lease_state(entry)
+            if state == "dead":
                 data.pop(key, None)
+            elif state == "unknown":
+                raise PreviewError(
+                    "could not prove whether an existing preview startup is inactive; preserving its lease")
         else:
             state = record_state(entry)
             if state == "dead":
@@ -717,6 +747,10 @@ def prune_registry(data):
 
 def reserve(registry, project_root, unit, unit_number, host):
     key = project_root + "\0" + unit
+    launcher_pid = os.getpid()
+    launcher_identity = pid_identity(launcher_pid)
+    if not launcher_identity:
+        raise PreviewError("could not establish exact preview launcher identity")
     with locked_registry(registry) as data:
         prune_registry(data)
         existing = data.get(key)
@@ -752,6 +786,8 @@ def reserve(registry, project_root, unit, unit_number, host):
                 "port": port,
                 "status": "starting",
                 "reserved_at": time.time(),
+                "launcher_pid": launcher_pid,
+                "launcher_identity": launcher_identity,
             }
             data[key] = lease
             return lease, False

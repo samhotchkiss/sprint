@@ -443,7 +443,8 @@ class SprintPreviewTest(unittest.TestCase):
         env["TEST_PS_DELAY"] = "0.3"
         proc = self.run_preview("start", 90, project, extra, check=False, env=env)
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("could not record", proc.stderr)
+        self.assertTrue("could not record" in proc.stderr or
+                        "could not establish exact preview launcher identity" in proc.stderr)
         if child_pid_file.exists():
             child_pid = int(child_pid_file.read_text(encoding="utf-8"))
             self.assert_pid_gone(child_pid)
@@ -476,9 +477,11 @@ class SprintPreviewTest(unittest.TestCase):
         env["TEST_PS_DELAY"] = "3"
         proc = self.run_preview("start", 92, project, extra, check=False, env=env)
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("could not record", proc.stderr)
-        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
-        self.assert_pid_gone(child_pid)
+        self.assertTrue("could not record" in proc.stderr or
+                        "could not establish exact preview launcher identity" in proc.stderr)
+        if child_pid_file.exists():
+            child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+            self.assert_pid_gone(child_pid)
         self.assertFalse((project / ".sprint" / "previews" / "card-92.json").exists())
 
     def test_launch_exception_releases_starting_lease(self):
@@ -1516,6 +1519,71 @@ with tempfile.TemporaryDirectory() as root:
  threads=[threading.Thread(target=run) for _ in range(2)]
  [t.start() for t in threads]; [t.join() for t in threads]
  assert sorted(kind for kind,_ in results)==['blocked','ok'],results
+""" % str(PREVIEW)
+        proc = subprocess.run([sys.executable, "-c", code], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_aged_starting_lease_with_live_http_is_not_replaced(self):
+        project, worktree = self.board("aged-starting-live")
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        blocker = self.start_blocker("v4", "127.0.0.1", port)
+        identity = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(blocker.pid)], text=True,
+            stdout=subprocess.PIPE, check=True).stdout.strip()
+        key = os.path.realpath(project) + "\0card-199"
+        old = {"lease": "aged-live", "project_root": os.path.realpath(project),
+               "unit": "card-199", "host": "127.0.0.1", "port": port,
+               "status": "starting", "reserved_at": time.time() - 120,
+               "launcher_pid": blocker.pid, "launcher_identity": identity}
+        self.registry.write_text(json.dumps({key: old}), encoding="utf-8")
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "3",
+                 "--", sys.executable, self.server_script, "{host}", "{port}", "new"]
+        proc = self.run_preview("start", 199, project, extra, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(json.loads(self.registry.read_text(encoding="utf-8"))[key]["lease"],
+                         "aged-live")
+
+    def test_aged_starting_lease_state_matrix_is_conservative(self):
+        code = """
+import importlib.machinery, importlib.util, time
+loader=importlib.machinery.SourceFileLoader('preview', %r)
+spec=importlib.util.spec_from_loader(loader.name, loader)
+m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+entry={'status':'starting','reserved_at':time.time()-120,'launcher_pid':63000,
+ 'launcher_identity':'original','port':24992}
+# An exact live launcher wins without consulting the listener tool.
+m.pid_exists=lambda pid:True; m.pid_identity=lambda pid:'original'
+assert m.starting_lease_state(entry)=='live'
+# A renewed lease is protected even if ownership tools are unavailable.
+renewed=dict(entry,reserved_at=time.time())
+m.pid_identity=lambda pid:''
+assert m.starting_lease_state(renewed)=='live'
+for mode in ('ps-missing','ps-timeout','ps-nonzero','ps-error'):
+ m.pid_exists=lambda pid:True
+ m.pid_identity=lambda pid:''
+ assert m.starting_lease_state(entry)=='unknown',mode
+# Dead/reused launchers with an occupied port remain live or unknown on every
+# lsof absence/failure mode; no numeric PID or age-only inference replaces it.
+for mode in ('lsof-missing','lsof-timeout','lsof-nonzero','lsof-error'):
+ m.pid_exists=lambda pid:False
+ m.port_is_clear=lambda port:False
+ def rows(port):
+  if mode=='lsof-nonzero': return []
+  raise m.PreviewError(mode)
+ m.listener_rows=rows
+ assert m.starting_lease_state(entry)=='unknown',mode
+m.pid_exists=lambda pid:True; m.pid_identity=lambda pid:'reused'
+m.port_is_clear=lambda port:False; m.listener_rows=lambda port:[{'pid':64000}]
+assert m.starting_lease_state(entry)=='live'
+# Replacement is allowed only when the exact launcher is gone/reused and the
+# kernel proves no process owns the reserved port.
+m.port_is_clear=lambda port:True
+assert m.starting_lease_state(entry)=='dead'
+m.pid_exists=lambda pid:False
+assert m.starting_lease_state(entry)=='dead'
 """ % str(PREVIEW)
         proc = subprocess.run([sys.executable, "-c", code], text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
