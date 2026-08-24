@@ -370,16 +370,43 @@ def matching_listener_pids(record):
 def capture_listener_proofs(record):
     owned = descendants(int(record["pid"]))
     pids = matching_listener_pids(record)
-    if not pids or not pids.issubset(owned):
+    if not pids:
         raise PreviewError("could not capture exact preview listener ownership")
     proofs = []
     for pid in sorted(pids):
         identity = pid_identity(pid)
         if not identity:
             raise PreviewError("could not capture preview listener identity")
+        listener_pgid = os.getpgid(pid)
+        expected_pgid = int(record.get("pgid") or record["pid"])
+        if listener_pgid != expected_pgid:
+            cleanup_detached_listener(pid, listener_pgid, identity)
+            raise PreviewError("preview listener escaped the owned process group")
+        if pid not in owned:
+            raise PreviewError("could not capture exact preview listener ownership")
         proofs.append({"pid": pid, "pid_identity": identity,
-                       "pgid": os.getpgid(pid)})
+                       "pgid": listener_pgid})
     return proofs
+
+
+def cleanup_detached_listener(pid, pgid, identity):
+    """Clean only a proven detached listener that leads its own new session."""
+    executable = pid_executable(pid)
+    if (pgid != pid or not executable or not pid_exists(pid)
+            or pid_identity(pid) != identity or os.getpgid(pid) != pgid
+            or pid_executable(pid) != executable):
+        raise PreviewError("refusing cleanup of detached preview listener")
+    os.killpg(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + 1
+    while pid_exists(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if pid_exists(pid) and pid_identity(pid) == identity:
+        try:
+            still_pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            still_pgid = None
+        if still_pgid == pgid:
+            os.killpg(pgid, signal.SIGKILL)
 
 
 def recorded_listeners_still_own_group(record, pgid):
@@ -480,7 +507,8 @@ def write_record(path, record):
         dst.write("\n")
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
-    test_delay = float(os.environ.get("SPRINT_PREVIEW_TEST_POST_REPLACE_DELAY", "0"))
+    test_delay = (float(os.environ.get("SPRINT_PREVIEW_TEST_POST_REPLACE_DELAY", "0"))
+                  if ".supervisor" not in path else 0)
     if test_delay > 0:
         time.sleep(test_delay)
 
@@ -636,7 +664,7 @@ def terminate_record(record, timeout=5, child=None):
         child.wait(timeout=1)
 
 
-def terminate_launched_group(child, pgid, timeout=1):
+def terminate_launched_group(child, pgid, timeout=1, control=None):
     """Reap the exact session created by our still-owned Popen handle.
 
     Unlike record cleanup, this path deliberately does not depend on ps: the
@@ -652,11 +680,21 @@ def terminate_launched_group(child, pgid, timeout=1):
         except ProcessLookupError:
             child.poll()
     else:
-        # The persistent supervisor never exits while an owned group member is
-        # alive. Once its Popen handle is reaped, the numeric PGID is no longer
-        # ownership evidence and must never be signalled.
         child.wait(timeout=1)
-        return
+        proof = read_record(control) if control else None
+        command_pid = int((proof or {}).get("command_pid") or 0)
+        command_identity = (proof or {}).get("command_identity")
+        command_pgid = int((proof or {}).get("command_pgid") or 0)
+        settle_deadline = time.monotonic() + timeout
+        while process_group_alive(pgid) and time.monotonic() < settle_deadline:
+            time.sleep(0.05)
+        if not process_group_alive(pgid):
+            return
+        if (not command_pid or command_pgid != pgid or not pid_exists(command_pid)
+                or pid_identity(command_pid) != command_identity
+                or os.getpgid(command_pid) != pgid):
+            raise PreviewError(
+                "refusing startup cleanup: supervisor died without a live exact group proof")
     with contextlib.suppress(ProcessLookupError):
         os.killpg(pgid, signal.SIGTERM)
     deadline = time.time() + timeout
@@ -693,6 +731,16 @@ def _supervisor_parent_alive(pid, identity):
     return proc.returncode == 0 and proc.stdout.strip() == identity
 
 
+def _system_pid_identity(pid):
+    try:
+        proc = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(pid)],
+                              text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
 def run_supervisor(spec_path, parent_fd):
     """Own the preview session until publication or exact group teardown.
 
@@ -710,17 +758,46 @@ def run_supervisor(spec_path, parent_fd):
 
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, request_shutdown)
+    spec.update({"supervisor_pid": os.getpid(), "supervisor_pgid": os.getpgrp(),
+                 "supervisor_identity": _system_pid_identity(os.getpid()),
+                 "supervisor_executable": os.path.realpath(sys.executable)})
+    write_record(spec_path, spec)
+    pre_command_delay = float(os.environ.get(
+        "SPRINT_PREVIEW_TEST_SUPERVISOR_PRE_COMMAND_DELAY", "0"))
+    if pre_command_delay:
+        time.sleep(pre_command_delay)
+    gate_read, gate_write = os.pipe()
     with open(spec["log"], "ab", buffering=0) as log:
         try:
-            command = subprocess.Popen(spec["command"], cwd=spec["worktree"],
-                                       env=os.environ.copy(), stdin=subprocess.DEVNULL,
-                                       stdout=log, stderr=subprocess.STDOUT)
+            command = subprocess.Popen(
+                [sys.executable, os.path.realpath(__file__), "--gated-exec",
+                 str(gate_read), json.dumps(spec["command"])],
+                cwd=spec["worktree"], env=os.environ.copy(),
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                pass_fds=(gate_read,))
         except OSError as exc:
             pathlib.Path(spec["ready"]).write_text(
                 json.dumps({"error": str(exc)}), encoding="utf-8")
             return 127
+        finally:
+            os.close(gate_read)
+    spec.update({"command_pid": command.pid,
+                 "command_pgid": os.getpgid(command.pid),
+                 "command_identity": _system_pid_identity(command.pid)})
+    write_record(spec_path, spec)
+    pre_ready_delay = float(os.environ.get(
+        "SPRINT_PREVIEW_TEST_SUPERVISOR_PRE_READY_DELAY", "0"))
+    if pre_ready_delay:
+        time.sleep(pre_ready_delay)
+    os.write(gate_write, b"1")
+    os.close(gate_write)
+    post_command_delay = float(os.environ.get(
+        "SPRINT_PREVIEW_TEST_SUPERVISOR_POST_COMMAND_DELAY", "0"))
+    if post_command_delay:
+        time.sleep(post_command_delay)
     pathlib.Path(spec["ready"]).write_text(
-        json.dumps({"command_pid": command.pid}), encoding="utf-8")
+        json.dumps({"command_pid": command.pid,
+                    "command_identity": spec["command_identity"]}), encoding="utf-8")
     parent_lost = False
     inspection_failed_at = None
 
@@ -806,6 +883,18 @@ def _supervisor_group_state():
                 and not fields[2].startswith("Z")):
             return "live"
     return "empty"
+
+
+def run_gated_exec(gate_fd, command_json):
+    """Exec only after the supervisor durably records this exact child."""
+    try:
+        released = os.read(gate_fd, 1)
+    finally:
+        os.close(gate_fd)
+    if released != b"1":
+        return 125
+    command = json.loads(command_json)
+    os.execvpe(command[0], command, os.environ.copy())
 
 
 def command_start(args, project_root, unit, unit_number, registry):
@@ -940,10 +1029,31 @@ def command_start(args, project_root, unit, unit_number, registry):
                     time.sleep(0.1)
                 if ready:
                     raise_if_startup_interrupted()
-                    record["listener_proofs"] = capture_listener_proofs(record)
+                    stable_deadline = time.monotonic() + 10
+                    previous_proofs = None
+                    stable_proofs = None
+                    while time.monotonic() < stable_deadline:
+                        try:
+                            observed_proofs = capture_listener_proofs(record)
+                        except PreviewError as exc:
+                            if "could not capture exact preview listener ownership" not in str(exc):
+                                raise
+                            observed_proofs = None
+                        if (observed_proofs and observed_proofs == previous_proofs
+                                and http_reachable(host, port, path)):
+                            stable_proofs = observed_proofs
+                            break
+                        previous_proofs = observed_proofs
+                        raise_if_startup_interrupted()
+                        time.sleep(0.2)
+                    if not stable_proofs:
+                        raise PreviewError("preview listener was not stable before publication")
+                    record["listener_proofs"] = stable_proofs
                     write_record(record_file, record)
                     raise_if_startup_interrupted()
                     publish_lease(registry, record)
+                    if record_state(record, require_http=True) != "live":
+                        raise PreviewError("preview ownership was not immediately readable")
                     pathlib.Path(commit_path).touch(mode=0o600, exist_ok=True)
                     os.close(parent_write_fd)
                     parent_write_fd = None
@@ -958,20 +1068,19 @@ def command_start(args, project_root, unit, unit_number, registry):
                     return 0
             finally:
                 if not keep_running:
-                    try:
-                        if child is not None:
-                            terminate_launched_group(child, pgid, timeout=1)
-                    finally:
-                        if lease is not None:
-                            release_lease(registry, lease)
-                            remove_record_for_lease(record_file, lease)
-                        for cleanup_path in (control, ready_path, commit_path):
-                            if cleanup_path:
-                                with contextlib.suppress(FileNotFoundError):
-                                    os.unlink(cleanup_path)
-                        if parent_write_fd is not None:
-                            with contextlib.suppress(OSError):
-                                os.close(parent_write_fd)
+                    if parent_write_fd is not None:
+                        with contextlib.suppress(OSError):
+                            os.close(parent_write_fd)
+                    if child is not None:
+                        terminate_launched_group(child, pgid, timeout=1,
+                                                 control=control)
+                    if lease is not None:
+                        release_lease(registry, lease)
+                        remove_record_for_lease(record_file, lease)
+                    for cleanup_path in (control, ready_path, commit_path):
+                        if cleanup_path:
+                            with contextlib.suppress(FileNotFoundError):
+                                os.unlink(cleanup_path)
         # A listener race or a child bind failure is recoverable on another
         # reserved port. Other startup failures are surfaced after a few tries.
         if attempts >= 3:
@@ -1031,6 +1140,8 @@ def command_stop(args, project_root, unit, registry):
 def main(argv):
     if len(argv) == 3 and argv[0] == "--supervise":
         return run_supervisor(argv[1], int(argv[2]))
+    if len(argv) == 3 and argv[0] == "--gated-exec":
+        return run_gated_exec(int(argv[1]), argv[2])
     args = parse_args(argv)
     try:
         project_root = resolve_project_root(args.project_root, args.server)

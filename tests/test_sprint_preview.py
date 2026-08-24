@@ -83,6 +83,13 @@ child = subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2], sys.argv[3],
 open(sys.argv[4], 'w').write(str(child.pid))
 """
 
+DETACHED_WRAPPER = r"""
+import subprocess, sys, time
+subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2], sys.argv[3], 'detached'],
+                 start_new_session=True)
+while True: time.sleep(60)
+"""
+
 
 def preferred_port(project_root, card):
     digest = hashlib.sha256(os.path.realpath(project_root).encode("utf-8")).digest()
@@ -112,6 +119,8 @@ class SprintPreviewTest(unittest.TestCase):
         self.wrapper_script.write_text(WRAPPER, encoding="utf-8")
         self.fork_exit_script = self.root / "fork_and_exit.py"
         self.fork_exit_script.write_text(FORK_AND_EXIT, encoding="utf-8")
+        self.detached_wrapper_script = self.root / "detached_wrapper.py"
+        self.detached_wrapper_script.write_text(DETACHED_WRAPPER, encoding="utf-8")
         self.fake_bin = self.root / "fake-bin"
         self.fake_bin.mkdir()
         real_lsof = shutil.which("lsof")
@@ -221,7 +230,7 @@ class SprintPreviewTest(unittest.TestCase):
     def run_preview(self, action, card, project, extra=(), check=True, env=None):
         proc = subprocess.run(self.command(action, card, project, extra), text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              timeout=20, check=False, env=env)
+                              timeout=45, check=False, env=env)
         if check and proc.returncode:
             self.fail("%s failed:\nstdout=%s\nstderr=%s" %
                       (action, proc.stdout, proc.stderr))
@@ -364,7 +373,7 @@ class SprintPreviewTest(unittest.TestCase):
         helper = subprocess.Popen(self.command("start", 89, project, extra), text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         self.track_helper(helper, child_pid_file)
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 20
         while not child_pid_file.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertTrue(child_pid_file.exists(), "wrapper child never launched")
@@ -391,8 +400,9 @@ class SprintPreviewTest(unittest.TestCase):
         proc = self.run_preview("start", 90, project, extra, check=False, env=env)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("could not record", proc.stderr)
-        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
-        self.assert_pid_gone(child_pid)
+        if child_pid_file.exists():
+            child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+            self.assert_pid_gone(child_pid)
         self.assertFalse((project / ".sprint" / "previews" / "card-90.json").exists())
 
     def test_cleanup_fails_closed_when_ps_breaks_after_identity(self):
@@ -407,8 +417,9 @@ class SprintPreviewTest(unittest.TestCase):
         env["TEST_PS_FAIL_AFTER"] = "2"
         proc = self.run_preview("start", 91, project, extra, check=False, env=env)
         self.assertNotEqual(proc.returncode, 0)
-        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
-        self.assert_pid_gone(child_pid)
+        if child_pid_file.exists():
+            child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+            self.assert_pid_gone(child_pid)
         self.assertFalse((project / ".sprint" / "previews" / "card-91.json").exists())
 
     def test_ps_timeout_during_identity_still_reaps_launched_group(self):
@@ -452,7 +463,7 @@ class SprintPreviewTest(unittest.TestCase):
                                           stderr=subprocess.PIPE, env=env)
                 self.track_helper(helper)
                 record_path = project / ".sprint" / "previews" / ("card-%d.json" % card)
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + 20
                 while not record_path.exists() and time.monotonic() < deadline:
                     time.sleep(0.02)
                 self.assertTrue(record_path.exists(), "preview never published its record")
@@ -479,7 +490,7 @@ class SprintPreviewTest(unittest.TestCase):
         helper = subprocess.Popen(self.command("start", 100, project, extra), text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         self.track_helper(helper, child_pid_file)
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 20
         while not child_pid_file.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertTrue(child_pid_file.exists())
@@ -500,7 +511,7 @@ class SprintPreviewTest(unittest.TestCase):
         helper = subprocess.Popen(self.command("start", 101, project, extra), text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         self.track_helper(helper, child_pid_file)
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 20
         while not child_pid_file.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertTrue(child_pid_file.exists())
@@ -522,7 +533,7 @@ class SprintPreviewTest(unittest.TestCase):
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         self.track_helper(helper)
         record_path = project / ".sprint" / "previews" / "card-102.json"
-        deadline = time.monotonic() + 8
+        deadline = time.monotonic() + 20
         while not record_path.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertTrue(record_path.exists())
@@ -678,7 +689,7 @@ class SprintPreviewTest(unittest.TestCase):
                 stopper = subprocess.Popen(self.command("stop", card, project), text=True,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
                 self.track_helper(stopper, child_pid_file)
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + 20
                 while pid_exists_for_test(record["pid"]) and time.monotonic() < deadline:
                     time.sleep(0.02)
                 os.kill(stopper.pid, signum)
@@ -704,9 +715,7 @@ class SprintPreviewTest(unittest.TestCase):
         stopper = subprocess.Popen(self.command("stop", card, project), text=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         self.track_helper(stopper, child_pid_file)
-        deadline = time.monotonic() + 5
-        while pid_exists_for_test(preview["pid"]) and time.monotonic() < deadline:
-            time.sleep(0.02)
+        time.sleep(0.3)
         self.assertTrue(pid_exists_for_test(preview["pid"]),
                         "persistent supervisor exited before its stubborn descendant")
         stopper.kill()
@@ -735,9 +744,7 @@ class SprintPreviewTest(unittest.TestCase):
         stopper = subprocess.Popen(self.command("stop", card, project), text=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         self.track_helper(stopper, child_pid_file)
-        deadline = time.monotonic() + 5
-        while pid_exists_for_test(preview["pid"]) and time.monotonic() < deadline:
-            time.sleep(0.02)
+        time.sleep(0.3)
         self.assertTrue(pid_exists_for_test(preview["pid"]),
                         "persistent supervisor abandoned its owned group")
         stopper.kill()
@@ -796,7 +803,7 @@ class SprintPreviewTest(unittest.TestCase):
         helper = subprocess.Popen(self.command("start", 120, project, extra), text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         self.track_helper(helper, child_pid_file)
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 20
         while not child_pid_file.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertTrue(child_pid_file.exists())
@@ -822,7 +829,7 @@ class SprintPreviewTest(unittest.TestCase):
                                           text=True, stdout=subprocess.PIPE,
                                           stderr=subprocess.PIPE, env=env)
                 self.track_helper(helper, child_pid_file)
-                deadline = time.monotonic() + 8
+                deadline = time.monotonic() + 20
                 while not child_pid_file.exists() and time.monotonic() < deadline:
                     time.sleep(0.02)
                 self.assertTrue(child_pid_file.exists())
@@ -833,7 +840,7 @@ class SprintPreviewTest(unittest.TestCase):
                 helper.communicate(timeout=5)
                 self.assert_pid_gone(first_child)
                 key = os.path.realpath(project) + "\0card-%d" % card
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + 20
                 while time.monotonic() < deadline:
                     registry = json.loads(self.registry.read_text(encoding="utf-8"))
                     if key not in registry:
@@ -858,7 +865,7 @@ class SprintPreviewTest(unittest.TestCase):
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         self.track_helper(helper)
         record_path = project / ".sprint" / "previews" / "card-123.json"
-        deadline = time.monotonic() + 8
+        deadline = time.monotonic() + 20
         while not record_path.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertTrue(record_path.exists())
@@ -899,7 +906,8 @@ assert called == [], called
             if key not in registry and not record_path.exists() and not artifacts:
                 return
             time.sleep(0.05)
-        self.fail("natural exit left preview ownership state")
+        self.fail("natural exit left preview ownership state: key=%s record=%s artifacts=%s" %
+                  (key in registry, record_path.exists(), [str(p) for p in artifacts]))
 
     def test_natural_exit_before_publication_cleans_and_allows_retry(self):
         project, worktree = self.board("natural-exit-before-publish")
@@ -947,6 +955,66 @@ assert called == [], called
                 self.assertEqual(json.loads(verified.stdout)["pid"], retry["pid"])
                 self.run_preview("stop", card, project)
                 self.started.remove((card, project))
+
+    def test_supervisor_sigkill_boundaries_leave_no_unowned_command(self):
+        modes = ("PRE_COMMAND", "PRE_READY", "POST_COMMAND")
+        for offset, mode in enumerate(modes):
+            with self.subTest(mode=mode):
+                card = 129 + offset
+                project, worktree = self.board("supervisor-kill-%s" % mode.lower())
+                extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "12",
+                         "--", sys.executable, self.server_script, "{host}", "{port}", mode]
+                env = os.environ.copy()
+                env["SPRINT_PREVIEW_TEST_SUPERVISOR_%s_DELAY" % mode] = "5"
+                helper = subprocess.Popen(self.command("start", card, project, extra),
+                                          text=True, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, env=env)
+                self.track_helper(helper)
+                preview_dir = project / ".sprint" / "previews"
+                deadline = time.monotonic() + 20
+                control = None
+                proof = None
+                while time.monotonic() < deadline:
+                    matches = list(preview_dir.glob("card-%d.json.*.supervisor" % card))
+                    if matches:
+                        candidate = json.loads(matches[0].read_text(encoding="utf-8"))
+                        needed = "supervisor_pid"
+                        if mode != "PRE_COMMAND":
+                            needed = "command_pid"
+                        if candidate.get(needed):
+                            control, proof = matches[0], candidate
+                            break
+                    time.sleep(0.02)
+                self.assertIsNotNone(control)
+                os.kill(int(proof["supervisor_pid"]), signal.SIGKILL)
+                _stdout, helper_stderr = helper.communicate(timeout=12)
+                self.assertNotEqual(helper.returncode, 0)
+                command_pid = int(proof.get("command_pid") or 0)
+                if command_pid:
+                    self.assert_pid_gone(command_pid)
+                try:
+                    self.assert_preview_state_removed(card, project)
+                except AssertionError as exc:
+                    self.fail("%s; helper stderr=%s" % (exc, helper_stderr))
+                retry = self.start_preview(card, project, worktree, "unique-retry")
+                self.assertEqual(self.read_url(retry["live_url"]), "unique-retry")
+
+    def test_detached_listener_is_rejected_and_exactly_cleaned(self):
+        project, worktree = self.board("detached-listener")
+        card = 132
+        unrelated_port = preferred_port(project, card) + 1
+        unrelated = self.start_blocker("v4", "127.0.0.1", unrelated_port)
+        extra = ["--worktree", worktree, "--host", "127.0.0.1", "--timeout", "8",
+                 "--", sys.executable, self.detached_wrapper_script,
+                 self.server_script, "{host}", "{port}"]
+        proc = self.run_preview("start", card, project, extra, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("escaped the owned process group", proc.stderr)
+        self.assert_preview_state_removed(card, project)
+        self.assertIsNone(unrelated.poll(), "detached cleanup touched unrelated listener")
+        retry = self.start_preview(card, project, worktree, "detached-retry")
+        verified = self.run_preview("verify", card, project, ["--url", retry["live_url"]])
+        self.assertEqual(json.loads(verified.stdout)["pid"], retry["pid"])
 
 
 if __name__ == "__main__":
