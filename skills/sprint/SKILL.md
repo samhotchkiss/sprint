@@ -447,10 +447,12 @@ immediately, without asking**:
    dropping it). Set `"actor": "session"` — you wrote these, not the
    user — and `"hold": false`, since a split is work the user already
    asked for. One call, one atomic write, no half-split.
-2. `POST /api/cards/:original/action {"action":"cancel"}` and post a
-   `note` on the original listing the new card numbers (`split into
-   #131, #132, #133`) — the UI autolinks `#N` so this is one-click
-   navigable even without a dedicated merge-back field in the schema.
+2. Post a note on the original listing the child cards (`split into
+   #131, #132, #133`). Keep it open and record the dependency with
+   `POST /api/cards/:original/state {"actor":"session","state":"blocked","reason":"split_children_pending"}`.
+   Do not cancel it or dispatch its duplicated scope. When the children demonstrate
+   the original outcome, move the original to `in_progress` and submit a reviewable
+   ops packet linking their evidence. Only the user closes the original or children.
 3. The new sibling cards land `queued` (or `held` if hold mode is on)
    and go through normal dispatch/batching from here — including being
    swept into a batch together if they turn out to be one shape of
@@ -836,14 +838,12 @@ alone does not authorize deleting dirty or unmerged work.
 
 Any card/batch whose evidence packet had `ui_change: true` has a worker
 preview server still running on `8400 + (card_num % 100)` (batch: batch
-id) — the worker was told to leave it up until the verdict. **On any
-terminal state** (`completed`, `rejected`, `failed`, `canceled`,
-`duplicate`) kill that process: the deterministic port makes it findable
-even if you don't have the PID handy (`lsof -ti :<port> | xargs kill`,
-or whatever's appropriate on the box), then proceed with the worktree
-prune. Don't kill it while the card is merely `bounced` back to
-`in_progress` or failed integration — the worker may still need it to
-re-verify the fix.
+id). Before stopping it, verify that the process still belongs to this card;
+the port alone is insufficient because card numbers can share it. Stop a verified
+preview when the user's disposition ends its use. Preserve previews needed by an
+active recovery, bounce or integration fix. Preview cleanup does not authorize
+worktree removal: apply the inspected-work preservation procedure separately,
+including for failed and terminal cards.
 
 ---
 
