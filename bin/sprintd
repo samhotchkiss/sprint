@@ -4436,12 +4436,36 @@ def read_server_json(path: str):
 
 
 def write_server_json(path: str, info: dict):
+    """Write the liveness record, which contains the bearer token, owner-only THROUGHOUT.
+
+    The chmod used to happen after os.replace, which left two holes. The temp file was
+    created at the process umask -- 0644 on this machine -- and it already contained the
+    token, so the secret existed world-readable for the length of a write. And a file
+    written by an older build simply stayed 0644 forever, because nothing rewrote it: on
+    2026-09-07 the live board's server.json was mode 0644 with a 32-character token in it,
+    readable by anyone, while every other board on the studio was 0600. Dana found it while
+    reviewing a credential wrapper whose entire design assumed this file was protected.
+
+    Creating the descriptor with 0600 closes both: there is no instant at which the token
+    is on disk under a wider mode, and the mode does not depend on a later call succeeding.
+    """
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(info, fh, indent=2, sort_keys=True)
-        fh.flush()
-        os.fsync(fh.fileno())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(info, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     os.replace(tmp, path)
+    # Belt and braces for a path written by an older build, and for an inherited file
+    # os.replace kept the mode of. Failure here is not fatal because the descriptor above
+    # already established the mode for anything this build created.
     try:
         os.chmod(path, 0o600)
     except OSError:
