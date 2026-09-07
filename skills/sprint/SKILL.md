@@ -209,7 +209,7 @@ the board is quiet:
 
 ```
 Monitor(
-  command: "bin/sprintd tail --after $CURSOR",
+  command: "bin/sprintd tail --after $CURSOR --no-progress",
   description: "sprint board events",
   persistent: true)
 ```
@@ -234,6 +234,12 @@ Each line it prints is one event, pre-summarised:
   is still in the log, so a cursor drain still sees it. Pass
   `--include-self` if you ever want the raw stream back (debugging the
   board itself, mostly).
+- `--no-progress` additionally suppresses only `actor: "worker"`,
+  `kind: "progress"` notifications. User input, questions, evidence, errors,
+  state changes and server faults still wake the lead. Progress remains in
+  the board and `/api/events`; this changes notifications, not the saved
+  cursor or the requirement to drain it on a wake. Omit the flag when you
+  need to watch intermediate progress.
 - It **never exits on its own.** It reconnects through drops by itself,
   resuming from the last seq — so one Monitor call lasts the sprint.
   Re-arm only if the monitor itself reports that the process exited.

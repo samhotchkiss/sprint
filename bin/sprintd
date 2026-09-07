@@ -5177,6 +5177,7 @@ def cmd_tail(args) -> int:
     # same reason heartbeats and cursor frames are: a wakeup should mean
     # somebody else moved. `--include-self` is the way back to the raw log.
     include_self = bool(getattr(args, "include_self", False))
+    no_progress = bool(getattr(args, "no_progress", False))
     unreachable_after = float(args.unreachable_after)
     read_timeout = float(args.read_timeout)
 
@@ -5243,6 +5244,8 @@ def cmd_tail(args) -> int:
                     continue
                 if not include_self and obj.get("actor") == "session":
                     continue          # the session's own echo; it already knows
+                if no_progress and obj.get("actor") == "worker" and obj.get("kind") == "progress":
+                    continue          # retained in /api/events; no routine wake
                 emit(tail_line(obj))
         except (OSError, http.client.HTTPException, ValueError):
             pass
@@ -6315,6 +6318,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--user-only", action="store_true",
                    help="print only actor=user events -- the ones a session must "
                         "answer promptly")
+    s.add_argument("--no-progress", action="store_true",
+                   help="skip routine worker progress; keep user input, questions, "
+                        "results, errors and server events")
     s.add_argument("--include-self", action="store_true",
                    help="also print actor=session events; by default the "
                         "session's own posts are suppressed so its standing "
