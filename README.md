@@ -109,6 +109,9 @@ happened) and still the right tool where the streaming monitor isn't
 available, or as a slow heartbeat that would notice a wedged tail. You
 can watch either one yourself: `bin/sprintd tail --user-only` in a
 terminal prints a line the moment you post anything on the board.
+Use `--no-progress` for an active lead who needs questions, results and faults
+without routine worker progress wakes. Those progress events remain on the board;
+user input is always retained by this filter.
 
 ## Multiple sprints on one machine
 

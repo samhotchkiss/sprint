@@ -2988,6 +2988,45 @@ class TestTail(unittest.TestCase):
         self.assertEqual([ev["text"] for ev in got],
                          ["a card, which is a user event", "the human again"])
 
+    def test_no_progress_retains_questions_results_faults_and_user_input(self):
+        """A lead can skip routine wakes without losing the events needing action."""
+        card = self.new_card("work with progress and a real question")
+        path = "/api/cards/%d" % card["num"]
+        self.assertEqual(self.api("POST", path + "/state",
+                                  {"state": "in_progress"})[0], 200)
+        cursor = self.head()
+        _raw, raw_lines, _ = self.tail("--after", str(cursor))
+        _quiet, quiet_lines, _ = self.tail("--after", str(cursor), "--no-progress")
+        for actor, kind, text in [
+                ("worker", "progress", "compiling"),
+                ("worker", "error", "required check failed"),
+                ("user", "progress", "stop this work")]:
+            self.assertEqual(self.api("POST", path + "/events",
+                {"actor": actor, "kind": kind, "text": text})[0], 201)
+        self.assertEqual(self.api("POST", path + "/question",
+                                  {"text": "which target is intended?"})[0], 201)
+        self.assertEqual(self.api("POST", path + "/answer",
+                                  {"text": "the existing target"})[0], 200)
+        self.assertEqual(self.api("POST", path + "/ready", GOOD_PACKET)[0], 200)
+        self.user_says("end of this event batch")
+        barrier = self.head()
+        status, data = self.api("GET", "/api/events?after=%d" % cursor)
+        self.assertEqual(status, 200)
+        retained = [ev for ev in data["events"] if ev["seq"] <= barrier]
+        for lines in (raw_lines, quiet_lines):
+            self._await(lambda: any(ev.get("seq") == barrier for ev in self.parsed(lines)),
+                        what="the final user event on both tails")
+        raw = self.parsed(raw_lines)
+        quiet = self.parsed(quiet_lines)
+        self.assertEqual([ev["seq"] for ev in raw], [ev["seq"] for ev in retained])
+        self.assertEqual([ev["seq"] for ev in quiet],
+                         [ev["seq"] for ev in retained
+                          if not (ev["actor"] == "worker" and ev["kind"] == "progress")])
+        self.assertIn("compiling", [ev["text"] for ev in raw])
+        self.assertIn("stop this work", [ev["text"] for ev in quiet])
+        self.assertTrue({"question", "answer", "evidence", "error", "state"}
+                        <= {ev["kind"] for ev in quiet})
+
     def test_after_catches_up_from_the_cursor_before_streaming(self):
         """Restarting a monitor must not replay the whole sprint, and must not
         lose what landed while it was down."""
