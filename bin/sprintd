@@ -30,6 +30,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -4449,8 +4450,18 @@ def write_server_json(path: str, info: dict):
     Creating the descriptor with 0600 closes both: there is no instant at which the token
     is on disk under a wider mode, and the mode does not depend on a later call succeeding.
     """
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # mkstemp, not a fixed ".tmp" name with O_CREAT. Dana rejected the first version and was
+    # right: O_CREAT WITHOUT O_EXCL ignores the mode argument when the file already exists,
+    # so a leftover 0644 tmp -- from a SIGKILL, or written by the older build -- takes the
+    # token at 0644 for the length of the write. She reproduced it: pre-existing 0644 tmp,
+    # token written in, fstat on the descriptor reads 0644. In the very directory that held a
+    # 0644 token today. The replace-and-chmod still fixed the FINAL file, so what remained
+    # exposed was the write window itself, which is exactly what this change claimed to close.
+    #
+    # mkstemp creates a fresh unique name with O_EXCL and mode 0600 by construction, so there
+    # is no pre-existing file whose mode can be inherited and no fixed name to collide on.
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".server.json.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(info, fh, indent=2, sort_keys=True)
