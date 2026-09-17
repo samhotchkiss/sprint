@@ -552,7 +552,7 @@ export function mergeSidebar(existing, incoming, watermark) {
 
 /**
  * Bind one incoming server line onto at most one local echo.
- * Identity is seq, then localId, then a single unsequenced text match —
+ * Identity is seq, then localId, without matching message text —
  * never a Set of texts, which would consume every identical pending "ok".
  */
 export function claimSidebarEcho(list, incoming, used) {
@@ -566,9 +566,7 @@ export function claimSidebarEcho(list, incoming, used) {
     const byId = rows.find((e) => !used.has(e) && e.seq == null && e.localId === incoming.localId);
     if (byId) return byId;
   }
-  return rows.find((e) => !used.has(e) && e.seq == null
-    && (e.localEcho || e.local || e.pending)
-    && e.payload && incoming.payload && e.payload.text === incoming.payload.text) || null;
+  return null;
 }
 
 /** Fold a server sidebar event onto the matching echo, or append. */
@@ -615,8 +613,7 @@ export function claimPendingEcho(pending, incoming, used) {
     const byId = rows.find((e) => !used.has(e) && e.seq == null && e.localId === incoming.localId);
     if (byId) return byId;
   }
-  return rows.find((e) => !used.has(e) && e.seq == null
-    && e.payload && incoming.payload && e.payload.text === incoming.payload.text) || null;
+  return null;
 }
 
 /** Optimistic thread lines the server copy has not yet replaced. */

@@ -91,9 +91,9 @@ test('two identical pending sidebar lines survive a snapshot that contains one c
   const merged = mergeSidebar([a, b], [
     { seq: 5, actor: 'user', kind: 'chat', payload: { text: 'ok' } },
   ], 5);
-  assert.equal(merged.filter((e) => e.payload && e.payload.text === 'ok').length, 2,
-    'a text Set must not swallow the second unconfirmed "ok"');
-  assert.equal(merged.filter((e) => e.seq == null).length, 1);
+  assert.equal(merged.filter((e) => e.payload && e.payload.text === 'ok').length, 3,
+    'an unrelated historical message must not swallow an unconfirmed "ok"');
+  assert.equal(merged.filter((e) => e.seq == null).length, 2);
 });
 
 test('SSE then POST replay does not eat a second identical pending line', () => {
@@ -102,7 +102,7 @@ test('SSE then POST replay does not eat a second identical pending line', () => 
   const b = echo('ok', { localId: 'b' });
   store.sidebar = [a, b];
   applyEvents([{ seq: 10, actor: 'user', kind: 'chat', payload: { text: 'ok' } }]);
-  assert.equal(a.seq, 10);
+  assert.equal(a.seq, undefined);
   assert.equal(b.seq, undefined);
   acknowledgeSidebarLine({ seq: 10, actor: 'user', kind: 'chat', payload: { text: 'ok' } }, a);
   const oks = store.sidebar.filter((e) => e.payload && e.payload.text === 'ok');
@@ -128,12 +128,12 @@ test('keepPendingLines retains a settled seq the stale timeline lacks', () => {
   assert.equal(kept[0].seq, 50);
 });
 
-test('keepPendingLines claims one of two identical pending lines', () => {
+test('historical timeline text cannot claim either unconfirmed message', () => {
   const p1 = { seq: null, pending: true, actor: 'user', payload: { text: 'hi' } };
   const p2 = { seq: null, pending: true, actor: 'user', payload: { text: 'hi' } };
   const kept = keepPendingLines([p1, p2],
     [{ seq: 9, actor: 'user', kind: 'chat', payload: { text: 'hi' } }]);
-  assert.equal(kept.length, 1, 'one timeline event retires one echo, not both');
+  assert.equal(kept.length, 2, 'only a confirmed identity can retire an echo');
 });
 
 test('older timeline cannot drop a newer seq', () => {
