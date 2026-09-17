@@ -460,7 +460,7 @@ function route(method, path, query, body) {
         const reply = push({ card_num: num, actor: 'worker', kind: 'chat', payload: { text: 'Got it — folding that in now.' } });
         pushTimeline(num, reply);
       }, 1400);
-      return json({ ok: true });
+      return json({ ok: true, event: e });
     }
     if (sub === 'answer') {
       if (!c.question || c.question.answered_at) return json({ error: 'already answered' }, 409);
@@ -522,14 +522,13 @@ function route(method, path, query, body) {
     return json(created);
   }
   if (method === 'POST' && path === '/api/sidebar') {
-    const e = { seq: nextSeq(), card_num: null, ts: new Date().toISOString(), actor: 'user', kind: 'chat', payload: { text: body.text } };
+    const e = push({ card_num: null, actor: 'user', kind: 'chat', payload: { text: body.text } });
     state.sidebar.push(e);
-    state.queue.push(e);
     setTimeout(() => {
       const reply = { card_num: null, actor: 'session', kind: 'chat', payload: { text: 'Heard. I will fold that into the next dispatch pass — watch #140 and #141.' } };
       state.sidebar.push(push(reply));
     }, 1500);
-    return json({ ok: true });
+    return json({ ok: true, event: e });
   }
   if (method === 'POST' && path === '/api/sprint') {
     if (body.action === 'set_hold_mode') state.sprint.hold_mode = !!body.hold_mode;

@@ -5,15 +5,26 @@
 // Running work is a one-line-per-card list you can open but not act on, and
 // blocked + queued collapse to a single read-only sentence. Everything that can
 // be tapped is at least 44px.
-import { h } from './util.js';
-import { sections, meterSegments, motionState, needsKind, needsYouCount } from './state.js';
+import { h, reconcile } from './util.js';
+import {
+  sections, meterSegments, motionState, needsKind, needsYouCount, cardPaintVer, meterPaintVer,
+} from './state.js';
 import { renderMeter } from './meter.js';
 import { needsRow } from './list.js';
 import { reviewBlock } from './review.js';
 
 export function renderPhone(root, app) {
   const secs = sections();
+  const ver = [
+    meterPaintVer(secs),
+    (secs.needs_you.cards || []).map(cardPaintVer).join(';'),
+    (secs.in_motion.cards || []).map(cardPaintVer).join(';'),
+    secs.blocked.cards.length, secs.waiting.cards.length,
+  ].join('|');
+  reconcile(root, [{ key: 'phone', ver, make: () => phoneShell(secs, app) }]);
+}
 
+function phoneShell(secs, app) {
   const head = h('div.col-head',
     h('span.col-dot', { style: { background: 'var(--accent)' } }),
     h('span.col-name', 'Needs you'),
@@ -50,8 +61,8 @@ export function renderPhone(root, app) {
   }
   strip.appendChild(h('p.phone-readonly', readonlyLine(secs)));
 
-  root.appendChild(h('div.fold-cols',
-    h('section.col.col-needs_you', head, h('div.col-body', meter, list, strip))));
+  return h('div.fold-cols',
+    h('section.col.col-needs_you', head, h('div.col-body', meter, list, strip)));
 }
 
 function readonlyLine(secs) {

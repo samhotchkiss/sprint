@@ -142,6 +142,11 @@ export const store = {
   // expanding one list never expands the other.
   convoMore: false,
   loaded: false,
+  // Last board snapshot we treated as authoritative. A slower, older fetch
+  // must not be allowed to un-see cards or chat lines a newer one already
+  // applied — see applyBoard's epoch/seq guard.
+  boardEpoch: 0,
+  boardSeq: 0,
   // How many report documents THIS sprint has. The header's Reports link exists
   // only when this is > 0 — user, verbatim: "link should only appear once
   // there's a report within the sprint".
@@ -397,8 +402,30 @@ export function applyCursor(seq) {
 
 // ---- board ---------------------------------------------------------------
 
-export function applyBoard(board) {
+export function applyBoard(board, opts = {}) {
   if (!board || typeof board !== 'object') return;
+  const epoch = num(opts.epoch);
+  const incoming = num(board.seq != null ? board.seq : board.last_seq);
+  // A fetch that left the network later can still land first. The epoch is
+  // the tab's own counter for that. Seq is the server's, and live events
+  // advance `store.seq` without waiting for the next /api/board — so a
+  // snapshot whose seq is behind the event cursor is stale even when it is
+  // the newest HTTP response. A current snapshot (seq >= live cursor) is
+  // still allowed to delete cards: that is the authoritative removal path.
+  const stale = epoch != null && (
+    (store.boardEpoch != null && epoch < store.boardEpoch)
+    || (incoming != null && store.boardSeq != null && incoming < store.boardSeq)
+    || (incoming != null && store.seq != null && incoming < store.seq)
+  );
+  if (stale) {
+    const sess = normSession(board);
+    applyCursor(sess.cursor);
+    if (incoming != null) store.seq = Math.max(store.seq, incoming);
+    return;
+  }
+  if (epoch != null) store.boardEpoch = Math.max(store.boardEpoch || 0, epoch);
+  if (incoming != null) store.boardSeq = Math.max(store.boardSeq || 0, incoming);
+
   const sprint = board.sprint && typeof board.sprint === 'object' ? board.sprint : {};
   store.sprint = {
     id: sprint.id != null ? sprint.id : null,
@@ -450,11 +477,7 @@ export function applyBoard(board) {
 
   const sidebar = board.sidebar;
   if (Array.isArray(sidebar)) {
-    const lines = sidebar.map(normEvent).filter(Boolean);
-    const texts = new Set(lines.map((e) => e.payload && e.payload.text));
-    // keep any of our own lines the board has not caught up with yet
-    const echoes = store.sidebar.filter((e) => e.localEcho && !texts.has(e.payload && e.payload.text));
-    store.sidebar = lines.concat(echoes);
+    store.sidebar = mergeSidebar(store.sidebar, sidebar, incoming);
   }
 
   // Scoped to the open sprint by the server — never a lifetime total, because
@@ -485,6 +508,152 @@ export function applyBoard(board) {
   store.loaded = true;
 }
 
+/**
+ * Fold a board sidebar snapshot into what the tab already has.
+ *
+ * The snapshot is the last N lines, not the whole log. Anything we already
+ * have with a seq past the snapshot's watermark — or an unconfirmed echo the
+ * snapshot has not caught — stays. A delayed fetch whose seq is behind the
+ * one we just applied never reaches here (applyBoard returns first).
+ */
+export function mergeSidebar(existing, incoming, watermark) {
+  const lines = (incoming || []).map(normEvent).filter(Boolean);
+  const used = new Set();
+  const out = [];
+  let mark = watermark;
+  if (mark == null) {
+    mark = 0;
+    for (const e of lines) if (e.seq != null && e.seq > mark) mark = e.seq;
+  }
+  for (const e of lines) {
+    const claimed = claimSidebarEcho(existing, e, used);
+    if (claimed) {
+      used.add(claimed);
+      Object.assign(claimed, e, { localEcho: false, local: false, failed: false });
+      out.push(claimed);
+    } else {
+      out.push(e);
+    }
+  }
+  for (const e of existing || []) {
+    if (used.has(e)) continue;
+    if (e.seq != null) {
+      if (out.some((x) => x.seq === e.seq)) continue;
+      if (mark == null || e.seq >= mark) out.push(e);
+      continue;
+    }
+    // Unconfirmed lines keep their identity. A snapshot that happens to
+    // contain the same words is not allowed to swallow a second pending
+    // "ok" — only a seq (or a claim above) retires an echo.
+    if (e.localEcho || e.local || e.pending || e.failed) out.push(e);
+  }
+  return out;
+}
+
+/**
+ * Bind one incoming server line onto at most one local echo.
+ * Identity is seq, then localId, then a single unsequenced text match —
+ * never a Set of texts, which would consume every identical pending "ok".
+ */
+export function claimSidebarEcho(list, incoming, used) {
+  const rows = list || [];
+  if (incoming.seq != null) {
+    const bySeq = rows.find((e) => !used.has(e) && e.seq === incoming.seq);
+    if (bySeq) return bySeq;
+  }
+  if (incoming.actor !== 'user') return null;
+  if (incoming.localId) {
+    const byId = rows.find((e) => !used.has(e) && e.seq == null && e.localId === incoming.localId);
+    if (byId) return byId;
+  }
+  return rows.find((e) => !used.has(e) && e.seq == null
+    && (e.localEcho || e.local || e.pending)
+    && e.payload && incoming.payload && e.payload.text === incoming.payload.text) || null;
+}
+
+/** Fold a server sidebar event onto the matching echo, or append. */
+export function acknowledgeSidebarLine(raw, echo) {
+  const ev = normEvent(raw);
+  if (!ev) return null;
+  if (echo && store.sidebar.includes(echo)) {
+    if (ev.seq != null) {
+      const existing = store.sidebar.find((e) => e !== echo && e.seq === ev.seq);
+      if (existing) {
+        Object.assign(existing, ev, { localEcho: false, local: false, failed: false });
+        store.sidebar = store.sidebar.filter((e) => e !== echo);
+        return existing;
+      }
+    }
+    Object.assign(echo, ev, { localEcho: false, local: false, failed: false });
+    return echo;
+  }
+  const claimed = claimSidebarEcho(store.sidebar, ev, new Set());
+  if (claimed) {
+    Object.assign(claimed, ev, { localEcho: false, local: false, failed: false });
+    return claimed;
+  }
+  if (ev.seq != null) {
+    const existing = store.sidebar.find((e) => e.seq === ev.seq);
+    if (existing) {
+      Object.assign(existing, ev, { localEcho: false, local: false, failed: false });
+      return existing;
+    }
+  }
+  store.sidebar.push(ev);
+  return ev;
+}
+
+/** Bind one timeline event onto at most one pending card-chat line. */
+export function claimPendingEcho(pending, incoming, used) {
+  const rows = pending || [];
+  if (incoming.seq != null) {
+    const bySeq = rows.find((e) => !used.has(e) && e.seq === incoming.seq);
+    if (bySeq) return bySeq;
+  }
+  if (incoming.actor !== 'user') return null;
+  if (incoming.localId) {
+    const byId = rows.find((e) => !used.has(e) && e.seq == null && e.localId === incoming.localId);
+    if (byId) return byId;
+  }
+  return rows.find((e) => !used.has(e) && e.seq == null
+    && e.payload && incoming.payload && e.payload.text === incoming.payload.text) || null;
+}
+
+/** Optimistic thread lines the server copy has not yet replaced. */
+export function keepPendingLines(pending, timeline) {
+  const used = new Set();
+  const claimed = new Set();
+  for (const ev of timeline || []) {
+    const echo = claimPendingEcho(pending, ev, used);
+    if (echo) { used.add(echo); claimed.add(echo); }
+  }
+  const known = new Set((timeline || []).map((e) => e.seq).filter((s) => s != null));
+  return (pending || []).filter((p) => {
+    if (claimed.has(p)) return false;
+    if (p.pending || p.failed) return true;
+    if (p.seq != null) return !known.has(p.seq);
+    return true;
+  });
+}
+
+/** Union of two timelines; a shorter older one cannot drop a newer seq. */
+export function mergeTimeline(current, incoming) {
+  const bySeq = new Map();
+  let maxIn = 0;
+  for (const e of incoming || []) {
+    if (!e) continue;
+    if (e.seq != null) {
+      bySeq.set(e.seq, e);
+      if (e.seq > maxIn) maxIn = e.seq;
+    }
+  }
+  for (const e of current || []) {
+    if (!e || e.seq == null) continue;
+    if (!bySeq.has(e.seq) && e.seq >= maxIn) bySeq.set(e.seq, e);
+  }
+  return Array.from(bySeq.values()).sort((a, b) => (a.seq || 0) - (b.seq || 0));
+}
+
 export function isSidebarEvent(ev) {
   // Mirrors the server's sidebar projection exactly: sprint-level user/session
   // lines only, never worker telemetry.
@@ -504,11 +673,9 @@ export function applyEvents(events) {
     if (ev.seq != null) store.seq = Math.max(store.seq, ev.seq);
 
     if (isSidebarEvent(ev)) {
-      // the server's own copy supersedes our optimistic echo
-      if (ev.actor === 'user') {
-        store.sidebar = store.sidebar.filter((e) => !(e.localEcho && e.payload.text === ev.payload.text));
-      }
-      if (!store.sidebar.some((e) => e.seq != null && e.seq === ev.seq)) store.sidebar.push(ev);
+      // Seq first, then one unsequenced echo. Replay of the same seq must
+      // not consume a second identical pending "ok".
+      acknowledgeSidebarLine(ev);
       out.sidebar = true;
       // The Chat button is the only "there's something here" signal in the
       // product: a line from the session that arrived while you were not
@@ -571,6 +738,13 @@ export function applyEvents(events) {
     }
     card.last_event = ev;
     if (ev.kind === 'submitted' || ev.kind === 'verdict') out.needsBoard = true;
+    if (store.detail && store.detail.num === ev.card_num) {
+      const tl = store.detail.timeline || [];
+      if (ev.seq == null || !tl.some((e) => e.seq === ev.seq)) {
+        store.detail.timeline = tl.concat([ev]);
+      }
+      store.detail.pendingLines = keepPendingLines(store.detail.pendingLines, store.detail.timeline);
+    }
   }
   return out;
 }
@@ -860,6 +1034,78 @@ export function sections() {
  * sprint — no chart, no axis, and no number on it bigger than the legend's 12.5px.
  * A segment with nothing in it is dropped rather than drawn as a sliver.
  */
+/** Stable across a no-op refresh, so the meter node can be reused. */
+export function meterPaintVer(secs = sections()) {
+  return meterSegments(secs).map((m) => m.key + ':' + m.count).join(',');
+}
+
+/**
+ * Identity of a card face/row for keyed reconcile. Time-ticking ages are
+ * NOT in here — `tickTimes` patches those in place — so a regular refresh
+ * of an unchanged board does not throw the node away.
+ */
+export function cardPaintVer(card) {
+  if (!card) return '';
+  if (card.pendingSubmit) {
+    return ['pending', card.id || card.key || '', card.error ? 1 : 0, card.title || ''].join('|');
+  }
+  const q = card.question;
+  const ev = card.last_event;
+  // Full normalized face plus the derived bits a paint actually reads.
+  // Time-ticking ages stay out — tickTimes patches those in place.
+  return stableJson({
+    num: card.num,
+    title: card.title || '',
+    body: card.body || '',
+    state: card.state,
+    shown: cardState(card),
+    pinned: !!card.pinned,
+    stuck: !!card.stuck,
+    phase: card.phase || '',
+    phase_expected: card.phase_expected_seconds,
+    agent: card.agent_name || '',
+    queue: card.queue_position,
+    blocked_by: card.blocked_by,
+    blocked_reason: card.blocked_reason || '',
+    bounce: card.bounce_count || 0,
+    long_running: !!card.long_running,
+    error: card.error || '',
+    reason: card.reason || '',
+    model: card.model || '',
+    model_reason: card.model_reason || '',
+    executor: card.executor || '',
+    dispatch: card.dispatch || null,
+    kind: card.kind || '',
+    question: q ? {
+      text: q.text || '',
+      options: (q.options || []).map((o) => o && (o.value || o.label || o)),
+      artifacts: q.artifacts || null,
+    } : null,
+    evidence: evidencePaintVer(card.evidence),
+    conversation: card.conversation || null,
+    last: ev ? { seq: ev.seq, kind: ev.kind, actor: ev.actor, text: eventText(ev) } : null,
+    open: isOpenInRail(card) ? 1 : 0,
+    silent: isSilent(card) ? 1 : 0,
+    needs: needsKind(card),
+    session: store.agentName || '',
+  });
+}
+
+function evidencePaintVer(p) {
+  if (!p || typeof p !== 'object') return null;
+  return {
+    claim: p.claim || '',
+    validate: Array.isArray(p.validate) ? p.validate.length : (p.validate ? 1 : 0),
+    shots: Array.isArray(p.screenshots) ? p.screenshots.length : 0,
+    branch: p.branch || '',
+    live_url: p.live_url || '',
+  };
+}
+
+function stableJson(v) {
+  return JSON.stringify(v);
+}
+
 export function meterSegments(secs = sections()) {
   return METER
     .map((m) => {

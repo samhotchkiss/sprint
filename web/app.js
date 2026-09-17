@@ -8,6 +8,7 @@ import {
   store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
   sections, headline, countFor, loadView, setView, setChatOpen, bounceComposing,
   activeLimits, limitLine, accountLimit, autohealNote, isConversation,
+  keepPendingLines, mergeTimeline, acknowledgeSidebarLine,
 } from './state.js';
 import { renderList } from './list.js';
 import { renderBoard, renderFold } from './board.js';
@@ -131,7 +132,18 @@ function paint() {
   if (store.chatOpen && !store.detail && !store.unit) markSidebarSeen();
   paintChatButton();
 
-  clear(el.main);
+  // Layout identity, not content: switching List ↔ Board (or opening a
+  // report) still starts clean. A live refresh of the SAME layout must not
+  // throw the board away — that is the "every few seconds the cards flash
+  // off and back on" bug. Board/list/phone now reconcile in place.
+  const layout = page ? `page:${page.kind}`
+    : phoneQuery.matches ? 'phone'
+      : foldQuery.matches ? 'fold'
+        : (store.view === 'board' ? 'board' : 'list');
+  if (el.main.dataset.layout !== layout) {
+    clear(el.main);
+    el.main.dataset.layout = layout;
+  }
   paintShell();
   if (page && page.kind === 'reports') renderReportsPage(el.main, app, page);
   else if (page && page.kind === 'report') renderReportPage(el.main, app, page);
@@ -393,10 +405,13 @@ function applyPendingFocus() {
 
 // ---- data ----------------------------------------------------------------
 
+let boardEpoch = 0;
+
 const refreshBoard = debounce(async () => {
+  const epoch = ++boardEpoch;
   try {
     const board = await api.board();
-    applyBoard(board);
+    applyBoard(board, { epoch });
     if (store.detail) syncDetailCard();
     // A board we could actually fetch is proof our credentials are good — so a
     // sign-in wall raised by an earlier 401 comes back down by itself once a
@@ -406,20 +421,27 @@ const refreshBoard = debounce(async () => {
   } catch (err) { handleError(err, null); }
 }, 200);
 
+let detailEpoch = 0;
+
 const refreshDetail = debounce(async () => {
   if (!store.detail) return;
   const num = store.detail.num;
+  const epoch = ++detailEpoch;
   try {
     const res = await api.card(num);
     if (!store.detail || store.detail.num !== num) return;
+    if (epoch !== detailEpoch) return;
     const d = normDetail(res, num);
+    d.timeline = mergeTimeline(store.detail.timeline, d.timeline);
     // Lines still in flight stay, and so does anything that FAILED: a message
     // the board never took has to survive every refresh until you retry it or
-    // give up on it. Dropping it here is how a send became silence.
+    // give up on it. A line that already has a seq stays until the timeline
+    // itself carries that seq — dropping it the moment the POST returned is
+    // how a send appeared, vanished, and came back on reload.
     store.detail = {
       ...store.detail,
       ...d,
-      pendingLines: (store.detail.pendingLines || []).filter((p) => p.pending || p.failed),
+      pendingLines: keepPendingLines(store.detail.pendingLines, d.timeline),
     };
     // Only the rail changed. On a fresh load this fetch lands a beat after the
     // board does, and repainting the whole page for it is the "card comes in
@@ -687,20 +709,21 @@ async function sessionChat(text, images, key, reuse) {
   line.failed = false;
   line.retry = null;
   line.localEcho = true;     // replaced when the server's own copy arrives
+  if (!line.localId) line.localId = idem;
   if (line.sortSeq == null) line.sortSeq = store.seq + 0.5;   // ordering only, never a delivery claim
   if (!reuse) store.sidebar.push(line);
   render();
   try {
     const res = await api.sidebar(text, toBase64List(imgs), idem);
-    line.local = false;
-    if (res && res.event && res.event.payload && res.event.payload.attachments) {
-      line.payload.attachments = res.event.payload.attachments;
-    }
-    const seq = res && res.event && Number(res.event.seq);
-    if (seq && !Number.isNaN(seq)) {
-      line.seq = seq;
-      line.ts = res.event.ts || line.ts;
-      store.seq = Math.max(store.seq, seq);
+    const ev = res && res.event;
+    if (ev) {
+      // Canonical seq: if SSE already folded this event onto an echo, this
+      // call merges onto that same line instead of minting a duplicate.
+      acknowledgeSidebarLine(ev, line);
+      const seq = Number(ev.seq);
+      if (seq && !Number.isNaN(seq)) store.seq = Math.max(store.seq, seq);
+    } else {
+      line.local = false;
     }
     render();
   } catch (err) {
@@ -1428,9 +1451,10 @@ async function boot() {
 }
 
 async function firstLoad() {
+  const epoch = ++boardEpoch;
   try {
     const board = await api.board();
-    applyBoard(board);
+    applyBoard(board, { epoch });
   } catch (err) {
     handleError(err, null);
     if (!(err instanceof ApiError && err.status === 401)) {

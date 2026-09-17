@@ -6,8 +6,10 @@
 import { h } from './util.js';
 
 export function renderMeter(segments) {
-  const frag = document.createDocumentFragment();
-  if (!segments.length) return frag;
+  // One node, not a fragment: keyed reconcile needs a place to stamp
+  // data-k, and a no-op refresh has to be able to keep this exact element.
+  const wrap = h('div.meter-block');
+  if (!segments.length) return wrap;
 
   const bar = h('div.meter', { role: 'img', 'aria-label': segments.map((s) => s.label).join(', ') });
   for (const seg of segments) {
@@ -16,7 +18,7 @@ export function renderMeter(segments) {
       style: { flex: String(seg.count), background: seg.color },
     }));
   }
-  frag.appendChild(bar);
+  wrap.appendChild(bar);
 
   const legend = h('div.legend');
   for (const seg of segments) {
@@ -24,6 +26,6 @@ export function renderMeter(segments) {
       h('span.legend-dot', { style: { background: seg.color } }),
       h('span.legend-label', seg.label)));
   }
-  frag.appendChild(legend);
-  return frag;
+  wrap.appendChild(legend);
+  return wrap;
 }

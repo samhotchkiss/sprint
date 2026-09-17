@@ -10,8 +10,8 @@
 // how many it is holding. No tiles, no cards, no celebration, and (per the
 // spec's hard rule) no count anywhere in the chrome that isn't the expander's
 // own sentence about itself.
-import { h, timeEl } from './util.js';
-import { cardState, store, STATE_LABEL, isOpenInRail } from './state.js';
+import { h, timeEl, reconcile } from './util.js';
+import { cardState, store, STATE_LABEL, isOpenInRail, cardPaintVer } from './state.js';
 
 const MARK = {
   completed: '✓', rejected: '✕', canceled: '✕', duplicate: '·',
@@ -60,27 +60,43 @@ export function renderDone(col, app) {
  */
 export function completeList(cards, app, { moreKey = 'doneMore', visible = DONE_VISIBLE } = {}) {
   const list = h('div.done-list');
-  if (!cards.length) return list;
+  fillCompleteList(list, cards, app, moreKey, visible);
+  return list;
+}
+
+function fillCompleteList(list, cards, app, moreKey, visible) {
+  const items = [];
+  if (!cards.length) { reconcile(list, items); return; }
 
   const showAll = !!store[moreKey];
   const shown = showAll ? cards : cards.slice(0, visible);
   const hidden = cards.length - shown.length;
 
-  for (const card of shown) list.appendChild(doneRow(card, app));
+  for (const card of shown) {
+    items.push({
+      key: 'card:' + card.num,
+      ver: cardPaintVer(card),
+      make: () => doneRow(card, app),
+    });
+  }
 
   // One expander, and it is the only thing here that says a number — because
   // the number IS the sentence ("show 31 older"), not a badge on the chrome.
   if (hidden > 0 || showAll) {
     const older = cards.length - visible;
     if (older > 0) {
-      list.appendChild(h('button.done-more', {
-        type: 'button',
-        'aria-expanded': showAll ? 'true' : 'false',
-        onclick: () => { store[moreKey] = !showAll; app.render(); },
-      }, showAll ? `hide the ${older} older` : `show ${older} older`));
+      items.push({
+        key: 'more',
+        ver: showAll + ':' + older,
+        make: () => h('button.done-more', {
+          type: 'button',
+          'aria-expanded': showAll ? 'true' : 'false',
+          onclick: () => { store[moreKey] = !showAll; app.render(); },
+        }, showAll ? `hide the ${older} older` : `show ${older} older`),
+      });
     }
   }
-  return list;
+  reconcile(list, items);
 }
 
 function doneRow(card, app) {

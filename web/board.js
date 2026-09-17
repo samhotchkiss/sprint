@@ -13,11 +13,12 @@
 // (awaiting review → complete). The two things that are on HIM are deliberately
 // apart: answering a question and signing off a finished branch are not the
 // same job.
-import { h, timeEl, firstLine } from './util.js';
+import { h, timeEl, firstLine, reconcile } from './util.js';
 import {
   boardColumns, cardState, needsKind, motionState, blockedReason, waitingMark,
   meterSegments, sections, isSilent, isStuck, STUCK_HINT, STATE_LABEL,
-  blockedByMark, isOpenInRail,
+  blockedByMark, isOpenInRail, cardPaintVer, meterPaintVer, store,
+  conversations, resolvedConversations,
 } from './state.js';
 import { phaseChip } from './phase.js';
 import { executorTag } from './settings.js';
@@ -33,8 +34,15 @@ export function renderBoard(root, app) {
   // The meter stays in urgency order (need you → in motion → blocked → queued),
   // not column order: it answers "what shape is this sprint in", and the column
   // strip right below it answers "where is everything".
-  root.appendChild(renderMeter(meterSegments(sections())));
-  root.appendChild(boardGrid(app, { fold: false }));
+  //
+  // Keyed, so a refresh that changed nothing replaces nothing. Clearing #main
+  // on every frame is what made every card flash off and back on.
+  reconcile(root, [
+    { key: 'meter', ver: meterPaintVer(), make: () => renderMeter(meterSegments(sections())) },
+    { key: 'grid', ver: 'board', make: () => h('div.board') },
+  ]);
+  const grid = childByKey(root, 'grid');
+  fillBoardGrid(grid, app, { fold: false });
 }
 
 /**
@@ -43,8 +51,25 @@ export function renderBoard(root, app) {
  * pile drops to the "Elsewhere" strip at the bottom as pills.
  */
 export function renderFold(root, app) {
-  root.appendChild(boardGrid(app, { fold: true }));
-  root.appendChild(elsewhereStrip(app));
+  reconcile(root, [
+    { key: 'grid', ver: 'fold', make: () => h('div.fold-cols') },
+    { key: 'elsewhere', ver: elsewhereVer(), make: () => elsewhereStrip(app) },
+  ]);
+  const grid = childByKey(root, 'grid');
+  fillBoardGrid(grid, app, { fold: true });
+}
+
+function childByKey(root, key) {
+  for (const n of Array.from(root.children)) {
+    if (n.dataset && n.dataset.k === key) return n;
+  }
+  return null;
+}
+
+function elsewhereVer() {
+  const col = boardColumns().find((c) => c.key === 'waiting');
+  const cards = col ? col.sections.reduce((all, s) => all.concat(s.cards), []) : [];
+  return cards.map(cardPaintVer).join(';');
 }
 
 /**
@@ -74,8 +99,8 @@ export function collapsePlan(lanes, cursorCol) {
   return lanes.map((l) => l.empty && anyOccupied && l.key !== cursorCol);
 }
 
-function boardGrid(app, { fold }) {
-  const grid = h('div', { class: fold ? 'fold-cols' : 'board' });
+function fillBoardGrid(grid, app, { fold }) {
+  if (!grid) return;
   // On the Fold the waiting pile becomes the Elsewhere strip; everything that is
   // live, or waiting on the user, keeps a real column.
   const wanted = fold
@@ -88,7 +113,8 @@ function boardGrid(app, { fold }) {
     .filter((col) => wanted.includes(col.key))
     .map((col) => {
       // The Needs-you column's lower section: ongoing threads, below the
-      // questions, in the same place the List puts them.
+      // questions, in the same place the List puts them. Presence only — the
+      // body reconciles the actual block.
       const convo = col.key === 'needs_you' ? conversationBlock(app, { compact: true }) : null;
       return { col, key: col.key, convo, empty: !col.count && !convo };
     });
@@ -103,62 +129,133 @@ function boardGrid(app, { fold }) {
   grid.style.gridTemplateColumns = built
     .map((b) => (b.collapsed ? 'var(--col-sliver)' : 'var(--col-track)'))
     .join(' ');
+  grid.className = fold ? 'fold-cols' : 'board';
 
-  for (const { col, convo, collapsed } of built) {
-    // A sliver is its header and nothing else — there is no body to draw, no
-    // scroll position to remember, and nothing in it for the cursor to land on.
-    if (collapsed) {
-      grid.appendChild(h('section.col', { class: `col col-${col.key} is-collapsed` },
-        columnHead(col, { collapsed: true })));
-      continue;
-    }
-    // remember where each column was scrolled to across re-renders
-    const prev = scrollMemo.get(col.key);
+  reconcile(grid, built.map((b) => ({
+    key: 'col:' + b.key,
+    ver: b.collapsed ? 'collapsed' : 'open',
+    data: { built: b, app },
+    make: () => makeColumn(b, app),
+  })));
+}
 
-    const body = h('div.col-body', { 'data-col': col.key });
-    if (!col.count && !convo) body.appendChild(h('p.col-empty', col.empty));
-    // Sections appear only when they have something in them — an empty "Held"
-    // heading is a promise of a pile that isn't there.
-    for (const sec of col.sections) {
-      if (!sec.cards.length) continue;
-      if (sec.label && col.sections.length > 1) {
-        body.appendChild(h('div.col-sec',
+function makeColumn(b, app) {
+  const col = b.col;
+  // A sliver is its header and nothing else — there is no body to draw, no
+  // scroll position to remember, and nothing in it for the cursor to land on.
+  if (b.collapsed) {
+    return h('section.col', { class: `col col-${col.key} is-collapsed` },
+      columnHead(col, { collapsed: true }));
+  }
+  const head = columnHead(col, { collapsed: false });
+  const body = h('div.col-body', { 'data-col': col.key });
+  fillColBody(body, b, app);
+  bindColScroll(body, col.key);
+  const node = h('section.col', { class: `col col-${col.key}` }, head, body);
+  node._sync = ({ built, app: next }) => {
+    const countEl = head.querySelector('.col-count');
+    if (countEl) countEl.textContent = String(built.col.count);
+    fillColBody(body, built, next);
+  };
+  return node;
+}
+
+function bindColScroll(body, key) {
+  const prev = scrollMemo.get(key);
+  if (prev) body.scrollTop = prev;
+  if (body._scrollBound) return;
+  body._scrollBound = true;
+  body.addEventListener('scroll', () => scrollMemo.set(key, body.scrollTop), { passive: true });
+}
+
+function fillColBody(body, b, app) {
+  const col = b.col;
+  const items = [];
+  if (!col.count && !b.convo) {
+    items.push({ key: 'empty', ver: col.empty || '1', make: () => h('p.col-empty', col.empty) });
+  }
+  // Sections appear only when they have something in them — an empty "Held"
+  // heading is a promise of a pile that isn't there.
+  for (const sec of col.sections) {
+    if (!sec.cards.length) continue;
+    if (sec.label && col.sections.length > 1) {
+      const n = sec.count != null ? sec.count : sec.cards.length;
+      items.push({
+        key: 'sec:' + sec.key,
+        ver: n + ':' + sec.label,
+        make: () => h('div.col-sec',
           h('span.col-sec-name', sec.label),
           h('span.grow'),
-          h('span.col-sec-count', String(sec.count != null ? sec.count : sec.cards.length))));
-      }
-      if (sec.note) body.appendChild(h('p.col-note', sec.note));
-      // Awaiting review is the one section whose tiles ARE interactive, on the
-      // user's ruling that an easy yes should not cost a drawer. It is ONE card
-      // per work unit (card #55) — opening one fills the rail with an outline of
-      // everything that changed; everything else on the Board stays a face that
-      // only opens the rail.
-      if (col.key === 'review' && sec.key === 'awaiting') {
-        body.appendChild(reviewBlock(sec.cards, app, { compact: true }));
-        continue;
-      }
-      // Complete is a compact list, not a stack of tiles. User, verbatim: "we
-      // need completed to just be a compact list. you can click each item to
-      // open the card. and, beyond 20 completed, they're hidden and you can
-      // expand that list." Finished work is history — it should read like an
-      // index, not compete with the work that is still live.
-      if (col.key === 'review' && sec.key === 'complete') {
-        body.appendChild(completeList(sec.cards, app));
-        continue;
-      }
-      const group = h('div.col-group', { class: sec.quiet ? 'col-group is-quiet' : 'col-group' });
-      for (const card of sec.cards) group.appendChild(renderCardFace(card, app));
-      body.appendChild(group);
+          h('span.col-sec-count', String(n))),
+      });
     }
-    if (convo) body.appendChild(convo);
-    if (prev) requestAnimationFrame(() => { body.scrollTop = prev; });
-    body.addEventListener('scroll', () => scrollMemo.set(col.key, body.scrollTop), { passive: true });
-
-    grid.appendChild(h('section.col', { class: `col col-${col.key}` },
-      columnHead(col, { collapsed: false }),
-      body));
+    if (sec.note) {
+      items.push({ key: 'note:' + sec.key, ver: 1, make: () => h('p.col-note', sec.note) });
+    }
+    // Awaiting review is the one section whose tiles ARE interactive, on the
+    // user's ruling that an easy yes should not cost a drawer. It is ONE card
+    // per work unit (card #55) — opening one fills the rail with an outline of
+    // everything that changed; everything else on the Board stays a face that
+    // only opens the rail.
+    if (col.key === 'review' && sec.key === 'awaiting') {
+      items.push({
+        key: 'awaiting',
+        ver: sec.cards.map(cardPaintVer).join(';'),
+        make: () => reviewBlock(sec.cards, app, { compact: true }),
+      });
+      continue;
+    }
+    // Complete is a compact list, not a stack of tiles. User, verbatim: "we
+    // need completed to just be a compact list. you can click each item to
+    // open the card. and, beyond 20 completed, they're hidden and you can
+    // expand that list." Finished work is history — it should read like an
+    // index, not compete with the work that is still live.
+    if (col.key === 'review' && sec.key === 'complete') {
+      items.push({
+        key: 'complete',
+        ver: sec.cards.map(cardPaintVer).join(',') + ':' + store.doneMore,
+        make: () => completeList(sec.cards, app),
+      });
+      continue;
+    }
+    items.push({
+      key: 'group:' + sec.key,
+      ver: sec.quiet ? 'q' : 'n',
+      data: { sec, app },
+      make: () => {
+        const group = h('div.col-group', { class: sec.quiet ? 'col-group is-quiet' : 'col-group' });
+        fillGroup(group, sec, app);
+        group._sync = ({ sec: next, app: nextApp }) => fillGroup(group, next, nextApp);
+        return group;
+      },
+    });
   }
-  return grid;
+  if (col.key === 'needs_you') {
+    const convo = conversationBlock(app, { compact: true });
+    if (convo) {
+      items.push({
+        key: 'convo',
+        ver: convoVer(),
+        make: () => conversationBlock(app, { compact: true }),
+      });
+    }
+  }
+  reconcile(body, items);
+}
+
+function fillGroup(group, sec, app) {
+  reconcile(group, sec.cards.map((card) => ({
+    key: card.pendingSubmit ? 'pending:' + (card.id || card.key) : 'card:' + card.num,
+    ver: cardPaintVer(card),
+    data: card,
+    make: () => renderCardFace(card, app),
+  })));
+}
+
+function convoVer() {
+  return conversations().map(cardPaintVer).join(';')
+    + '|' + resolvedConversations().map(cardPaintVer).join(',')
+    + ':' + store.convoMore;
 }
 
 /**

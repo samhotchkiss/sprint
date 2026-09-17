@@ -21,7 +21,7 @@ import { h, ageSuffix, richText, firstLine, reconcile, timeEl, autolink } from '
 import { attachmentUrl, attachmentCaption } from './api.js';
 import {
   SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, normArtifacts, actorLabel,
-  sessionLabel, store, attachedImages, cardComposerKey, draft,
+  sessionLabel, store, attachedImages, cardComposerKey, draft, claimPendingEcho,
 } from './state.js';
 import { detailBlock } from './detail.js';
 import { splitAttachments, docsVer, reportRow } from './reports.js';
@@ -56,7 +56,13 @@ export function threadItems(detail, app) {
 
   const items = (detail.timeline || []).slice();
   const known = new Set(items.map((e) => e.seq).filter((s) => s != null));
+  const claimed = new Set();
+  for (const ev of items) {
+    const echo = claimPendingEcho(detail.pendingLines, ev, claimed);
+    if (echo) claimed.add(echo);
+  }
   for (const p of detail.pendingLines || []) {
+    if (claimed.has(p)) continue;
     if (p.seq != null && known.has(p.seq)) continue;
     items.push(p);
   }
@@ -192,7 +198,8 @@ export function chatItems(lines, app) {
   }
   const out = [];
   lines.forEach((ev, i) => {
-    const key = ev.seq != null ? 's' + ev.seq : 'echo' + i;
+    const key = ev.seq != null ? 's' + ev.seq
+      : (ev.localId ? 'l' + ev.localId : 'echo' + i);
     out.push({ key, ver: 1, data: ev, make: () => message(ev, app) });
     const atts = ev.payload && (ev.payload.attachments || ev.payload.images);
     if (Array.isArray(atts) && atts.length) {
