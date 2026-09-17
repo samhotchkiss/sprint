@@ -1299,3 +1299,13 @@ facts, never which facts are gathered.
 Multi-user, public exposure, auto-dup-detection, priority pickers/drag-reorder, batch blind-approve,
 session summaries beyond the end-sprint card, phone-portrait optimization, agent-list integration
 (possible later mirror).
+
+## Deterministic event dispatch
+
+`bin/sprint-dispatch` is external ingress, not an autonomous board agent. It
+may read state and deliver a bounded wake signal to the registered coordinator;
+it cannot assign work, make product decisions, or advance the consumer cursor.
+Normal quiet polling must make zero model calls. A held OS lock and fresh lease
+exclude simultaneous hub autoheal. Durable pre-send intent prevents blind resend
+after uncertain delivery. Explicit acknowledgment, failure visibility, a rolling
+wake cap, and safe ownership handoff are required. See `docs/EVENT-DISPATCH.md`.

@@ -64,7 +64,7 @@ Interpret the canonical host terms as follows:
 | SendMessage | `collaboration.send_message` for a running turn; `collaboration.followup_task` to resume an idle worker |
 | Agent/task inspection | `collaboration.list_agents` |
 | Stop a canceled worker | `collaboration.interrupt_agent` |
-| Monitor | the yielded-tail ingress below |
+| Monitor | `sprint-dispatch`, outside the model turn |
 
 Codex task names accept underscores, not the board's hyphens. Use
 `sprint_card_<n>`, `sprint_batch_<id>`, and `sprint_review_<n>` as collaboration
@@ -77,26 +77,47 @@ Before relaying to a worker, call `list_agents`. Send to a running worker; use
 `followup_task` for an idle worker. A worker missing from the current agent tree
 is dead for recovery purposes; follow the canonical fresh-agent procedure.
 
-## Persistent event ingress
+## Event-driven ingress: end idle turns
 
-Codex has no tool literally named `Monitor`, but a yielded `functions.exec`
-cell provides the same behavior:
+Use `bin/sprint-dispatch`, the deterministic watcher described in the canonical
+skill. It owns polling and `tmux-send`; it makes **no model calls**. There is no
+Codex `Monitor` emulation, yielded-tail loop, timed `functions.wait`, or
+`write_stdin` polling loop for ingress. Never keep a Codex turn alive merely
+because a worker or test process is running.
 
-1. Start `bin/sprintd tail --after <persisted-cursor>` with `exec_command` and a
-   short initial yield.
-2. In the same JavaScript cell, loop on `write_stdin` for that command session.
-   When output arrives, emit it with `text(...)` and call `yield_control()`.
-3. Keep the returned cell id. After handling and fully draining the event log,
-   call `functions.wait` on that cell to return to the same live tail.
-4. A tail line is only a wake signal. Always fetch the full event/card and run
-   the canonical cursor drain before acting.
+After confirming ownership and registering this session's exact pane:
 
-If a yielded cell is unavailable, use the canonical `sprintd wait --timeout
-60` fallback. Re-arm before draining every time. Keep the orchestrator turn
-alive while the sprint is open; use commentary for concise progress and put
-all board-originated replies back on the board. If the host forces a turn end,
-re-ground before the next action and rely on the correctly registered tmux
-autoheal target for recovery.
+```bash
+"$SPRINT_REPO/bin/sprint-dispatch" start --project-root "$PROJECT_ROOT" --target "%5"
+```
+
+Replace `%5` with the pane returned by tmux, never a guessed address. Read the
+startup result. Do not claim the watcher is running if startup failed. After
+handling the available event batch and persisting the orchestrator cursor,
+**end your turn**. Workers must report decisions/results through the board so
+the watcher can wake you. Stop the dispatcher on handoff or End Sprint; do not
+leave a second ingress listener attached. The watcher will stop on target
+ownership changes without claiming the new session.
+
+If no tmux target exists, report that unattended wakeup is unavailable. Handle
+the current batch and return; do not replace the missing channel with paid
+model polling. The user can resume manually or set up a dedicated tmux session.
+
+### Small dispatcher, separate specialists
+
+For a newly created dedicated routing session, prefer `gpt-5.6-luna` with low
+reasoning. Do not silently change the user's active session model. The watcher
+itself is ordinary code and needs no model configuration or API credentials.
+Keep routing context to the incoming event, relevant card, worker assignment,
+and applicable standing instructions. Do not fork a whole coordinator history
+into workers. Use stronger agents for ambiguous decisions, complex work, and
+review. The dispatcher should assign once, then wait outside the model; worker
+completion, a question, or failure is the next reason to wake.
+
+Bound each assignment with an outcome, allowed scope, and time/usage limit.
+No repeated “status?” follow-ups. No automatic review loop without new changes
+or evidence. When a worker finishes, handle its result once; do not turn a
+finished specialist into a permanent polling assistant.
 
 Shell environments do not persist automatically across Codex tool calls.
 Re-read `.sprint/server.json` after restarts and pass `SPRINT_SERVER` and

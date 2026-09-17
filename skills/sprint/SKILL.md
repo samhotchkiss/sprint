@@ -194,7 +194,7 @@ went green, the overlapping card landed, the dependency shipped).
    below; do it before you dispatch anything.
 8. Reap orphaned worktrees (see step 3's reap procedure) — cheap
    insurance even on a clean boot.
-9. Arm your ingress (step 2's `sprintd tail` under Monitor) and enter the
+9. Arm your ingress (step 2's `sprint-dispatch`) and enter the
    drain loop (step 2). This is where boot and resume converge into the
    same loop — from here on there is no difference between "just
    started" and "been running for days."
@@ -235,6 +235,8 @@ dispatch before the cursor is current — a fresh agent on top of an
 un-drained cursor re-does work that already landed.
 
 ### The cadence — re-ground on a clock, not on a feeling
+
+This cadence applies only during active work; never wake a resting model for it.
 
 **Re-ground every 50 tool calls, or every 30 minutes of continuous
 work, whichever comes first** (`reason=periodic`). Not when you feel
@@ -322,11 +324,8 @@ plan'."
 anything — do these in this exact order:**
 
 1. **Make sure your ingress is armed FIRST**, before you do anything
-   else, using your current persisted cursor. See "Ingress" just below
-   for the two modes: with `sprintd tail` under Monitor this is normally
-   already true (it survives drops on its own and runs the whole
-   sprint), so it's a check, not a relaunch. With the `wait` fallback it
-   IS a relaunch, and it goes before the drain every single time.
+   else. The deterministic `sprint-dispatch` process stays armed between
+   turns; do not restart it per event or attach a second tail.
 2. **Then drain**: `GET /api/events?after=$CURSOR&limit=50` in a loop
    until the response is empty. Send the waiter marker on these drains —
    `-H "X-Sprint-Waiter: session"` (or `&waiter=1`) — so the board counts
@@ -338,9 +337,9 @@ anything — do these in this exact order:**
    end of a big backlog — a moving cursor is how the user's messages flip
    from "landed" to "session is on it", and a long silent catch-up shows
    the board as **catching up** rather than caught up.
-3. **Only once the page is empty** does step 1 repeat (you armed your
-   ingress before draining, so there's no gap where a new event could
-   land and go unnoticed — that's the whole point of the ordering).
+3. **Once the page is empty, end the turn** unless immediate work remains.
+   The external watcher remains armed; the next actionable event starts the
+   next drain. Do not run an idle model loop.
 
 Ingress is **transport**. Whatever wakes you — a tail line, a waiter
 exit — it tells you sooner than a dumb poll would and nothing more. The
@@ -357,79 +356,52 @@ on in a previous, interrupted drain — your actions themselves should be
 idempotent where possible (e.g. don't re-dispatch a card that already
 has a live `agent_name`).
 
-### Ingress: how you find out something happened
+### Ingress: deterministic watcher, not an agent loop
 
-**Primary — `sprintd tail` under the Monitor tool.** One held-open
-connection, one notification per real event, and nothing at all while
-the board is quiet:
+With an owned, registered tmux pane, start one **ordinary process**:
 
-```
-Monitor(
-  command: "bin/sprintd tail --after $CURSOR",
-  description: "sprint board events",
-  persistent: true)
+```bash
+"$SPRINT_REPO/bin/sprint-dispatch" start --project-root "$PROJECT_ROOT" --target "%5"
 ```
 
-Each line it prints is one event, pre-summarised:
+Use the exact pane ID returned by tmux. The watcher validates the board's
+registered target; it never registers itself, changes assignments, or advances
+the orchestrator cursor. It polls the local event API every two seconds without
+calling a model and sends a compact wake signal through `tmux-send`. It ignores
+heartbeats, cursor changes, routine progress, and the session's own posts.
+User input, worker evidence/questions/errors, state transitions requiring action,
+unblocked dependencies, and stalled-worker signals trigger a wakeup.
 
+On wake, drain and act using the contract above. When the available work is
+handled and the cursor is persisted, **END YOUR TURN**. Do not stay alive by
+sleeping, checking clocks, polling worker output, or requesting status. Launch
+long-running tests in a worker that reports its outcome to the board. Workers
+continue independently; the next actionable event wakes the coordinator.
+
+A burst is batched; only one wakeup may await acknowledgment. Delivery is saved
+before typing, so an uncertain send or crash cannot blindly repeat the prompt.
+Only the coordinator's persisted cursor acknowledges consumption. After five
+minutes without acknowledgment, status becomes `needs_attention`; it does not
+send another prompt. Inspect the pane and `sprint-dispatch status`. After
+resolving the cause, `stop` then `start --reset` explicitly retries from the
+board cursor. Never reset on a timer. A stale/crashed watcher releases normal
+hub recovery; a healthy watcher owns delivery so the hub does not also wake it.
+
+```bash
+bin/sprint-dispatch status --project-root "$PROJECT_ROOT"
+bin/sprint-dispatch stop --project-root "$PROJECT_ROOT"
 ```
-{"seq":48,"card":5,"actor":"user","kind":"chat","reply_to":"card:5","text":"can you also…"}
-```
 
-- Heartbeats and cursor moves are consumed and never printed, so an idle
-  board costs you **zero** wakeups (the old 60s long-poll cost you one a
-  minute, forever, whether or not anything happened).
-- **Your own posts are suppressed by default, so your standing tail never
-  wakes you on your own writing.** Everything you write as
-  `actor: "session"` — sidebar replies, notes on cards, status lines —
-  used to come straight back down this stream and wake you to read what
-  you had just said. `actor: "session"` events are now dropped here for
-  the same reason heartbeats are: a wakeup should mean *somebody else
-  moved*. Nothing else changes — user, worker and server events (that
-  includes `agent_silent` and `stuck`) all still wake you, and the event
-  is still in the log, so a cursor drain still sees it. Pass
-  `--include-self` if you ever want the raw stream back (debugging the
-  board itself, mostly).
-- It **never exits on its own.** It reconnects through drops by itself,
-  resuming from the last seq — so one Monitor call lasts the sprint.
-  Re-arm only if the monitor itself reports that the process exited.
-- Two lines are not events, and both mean act now:
-  `{"error":"unreachable"}` — the board has been gone a full minute; run
-  `bin/sprintd start` (idempotent) and say so in the sidebar once it's
-  back. `{"restart":true,…}` — a different sprintd process is answering
-  on that port; re-read `.sprint/server.json` (the token may have
-  rotated) and drain from your cursor. Neither is a reason to re-arm:
-  the tail is still running and will pick the stream back up.
-- `--after $CURSOR` catches you up from the cursor before it streams, so
-  arming it after a gap replays exactly what you missed and nothing else.
-- The tail holds the stream open with the waiter marker, so **sitting on
-  it is your proof of life** — the board shows the session as live for
-  exactly as long as your tail is attached, the same way the waiter's
-  polling used to.
-- `--user-only` narrows it to `actor: "user"` events. That is the subset
-  you must answer *promptly*, but it also means `agent_silent`, `stuck`,
-  `evidence` and worker `error` events stop waking you — so use it only
-  while you are genuinely parked on a human (hold mode, or every card is
-  in `ready` waiting on a verdict), and go back to the unfiltered tail
-  the moment agents are running.
+Stop it before handoff or End Sprint. A target change stops it automatically.
+Use a process supervisor to restart `run` after crashes; persisted delivery
+state survives restart. No model is needed to supervise the watcher.
 
-**Fallback — the `wait` long-poll.** `bin/sprintd wait --after $CURSOR
---timeout 60`, run as a background Bash task; its exit is your wakeup.
-Exit 0 = events are waiting. Exit 2 = timeout, nothing happened →
-relaunch with the same cursor. Any other exit = server unreachable → run
-`bin/sprintd start` again (idempotent) and retry; if it keeps failing,
-post what's happening to the sidebar so it isn't silent, and keep
-retrying — never give up unattended (restore, log, move on). Reach for
-it when:
-
-- the Monitor tool isn't available to you, or a monitor was
-  auto-stopped for volume; or
-- you want a **crash detector** alongside the tail. A tail that is
-  wedged rather than dead looks identical to a quiet board. One
-  `wait --after $CURSOR --timeout 900` in the background, re-armed each
-  time it exits, is a cheap 15-minute "am I still attached" check that
-  costs four wakeups an hour and catches the case the tail can't
-  report on: itself.
+Without tmux, native host event notifications may be used when they genuinely
+wake only on new events. Otherwise report the missing wake channel and return
+after the current batch. **Do not fall back to model-driven timed polling.**
+`sprintd tail` and `wait` remain diagnostic/transport tools for external code,
+not a reason to keep an agent turn running. See `docs/EVENT-DISPATCH.md` for
+recovery, lightweight routing, and process-supervisor setup.
 
 ### Where the reply goes: `payload.reply_to` is the routing key
 
@@ -1861,6 +1833,8 @@ and #128 been blocked so long," answer AND act if action is warranted
 is actually blocking it anymore).
 
 ## End sprint
+
+First stop `sprint-dispatch` for this project; leave its persisted state intact.
 
 `POST /api/sprint {"action":"close"}`. Post one summary as a sidebar
 note (or a synthetic sprint-level card, whichever the API supports at

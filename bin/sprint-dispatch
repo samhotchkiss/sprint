@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""Deterministic Sprint ingress. No model, shell evaluation, or board mutations.
+
+One process per data directory owns the flock. Delivery is recorded BEFORE
+tmux-send: a crash or uncertain submission must never replay a prompt blindly.
+The board's orchestrator cursor, never this reader's cursor, acknowledges work.
+"""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return default
+
+
+def write_json(path, value):
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w") as out:
+        os.chmod(tmp, 0o600)
+        json.dump(value, out)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, path)
+
+
+def actionable(event):
+    """Only lifecycle/decision events, never progress, heartbeats or our echo."""
+    actor, kind = event.get("actor"), event.get("kind")
+    payload = event.get("payload") or {}
+    if actor == "session" or kind in ("heartbeat", "cursor", "progress", "phase"):
+        return False
+    if actor == "user":
+        return True
+    if kind in ("submitted", "chat", "answer", "question", "evidence", "verdict",
+                "error", "agent_silent", "stuck", "limit_cleared"):
+        return True
+    if kind == "state":
+        return payload.get("to", payload.get("state")) in (
+            "queued", "ready", "integrating", "failed", "blocked", "needs_you",
+            "completed", "canceled", "rejected")
+    if kind == "note":
+        return bool(payload.get("restart_pending") or (
+            payload.get("settings") and payload.get("by") == "user") or (
+            payload.get("blocked_by_change") and payload.get("blocked_by") is None))
+    return False
+
+
+def new_state(target, cursor):
+    return dict(version=1, target=target, scanned=cursor, acknowledged=cursor,
+                pending=[], inflight=None, status="idle", deliveries=0)
+
+
+def collect(state, events, cursor):
+    # A rollback/restore requires an explicit restart from the restored cursor.
+    if cursor < state["acknowledged"]:
+        raise ValueError("board cursor moved backwards; inspect before resetting dispatcher")
+    state["acknowledged"] = cursor
+    state["pending"] = [p for p in state["pending"] if p["seq"] > cursor]
+    if state["inflight"] and cursor >= state["inflight"]["through"]:
+        state["inflight"] = None
+    for ev in events:
+        seq = int(ev["seq"])
+        if seq <= state["scanned"]:
+            continue
+        if seq > cursor and actionable(ev):
+            state["pending"].append(dict(seq=seq, card=ev.get("card_num"),
+                                         kind=ev["kind"]))
+            if len(state["pending"]) > 256:
+                # Keep range endpoints; full event contents remain on the board.
+                state["pending"].pop(1)
+        state["scanned"] = seq
+
+
+def wake_text(project, state):
+    pending = state["pending"]
+    cards = sorted({p["card"] for p in pending if isinstance(p["card"], int)})
+    return ("Sprint events need handling. Project: %s\n"
+            "Events through %d; cards: %s. This is a wake signal, not a task brief.\n"
+            "Verify you own this board. Read its persisted orchestrator cursor and "
+            "drain /api/events from that cursor. Read full relevant cards, answer "
+            "user messages, and route bounded work to the appropriate worker. "
+            "Do not duplicate an active assignment. Acknowledge handled events "
+            "through /api/cursors/orchestrator. When there is no immediate "
+            "decision left, END YOUR TURN. sprint-dispatch is watching; do not "
+            "poll, sleep, tail logs, or keep a model turn alive while waiting."
+            % (project, pending[-1]["seq"], ", ".join(map(str, cards[:20])) or "sidebar"))
+
+
+class Board:
+    def __init__(self, data):
+        self.data = data
+
+    def get(self, path):
+        # Reload for server restarts/token rotation. Loopback only; no proxy.
+        info = read_json(self.data / "server.json")
+        if not info:
+            raise RuntimeError("board is not running")
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (int(info["port"]), path),
+            headers={"Authorization": "Bearer " + info["token"]})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=5) as response:
+            return json.load(response)
+
+
+def tick(state, board, project, save, send, at, ack_timeout=300, max_wakes=30):
+    settings = board.get("/api/settings")
+    target = settings.get("session_tmux_window",
+                          settings.get("settings", {}).get("session_tmux_window"))
+    if target != state["target"]:
+        state["status"] = "ownership_changed"
+        save()
+        return False
+    events = board.get("/api/events?after=%d&limit=500" % state["scanned"])
+    if int(events["head"]) < state["scanned"]:
+        raise ValueError("board history moved backwards; inspect before resetting dispatcher")
+    collect(state, events["events"], int(events["cursor"]))
+    # Read all pages before dispatch, so a burst produces one wakeup.
+    if int(events["head"]) > state["scanned"]:
+        state["status"] = "collecting"
+        save()
+        return True
+    if state["inflight"]:
+        flight = state["inflight"]
+        state["status"] = ("needs_attention" if at - flight["at"] >= ack_timeout
+                           or flight.get("result") not in (0, None)
+                           else "awaiting_ack")
+        save()
+        return True
+    if not state["pending"]:
+        state["status"] = "idle"
+        save()
+        return True
+    if board.get("/api/autoheal").get("account_limited"):
+        state["status"] = "account_limited"
+        save()
+        return True
+    state["wake_times"] = [t for t in state.get("wake_times", []) if at - t < 3600]
+    if len(state["wake_times"]) >= max_wakes:
+        state["status"] = "budget_limited"
+        save()
+        return True
+    # Revalidate ownership and the cursor immediately before sending.
+    settings = board.get("/api/settings")
+    if settings.get("session_tmux_window", settings.get("settings", {}).get(
+            "session_tmux_window")) != state["target"]:
+        state["status"] = "ownership_changed"
+        save()
+        return False
+    cursor = int(board.get("/api/cursors/orchestrator")["seq"])
+    collect(state, [], cursor)
+    if not state["pending"]:
+        state["status"] = "idle"
+        save()
+        return True
+    state["inflight"] = dict(through=state["pending"][-1]["seq"], at=at,
+                             result=None)
+    state["status"] = "dispatching"
+    state["deliveries"] += 1
+    state["wake_times"].append(at)
+    save()  # Crash after this point is uncertain; never blindly resend.
+    try:
+        code = send(state["target"], wake_text(project, state))
+    except (OSError, subprocess.TimeoutExpired):
+        code = -1
+    state["inflight"]["result"] = code
+    state["status"] = "awaiting_ack" if code == 0 else "needs_attention"
+    save()
+    return True
+
+
+def lock_file(data):
+    data.mkdir(parents=True, exist_ok=True)
+    handle = open(data / "dispatch.lock", "a+")
+    os.chmod(data / "dispatch.lock", 0o600)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def status(data):
+    probe = lock_file(data)
+    running = probe is None
+    if probe:
+        probe.close()
+    result = read_json(data / "dispatch.json", {})
+    return dict(result, running=running)
+
+
+def run(args, lease):
+    data, project = args.data, args.project_root
+    board = Board(data)
+    state = read_json(data / "dispatch.json")
+    if state and state["target"] != args.target and not args.reset:
+        raise ValueError("saved dispatcher belongs to another target; inspect and use --reset")
+    if not state or args.reset:
+        state = new_state(args.target, int(board.get("/api/cursors/orchestrator")["seq"]))
+    # The lock, not a PID, proves ownership. This nonce also scopes stop requests.
+    instance = os.environ.pop("SPRINT_DISPATCH_INSTANCE", None) or secrets.token_hex(16)
+    state.update(instance=instance, pid=os.getpid(), project_root=str(project),
+                 ack_timeout=args.ack_timeout)
+    state["status"] = "awaiting_ack" if state["inflight"] else "idle"
+    stopping = False
+
+    def stop(signum, frame):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    def save():
+        state["heartbeat_at"] = time.time()
+        write_json(data / "dispatch.json", state)
+
+    def send(target, text):
+        return subprocess.run([args.tmux_send, "--no-stash", "--wait", "0",
+                               target, text], timeout=20, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode
+
+    save()
+    try:
+        while not stopping:
+            requested = read_json(data / "dispatch-stop.json", {})
+            if requested.get("instance") == instance:
+                break
+            try:
+                if not tick(state, board, project, save, send, time.time(),
+                            args.ack_timeout, args.max_wakes_per_hour):
+                    break
+                state.pop("error", None)
+            except (OSError, ValueError, RuntimeError, KeyError) as exc:
+                # Never echo exception text: an HTTP/auth error may contain secrets.
+                state["status"] = "unavailable"
+                state["error"] = type(exc).__name__
+                save()
+            time.sleep(args.poll)
+    finally:
+        state["status"] = "stopped"
+        save()
+        lease.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("start", "run", "status", "stop"))
+    parser.add_argument("--project-root", type=Path, default=Path.cwd())
+    parser.add_argument("--data-dir", type=Path)
+    parser.add_argument("--target", help="exact already-registered tmux pane, e.g. %%5")
+    parser.add_argument("--poll", type=float, default=2)
+    parser.add_argument("--ack-timeout", type=float, default=300)
+    parser.add_argument("--max-wakes-per-hour", type=int, default=30)
+    parser.add_argument("--tmux-send", default=os.path.expanduser("~/.local/bin/tmux-send"))
+    parser.add_argument("--reset", action="store_true",
+                        help="explicitly discard delivery state after inspecting the target")
+    args = parser.parse_args()
+    args.project_root = args.project_root.resolve()
+    args.data = (args.data_dir or args.project_root / ".sprint").resolve()
+    if not 0.1 <= args.poll <= 10 or not 30 <= args.ack_timeout <= 3600:
+        parser.error("poll must be 0.1–10 seconds; ack-timeout must be 30–3600 seconds")
+    if not 1 <= args.max_wakes_per_hour <= 120:
+        parser.error("max-wakes-per-hour must be 1–120")
+    if args.command == "status":
+        print(json.dumps(status(args.data)))
+        return 0
+    if args.command == "stop":
+        current = status(args.data)
+        deadline = time.monotonic() + 30
+        requested = None
+        while current.get("running") and time.monotonic() < deadline:
+            instance = current.get("instance")
+            if instance and instance != requested:
+                write_json(args.data / "dispatch-stop.json", {"instance": instance})
+                requested = instance
+            # A concurrent start may hold the lock before publishing its nonce.
+            # Follow that publication rather than stopping an old PID or nonce.
+            time.sleep(.1)
+            current = status(args.data)
+        result = status(args.data)
+        print(json.dumps(result))
+        return 1 if result["running"] else 0
+    if not args.target or not re.fullmatch(r"%[0-9]+", args.target):
+        parser.error("--target must be an exact tmux pane id, e.g. %5")
+    inherited = os.environ.pop("SPRINT_DISPATCH_LOCK_FD", None)
+    lease = (os.fdopen(int(inherited), "a+") if inherited is not None
+             and args.command == "run" else lock_file(args.data))
+    if lease is None:
+        current = status(args.data)
+        if current.get("target") != args.target or args.reset:
+            parser.error("another dispatcher owns this board; stop it before changing/resetting")
+        print(json.dumps(current))
+        return 0
+    # Refuse old boards where autoheal would compete with normal dispatch.
+    capability = Board(args.data).get("/api/autoheal")
+    if not capability.get("event_dispatch_supported"):
+        parser.error("board lacks event dispatch support; update sprintd first")
+    if capability.get("tmux_window") != args.target:
+        parser.error("target does not match the board's registered owner")
+    if args.command == "run":
+        run(args, lease)
+        return 0
+    initial = read_json(args.data / "dispatch.json")
+    if initial and initial["target"] != args.target and not args.reset:
+        parser.error("saved dispatcher belongs to another target; inspect and use --reset")
+    if not initial or args.reset:
+        initial = new_state(args.target, int(Board(args.data).get(
+            "/api/cursors/orchestrator")["seq"]))
+    instance = secrets.token_hex(16)
+    initial.update(instance=instance, pid=None, status="starting", heartbeat_at=time.time(),
+                   project_root=str(args.project_root))
+    write_json(args.data / "dispatch.json", initial)
+    argv = [sys.executable, str(Path(__file__).resolve()), "run", "--project-root",
+            str(args.project_root), "--data-dir", str(args.data), "--target", args.target,
+            "--poll", str(args.poll), "--ack-timeout", str(args.ack_timeout),
+            "--max-wakes-per-hour", str(args.max_wakes_per_hour),
+            "--tmux-send", args.tmux_send]
+    if args.reset:
+        argv.append("--reset")
+    # Child inherits the exact lock; avoid a double-start window.
+    os.environ["SPRINT_DISPATCH_LOCK_FD"] = str(lease.fileno())
+    os.environ["SPRINT_DISPATCH_INSTANCE"] = instance
+    with open(args.data / "dispatch.log", "ab") as log:
+        os.chmod(args.data / "dispatch.log", 0o600)
+        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 start_new_session=True, pass_fds=(lease.fileno(),))
+    lease.close()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        current = status(args.data)
+        if current.get("pid") == child.pid and current.get("running"):
+            print(json.dumps(current))
+            return 0
+        if child.poll() is not None:
+            raise RuntimeError("dispatcher failed to start; inspect private dispatch.log")
+        time.sleep(.05)
+    raise RuntimeError("dispatcher startup not confirmed; inspect status before retrying")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, RuntimeError, KeyError) as error:
+        print("sprint-dispatch: " + str(error), file=sys.stderr)
+        sys.exit(1)

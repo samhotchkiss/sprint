@@ -459,3 +459,15 @@ lives in the session, driven by the skill in
 - **Single user, single tailnet.** This is not built for public exposure
   or multi-user access — see the spec's non-goals. If you need that,
   this isn't it yet.
+
+### Event-driven coordination
+
+Use `bin/sprint-dispatch` to watch a tmux-owned board outside the model turn.
+It filters routine telemetry, batches actionable events, and sends one wakeup
+until the coordinator acknowledges it. Quiet polling makes no model calls.
+The coordinator handles its batch and ends the turn; workers report results
+to the board. See [setup, recovery, limits, and Luna routing](docs/EVENT-DISPATCH.md).
+
+This is opt-in for existing boards: update the server/helper together, then
+start the watcher from the session that owns the registered pane. Do not attach
+it to another session's board or leave the old model-held tail running.

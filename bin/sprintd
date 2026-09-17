@@ -19,6 +19,7 @@ import base64
 import binascii
 import datetime
 import errno
+import fcntl
 import hashlib
 import http.client
 import json
@@ -5179,11 +5180,23 @@ class App:
             "busy": "session is on it — catching up",
             "offline": "session offline — items will queue",
         }[status]
+        dispatcher = self.event_dispatch_state(ts)
+        if dispatcher:
+            mode = dispatcher["status"]
+            if mode == "budget_limited":
+                status, note = "offline", "wake-up budget reached — events retained"
+            elif mode == "needs_attention":
+                status, note = "offline", "wake-up not acknowledged — inspect the session"
+            elif mode == "idle":
+                status, note = "online", "watching for actionable events — session resting"
+            elif mode != "account_limited":
+                status, note = "busy", "wake-up pending — waiting for the session"
         return {
             "status": status,
             # `online` is what the UI keys its banner off: busy is NOT offline.
             "online": status != "offline",
             "note": note,
+            "event_dispatcher": dispatcher,
             "cursor": cursor_seq,
             "head": head,
             "pending": pending,
@@ -5263,6 +5276,37 @@ class App:
                        "AND cleared_at IS NULL AND resets_at > ? LIMIT 1",
                        (at,)) is not None
 
+    def event_dispatch_state(self, at=None):
+        """A live deterministic dispatcher owns wake delivery, not consumption.
+
+        Require both a fresh lease and a held OS lock. A stale file/PID cannot
+        suppress fallback recovery. Never move the orchestrator cursor here.
+        """
+        at = now() if at is None else at
+        try:
+            with open(os.path.join(self.data_dir, "dispatch.json")) as fh:
+                state = json.load(fh)
+            if not isinstance(state, dict):
+                return None
+            age = at - float(state["heartbeat_at"])
+            if (state.get("version") != 1 or not 0 <= age <= 30
+                    or state.get("target") != self.session_tmux_window()
+                    or state.get("project_root") != self.project_root
+                    or state.get("status") not in (
+                        "starting", "idle", "collecting", "dispatching", "awaiting_ack",
+                        "needs_attention", "account_limited", "budget_limited")):
+                return None
+            with open(os.path.join(self.data_dir, "dispatch.lock"), "r+") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return {k: state.get(k) for k in (
+                        "status", "target", "acknowledged", "scanned", "deliveries")}
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+        return None
+
     def session_dead_state(self, at: float = None) -> dict:
         """Is this board's session dead, and everything the answer stands on.
 
@@ -5289,6 +5333,8 @@ class App:
         head = self.max_seq()
         if limited:
             reason = "account_limited"
+        elif self.event_dispatch_state(at):
+            reason = "event_dispatcher"
         elif quiet < self.session_dead_seconds:
             reason = "alive"
         elif not owed_count:
@@ -5676,6 +5722,8 @@ class App:
         rev = self.revive_state(at, dead=ds)
         declared = self.session_dead_declared(ds["last_seen_at"])
         return {
+            "event_dispatch_supported": True,
+            "event_dispatcher": self.event_dispatch_state(at),
             # Is there a channel at all? No tmux window means this board is not
             # autohealable, and saying so is better than a silent no-op.
             "registered": bool(ds["tmux_window"]),
