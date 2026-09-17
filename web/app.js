@@ -223,7 +223,7 @@ function renderSessionBanner() {
   // and "autoheal gave up …" is the one he has to act on.
   const note = offline ? autohealNote() : null;
   const text = offline ? (note ? `session offline — ${note}`
-    : 'session offline — items will queue')
+    : (store.session.note || 'session offline — items will queue'))
     : 'lost the board connection — retrying';
   // Same words, same banner: rewriting it on every paint is one more thing
   // flickering on a page that should be still.
