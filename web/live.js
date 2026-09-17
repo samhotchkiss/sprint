@@ -1,5 +1,5 @@
-// Liveness transport: SSE first (with Last-Event-ID reconnect handled by the browser),
-// degrading to polling /api/events if the stream keeps failing.
+// Short polling leaves browser connections available for sends, even with many
+// board tabs open. Persistent SSE is opt-in for multiplexed deployments.
 // The cursor drain is the truth — every (re)connect catches up from our last seq.
 import { api, ApiError, rememberGeneration } from './api.js';
 
@@ -10,7 +10,8 @@ const SSE_RETRY_MS = 120000;    // while polling, occasionally re-try the stream
 const PROBE_MS = 2500;          // don't hammer /healthz while a stream flaps
 
 export class Live {
-  constructor({ onEvents, onStatus, onAuthError, onCursor }) {
+  constructor({ onEvents, onStatus, onAuthError, onCursor, allowStream = false }) {
+    this.allowStream = allowStream;
     this.onEvents = onEvents;
     this.onStatus = onStatus || (() => {});
     this.onAuthError = onAuthError || (() => {});
@@ -31,7 +32,7 @@ export class Live {
   start(fromSeq = 0) {
     this.seq = Math.max(this.seq, fromSeq || 0);
     this.stopped = false;
-    if (typeof EventSource === 'function') this.openStream();
+    if (this.allowStream && typeof EventSource === 'function') this.openStream();
     else this.startPolling();
   }
 
@@ -52,6 +53,8 @@ export class Live {
   // ---- SSE ---------------------------------------------------------------
 
   openStream() {
+    if (this.stopped) return;
+    if (!this.allowStream) { this.startPolling(); return; }
     this.closeStream();
     let es;
     try {
@@ -95,8 +98,8 @@ export class Live {
     clearTimeout(this.retryTimer);
     clearTimeout(this.pollTimer);
     this.fails = 0;
-    if (typeof EventSource === 'function') this.openStream();
-    else this.poll();
+    if (this.allowStream && typeof EventSource === 'function') this.openStream();
+    else this.startPolling();
   }
 
   /** Ask an unauthenticated /healthz who it is. Throttled; never throws. */
@@ -152,21 +155,26 @@ export class Live {
 
   startPolling() {
     if (this.stopped) return;
+    this.closeStream();
     this.setMode('polling');
     this.pollDelay = POLL_MS;
     clearTimeout(this.pollTimer);
     this.poll();
     clearTimeout(this.retryTimer);
-    this.retryTimer = setTimeout(() => { if (!this.stopped) this.openStream(); }, SSE_RETRY_MS);
+    if (this.allowStream) {
+      this.retryTimer = setTimeout(() => { if (!this.stopped) this.openStream(); }, SSE_RETRY_MS);
+    }
   }
 
   async poll() {
     if (this.stopped || this.mode === 'sse') return;
     try {
       await this.catchUp();
+      if (this.stopped) return;
       this.pollDelay = POLL_MS;
       this.setMode('polling');
     } catch (err) {
+      if (this.stopped) return;
       if (err instanceof ApiError && err.status === 401) {
         // Auth is the one failure a restart can cause that polling cannot fix
         // by itself. Find out whether this is a NEW server first, so the wall
