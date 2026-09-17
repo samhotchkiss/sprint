@@ -11,7 +11,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { store, applyBoard, normAutoheal, autohealNote } from '../web/state.js';
+import { store, applyBoard, normAutoheal, autohealNote, sessionOfflineMessage } from '../web/state.js';
 
 /** The smallest board payload applyBoard will accept, plus an autoheal block. */
 function board(autoheal) {
@@ -101,4 +101,17 @@ test('normAutoheal refuses junk rather than half-rendering it', () => {
   assert.equal(normAutoheal(null), null);
   assert.equal(normAutoheal('offline'), null);
   assert.equal(normAutoheal(42), null);
+});
+
+
+test('a response after a wake invalidates the claim that the session never stirred', () => {
+  const snapshot = board({ ...DEAD, gave_up: true, gave_up_text: 'never stirred',
+    last_attempt_at: 1700000000 });
+  snapshot.session.consumer_last_seen_at = 1700000100;
+  applyBoard(snapshot);
+  assert.equal(sessionOfflineMessage(), 'The session responded, but has not caught up with all your messages.');
+  assert.equal(store.session.online, false, 'do not hide the outstanding work');
+  snapshot.session.consumer_last_seen_at = 1699999900;
+  applyBoard(snapshot);
+  assert.match(sessionOfflineMessage(), /never stirred/);
 });

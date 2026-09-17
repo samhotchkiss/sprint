@@ -8,7 +8,7 @@ import {
   store, applyBoard, applyEvents, applyCursor, normCard, normEvent, eventText,
   sections, headline, countFor, loadView, setView, setChatOpen, bounceComposing,
   activeLimits, limitLine, accountLimit, autohealNote, isConversation,
-  keepPendingLines, mergeTimeline, acknowledgeSidebarLine,
+  keepPendingLines, mergeTimeline, acknowledgeSidebarLine, sessionOfflineMessage,
 } from './state.js';
 import { renderList } from './list.js';
 import { renderBoard, renderFold } from './board.js';
@@ -233,9 +233,7 @@ function renderSessionBanner() {
   // "items will queue" to a person watching a board nobody is reading is the
   // wrong half of the truth — "revival attempted 12:03" is the useful half,
   // and "autoheal gave up …" is the one he has to act on.
-  const note = offline ? autohealNote() : null;
-  const text = offline ? (note ? `session offline — ${note}`
-    : (store.session.note || 'session offline — items will queue'))
+  const text = offline ? sessionOfflineMessage()
     : 'lost the board connection — retrying';
   // Same words, same banner: rewriting it on every paint is one more thing
   // flickering on a page that should be still.

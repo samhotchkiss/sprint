@@ -384,6 +384,7 @@ function normSession(board) {
       note: s.note || null,
       cursor: cursor != null ? cursor : null,
       waiterSeconds: num(s.seconds_since_waiter),
+      consumerActivityAt: ms(s.consumer_last_seen_at),
     };
   }
   return { status: 'online', online: true, since: null, note: null, cursor: flat, waiterSeconds: null };
@@ -1436,6 +1437,17 @@ export function normAutoheal(a) {
  * Returns null when there is nothing extra worth saying, so the banner's
  * default text is never rewritten for the sake of it.
  */
+/** Recovery history cannot override newer evidence that the session responded. */
+export function sessionOfflineMessage() {
+  const a = store.autoheal;
+  if (a && a.lastAttemptAt && store.session.consumerActivityAt > a.lastAttemptAt) {
+    return 'The session responded, but has not caught up with all your messages.';
+  }
+  const note = autohealNote();
+  return note ? `session offline — ${note}`
+    : (store.session.note || 'session offline — items will queue');
+}
+
 export function autohealNote() {
   const a = store.autoheal;
   if (!a || !a.dead) return null;
