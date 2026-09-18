@@ -4065,3 +4065,15 @@ html.skin-chaos .si-mark.is-split {
   .si-slot, .si-mark { width: 11px; }
   .si-mark { height: 11px; }
 }
+
+/* Keep every navigation action reachable when the header needs another row. */
+@media (max-width: 1199px) {
+  #app { grid-template-columns: minmax(0, 1fr) !important; grid-template-rows: auto auto minmax(0, 1fr) auto; }
+  .topbar { height: auto; min-height: 54px; min-width: 0; flex-wrap: wrap; padding: 10px 12px; gap: 8px 12px; }
+  .topbar > .grow { display: none; }
+  .topbar .title-wrap,
+  html.skin-chaos .topbar .title-wrap.has-menu { flex: 1 1 100%; max-width: 100%; }
+  .topbar .sprint-name { max-width: 100%; }
+  .topbar .headline { flex: 1 1 12rem; min-width: 0; white-space: normal; }
+  .topbar > .btn, .topbar > .seg, .topbar > .reports-link { flex-shrink: 0; }
+}
