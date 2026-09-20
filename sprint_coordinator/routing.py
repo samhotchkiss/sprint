@@ -184,10 +184,12 @@ class Router:
         now = self.clock.now()
         self.store.update_obligation(oid, status="held", last_error=reason, routed_at=now)
 
-    def start_routing(self, submit) -> list:
+    def start_routing(self, submit, available: int = 2) -> list:
         started = []
         now = self.clock.now()
         for obl in self.store.obligations("received"):
+            if len(started) >= available:
+                break
             event = self.store.event(obl["event_seq"])
             if event and event.get("kind") in DETERMINISTIC_KINDS:
                 self.store.update_obligation(

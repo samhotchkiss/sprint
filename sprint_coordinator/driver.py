@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from sprint_coordinator.board import BoardClient
 from sprint_coordinator.config import CoordinatorConfig
@@ -45,6 +46,7 @@ class Coordinator:
         self.last_takeover = None
         self.caught_up = False
         self._closed = False
+        self._session_poll_at = {}
         if start_cursor is _UNSET:
             self.start_cursor = _start_cursor_from_config(config)
         else:
@@ -93,7 +95,7 @@ class Coordinator:
                 self.runner.close()
             if getattr(self, "pool", None) is not None:
                 self.pool.close(timeout=min(2.0, float(self.config.worker_timeout_seconds)))
-            if getattr(self, "store", None) is not None and self.store.conn is not None:
+            if self.lock_handle is not None and self.store.conn is not None:
                 self.store.recover_uncertain(self.clock.now())
         finally:
             if self.lock_handle is not None:
@@ -174,7 +176,9 @@ class Coordinator:
                 ],
             })
             return snap
-        routed = self.router.start_routing(self.pool.submit)
+        self._reconcile_sessions()
+        routed = self.router.start_routing(self.pool.submit,
+                                          available=max(0, 2 - self.pool.count("classify")))
         expired = self.router.expire_deadlines()
         started = self._launch()
         reaped = self._drain()
@@ -251,11 +255,25 @@ class Coordinator:
                 self.router.apply_classify(key, result, err)
                 done.append(key)
                 continue
+            if kind == "session":
+                row = self.store.assignment(key)
+                if row:
+                    if err is not None or not isinstance(result, dict) or not result.get("ok"):
+                        self._hold_session(row, result, err)
+                    else:
+                        self._submit_verify(row, result)
+                done.append(key)
+                continue
             if kind == "worker":
                 row = self.store.assignment(key)
                 role = row["role"] if row and row["role"] in ("response", "code") else "response"
                 self.slots.release(role)
                 if row is None:
+                    done.append(key)
+                    continue
+                if self._is_session_worker(row) and (err is not None or not isinstance(result, dict)
+                                                     or not result.get("ok")):
+                    self._hold_session(row, result, err)
                     done.append(key)
                     continue
                 if err is not None:
@@ -279,6 +297,38 @@ class Coordinator:
                 done.append(key)
         self.pool.prune()
         return done
+
+    def _is_session_worker(self, row: dict) -> bool:
+        command = self.config.worker(row["worker"])["command"]
+        return any(Path(arg).name == "sprint-session-worker" for arg in command[:2])
+
+    def _hold_session(self, row: dict, result, err=None) -> None:
+        """A transport timeout is not a failed candidate or permission to duplicate work."""
+        payload = result if isinstance(result, dict) else {}
+        reason = payload.get("reason") or (type(err).__name__ if err else "delivery_pending")
+        self.store.update_assignment(row["id"], status="awaiting_session", result=payload,
+                                     last_error=reason)
+        self.store.update_obligation(row["obligation_id"], status="assigned", due_at=None,
+                                     last_error=reason)
+
+    def _reconcile_sessions(self) -> None:
+        now = self.clock.now()
+        for row in self.store.assignments_by_status("awaiting_session", "uncertain"):
+            if not self._is_session_worker(row):
+                continue
+            if row["status"] == "uncertain":
+                self._hold_session(row, row.get("result"))
+            if self.pool.count("session") >= 2:
+                break
+            if now - self._session_poll_at.get(row["id"], float("-inf")) < 2:
+                continue
+            command = self.config.worker(row["worker"])["command"]
+            # The adapter's reconcile-only path cannot call tmux-send. No model
+            # budget is charged for checking a previously submitted result.
+            if self.pool.submit("session", row["id"], self.runner.run,
+                                command + ["--reconcile", "--wait-seconds", "0"],
+                                row.get("job") or {}):
+                self._session_poll_at[row["id"]] = now
 
     def _submit_verify(self, row: dict, result: dict) -> None:
         if not self.router.reserve(1, 0.0):

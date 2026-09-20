@@ -51,6 +51,10 @@ Jev:
   calculated in code. No model runs just because a timer ticks.
 
 Generative agents:
+- Provider and role are independent: Codex, Claude, and Grok can each be the
+  main agent or any task worker. All use the same `tmux-send` transport,
+  assignment/result protocol, verification, and restart behavior. Provider
+  selection is installation configuration, never a different coordination path.
 - A short-lived response assignment handles discussion or judgment that templates
   cannot express. It can run while coding jobs continue. Use a configured separate
   session or service, not input queued behind the same busy terminal.

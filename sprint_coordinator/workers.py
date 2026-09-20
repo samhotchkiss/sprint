@@ -88,7 +88,11 @@ class TaskPool:
         with self._lock:
             items = list(self._done)
             self._done.clear()
-        return items
+            return items
+
+    def count(self, kind: str) -> int:
+        with self._lock:
+            return sum(token.startswith(kind + ":") for token in self._inflight)
 
     def prune(self) -> None:
         with self._lock:
