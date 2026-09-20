@@ -6526,7 +6526,7 @@ class App:
                 apayload = {"question_id": question_id, "text": text}
                 if attachments:
                     apayload["attachments"] = attachments
-                self._append_event(num, actor, "answer", apayload)
+                seq = self._append_event(num, actor, "answer", apayload)
                 self.conn.execute("COMMIT")
             except ApiError:
                 raise
@@ -6538,6 +6538,7 @@ class App:
             self.transition(num, "in_progress", actor, reason="answered")
         self.notify()
         return {"ok": True, "question_id": question_id,
+                "event": self.event_row(seq),
                 "card": self.card_json(self.card_row(num), brief=True)}
 
     # -- misc writes ------------------------------------------------------

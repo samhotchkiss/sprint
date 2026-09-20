@@ -2017,6 +2017,10 @@ class TestRetryIsIdempotent(Base):
         answers = [e for e in self.get("/api/cards/%d" % num)[1]["timeline"]
                    if e["kind"] == "answer"]
         self.assertEqual(len(answers), 1, answers)
+        self.assertEqual(b1["event"]["seq"], answers[0]["seq"])
+        self.assertEqual(b2["event"], b1["event"])
+        self.assertEqual(b1["event"]["kind"], "answer")
+        self.assertEqual(b1["event"]["payload"]["question_id"], qid)
         self.assertEqual(self.state_of(num), "in_progress")
 
     def test_retrying_a_verdict_replays_instead_of_409ing(self):
