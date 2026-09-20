@@ -2914,6 +2914,12 @@ class App:
         version of this (a kill between the two) recovers on the next open.
         """
         argv = list(self.restart_argv or [])
+        # A self-restart must not restore a stale startup pane after a handoff.
+        for i, arg in enumerate(argv):
+            if arg == "--tmux-window" and i + 1 < len(argv):
+                argv[i + 1] = self.session_tmux_window()
+            elif arg.startswith("--tmux-window="):
+                argv[i] = "--tmux-window=" + self.session_tmux_window()
         if not argv:
             self.log("self-restart wanted but no argv was recorded")
             return False

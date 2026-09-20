@@ -29,7 +29,7 @@ def takeover_report(autoheal: dict, board_data_dir: Path, mode: str,
     """Explicit checks. This task never performs live takeover."""
     blockers = []
     warnings = []
-    if not autoheal.get("event_dispatch_supported"):
+    if not (autoheal.get("event_dispatch_supported") or autoheal.get("coordinator_supported")):
         blockers.append("board lacks event_dispatch_supported; update sprintd")
     if live_dispatcher(autoheal) or dispatch_lock_held(board_data_dir):
         blockers.append("sprint-dispatch is live; stop it before active mode")

@@ -10620,6 +10620,13 @@ class SelfRestartBase(Base):
 
 
 class TestSelfRestart(SelfRestartBase):
+    def test_restart_preserves_current_wake_target_instead_of_startup_target(self):
+        self.app.restart_argv += ["--tmux-window", "%76"]
+        self.app.claim_tmux_window("%72")
+        self.write_code(FAKE_SOURCE + "VALUE = 2\n")
+        self.assertEqual(self.look(), ["settling", "restarting"])
+        self.assertEqual(self.execs[0][1][-2:], ["--tmux-window", "%72"])
+
     def test_new_code_re_execs_this_process(self):
         self.write_code(FAKE_SOURCE + "VALUE = 2\n")
         self.assertEqual(self.look(), ["settling", "restarting"])
