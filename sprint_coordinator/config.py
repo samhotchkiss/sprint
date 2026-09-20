@@ -12,6 +12,20 @@ DEFAULT_KEY_FILE = "~/.config/sprint/typesafe.env"
 PROMPT_VERSION = "sprint-coordinator-route-v1"
 
 
+def _integer(raw: dict, name: str, default: int) -> int:
+    value = raw.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(name + " must be an integer")
+    return value
+
+
+def _number(raw: dict, name: str, default: float) -> float:
+    value = raw.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(name + " must be a number")
+    return float(value)
+
+
 def default_config_path() -> Path:
     return Path.home() / ".config" / "sprint" / "coordinator.json"
 
@@ -72,7 +86,7 @@ class CoordinatorConfig:
                 raise ValueError(key + " must be a boolean")
         self.activation_ready = raw.get("activation_ready", False)
         self.path = path
-        self.version = int(raw.get("version", CONFIG_VERSION))
+        self.version = _integer(raw, "version", CONFIG_VERSION)
         if self.version != CONFIG_VERSION:
             raise ValueError("unsupported config version")
         self.project_root = Path(raw.get("project_root") or ".").expanduser().resolve()
@@ -86,17 +100,17 @@ class CoordinatorConfig:
             Path(data).expanduser().resolve()
             if data else self.board_data_dir / "coordinator"
         )
-        self.poll_seconds = float(raw.get("poll_seconds") or 2.0)
-        self.concurrency = int(raw.get("concurrency") or 3)
-        self.reserved_response_slots = int(raw.get("reserved_response_slots") or 1)
-        self.daily_max_calls = int(raw.get("daily_max_calls", 200))
-        self.daily_max_spend_usd = float(raw.get("daily_max_spend_usd", 5.0))
-        self.max_escalation_retries = int(raw.get("max_escalation_retries", 1))
-        self.routing_deadline_seconds = float(raw.get("routing_deadline_seconds") or 2.0)
-        self.simple_reply_deadline_seconds = float(
-            raw.get("simple_reply_deadline_seconds") or 10.0)
-        self.reply_deadline_seconds = float(raw.get("reply_deadline_seconds") or 30.0)
-        self.worker_timeout_seconds = float(raw.get("worker_timeout_seconds") or 120.0)
+        self.poll_seconds = _number(raw, "poll_seconds", 2.0)
+        self.concurrency = _integer(raw, "concurrency", 3)
+        self.reserved_response_slots = _integer(raw, "reserved_response_slots", 1)
+        self.daily_max_calls = _integer(raw, "daily_max_calls", 200)
+        self.daily_max_spend_usd = _number(raw, "daily_max_spend_usd", 5.0)
+        self.max_escalation_retries = _integer(raw, "max_escalation_retries", 1)
+        self.routing_deadline_seconds = _number(raw, "routing_deadline_seconds", 2.0)
+        self.simple_reply_deadline_seconds = _number(
+            raw, "simple_reply_deadline_seconds", 10.0)
+        self.reply_deadline_seconds = _number(raw, "reply_deadline_seconds", 30.0)
+        self.worker_timeout_seconds = _number(raw, "worker_timeout_seconds", 120.0)
         self.require_jev_for_approval = bool(raw.get("require_jev_for_approval", True))
         jev = raw.get("jev") if isinstance(raw.get("jev"), dict) else {}
         if "enabled" in jev and type(jev["enabled"]) is not bool:
@@ -107,7 +121,7 @@ class CoordinatorConfig:
             raise ValueError("jev.model must match the evaluated model " + DEFAULT_MODEL)
         self.jev_key_file = Path(jev.get("key_file") or DEFAULT_KEY_FILE).expanduser()
         self.jev_prompt_version = str(jev.get("prompt_version") or PROMPT_VERSION)
-        self.jev_timeout_seconds = float(jev.get("timeout_seconds") or 20.0)
+        self.jev_timeout_seconds = _number(jev, "timeout_seconds", 20.0)
         workers = raw.get("workers") if isinstance(raw.get("workers"), dict) else {}
         self.workers = {}
         for name, spec in workers.items():
@@ -213,4 +227,3 @@ def init_config(path: Path, project_root: Path | None = None) -> Path:
         raise FileExistsError("config already exists: %s" % path)
     write_json_private(path, example_config(str(project_root) if project_root else None))
     return path
-
