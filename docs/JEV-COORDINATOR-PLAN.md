@@ -75,9 +75,11 @@ publishes, recheck the relevant thread revision and incorporate it when it chang
 that answer. Do not invalidate replies because an unrelated card changed.
 
 No claim of exactly-once terminal delivery: crashes can leave an uncertain send.
-Prefer structured CLI/API jobs with run IDs and durable acknowledgments. Keep tmux
-as a compatibility adapter; uncertain sends require reconciliation, not repeated
-Enter presses. Detect dialogs and unavailable runners explicitly.
+All agent-session messages go through `tmux-send`, as Sam required during
+implementation. Use stable job IDs and private result artifacts for acknowledgments
+and candidates; never bypass delivery with direct provider prompts, stdin, raw
+`tmux send-keys`, or `paste-buffer`. An uncertain send requires reconciliation,
+not another delivery. Detect dialogs and unavailable runners explicitly.
 
 User-facing responses get reserved capacity. Suggested initial targets: routing
 starts within two seconds; a simple factual answer is posted within ten seconds;
