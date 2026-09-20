@@ -37,10 +37,7 @@ def takeover_report(autoheal: dict, board_data_dir: Path, mode: str,
     if mode == "active" and tmux:
         msg = ("sprintd autoheal still keys off dispatch.json leases, not the "
                "coordinator lock; a registered tmux window can be revived by the hub")
-        if acknowledge_autoheal_gap:
-            warnings.append(msg)
-        else:
-            blockers.append(msg + "; pass --acknowledge-autoheal-gap only after stopping hub autoheal")
+        blockers.append(msg + "; finish the explicit ownership handoff before activation")
     dispatch_state = read_json(Path(board_data_dir) / "dispatch.json")
     if dispatch_state and mode == "active":
         warnings.append("dispatch.json is present; inspect it before claiming exclusive ownership")

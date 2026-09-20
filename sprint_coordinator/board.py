@@ -47,10 +47,13 @@ class BoardClient:
             raise BoardError("board token missing")
         return {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
 
-    def request(self, method: str, path: str, body=None, timeout: float = 5.0) -> dict:
+    def request(self, method: str, path: str, body=None, timeout: float = 5.0, idempotency_key: str | None = None) -> dict:
         data = None if body is None else json.dumps(body).encode("utf-8")
+        headers = self._headers()
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
         req = urllib.request.Request(
-            self._url(path), data=data, headers=self._headers(), method=method)
+            self._url(path), data=data, headers=headers, method=method)
         try:
             with self._opener.open(req, timeout=timeout) as resp:
                 raw = resp.read()
@@ -65,8 +68,10 @@ class BoardClient:
     def get(self, path: str, timeout: float = 5.0) -> dict:
         return self.request("GET", path, timeout=timeout)
 
-    def post(self, path: str, body: dict, timeout: float = 5.0) -> dict:
-        return self.request("POST", path, body, timeout=timeout)
+    def post(self, path: str, body: dict, timeout: float = 5.0,
+             idempotency_key: str | None = None) -> dict:
+        return self.request("POST", path, body, timeout=timeout,
+                            idempotency_key=idempotency_key)
 
     def events_after(self, after: int, limit: int = 500) -> dict:
         q = urllib.parse.urlencode({"after": int(after), "limit": int(limit)})
@@ -81,14 +86,16 @@ class BoardClient:
     def orchestrator_cursor(self) -> dict:
         return self.get("/api/cursors/orchestrator")
 
-    def post_sidebar(self, text: str, detail=None) -> dict:
+    def post_sidebar(self, text: str, detail=None, *, idempotency_key: str | None = None) -> dict:
         body = {"text": text, "actor": "session"}
         if detail is not None:
             body["detail"] = detail
-        return self.post("/api/sidebar", body)
+        return self.post("/api/sidebar", body, idempotency_key=idempotency_key)
 
-    def post_card_chat(self, card_num: int, text: str, detail=None) -> dict:
+    def post_card_chat(self, card_num: int, text: str, detail=None, *,
+                       idempotency_key: str | None = None) -> dict:
         body = {"text": text, "actor": "session"}
         if detail is not None:
             body["detail"] = detail
-        return self.post("/api/cards/%d/chat" % int(card_num), body)
+        return self.post("/api/cards/%d/chat" % int(card_num), body,
+                         idempotency_key=idempotency_key)

@@ -83,6 +83,8 @@ def cmd_status(args) -> int:
 def _build(args) -> Coordinator:
     cfg = _config(args)
     mode = _mode(args)
+    if mode == "active":
+        cfg.validate_active()
     coord = Coordinator(
         cfg, mode=mode, clock=Clock.live(),
         acknowledge_autoheal_gap=bool(args.acknowledge_autoheal_gap))
@@ -145,7 +147,7 @@ def main(argv=None) -> int:
     parser.add_argument("--active", action="store_true",
                         help="publish replies after explicit takeover checks")
     parser.add_argument("--acknowledge-autoheal-gap", action="store_true",
-                        help="active mode may run even though sprintd autoheal is not suppressed")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
     try:
