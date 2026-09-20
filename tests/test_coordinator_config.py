@@ -11,8 +11,8 @@ def configured(project):
     raw = example_config(str(project))
     adapter = str(Path(__file__).resolve().parents[1] / "bin" / "sprint-session-worker")
     raw["workers"] = {
-        "low": {"command": [adapter, "--pane", "%1"], "role": "response"},
-        "high": {"command": [adapter, "--pane", "%2"], "role": "response"},
+        "low": {"command": [adapter, "--pane", "%1"], "role": "response", "provider": "grok", "model": "configured-model"},
+        "high": {"command": [adapter, "--pane", "%2"], "role": "response", "provider": "grok", "model": "configured-model"},
     }
     return raw
 

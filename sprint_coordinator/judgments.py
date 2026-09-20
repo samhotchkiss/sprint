@@ -145,6 +145,11 @@ class JevPolicy:
             "usage": usage,
         }
 
+    def evaluate_provider_override(self, **kwargs):
+        outcome = self.jev_mod.evaluate_provider_override(self.client, **kwargs)
+        self.calls.append(outcome)
+        return outcome
+
     def verify_candidate(self, *, task, constraints, candidate, evidence,
                          code_change=False, independent_checks=(), context=None,
                          **_kwargs):

@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Install a board-specific macOS supervisor. No model is involved in restart."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from sprint_coordinator.config import load_config
+
+p = argparse.ArgumentParser()
+p.add_argument('action', choices=['install', 'uninstall', 'status'])
+p.add_argument('--config', required=True)
+a = p.parse_args()
+config_path = Path(a.config).expanduser().resolve()
+cfg = load_config(config_path)
+label = 'day.sprint.coordinator.' + hashlib.sha256(str(cfg.board_data_dir).encode()).hexdigest()[:12]
+domain = 'gui/' + str(os.getuid())
+plist = Path.home() / 'Library/LaunchAgents' / (label + '.plist')
+if a.action == 'status':
+    sys.exit(subprocess.run(['launchctl', 'print', domain + '/' + label]).returncode)
+if a.action == 'uninstall':
+    subprocess.run(['launchctl', 'bootout', domain + '/' + label], capture_output=True)
+    plist.unlink(missing_ok=True)
+    print(json.dumps({'uninstalled': label}))
+    sys.exit(0)
+cfg.validate_active()
+cfg.data_dir.mkdir(parents=True, exist_ok=True)
+plist.parent.mkdir(parents=True, exist_ok=True)
+value = {
+    'Label': label,
+    'ProgramArguments': [sys.executable, str(ROOT / 'bin/sprint-coordinate'), 'run', '--active', '--config', str(config_path)],
+    'WorkingDirectory': str(ROOT), 'RunAtLoad': True, 'KeepAlive': True,
+    'ThrottleInterval': 30,
+    'EnvironmentVariables': {'PATH': '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:' + str(Path.home() / '.local/bin')},
+    'StandardOutPath': str(cfg.data_dir / 'service.log'),
+    'StandardErrorPath': str(cfg.data_dir / 'service.log'),
+}
+with open(plist, 'wb') as f:
+    plistlib.dump(value, f)
+os.chmod(plist, 0o600)
+subprocess.run(['launchctl', 'bootout', domain + '/' + label], capture_output=True)
+subprocess.run(['launchctl', 'bootstrap', domain, str(plist)], check=True)
+print(json.dumps({'installed': label, 'plist': str(plist)}))

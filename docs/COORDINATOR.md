@@ -1,187 +1,104 @@
-# Sprint deterministic coordinator
+# Sprint coordinator
 
-Code owns coordination. Jev supplies bounded language judgments. Workers run
-specific assignments and return JSON results. This service does **not** take
-over a live board in this change.
+A persistent Python service reads Sprint events, schedules bounded assignments,
+checks results, and posts replies. Idle time does not invoke a model. Grok,
+Claude and Codex share the same `tmux-send` transport and durable result protocol.
 
-## Modes
+## Provider policy
 
-**Shadow** is ingest-only. It records board events and creates unanswered
-obligations. It does not call Jev, launch workers, run checks, publish, or mark
-obligations answered.
+The board's `settings.worker.default_executor` controls the default provider.
+Every active worker profile explicitly names its provider, model and tmux pane.
+Unsupported settings or an unavailable settings endpoint prevent dispatch.
 
-**Active** classifies, assigns workers, verifies, and publishes. It requires an
-explicit history origin (`start_cursor` / `ingest_start_seq` in the JSON config,
-or `Coordinator(..., start_cursor=)`). A new active coordinator without that
-origin refuses to start rather than replaying the whole board into paid work.
-Restart of an already-initialized store keeps the ingest cursor and unanswered
-obligations.
+An alternate provider or model needs a case-specific reason and Jev approval.
+Approval is bound to the assignment, task revision, requested provider/model,
+command, production base and override request ID. Changes invalidate approval.
+The final send boundary checks this again, then consumes approval in the same
+SQLite transaction that marks the assignment running. No blanket approvals.
 
-Production `--active` validation (worker adapters, takeover, autoheal) is
-enforced in the CLI, which this package does not own.
+Missing reasons, denials and unavailable verification cannot launch an alternate.
+Escalation carries the actual previous failure and candidate as evidence. Jev's
+approval permits provider selection only; it never grants merge or deployment
+permission. The audit is append-only in SQLite's `provider_decisions` table.
 
-## What it stores
+A supervisor can request an override for an **unsent** assignment:
 
-SQLite under `{board_data_dir}/coordinator/` (override with `data_dir`):
+```sh
+bin/sprint-coordinate override --config /private/coordinator.json \
+  --assignment ASSIGNMENT_ID --worker high \
+  --reason 'Specific evidence explaining why this task needs the alternate'
+```
 
-- ingest cursor: the event was recorded
-- obligation: one user request, independent of the cursor
-- assignment: worker job with stable id and lifecycle
-- outbox: reply with a stable idempotency key bound to a specific obligation
-- judgments / daily usage: cache and spend caps
+That command requests approval; it does not send the job. Budget limits apply to
+verification as well as work. Worker prices are configured estimates, not an
+invoice or a provider-enforced spending limit.
 
-Advancing the ingest cursor never marks a question answered. A worker progress
-or heartbeat event never satisfies an unanswered user request.
+## Delivery and recovery
 
-If ingest commits and obligation creation does not, the next `open`/`tick`
-scans stored user events that still lack an obligation and creates them
-idempotently.
+- The board-wide ownership flock prevents two service configurations owning one
+  board. A separate store lock protects each coordinator database.
+- `sprintd` recognizes ownership only while both a fresh lease and the OS lock
+  exist. A stale JSON file cannot hide a dead coordinator. No fake cursor writes.
+- The macOS supervisor restarts a crashed service without asking a model.
+- Assignment IDs, input, result tokens and outcomes are durable. Uncertain
+  session delivery is reconciled from the result file, never blindly resent.
+- A pane with unfinished work is not given a second assignment.
+- Replies have stable HTTP idempotency keys. Uncertain HTTP delivery can retry
+  the same key with backoff without another model call.
+- A newer user message prevents an older pending assignment from launching, and
+  invalidates an older candidate before publication.
 
-## CLI
-
-Local config and keys live **outside the repo** (`~/.config/sprint/` by default).
+Run or supervise a private installation:
 
 ```sh
 bin/sprint-coordinate init-config --project-root /absolute/project
-bin/sprint-coordinate status --config ~/.config/sprint/coordinator.json
-bin/sprint-coordinate run --shadow --config ~/.config/sprint/coordinator.json
-bin/sprint-coordinate run --active --config ~/.config/sprint/coordinator.json
-bin/sprint-coordinate run-once --shadow --config ~/.config/sprint/coordinator.json
+bin/sprint-coordinate run --shadow --config /private/coordinator.json
+bin/sprint-coordinate run --active --config /private/coordinator.json
+bin/sprint-coordinate-service install --config /private/coordinator.json
+bin/sprint-coordinate-service status --config /private/coordinator.json
+bin/sprint-coordinate status --config /private/coordinator.json
 ```
 
-Put `TYPESAFE_API_KEY` in `~/.config/sprint/typesafe.env` mode `0600`. Never
-commit it. Missing credentials hold the request; they cannot approve results.
+The service installer is macOS-specific. Other hosts can supervise the same
+foreground `run --active` command. `uninstall` stops and removes the launchd job.
 
-Worker entries are **command arrays** (no shell). The process reads one JSON
-job on stdin and writes one JSON result on stdout.
+Shadow mode is ingest-only: no inference, workers, publication or completion.
+Active startup needs an explicit `start_cursor`; use a fresh store for a live
+handoff, with the agreed cutoff. Do not turn a historical shadow store into an
+active replay without reviewing its obligations.
 
-Active JSON should set `start_cursor` or `ingest_start_seq` to the last board
-seq that must not be treated as new work. Shadow may start at 0.
+## Code work and review
 
-## Cheap-first policy (active)
+Code profiles use `--allow-code` and a bounded `--task-scope`. Configure
+`code_base_ref` to the verified production commit, never an unreleased branch.
+The coordinator creates a separate git worktree for each assignment, runs the
+entire trusted check catalog there, and independently reads its diff. New source
+files must be committed before review. Oversized diffs need smaller assignments.
+Code cannot pass by returning an ordinary reply or claiming tests succeeded.
 
-1. Deterministic board actions (`verdict`, `answer`, `action`) are recorded
-   only. The board already applied them; a worker is not launched.
-2. Status-only acknowledgements are recorded. No worker chatter.
-3. Approvals, unclear, and multi-intent messages are held. They cannot dispatch
-   privileged/code work.
-4. A question uses the configured `response`/`low` worker. `dispatch_work` uses
-   a trusted `code` worker profile, not the response default.
-5. On a failed low attempt, assign `high` at most `max_escalation_retries`
-   times (default 1), counting every high assignment. Budget exhaustion holds;
-   it does not escalate to a paid high worker.
-6. Stop. No retry storm, no turn cap.
+The result remains a candidate until executable checks and Jev pass. External
+factual and completion claims need evidence; self-contained arithmetic and text
+transformations can be checked against the task itself. Results are posted to
+the originating thread. Review, integration, deployment and product-specific
+acceptance remain separate operations; the coordinator does not auto-merge.
 
-User-facing work is scheduled with a reserved concurrency slot so a blocked
-code worker cannot starve a response assignment. Routing, catalog checks, and
-Jev verification run off the scheduling thread so a blocked check cannot block
-ingest of a new user message or heartbeat. SQLite writes stay on the owner
-thread.
+Main-agent responses receive current board context and standing instructions.
+The board has already applied deterministic answers/verdicts/actions; this first
+coordinator does not reapply those mutations. Existing worker conversations and
+unfinished board work must be explicitly handed over, not silently abandoned.
 
-## Jev adapter (owned file)
+## Live handoff
 
-`sprint_coordinator/jev.py` and `tests/test_jev_client.py` are owned by the
-Jev client agent. Do not rewrite them from this coordinator work.
+1. Verify the updated server's `/api/autoheal` reports `coordinator_supported`.
+2. Confirm the existing owner has stopped its board monitor and new dispatches.
+   Preserve its current workers and obtain their card/worktree mappings.
+3. Stop the old deterministic dispatcher, if present. Do not run two owners.
+4. Prepare private profiles, current production base, check catalog, explicit
+   history cutoff and fresh coordinator store.
+5. Install supervision. Verify the lease, default-provider round trip, denied
+   override, crash recovery, and absence of idle model calls.
+6. Keep the previous config and service available for rollback. Stop the new
+   coordinator before restoring the previous owner.
 
-The coordinator loads that module through `sprint_coordinator.judgments`:
-
-- credentials: `load_api_key(secret_file=...)` → unconfigured client if missing
-- client constructed with `max_attempts=1` so each reserved call is one HTTP try
-- routing: `route_request(...)`
-- verification: `verify_candidate(...)` for both replies and code. A missing
-  method, missing key, or service failure prevents publish.
-
-Judgments are cached on the full canonical typed request plus relevant state
-and prompt/model version. Different questions do not share a key.
-
-Daily call and spend caps apply to routing, workers, and verification, including
-failed attempts. Zero `daily_max_calls` or `daily_max_spend_usd` means zero
-calls. Spend from Jev is `input_tokens * 0.042 / 1e6` when input tokens are
-reported (conservative: `usage_tokens` treated as input when that is all the
-adapter exposes). Worker cost is an explicit bounded config estimate
-(`estimated_calls`, `estimated_spend_usd`). Status reports do not claim a live
-invoice.
-
-Choice confidence is not authorization. Semantic accept never authorizes merge
-or deploy.
-
-## Evidence
-
-Code assignments always run the **entire** local `allowed_checks` catalog with
-the configured cwd and timeout. Worker `check_ids` cannot omit a failing check.
-A code assignment with an empty catalog is rejected. `kind=reply` on a code
-assignment does not skip checks. Arbitrary `model_command` / `commands` fields
-are rejected.
-
-Empty candidate text and unknown result kinds fail. Worker
-`addresses_obligation` is not proof.
-
-## Crash recovery
-
-Non-idempotent assignments found `running`/`starting`/`verifying` after a crash
-or `close` become `uncertain` and are **not** relaunched. Outbox rows found
-`sending` become `uncertain` and are **not** resent. Idempotent jobs may return
-to `pending`. `close` kills tracked worker subprocesses so they cannot keep
-mutating after restart.
-
-Uncertain publishes stay reconcilable under the same idempotency key and are
-not retried automatically.
-
-## Publication (active only)
-
-Replies are posted with the outbox row's stable idempotency key. Events are
-refreshed first; publish is skipped until the ingest cursor has caught up to
-the reported board head (or the current page is known to be complete). An
-obligation is marked answered only after the board accepts the post.
-
-Shadow never writes an outbox row.
-
-## Activation compatibility (not performed here)
-
-Must:
-
-1. Same sprintd revision that serves `GET /api/autoheal` with
-   `event_dispatch_supported: true`.
-2. Endpoints used: `GET /api/events`, `GET /api/autoheal`,
-   `GET /api/settings`, `GET /api/cursors/orchestrator`,
-   `POST /api/sidebar`, `POST /api/cards/:num/chat`. Auth from
-   `.sprint/server.json` (loopback + bearer), never printed.
-3. Stop `bin/sprint-dispatch` first. Active mode refuses a live dispatch
-   lock or `event_dispatcher` lease.
-4. Stop hub autoheal or pass `--acknowledge-autoheal-gap` with eyes open.
-   sprintd only suppresses autoheal for a fresh `dispatch.json` lease plus
-   held `dispatch.lock`. This coordinator uses its own flock and does **not**
-   spoof that lease.
-5. Installation-local worker command arrays and TypeSafe key.
-6. Shadow on a copy of events before any active publish. Active needs an
-   explicit start cursor.
-
-Must not (this task):
-
-- mutate a live board, push, or rewrite `bin/sprintd`
-- disable autoheal by writing fake dispatcher state
-- treat the board orchestrator cursor as this service's answered set
-
-## Honest blockers
-
-- **Autoheal gap.** Until sprintd recognizes a coordinator lease, `--active`
-  on a board with a registered tmux window can still be revived by the hub.
-  That is a sprintd change, out of scope here.
-- **Conversation-first.** This cut routes and replies. It does not take over
-  worktree dispatch, merge, or review from the existing session.
-- **Jev client file.** Live TypeSafe evaluation depends on the owned `jev.py`
-  plus a local key. Tests never call the network. Combined `usage_tokens` are
-  billed conservatively as input tokens; that is not a provider invoice.
-- **CLI start cursor.** The CLI does not yet pass `--start-cursor`. Put
-  `start_cursor` in the JSON config until the CLI grows that flag.
-- **Uncertain sends.** A crash during publish is visible as `uncertain`, not
-  retried automatically.
-- **Held work.** Budget, missing Jev, and ambiguous/approval requests stay
-  `held` until a human or a later policy change moves them. They are not
-  discarded on restart.
-
-## Tests
-
-```sh
-python3 -m unittest tests.test_sprint_coordinator tests.test_jev_client -q
-```
+Keys stay in `~/.config/sprint/typesafe.env` (0600), or the installation's own
+configured key file. No account key ships in this repository.

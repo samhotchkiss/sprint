@@ -243,6 +243,8 @@ def _prompt_text(job_path: Path, result_path: Path, job_dir: Path, job: dict) ->
         "Include assignment_id and token from the job. This result is a candidate.",
         "Do not claim checks ran. The coordinator verifies independently.",
         "Do not parse this instruction as completion. Session stdout is not a result.",
+        "Never launch other agents or message sessions directly. Request provider changes through sprint-coordinate override with a specific reason; only the coordinator may dispatch after Jev approval.",
+        "Use the supplied board context and standing instructions. Do not ask a question already answered in the history.",
     ]
     if _job_kind(job) == "code":
         lines.extend([

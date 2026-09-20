@@ -65,11 +65,15 @@ def example_config(project_root: str | None = None) -> dict:
                 "command": ["/configure/your/low-cost-worker-adapter"],
                 "role": "response",
                 "cost": "low",
+                "provider": "grok",
+                "model": "configure-your-grok-model",
             },
             "high": {
                 "command": ["/configure/your/high-capacity-worker-adapter"],
                 "role": "response",
                 "cost": "high",
+                "provider": "claude",
+                "model": "configure-your-claude-model",
             },
         },
         "allowed_checks": [],
@@ -137,6 +141,8 @@ class CoordinatorConfig:
                 "command": list(command),
                 "role": str(spec.get("role") or "response"),
                 "cost": str(spec.get("cost") or name),
+                "provider": spec.get("provider"),
+                "model": spec.get("model"),
             }
         if "low" not in self.workers or "high" not in self.workers:
             raise ValueError("config.workers must define low and high adapters")
@@ -179,6 +185,8 @@ class CoordinatorConfig:
         if not self.activation_ready:
             raise ValueError("configure real worker adapters and set activation_ready before active mode")
         for worker in self.workers.values():
+            if worker.get("provider") not in ("grok", "claude", "codex") or not isinstance(worker.get("model"), str) or not worker["model"].strip():
+                raise ValueError("active workers require explicit provider and model")
             if any("fake_worker" in arg or arg.startswith("/configure/") for arg in worker["command"]):
                 raise ValueError("example or fake workers cannot run in active mode")
         if not self.require_jev_for_approval:

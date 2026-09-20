@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sprint_coordinator import judgments
+from sprint_coordinator import judgments, workspace
 from sprint_coordinator.evidence import EvidenceError, validate_code_result
 from sprint_coordinator.store import assignment_id_for, obligation_id_for, outbox_id_for
 from sprint_coordinator.workers import WorkerError
@@ -70,9 +70,6 @@ def select_worker(config, role: str, tier: str):
         return tier
     for name, item in workers.items():
         if item.get("role") == role and (item.get("cost") == tier or name == tier):
-            return name
-    for name, item in workers.items():
-        if item.get("role") == role:
             return name
     return None
 
@@ -308,7 +305,7 @@ class Router:
             or "approval" in intents
             or len(intents) != 1
         )
-        if blocked and not (privileged and len(intents) == 1):
+        if blocked:
             self.hold(obl["id"], reason or "ambiguous_or_privileged_hold")
             self.store.update_obligation(obl["id"], intent=",".join(intents), routed_at=now)
             return
@@ -333,6 +330,9 @@ class Router:
                 previous=None, idempotent: bool = False) -> str | None:
         obl = self.store.obligation(oid)
         if obl is None:
+            return None
+        if worker not in self.config.workers or self.config.worker(worker)["role"] != role:
+            self.hold(oid, "no_worker_for_role")
             return None
         if tier == "high" and not self.can_assign_high(oid):
             self.hold(oid, "escalation_exhausted")
@@ -362,6 +362,8 @@ class Router:
             "role": role,
             "tier": tier,
             "worker": worker,
+            "provider": self.config.worker(worker).get("provider"),
+            "selected_model": self.config.worker(worker).get("model"),
             "reply_to": obl["reply_to"],
             "question": obl.get("question_text"),
             "thread_revision": bound,
@@ -372,6 +374,8 @@ class Router:
             "allowed_checks": [item["id"] for item in self.config.allowed_checks] if role == "code" else [],
             "idempotent": idempotent,
         }
+        if job.get("provider") is None:
+            job.pop("provider", None)
         now = self.clock.now()
         self.store.put_assignment({
             "id": aid,
@@ -428,8 +432,6 @@ class Router:
         )
         if escalate:
             worker = select_worker(self.config, row["role"], "high")
-            if worker is None:
-                worker = "high" if "high" in self.config.workers else None
             if worker:
                 self.store.update_obligation(
                     obl["id"], escalations=int(obl["escalations"] or 0) + 1,
@@ -449,6 +451,8 @@ class Router:
         task = snapshot.get("task") or ""
         constraints = list(snapshot.get("constraints") or BASE_CONSTRAINTS)
         context = snapshot.get("context") or []
+        if snapshot.get("board_context"):
+            context = list(context) + [{"source": "Sprint API", "board": snapshot["board_context"]}]
         kind = result.get("kind")
         text = result.get("text")
         text = "" if text is None else str(text)
@@ -457,6 +461,11 @@ class Router:
         if kind not in (None, "reply", "code_result"):
             raise EvidenceError("unknown_result_kind")
         if role == "code":
+            if snapshot.get("workspace"):
+                try:
+                    snapshot["changes"] = workspace.evidence(snapshot["workspace"])
+                except (OSError, ValueError) as exc:
+                    raise EvidenceError(str(exc)) from exc
             if result.get("merge") or result.get("deploy"):
                 raise EvidenceError("semantic_approval_is_not_authorization")
             evidence = validate_code_result(result, catalog, runner=check_runner)
@@ -479,7 +488,7 @@ class Router:
                     task=task,
                     constraints=constraints,
                     candidate=text,
-                    evidence={"checks": evidence, "context": context},
+                    evidence={"checks": evidence, "context": context, "changes": snapshot.get("changes")},
                     code_change=True,
                     independent_checks=independent,
                     context=context,
@@ -559,7 +568,14 @@ class Router:
         obl = self.store.obligation(row["obligation_id"])
         job = row.get("job") or {}
         catalog = self.config.check_catalog if row["role"] == "code" else {}
+        changes = None
+        work = job.get('execution_workspace')
+        if row['role'] == 'code' and work:
+            catalog = {k:dict(v, cwd=work['path']) for k,v in catalog.items()}
         return {
+            "board_context": job.get("board_context"),
+            "workspace": work,
+            "changes": changes,
             "role": row["role"],
             "result": result,
             "catalog": catalog,
@@ -602,7 +618,7 @@ class Router:
             last = dict(last)
             last["result"] = result
             if self.can_assign_high(obl["id"]) and not self.budget_exhausted(1, 0.0):
-                worker = select_worker(self.config, last.get("role") or "response", "high") or "high"
+                worker = select_worker(self.config, last.get("role") or "response", "high")
                 nxt = int(obl["revision"]) + 1
                 self.store.update_obligation(
                     obl["id"], revision=nxt, bound_seq=head, status="escalated",
@@ -634,7 +650,7 @@ class Router:
                 last = self.store.assignments_for(obl["id"])
                 last = last[-1] if last else None
                 if last and self.can_assign_high(obl["id"]) and not self.budget_exhausted(1, 0.0):
-                    worker = select_worker(self.config, last.get("role") or "response", "high") or "high"
+                    worker = select_worker(self.config, last.get("role") or "response", "high")
                     nxt = int(obl["revision"]) + 1
                     self.store.update_obligation(
                         obl["id"], revision=nxt, bound_seq=head, status="escalated",

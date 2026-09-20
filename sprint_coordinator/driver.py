@@ -4,6 +4,8 @@ import time
 from pathlib import Path
 
 from sprint_coordinator.board import BoardClient
+from sprint_coordinator.dispatch_policy import DispatchPolicy
+from sprint_coordinator import workspace
 from sprint_coordinator.config import CoordinatorConfig
 from sprint_coordinator.judgments import load_jev_client, worker_budget_estimate
 from sprint_coordinator.lock import acquire
@@ -47,6 +49,8 @@ class Coordinator:
         self.caught_up = False
         self._closed = False
         self._session_poll_at = {}
+        self._outbox_retry_at = {}
+        self.dispatch_policy = DispatchPolicy(self)
         if start_cursor is _UNSET:
             self.start_cursor = _start_cursor_from_config(config)
         else:
@@ -58,6 +62,7 @@ class Coordinator:
         if self.lock_handle is None:
             raise RuntimeError("another coordinator holds the flock")
         self._init_history_cursor()
+        self.dispatch_policy.recover()
         gen = self.store.bump_generation()
         recovered = {"restarted": [], "uncertain": []}
         if recover:
@@ -177,6 +182,15 @@ class Coordinator:
             })
             return snap
         self._reconcile_sessions()
+        if getattr(self.board, 'supports_idempotent_posts', False):
+            now = self.clock.now()
+            for out in self.store.outbox_all():
+                if out['status'] != 'uncertain' or not out.get('idempotency_key'):
+                    continue
+                due = self._outbox_retry_at.setdefault(out['id'], now + 5)
+                if now >= due:
+                    self.store.update_outbox(out['id'], status='pending')
+                    self._outbox_retry_at[out['id']] = now + 30
         routed = self.router.start_routing(self.pool.submit,
                                           available=max(0, 2 - self.pool.count("classify")))
         expired = self.router.expire_deadlines()
@@ -219,12 +233,37 @@ class Coordinator:
         started = []
         if self._closed:
             return started
-        for row in self.store.assignments_by_status("pending"):
+        pending_rows = self.store.assignments_by_status("pending")
+        if not pending_rows:
+            return started
+        self.dispatch_policy.refresh()
+        for row in pending_rows:
             role = row["role"] if row["role"] in ("response", "code") else "response"
             obl = self.store.obligation(row["obligation_id"])
             if obl and obl["status"] in ("held", "failed", "answered", "recorded"):
                 continue
+            if obl and self.store.user_thread_head(obl['thread_key']) > int((row.get('job') or {}).get('thread_revision') or 0):
+                self.store.update_assignment(row['id'], status='superseded', last_error='newer_context_before_dispatch')
+                continue
             if not self.slots.can_start(role):
+                continue
+            if isinstance(self.board, BoardClient) and not (row.get('job') or {}).get('board_context'):
+                try:
+                    job = dict(row.get('job') or {})
+                    job['board_context'] = self.board.context(job.get('reply_to'))
+                    job['standing_instructions'] = self.board.settings().get('standing_instructions','')
+                    job['board_project_root'] = str(self.config.project_root)
+                    self.store.update_assignment(row['id'],job=job); row['job'] = job
+                except Exception:
+                    continue
+            command = self.config.worker(row['worker'])['command']
+            def pane_key(cmd):
+                return cmd[cmd.index('--pane') + 1] if '--pane' in cmd else tuple(cmd)
+            busy = any(a['id'] != row['id'] and pane_key(self.config.worker(a['worker'])['command']) == pane_key(command)
+                       for a in self.store.assignments_by_status('running', 'awaiting_session', 'uncertain'))
+            if busy:
+                continue
+            if not self.dispatch_policy.ready(row):
                 continue
             calls, spend, _est = worker_budget_estimate(self.config, row["worker"])
             if not self.router.reserve(calls, spend):
@@ -232,13 +271,46 @@ class Coordinator:
                     self.router.hold(obl["id"], "budget_exhausted")
                 continue
             spec = self.config.worker(row["worker"])
+            command = list(spec['command'])
+            if role == 'code' and self._is_session_worker(row):
+                try:
+                    saved = (row.get('job') or {}).get('execution_workspace')
+                    work = saved or workspace.prepare(self.config,row)
+                    job = dict(row.get('job') or {}); job['execution_workspace'] = work
+                    self.store.update_assignment(row['id'],job=job); row['job'] = job
+                    if '--worktree' in command:
+                        command[command.index('--worktree')+1] = work['path']
+                    else:
+                        command += ['--worktree',work['path']]
+                except Exception as exc:
+                    self.router.hold(row['obligation_id'],'workspace_setup_failed: '+str(exc))
+                    continue
             if not self.slots.acquire(role):
                 continue
-            now = self.clock.now()
-            self.store.update_assignment(row["id"], status="running", started_at=now,
-                                         progress_at=now)
+            self.store.conn.execute('BEGIN IMMEDIATE')
+            try:
+                current = self.store.assignment(row['id'])
+                if current['status'] != 'pending' or current['worker'] != row['worker'] or current['job'] != row['job']:
+                    self.store.conn.execute('ROLLBACK')
+                    self.slots.release(role)
+                    continue
+                self.dispatch_policy.consume(row)
+                job = dict(row.get('job') or {})
+                if spec.get('provider'):
+                    job.update(provider=spec['provider'], selected_model=spec['model'])
+                row['job'] = job
+                self.store.update_assignment(row['id'], job=job)
+                now = self.clock.now()
+                self.store.update_assignment(row["id"], status="running", started_at=now,
+                                             progress_at=now)
+                self.store.conn.execute('COMMIT')
+            except Exception:
+                if self.store.conn.in_transaction:
+                    self.store.conn.execute('ROLLBACK')
+                self.slots.release(role)
+                raise
             self.store.set_clock("job_progress:%s" % row["id"], now, "running")
-            if self.pool.submit("worker", row["id"], self.runner.run, spec["command"],
+            if self.pool.submit("worker", row["id"], self.runner.run, command,
                                 row.get("job") or {}):
                 started.append(row["id"])
             else:
@@ -251,6 +323,10 @@ class Coordinator:
         if self._closed or self.store.conn is None:
             return done
         for kind, key, result, err in self.pool.pop_done():
+            if kind == "provider_override":
+                self.dispatch_policy.finish(key, result, err)
+                done.append(key)
+                continue
             if kind == "classify":
                 self.router.apply_classify(key, result, err)
                 done.append(key)

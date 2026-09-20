@@ -16,6 +16,8 @@ class BoardError(RuntimeError):
 class BoardClient:
     """Loopback Sprint HTTP client. Auth comes from server.json and is never logged."""
 
+    supports_idempotent_posts = True
+
     def __init__(self, board_data_dir: Path, opener=None):
         self.board_data_dir = Path(board_data_dir)
         self._opener = opener or urllib.request.build_opener(
@@ -99,3 +101,15 @@ class BoardClient:
             body["detail"] = detail
         return self.post("/api/cards/%d/chat" % int(card_num), body,
                          idempotency_key=idempotency_key)
+
+    def context(self, destination):
+        if destination and destination.startswith('card:'):
+            number = int(destination.split(':',1)[1])
+            detail = self.get('/api/cards/%d' % number)
+            card = detail.get('card') or {}
+            return {'card': {k:card.get(k) for k in ('num','title','body','state','question','executor','model','worktree','branch')},
+                    'timeline': (detail.get('timeline') or [])[-25:]}
+        board = self.get('/api/board')
+        return {'cards': [{k:c.get(k) for k in ('num','title','state','executor','model','question')}
+                          for c in board.get('cards',[]) if c.get('state') not in ('completed','canceled')],
+                'sidebar': board.get('sidebar',[])[-25:]}

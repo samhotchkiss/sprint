@@ -12,6 +12,7 @@ from sprint_coordinator.config import (
 )
 from sprint_coordinator.driver import Coordinator
 from sprint_coordinator.lock import held
+from sprint_coordinator.lease import BoardLease
 from sprint_coordinator.store import Store
 from sprint_coordinator.util import Clock
 
@@ -93,24 +94,29 @@ def _build(args) -> Coordinator:
 
 def cmd_run_once(args) -> int:
     coord = _build(args)
-    opened = coord.open()
+    lease = BoardLease(coord.config).open() if coord.mode == "active" else None
     try:
+        opened = coord.open()
         if coord.mode == "active":
             report = coord.check_takeover()
             if not report["ok"]:
                 print(json.dumps({"takeover": report, "opened": opened}, default=str))
                 return 2
         result = coord.tick(wait=True)
+        if lease:
+            lease.heartbeat(coord.store.ingest_cursor())
         result["opened"] = opened
         print(json.dumps(result, default=str))
         return 0
     finally:
         coord.close()
+        if lease:
+            lease.close()
 
 
 def cmd_run(args) -> int:
     coord = _build(args)
-    opened = coord.open()
+    lease = BoardLease(coord.config).open() if coord.mode == "active" else None
     stopping = False
 
     def stop(signum, frame):
@@ -120,6 +126,7 @@ def cmd_run(args) -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
+        opened = coord.open()
         if coord.mode == "active":
             report = coord.check_takeover()
             if not report["ok"]:
@@ -127,17 +134,52 @@ def cmd_run(args) -> int:
                 return 2
         while not stopping:
             coord.tick(wait=False)
+            if lease:
+                lease.heartbeat(coord.store.ingest_cursor())
             time.sleep(coord.config.poll_seconds)
         print(json.dumps({"stopped": True, "status": coord.status()}, default=str))
         return 0
     finally:
         coord.close()
+        if lease:
+            lease.close()
+
+
+def cmd_override(args):
+    if not args.assignment or not args.worker or not (args.reason or '').strip():
+        raise ValueError('override requires --assignment, --worker, and a specific --reason')
+    cfg = _config(args)
+    spec = cfg.worker(args.worker)
+    store = Store(cfg.data_dir / 'coordinator.sqlite', Clock.live())
+    try:
+        store.conn.execute('BEGIN IMMEDIATE')
+        row = store.assignment(args.assignment)
+        if not row or row['status'] != 'pending':
+            raise ValueError('only an unsent pending assignment can request an override')
+        if spec['role'] != row['role']:
+            raise ValueError('override worker must have the same work role')
+        job = dict(row.get('job') or {})
+        job.update(worker=args.worker, provider=spec['provider'], selected_model=spec['model'],
+                   override_reason=args.reason.strip())
+        # One request identity per change; it cannot inherit an earlier approval.
+        import uuid
+        job['override_request_id'] = uuid.uuid4().hex
+        store.update_assignment(row['id'], worker=args.worker, job=job)
+        store.update_obligation(row['obligation_id'], status='assigned', last_error=None)
+        store.conn.execute('COMMIT')
+        print(json.dumps({'requested': row['id'], 'worker': args.worker, 'approval': 'pending'}))
+    except Exception:
+        if store.conn.in_transaction: store.conn.execute('ROLLBACK')
+        raise
+    finally:
+        store.close()
+    return 0
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Deterministic Sprint coordinator. No model runs because a timer ticked.")
-    parser.add_argument("command", choices=("init-config", "status", "run", "run-once"))
+    parser.add_argument("command", choices=("init-config", "status", "run", "run-once", "override"))
     parser.add_argument("--config", help="local coordinator.json (outside the repo is fine)")
     parser.add_argument("--project-root", type=Path)
     parser.add_argument("--data-dir", type=Path)
@@ -149,12 +191,17 @@ def main(argv=None) -> int:
     parser.add_argument("--acknowledge-autoheal-gap", action="store_true",
                         help=argparse.SUPPRESS)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--assignment")
+    parser.add_argument("--worker")
+    parser.add_argument("--reason")
     args = parser.parse_args(argv)
     try:
         if args.command == "init-config":
             return cmd_init_config(args)
         if args.command == "status":
             return cmd_status(args)
+        if args.command == "override":
+            return cmd_override(args)
         if args.command == "run-once":
             return cmd_run_once(args)
         return cmd_run(args)

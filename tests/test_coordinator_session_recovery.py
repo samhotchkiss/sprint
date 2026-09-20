@@ -59,6 +59,33 @@ class SessionRecoveryTests(unittest.TestCase):
                 finally:
                     c.close()
 
+    def test_lost_http_ack_retries_same_key_without_another_model_call(self):
+        class LostAckBoard(MemoryBoard):
+            supports_idempotent_posts = True
+            def __init__(self):
+                super().__init__(); self.keys = set()
+            def post_sidebar(self, text, detail=None, *, idempotency_key=None):
+                if idempotency_key in self.keys:
+                    return {'ok': True}
+                self.keys.add(idempotency_key)
+                super().post_sidebar(text, detail, idempotency_key=idempotency_key)
+                raise RuntimeError('connection lost after server commit')
+        from sprint_coordinator.workers import InProcessRunner
+        with tempfile.TemporaryDirectory() as tmp:
+            board=LostAckBoard(); clock=Clock(1000); jev=FakeJev()
+            c=Coordinator(make_config(tmp),'active',clock=clock,board=board,jev=jev,
+                          runner=InProcessRunner({'low':ok_reply,'high':ok_reply}))
+            c.open()
+            try:
+                board.add(user_event(1)); c.tick(wait=True)
+                self.assertEqual(c.store.outbox_all()[0]['status'],'uncertain')
+                calls=len(jev.calls)+len(jev.verify_calls)
+                c.tick(); clock.advance(6); c.tick(wait=True)
+                self.assertEqual(len(board.posts),1)
+                self.assertEqual(c.store.outbox_all()[0]['status'],'accepted')
+                self.assertEqual(len(jev.calls)+len(jev.verify_calls),calls)
+            finally:c.close()
+
 
 if __name__ == '__main__':
     unittest.main()

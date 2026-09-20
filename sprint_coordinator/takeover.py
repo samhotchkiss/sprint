@@ -34,7 +34,7 @@ def takeover_report(autoheal: dict, board_data_dir: Path, mode: str,
     if live_dispatcher(autoheal) or dispatch_lock_held(board_data_dir):
         blockers.append("sprint-dispatch is live; stop it before active mode")
     tmux = autoheal.get("tmux_window")
-    if mode == "active" and tmux:
+    if mode == "active" and tmux and not autoheal.get("coordinator_supported"):
         msg = ("sprintd autoheal still keys off dispatch.json leases, not the "
                "coordinator lock; a registered tmux window can be revived by the hub")
         blockers.append(msg + "; finish the explicit ownership handoff before activation")

@@ -65,7 +65,7 @@ class MemoryBoard:
         return dict(self.autoheal_doc)
 
     def settings(self):
-        return {"session_tmux_window": None}
+        return {"session_tmux_window": None, "settings": {"worker": {"default_executor": "grok"}}}
 
     def post_sidebar(self, text, detail=None, *, idempotency_key=None):
         if self.fail_posts:
