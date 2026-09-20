@@ -265,9 +265,34 @@ class Store:
 
     def open_obligations(self) -> list:
         rows = self.conn.execute(
-            "SELECT * FROM obligations WHERE status NOT IN ('answered','failed') "
+            "SELECT * FROM obligations WHERE status NOT IN ('answered','failed','recorded') "
             "ORDER BY created_at, id").fetchall()
         return [dict(r) for r in rows]
+
+    def events_without_obligations(self) -> list:
+        rows = self.conn.execute(
+            "SELECT e.* FROM events e LEFT JOIN obligations o ON o.event_seq = e.seq "
+            "WHERE o.id IS NULL ORDER BY e.seq"
+        ).fetchall()
+        return [self._event_dict(r) for r in rows]
+
+    def thread_events(self, key: str, up_to: int | None = None, limit: int = 50) -> list:
+        if up_to is None:
+            rows = self.conn.execute(
+                "SELECT * FROM events WHERE COALESCE(reply_to, "
+                "CASE WHEN card_num IS NULL THEN 'sidebar' ELSE 'card:' || card_num END)=? "
+                "ORDER BY seq",
+                (key,)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM events WHERE COALESCE(reply_to, "
+                "CASE WHEN card_num IS NULL THEN 'sidebar' ELSE 'card:' || card_num END)=? "
+                "AND seq<=? ORDER BY seq",
+                (key, int(up_to))).fetchall()
+        events = [self._event_dict(r) for r in rows]
+        if limit and len(events) > limit:
+            return events[-limit:]
+        return events
 
     def update_obligation(self, oid: str, **fields) -> None:
         if not fields:
@@ -410,7 +435,7 @@ class Store:
         uncertain = []
         self.begin()
         try:
-            for row in self.assignments_by_status("running", "starting"):
+            for row in self.assignments_by_status("running", "starting", "verifying"):
                 if row["idempotent"]:
                     self.update_assignment(row["id"], status="pending", last_error="recovered",
                                            progress_at=now)
@@ -440,7 +465,7 @@ class Store:
             "obligations_open": len(open_obls),
             "obligations_answered": len(self.obligations("answered")),
             "obligations_failed": len(self.obligations("failed")),
-            "assignments_running": len(self.assignments_by_status("running", "starting")),
+            "assignments_running": len(self.assignments_by_status("running", "starting", "verifying")),
             "assignments_uncertain": len(self.assignments_by_status("uncertain")),
             "outbox_pending": len(self.outbox_pending()),
             "service_heartbeat": self.get_clock("service_heartbeat"),

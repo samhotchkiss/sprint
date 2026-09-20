@@ -1,66 +1,32 @@
 from __future__ import annotations
 
-import threading
+import time
 
 from sprint_coordinator.board import BoardClient
 from sprint_coordinator.config import CoordinatorConfig
-from sprint_coordinator.judgments import load_jev_client
+from sprint_coordinator.judgments import load_jev_client, worker_budget_estimate
 from sprint_coordinator.lock import acquire
-from sprint_coordinator.routing import Router, budget_day, is_user_request
+from sprint_coordinator.routing import EVENT_PAGE_LIMIT, Router, budget_day, is_user_request
 from sprint_coordinator.store import Store
 from sprint_coordinator.takeover import takeover_report
 from sprint_coordinator.util import Clock
-from sprint_coordinator.workers import SlotGate, SubprocessRunner, WorkerError
+from sprint_coordinator.workers import SlotGate, SubprocessRunner, TaskPool, WorkerError
+
+_UNSET = object()
 
 
-class WorkerPool:
-    def __init__(self, runner, slots):
-        self.runner = runner
-        self.slots = slots
-        self._lock = threading.Lock()
-        self._done = []
-        self._threads = []
-
-    def start(self, row: dict, command: list, role: str) -> bool:
-        if not self.slots.acquire(role):
-            return False
-
-        def work():
-            result, err = None, None
-            try:
-                result = self.runner.run(command, row.get("job") or {})
-            except Exception as exc:
-                err = exc
-            with self._lock:
-                self._done.append((row["id"], role, result, err))
-
-        thread = threading.Thread(target=work, daemon=True, name="asg-%s" % row["id"])
-        with self._lock:
-            self._threads.append(thread)
-        thread.start()
-        return True
-
-    def pop_done(self) -> list:
-        with self._lock:
-            items = list(self._done)
-            self._done.clear()
-        return items
-
-    def join(self, timeout: float) -> None:
-        with self._lock:
-            threads = list(self._threads)
-        for thread in threads:
-            thread.join(timeout)
-
-    def alive(self) -> int:
-        with self._lock:
-            return sum(1 for t in self._threads if t.is_alive())
+def _start_cursor_from_config(config) -> int | None:
+    raw = getattr(config, "raw", None) or {}
+    for key in ("start_cursor", "ingest_start_seq", "ingest_after"):
+        if key in raw and raw[key] is not None:
+            return int(raw[key])
+    return None
 
 
 class Coordinator:
     def __init__(self, config: CoordinatorConfig, mode: str = "shadow", clock=None,
                  board=None, jev=None, runner=None, check_runner=None,
-                 acknowledge_autoheal_gap: bool = False):
+                 acknowledge_autoheal_gap: bool = False, start_cursor=_UNSET):
         if mode not in ("shadow", "active"):
             raise ValueError("mode must be shadow or active")
         self.config = config
@@ -71,31 +37,70 @@ class Coordinator:
         self.jev = load_jev_client(config, override=jev)
         self.runner = runner or SubprocessRunner(config.worker_timeout_seconds)
         self.slots = SlotGate(config.concurrency, config.reserved_response_slots)
-        self.pool = WorkerPool(self.runner, self.slots)
+        self.pool = TaskPool()
         self.router = Router(self.store, config, self.jev, self.runner, self.clock,
                              check_runner=check_runner)
         self.acknowledge_autoheal_gap = acknowledge_autoheal_gap
         self.lock_handle = None
         self.last_takeover = None
+        self.caught_up = False
+        self._closed = False
+        if start_cursor is _UNSET:
+            self.start_cursor = _start_cursor_from_config(config)
+        else:
+            self.start_cursor = start_cursor
 
     def open(self, recover: bool = True) -> dict:
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.lock_handle = acquire(self.config.data_dir)
         if self.lock_handle is None:
             raise RuntimeError("another coordinator holds the flock")
+        self._init_history_cursor()
         gen = self.store.bump_generation()
         recovered = {"restarted": [], "uncertain": []}
         if recover:
             recovered = self.store.recover_uncertain(self.clock.now())
+        self.router.reconcile_obligations()
         self.heartbeat("open")
         return {"generation": gen, "recovery": recovered, "mode": self.mode}
 
+    def _init_history_cursor(self) -> None:
+        if self.store.get_meta("start_cursor_set") is not None:
+            return
+        if self.store.ingest_cursor() > 0 or self.store.obligations():
+            self.store.set_meta("start_cursor_set", str(self.store.ingest_cursor()))
+            return
+        start = self.start_cursor
+        if start is None:
+            if self.mode == "active":
+                raise RuntimeError(
+                    "active coordinator refuses unsafely uninitialized history. "
+                    "Set start_cursor or ingest_start_seq in the coordinator config "
+                    "to the board event seq to begin after (use 0 only if the full "
+                    "log is intended). Shadow mode may ingest from 0 without this."
+                )
+            start = 0
+        start = int(start)
+        if start < 0:
+            raise ValueError("start_cursor must be >= 0")
+        self.store.set_meta("start_cursor_set", str(start))
+        self.store.set_meta("ingest_cursor", str(start))
+
     def close(self) -> None:
-        if self.lock_handle is not None:
-            self.lock_handle.close()
-            self.lock_handle = None
-        if getattr(self, "store", None) is not None:
-            self.store.close()
+        self._closed = True
+        try:
+            if getattr(self, "runner", None) is not None and hasattr(self.runner, "close"):
+                self.runner.close()
+            if getattr(self, "pool", None) is not None:
+                self.pool.close(timeout=min(2.0, float(self.config.worker_timeout_seconds)))
+            if getattr(self, "store", None) is not None and self.store.conn is not None:
+                self.store.recover_uncertain(self.clock.now())
+        finally:
+            if self.lock_handle is not None:
+                self.lock_handle.close()
+                self.lock_handle = None
+            if getattr(self, "store", None) is not None:
+                self.store.close()
 
     def heartbeat(self, detail: str = "") -> None:
         self.store.set_clock("service_heartbeat", self.clock.now(), detail)
@@ -114,36 +119,79 @@ class Coordinator:
 
     def ingest(self) -> list:
         after = self.store.ingest_cursor()
-        page = self.board.events_after(after)
+        limit = EVENT_PAGE_LIMIT
+        try:
+            page = self.board.events_after(after, limit=limit)
+        except TypeError:
+            page = self.board.events_after(after)
         events = page.get("events") or []
         head = int(page.get("head") or 0)
         if head and after and head < after:
             raise ValueError("board history moved backwards; inspect before resetting")
         inserted = self.store.ingest_events(events, self.clock.now())
-        # Pagination: if the page was full, caller ticks again.
+        cursor = self.store.ingest_cursor()
+        page_full = len(events) >= limit
+        if head and cursor < head:
+            self.caught_up = False
+        elif page_full and events:
+            # A full page with no head (or head already reached) still needs another read.
+            self.caught_up = bool(head) and cursor >= head and len(events) < limit
+        else:
+            self.caught_up = (not head) or cursor >= head
+        return inserted
+
+    def ingest_until_caught_up(self, max_pages: int = 32) -> list:
+        inserted = []
+        for _ in range(max_pages):
+            batch = self.ingest()
+            inserted.extend(batch)
+            if self.caught_up:
+                break
+            if not batch:
+                break
         return inserted
 
     def tick(self, wait: bool = False) -> dict:
         self.heartbeat("tick")
         inserted = self.ingest()
-        events = [self.store.event(seq) for seq in inserted]
-        created = self.router.create_obligations(events)
-        routed = self.router.route_received()
+        created = self.router.reconcile_obligations()
+        if self.mode == "shadow":
+            snap = self.store.snapshot()
+            snap.update({
+                "mode": self.mode,
+                "ingested": inserted,
+                "created": created,
+                "routed": [],
+                "expired": [],
+                "started": [],
+                "reaped": [],
+                "published": [],
+                "jev_calls": 0,
+                "caught_up": self.caught_up,
+                "user_requests_open": [
+                    o["id"] for o in self.store.open_obligations() if is_user_request(
+                        self.store.event(o["event_seq"]) or {})
+                ],
+            })
+            return snap
+        routed = self.router.start_routing(self.pool.submit)
         expired = self.router.expire_deadlines()
         started = self._launch()
+        reaped = self._drain()
         if wait:
-            self.pool.join(min(2.0, self.config.worker_timeout_seconds))
-        reaped = self._reap()
+            reaped.extend(self._settle())
+            started.extend(self._launch())
+            reaped.extend(self._drain())
+        inserted.extend(self.ingest_until_caught_up())
+        created.extend(self.router.reconcile_obligations())
+        published = self.router.publish_outbox(self.board, self.mode, self.caught_up)
         if wait:
             started.extend(self._launch())
-            self.pool.join(min(2.0, self.config.worker_timeout_seconds))
-            reaped.extend(self._reap())
-        published = self.router.publish_outbox(self.board, self.mode)
-        if wait:
-            started.extend(self._launch())
-            self.pool.join(min(2.0, self.config.worker_timeout_seconds))
-            reaped.extend(self._reap())
-            published.extend(self.router.publish_outbox(self.board, self.mode))
+            reaped.extend(self._settle())
+            inserted.extend(self.ingest_until_caught_up())
+            created.extend(self.router.reconcile_obligations())
+            published.extend(self.router.publish_outbox(
+                self.board, self.mode, self.caught_up))
         snap = self.store.snapshot()
         snap.update({
             "mode": self.mode,
@@ -155,6 +203,7 @@ class Coordinator:
             "reaped": reaped,
             "published": published,
             "jev_calls": self.router.jev_calls,
+            "caught_up": self.caught_up,
             "user_requests_open": [
                 o["id"] for o in self.store.open_obligations() if is_user_request(
                     self.store.event(o["event_seq"]) or {})
@@ -164,39 +213,102 @@ class Coordinator:
 
     def _launch(self) -> list:
         started = []
+        if self._closed:
+            return started
         for row in self.store.assignments_by_status("pending"):
             role = row["role"] if row["role"] in ("response", "code") else "response"
+            obl = self.store.obligation(row["obligation_id"])
+            if obl and obl["status"] in ("held", "failed", "answered", "recorded"):
+                continue
             if not self.slots.can_start(role):
                 continue
+            calls, spend, _est = worker_budget_estimate(self.config, row["worker"])
+            if not self.router.reserve(calls, spend):
+                if obl is not None:
+                    self.router.hold(obl["id"], "budget_exhausted")
+                continue
             spec = self.config.worker(row["worker"])
+            if not self.slots.acquire(role):
+                continue
             now = self.clock.now()
             self.store.update_assignment(row["id"], status="running", started_at=now,
                                          progress_at=now)
             self.store.set_clock("job_progress:%s" % row["id"], now, "running")
-            if self.pool.start(row, spec["command"], role):
+            if self.pool.submit("worker", row["id"], self.runner.run, spec["command"],
+                                row.get("job") or {}):
                 started.append(row["id"])
             else:
+                self.slots.release(role)
                 self.store.update_assignment(row["id"], status="pending")
         return started
 
-    def _reap(self) -> list:
+    def _drain(self) -> list:
         done = []
-        for aid, role, result, err in self.pool.pop_done():
-            row = self.store.assignment(aid)
-            if row is None:
-                self.slots.release(role)
+        if self._closed or self.store.conn is None:
+            return done
+        for kind, key, result, err in self.pool.pop_done():
+            if kind == "classify":
+                self.router.apply_classify(key, result, err)
+                done.append(key)
                 continue
-            try:
+            if kind == "worker":
+                row = self.store.assignment(key)
+                role = row["role"] if row and row["role"] in ("response", "code") else "response"
+                self.slots.release(role)
+                if row is None:
+                    done.append(key)
+                    continue
                 if err is not None:
                     if isinstance(err, WorkerError):
                         self.router._fail(row, str(err))
                     else:
                         self.router._fail(row, type(err).__name__)
+                elif not isinstance(result, dict) or not result.get("ok"):
+                    packed = dict(row)
+                    packed["result"] = result if isinstance(result, dict) else {}
+                    error = "worker_not_ok"
+                    if isinstance(result, dict):
+                        error = result.get("error") or error
+                    self.router._fail(packed, error)
                 else:
-                    self.router._finish(row, result)
-            finally:
-                self.slots.release(role)
-            done.append(aid)
+                    self._submit_verify(row, result)
+                done.append(key)
+                continue
+            if kind == "verify":
+                self.router.apply_verify(key, result, err)
+                done.append(key)
+        self.pool.prune()
+        return done
+
+    def _submit_verify(self, row: dict, result: dict) -> None:
+        if not self.router.reserve(1, 0.0):
+            packed = dict(row)
+            packed["result"] = result
+            self.router._fail(packed, "budget_exhausted")
+            return
+        now = self.clock.now()
+        self.store.update_assignment(row["id"], status="verifying", progress_at=now, result=result)
+        snapshot = self.router.verify_snapshot(row, result)
+        if not self.pool.submit("verify", row["id"], self.router.verify_offline, snapshot):
+            packed = dict(row)
+            packed["result"] = result
+            self.router._fail(packed, "verify_submit_failed")
+
+    def _settle(self) -> list:
+        done = []
+        timeout = min(2.0, float(self.config.worker_timeout_seconds))
+        deadline = time.time() + timeout
+        while time.time() < deadline and not self._closed:
+            done.extend(self._drain())
+            done.extend(self._launch())
+            if self.pool.alive() == 0:
+                done.extend(self._drain())
+                if self.pool.alive() == 0:
+                    break
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            self.pool.join(min(0.05, remaining))
         return done
 
     def status(self) -> dict:
@@ -207,10 +319,13 @@ class Coordinator:
             "data_dir": str(self.config.data_dir),
             "lock_held": self.lock_handle is not None,
             "usage": usage,
+            "usage_estimated": True,
             "clocks": {
                 "service_heartbeat": self.store.get_clock("service_heartbeat"),
             },
             "takeover": self.last_takeover,
             "jev_configured": bool(getattr(self.jev, "configured", lambda: False)()),
+            "start_cursor": self.store.get_meta("start_cursor_set"),
+            "caught_up": self.caught_up,
         })
         return snap

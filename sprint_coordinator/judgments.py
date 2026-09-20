@@ -4,18 +4,19 @@ Expected `sprint_coordinator.jev` surface (any one is enough):
 
 - `client_from_config(config) -> client`
 - `JevClient.from_config(config)` / `from_key_file(path)` / `from_env()`
-- `JevClient(api_key=..., model=..., timeout=...)`
+- `JevClient(api_key=..., model=..., timeout=..., max_attempts=1)`
 
 A client must provide:
 
 - `configured() -> bool`  (False when no installation key is present)
-- `judge(request: dict) -> dict`
-
-`request` keys: questions, state, model, prompt_version.
-`result` keys: answers (dict), raw, usage ({calls, spend_usd, tokens}), model.
+- `route(obligation) -> {intents, escalate, usage?}`
+- `verify_candidate(...)`  (missing method is a hard failure)
 
 Never read another user's key. Never log the secret. Missing credentials must
 not fall back to a shared or example key, and must not approve work.
+
+Spend is derived from reported input tokens at INPUT_TOKEN_USD_PER_MILLION.
+That figure is not a live invoice. Worker spend is an explicit config estimate.
 """
 
 from __future__ import annotations
@@ -33,6 +34,11 @@ class JevUnavailable(RuntimeError):
     pass
 
 
+INPUT_TOKEN_USD_PER_MILLION = 0.042
+MAX_WORKER_ESTIMATED_CALLS = 8
+MAX_WORKER_ESTIMATED_SPEND_USD = 1.0
+DEFAULT_WORKER_ESTIMATED_SPEND_USD = 0.01
+
 ROUTE_INTENTS = {
     "answer_question": "The user is asking a question that needs a reply.",
     "dispatch_work": "The user wants coding or other work dispatched.",
@@ -40,6 +46,39 @@ ROUTE_INTENTS = {
     "status_only": "The user is only acknowledging status, not asking a question.",
     "approval": "The user is approving something already proposed.",
 }
+
+
+def spend_usd_from_input_tokens(input_tokens: int) -> float:
+    return (max(0, int(input_tokens)) / 1_000_000.0) * INPUT_TOKEN_USD_PER_MILLION
+
+
+def usage_from_tokens(input_tokens: int, calls: int = 1) -> dict:
+    tokens = max(0, int(input_tokens or 0))
+    return {
+        "calls": int(calls),
+        "input_tokens": tokens,
+        "spend_usd": spend_usd_from_input_tokens(tokens),
+        "billing": "input_tokens_rate",
+        "rate_usd_per_million_input_tokens": INPUT_TOKEN_USD_PER_MILLION,
+    }
+
+
+def worker_budget_estimate(config, worker_name: str) -> tuple[int, float, bool]:
+    raw_workers = {}
+    if getattr(config, "raw", None) and isinstance(config.raw.get("workers"), dict):
+        raw_workers = config.raw["workers"]
+    spec = raw_workers.get(worker_name) or {}
+    try:
+        calls = int(spec.get("estimated_calls", 1))
+    except (TypeError, ValueError):
+        calls = 1
+    try:
+        spend = float(spec.get("estimated_spend_usd", DEFAULT_WORKER_ESTIMATED_SPEND_USD))
+    except (TypeError, ValueError):
+        spend = DEFAULT_WORKER_ESTIMATED_SPEND_USD
+    calls = max(1, min(calls, MAX_WORKER_ESTIMATED_CALLS))
+    spend = max(0.0, min(spend, MAX_WORKER_ESTIMATED_SPEND_USD))
+    return calls, spend, True
 
 
 class UnconfiguredJev:
@@ -53,6 +92,9 @@ class UnconfiguredJev:
     def route(self, obl: dict) -> dict:
         self.calls.append(obl)
         return {"intents": ["unclear"], "escalate": True, "reason": self.reason}
+
+    def verify_candidate(self, **kwargs):
+        raise MissingCredentials(self.reason)
 
     def verify_code(self, **kwargs):
         raise MissingCredentials(self.reason)
@@ -74,14 +116,20 @@ class JevPolicy:
         return True
 
     def route(self, obl: dict) -> dict:
+        if not hasattr(self.jev_mod, "route_request"):
+            raise JevUnavailable("missing_route_request")
         outcome = self.jev_mod.route_request(
             self.client,
             message=obl.get("question_text") or "",
-            context={"reply_to": obl.get("reply_to")},
+            context={
+                "reply_to": obl.get("reply_to"),
+                "thread_context": obl.get("thread_context") or [],
+            },
             intents=ROUTE_INTENTS,
         )
         self.calls.append(outcome)
-        usage = {"calls": 1, "spend_usd": 0.0, "tokens": getattr(outcome, "usage_tokens", 0)}
+        tokens = int(getattr(outcome, "usage_tokens", 0) or 0)
+        usage = usage_from_tokens(tokens)
         if getattr(outcome, "action", "") == "escalate":
             return {
                 "intents": ["unclear"],
@@ -97,23 +145,42 @@ class JevPolicy:
             "usage": usage,
         }
 
-    def verify_code(self, task: str, candidate: str, evidence: dict, checks: list):
+    def verify_candidate(self, *, task, constraints, candidate, evidence,
+                         code_change=False, independent_checks=(), context=None,
+                         **_kwargs):
+        fn = getattr(self.jev_mod, "verify_candidate", None)
+        if not callable(fn):
+            raise JevUnavailable("missing_verify_candidate")
+        packed = dict(evidence or {})
+        if context is not None:
+            packed = dict(packed)
+            packed["context"] = context
         independent = []
-        for check in checks:
+        for check in independent_checks or ():
+            if not isinstance(check, dict):
+                continue
             independent.append({
-                "passed": int(check.get("exit_code", 1)) == 0,
-                "command": " ".join(check.get("command") or []),
-                "source": "independent",
+                "passed": True if check.get("passed") is True else bool(
+                    check.get("passed") is True),
+                "command": check.get("command") or "",
+                "source": check.get("source") or "independent",
             })
-        return self.jev_mod.verify_candidate(
+            if check.get("passed") is True:
+                independent[-1]["passed"] = True
+        outcome = fn(
             self.client,
             task=task,
-            constraints=[],
+            constraints=list(constraints or []),
             candidate=candidate,
-            evidence=evidence,
-            code_change=True,
+            evidence=packed,
+            code_change=bool(code_change),
             independent_checks=independent,
         )
+        self.calls.append(outcome)
+        return outcome
+
+    def verify_code(self, **kwargs):
+        raise JevUnavailable("missing_verify_candidate")
 
 
 def read_typesafe_key(key_file: Path) -> str | None:
@@ -138,12 +205,14 @@ def read_typesafe_key(key_file: Path) -> str | None:
     return None
 
 
-def cache_key(prompt_version: str, model: str, request: dict) -> str:
+def cache_key(prompt_version: str, model: str, request: dict,
+              relevant_state=None) -> str:
+    """Hash the full canonical typed request plus relevant state/version."""
     payload = {
         "prompt_version": prompt_version,
         "model": model,
-        "questions": request.get("questions"),
-        "state": request.get("state"),
+        "request": request,
+        "state": relevant_state,
     }
     return sha256_text(canonical_json(payload))
 
@@ -194,6 +263,7 @@ def _instantiate(jev_mod, config, key):
     cls = getattr(jev_mod, "JevClient", None)
     if cls is None:
         return None
+    timeout = getattr(config, "jev_timeout_seconds", 8.0)
     for builder in ("from_config", "from_key_file", "from_env"):
         fn = getattr(cls, builder, None)
         if not callable(fn):
@@ -208,19 +278,27 @@ def _instantiate(jev_mod, config, key):
             continue
         except Exception:
             return UnconfiguredJev("jev_construct_failed")
-    try:
-        return cls(key, timeout=getattr(config, "jev_timeout_seconds", 8.0))
-    except TypeError:
+    # Production adapter: one HTTP attempt per reserved coordinator call.
+    for kwargs in (
+        {"timeout": timeout, "max_attempts": 1},
+        {"timeout": timeout},
+        {},
+    ):
         try:
-            return cls(api_key=key)
+            return cls(key, **kwargs)
         except TypeError:
             try:
-                return cls(key)
+                return cls(api_key=key, **kwargs)
             except TypeError:
-                return None
+                continue
+    try:
+        return cls(key)
+    except TypeError:
+        return None
 
 
-def routing_request(text: str, reply_to: str, candidates: list | None = None) -> dict:
+def routing_request(text: str, reply_to: str, candidates: list | None = None,
+                    thread_context=None) -> dict:
     return {
         "questions": [
             {
@@ -247,6 +325,7 @@ def routing_request(text: str, reply_to: str, candidates: list | None = None) ->
             "message_text": text,
             "reply_to": reply_to,
             "candidate_cards": candidates or [],
+            "thread_context": thread_context or [],
         },
     }
 
