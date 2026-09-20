@@ -11,12 +11,17 @@ The coordinator job is read as one JSON object from stdin.  The adapter starts a
 fresh, tool-free, non-persistent CLI turn and emits exactly one strict worker JSON
 object on stdout.  It supports response assignments only.  Code assignments need
 a separately configured workspace/scope adapter and are rejected here.
+
+Prompt context fields are explicit: ``question``, ``context``, ``thread_context``,
+``evidence``, ``constraints``, ``candidate``/``prior_candidate``, and
+``rejection_context``/``rejection_reason``. Unknown job fields are not forwarded.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -52,7 +57,8 @@ def _validate_job(job: Any) -> dict:
         raise AdapterError("unsupported_job_kind")
     if not isinstance(job.get("question"), str) or not job["question"].strip():
         raise AdapterError("missing_question")
-    for name in ("candidate", "rejection_context"):
+    for name in ("context", "thread_context", "evidence", "constraints", "candidate",
+                 "prior_candidate", "rejection_context", "rejection_reason"):
         if name in job and not isinstance(job[name], (str, dict, list, type(None))):
             raise AdapterError("invalid_" + name)
     return job
@@ -66,7 +72,13 @@ def _prompt(job: dict) -> str:
         "thread_revision": job.get("thread_revision"),
         "question": job["question"],
         "candidate": job.get("candidate"),
+        "prior_candidate": job.get("prior_candidate"),
         "rejection_context": job.get("rejection_context"),
+        "rejection_reason": job.get("rejection_reason"),
+        "context": job.get("context"),
+        "thread_context": job.get("thread_context"),
+        "evidence": job.get("evidence"),
+        "constraints": job.get("constraints"),
     }
     return (
         "You are a response-only Sprint worker. Use only the supplied JSON context; "
@@ -135,14 +147,26 @@ def _run(command: list[str], stdin: bytes | None, timeout: float, cwd: Path) -> 
         )
     except OSError as exc:
         raise AdapterError("spawn_failed") from exc
-    try:
-        stdout, _stderr = proc.communicate(input=stdin, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
+    previous_handlers = {}
+
+    def stop_for_parent_signal(signum, _frame):
         _terminate(proc)
+        raise SystemExit(128 + signum)
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, stop_for_parent_signal)
+        try:
+            stdout, _stderr = proc.communicate(input=stdin, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            _terminate(proc)
+            raise AdapterError("timeout") from exc
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
         for stream in (proc.stdin, proc.stdout, proc.stderr):
             if stream is not None and not stream.closed:
                 stream.close()
-        raise AdapterError("timeout") from exc
     if proc.returncode != 0:
         raise AdapterError("provider_exit_%d" % proc.returncode)
     return stdout
@@ -182,7 +206,7 @@ def run_job(*, provider: str, model: str, executable: str | None = None,
             timeout: float = 90.0, input_bytes: bytes | None = None) -> dict:
     if not model:
         raise AdapterError("missing_model")
-    if timeout <= 0:
+    if not math.isfinite(timeout) or timeout <= 0:
         raise AdapterError("invalid_timeout")
     executable = executable or shutil.which(provider)
     if not executable:

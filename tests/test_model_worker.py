@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -6,6 +7,9 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+import signal
+import subprocess
+import sys
 
 from sprint_coordinator.model_worker import AdapterError, run_job
 
@@ -57,6 +61,30 @@ print(json.dumps(%r))
             self.assertIn("sprint-model-worker-", observed["cwd"])
             self.assertFalse(Path(observed["args"][observed["args"].index("--prompt-file") + 1]).exists())
 
+    def test_prompt_preserves_declared_grounding_and_alias_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / "capture"
+            executable = fake_cli(Path(directory), """
+import os, pathlib, sys
+args = sys.argv[1:]
+prompt = pathlib.Path(args[args.index('--prompt-file') + 1])
+pathlib.Path(os.environ['CAPTURE']).write_text(prompt.read_text())
+print(%r)
+""" % json.dumps(GOOD))
+            grounded = job(
+                context={"board_status": "idle"},
+                thread_context=[{"actor": "user", "text": "earlier"}],
+                evidence={"card_state": "done"}, constraints=["be concise"],
+                prior_candidate="stale", rejection_reason="missed latest status",
+            )
+            with mock.patch.dict(os.environ, {"CAPTURE": str(capture)}):
+                run_job(provider="grok", model="cheap", executable=executable,
+                        timeout=2, input_bytes=grounded)
+            prompt = capture.read_text()
+            for expected in ("board_status", "earlier", "card_state", "be concise",
+                             "stale", "missed latest status"):
+                self.assertIn(expected, prompt)
+
     def test_claude_receives_prompt_on_stdin_and_accepts_structured_envelope(self):
         with tempfile.TemporaryDirectory() as directory:
             capture = Path(directory) / "prompt"
@@ -80,6 +108,37 @@ print(json.dumps({'structured_output': %r}))
                         timeout=.1, input_bytes=job())
             self.assertLess(time.monotonic() - started, 3)
 
+    def test_parent_sigterm_terminates_and_reaps_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "provider.pid"
+            executable = fake_cli(Path(directory), """
+import os, pathlib, time
+pathlib.Path(os.environ['PROVIDER_PID']).write_text(str(os.getpid()))
+time.sleep(30)
+""")
+            environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]),
+                               PROVIDER_PID=str(pid_file))
+            adapter = subprocess.Popen([
+                sys.executable, "-m", "sprint_coordinator.model_worker",
+                "--provider", "grok", "--model", "cheap", "--executable", executable,
+                "--timeout", "30",
+            ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+               env=environment)
+            adapter.stdin.write(job())
+            adapter.stdin.close()
+            deadline = time.monotonic() + 3
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue(pid_file.exists(), "provider did not start")
+            provider_pid = int(pid_file.read_text())
+            adapter.send_signal(signal.SIGTERM)
+            adapter.wait(timeout=3)
+            self.assertEqual(adapter.returncode, 128 + signal.SIGTERM)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(provider_pid, 0)
+            adapter.stdout.close()
+            adapter.stderr.close()
+
     def test_rejects_code_jobs_before_starting_provider(self):
         with self.assertRaisesRegex(AdapterError, "unsupported_job_kind"):
             run_job(provider="grok", model="cheap", executable="/not/executed",
@@ -94,6 +153,13 @@ print(json.dumps({'structured_output': %r}))
                 with self.subTest(index=index), self.assertRaises(AdapterError):
                     run_job(provider="grok", model="cheap", executable=executable,
                             timeout=2, input_bytes=job())
+
+    def test_timeout_must_be_finite_and_positive(self):
+        for timeout in (0, -1, math.nan, math.inf):
+            with self.subTest(timeout=timeout), self.assertRaisesRegex(
+                    AdapterError, "invalid_timeout"):
+                run_job(provider="grok", model="cheap", executable="/not/executed",
+                        timeout=timeout, input_bytes=job())
 
     def test_diagnostics_do_not_include_provider_stderr_or_request(self):
         with tempfile.TemporaryDirectory() as directory:
