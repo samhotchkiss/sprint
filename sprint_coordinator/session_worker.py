@@ -382,6 +382,7 @@ def run_job(
     allow_code: bool = False,
     worktree: Path | None = None,
     task_scope: str = "",
+    reconcile: bool = False,
     sleep: Sleep = time.sleep,
     monotonic: Clock = time.monotonic,
 ) -> dict:
@@ -395,12 +396,6 @@ def run_job(
     if not math.isfinite(poll_interval) or poll_interval <= 0:
         return adapter_result(STATUS_FAILED, "invalid_poll_interval")
 
-    executable = _absolute_executable(Path(tmux_send))
-    if executable is None:
-        if not Path(tmux_send).expanduser().is_absolute():
-            return adapter_result(STATUS_FAILED, "tmux_send_not_absolute")
-        return adapter_result(STATUS_FAILED, "tmux_send_missing")
-
     try:
         assignments_dir = _ensure_private_dir(_absolute_dir(Path(assignments_dir)))
         transport_root = _ensure_private_dir(_absolute_dir(Path(transport_root)))
@@ -413,6 +408,16 @@ def run_job(
     job = parsed
     assignment_id = canonical_assignment_id(job["assignment_id"])
     kind = _job_kind(job)
+    if reconcile:
+        return _reconcile(
+            kind=kind, assignment_id=assignment_id, pane_id=pane_id,
+            assignments_dir=assignments_dir, transport_root=transport_root,
+        )
+    executable = _absolute_executable(Path(tmux_send))
+    if executable is None:
+        if not Path(tmux_send).expanduser().is_absolute():
+            return adapter_result(STATUS_FAILED, "tmux_send_not_absolute")
+        return adapter_result(STATUS_FAILED, "tmux_send_missing")
     if kind == "code":
         if not allow_code:
             return adapter_result(STATUS_BLOCKED, "code_not_enabled",
@@ -556,7 +561,7 @@ def _run_locked(
             job_path=job_path, result_path=result_path, executable=executable,
             wait_seconds=wait_seconds, send_timeout=send_timeout,
             poll_interval=poll_interval, sleep=sleep, monotonic=monotonic,
-            interrupted=interrupted,
+            interrupted=interrupted, reconcile=False,
         )
 
     token = secrets.token_hex(16)
@@ -607,6 +612,54 @@ def _run_locked(
     )
 
 
+def _reconcile(
+    *,
+    kind: str,
+    assignment_id: str,
+    pane_id: str,
+    assignments_dir: Path,
+    transport_root: Path,
+) -> dict:
+    job_dir = (assignments_dir / assignment_id).resolve()
+    identity = {
+        "assignment_id": assignment_id,
+        "job_dir": str(job_dir),
+        "pane": pane_id,
+        "result_path": str(job_dir / "result.json"),
+    }
+    if not job_dir.is_dir():
+        return adapter_result(STATUS_PENDING, "not_prepared", **identity)
+    if not job_dir.is_relative_to(assignments_dir.resolve()):
+        return adapter_result(STATUS_FAILED, "invalid_assignment_id")
+    manifest = _load_manifest(job_dir)
+    if not manifest:
+        return adapter_result(STATUS_PENDING, "not_prepared", **identity)
+    _lock_path, marker_path = _pane_paths(transport_root, pane_id)
+    return _resume(
+        manifest=manifest, kind=kind, assignment_id=assignment_id, pane_id=pane_id,
+        job_dir=job_dir, marker_path=marker_path, job_path=job_dir / "job.json",
+        result_path=job_dir / "result.json", executable=None,
+        wait_seconds=0.0, send_timeout=DEFAULT_SEND_TIMEOUT,
+        poll_interval=DEFAULT_POLL_INTERVAL, sleep=time.sleep,
+        monotonic=time.monotonic, interrupted={"value": False}, reconcile=True,
+    )
+
+
+def _try_complete(result_path: Path, assignment_id: str, token: str | None,
+                  kind: str, job_dir: Path, marker_path: Path,
+                  identity: dict) -> dict | None:
+    if not token or not result_path.exists():
+        return None
+    cleaned, error = _validate_result_file(result_path, assignment_id, token, kind)
+    if cleaned:
+        _set_manifest_state(job_dir, MANIFEST_COMPLETED)
+        _clear_marker(marker_path, assignment_id)
+        return _completed_payload(cleaned, identity)
+    _set_manifest_state(job_dir, MANIFEST_BLOCKED, reason=error)
+    _clear_marker(marker_path, assignment_id)
+    return adapter_result(STATUS_FAILED, error, **identity)
+
+
 def _resume(
     *,
     manifest: dict,
@@ -617,13 +670,14 @@ def _resume(
     marker_path: Path,
     job_path: Path,
     result_path: Path,
-    executable: Path,
+    executable: Path | None,
     wait_seconds: float,
     send_timeout: float,
     poll_interval: float,
     sleep: Sleep,
     monotonic: Clock,
     interrupted: dict,
+    reconcile: bool,
 ) -> dict:
     if manifest.get("assignment_id") not in (None, assignment_id):
         return adapter_result(STATUS_FAILED, "assignment_mismatch",
@@ -633,6 +687,13 @@ def _resume(
                               assignment_id=assignment_id, job_dir=str(job_dir))
     state = manifest.get("state")
     token = manifest.get("token")
+    if not token and job_path.exists():
+        try:
+            stored = _read_json(job_path)
+        except (OSError, json.JSONDecodeError):
+            stored = None
+        if isinstance(stored, dict):
+            token = stored.get("token") or stored.get("result_token")
     identity = {
         "assignment_id": assignment_id,
         "job_dir": str(job_dir),
@@ -640,12 +701,11 @@ def _resume(
         "manifest_state": state,
         "result_path": str(result_path),
     }
+    completed = _try_complete(
+        result_path, assignment_id, token, kind, job_dir, marker_path, identity)
+    if completed is not None:
+        return completed
     if state == MANIFEST_COMPLETED:
-        if result_path.exists() and token:
-            cleaned, error = _validate_result_file(result_path, assignment_id, token, kind)
-            if cleaned:
-                _clear_marker(marker_path, assignment_id)
-                return _completed_payload(cleaned, identity)
         _clear_marker(marker_path, assignment_id)
         return adapter_result(STATUS_FAILED, "invalid_result", **identity)
     if state == MANIFEST_UNCERTAIN:
@@ -658,11 +718,16 @@ def _resume(
         return adapter_result(STATUS_BLOCKED, reason,
                               tmux_send_exit=manifest.get("tmux_send_exit"), **identity)
     if state == MANIFEST_DELIVERING:
+        if reconcile:
+            return adapter_result(STATUS_PENDING, "in_flight", **identity)
         _set_manifest_state(job_dir, MANIFEST_UNCERTAIN)
         _write_marker(marker_path, assignment_id, job_dir, pane_id, MANIFEST_UNCERTAIN)
         identity["manifest_state"] = MANIFEST_UNCERTAIN
         return adapter_result(STATUS_UNCERTAIN, "already_uncertain", **identity)
     if state == MANIFEST_DELIVERED:
+        if reconcile:
+            _write_marker(marker_path, assignment_id, job_dir, pane_id, state)
+            return adapter_result(STATUS_PENDING, "wait_timeout", **identity)
         _write_marker(marker_path, assignment_id, job_dir, pane_id, state)
         return _wait_for_result(
             assignment_id=assignment_id, pane_id=pane_id, job_dir=job_dir,
@@ -671,16 +736,19 @@ def _resume(
             sleep=sleep, monotonic=monotonic, interrupted=interrupted,
         )
     if state == MANIFEST_PREPARED:
-        # Crash before send: delivering this same assignment is not a duplicate.
+        if reconcile:
+            return adapter_result(STATUS_PENDING, "not_sent", **identity)
         stored = _read_json(job_path) if job_path.exists() else None
         prompt_path = Path(manifest.get("prompt_path") or (job_dir / "prompt.txt"))
         if not isinstance(stored, dict) or not prompt_path.exists():
             return adapter_result(STATUS_FAILED, "incomplete_prepared_job", **identity)
+        if executable is None:
+            return adapter_result(STATUS_FAILED, "tmux_send_missing", **identity)
         return _deliver(
             assignment_id=assignment_id, pane_id=pane_id, job_dir=job_dir,
             marker_path=marker_path, executable=executable,
             prompt_path=prompt_path, result_path=result_path,
-            token=stored.get("token") or manifest.get("token"),
+            token=stored.get("token") or token,
             kind=kind, wait_seconds=wait_seconds, send_timeout=send_timeout,
             poll_interval=poll_interval, sleep=sleep, monotonic=monotonic,
             interrupted=interrupted,
@@ -874,7 +942,7 @@ def submit_result(
 def _parse_argv(argv: list[str] | None) -> argparse.Namespace:
     argv = list(sys.argv[1:] if argv is None else argv)
     command = "run"
-    if argv and argv[0] in ("run", "submit-result"):
+    if argv and argv[0] in ("run", "submit-result", "reconcile"):
         command = argv.pop(0)
     parser = argparse.ArgumentParser(
         description="tmux-send session worker. No direct tmux or provider messaging.")
@@ -897,8 +965,13 @@ def _parse_argv(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--allow-code", action="store_true")
     parser.add_argument("--worktree", type=Path)
     parser.add_argument("--task-scope", default="")
+    parser.add_argument(
+        "--reconcile", action="store_true",
+        help="read durable result/manifest only; never send a session message")
     args = parser.parse_args(argv)
     args.command = command
+    if command == "reconcile":
+        args.reconcile = True
     return args
 
 
@@ -940,6 +1013,7 @@ def main(argv: list[str] | None = None, input_bytes: bytes | None = None) -> int
         allow_code=bool(args.allow_code),
         worktree=args.worktree,
         task_scope=args.task_scope,
+        reconcile=bool(getattr(args, "reconcile", False)),
     )
     print(json.dumps(result, sort_keys=True, ensure_ascii=False))
     return 0

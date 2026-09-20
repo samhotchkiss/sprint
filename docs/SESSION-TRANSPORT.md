@@ -14,6 +14,10 @@ bin/sprint-session-worker --pane '%5' \
   --tmux-send /absolute/tmux-send \
   --assignments-dir /absolute/private/assignments \
   --transport-root /absolute/private/transport < job.json
+
+bin/sprint-session-worker --reconcile --pane '%5' \
+  --assignments-dir /absolute/private/assignments \
+  --transport-root /absolute/private/transport < job.json
 ```
 
 Active coordinator workers must invoke this binary (see `validate_active`).
@@ -43,15 +47,25 @@ finished.
 
 Intent is fsynced as `delivering` before tmux-send. A process restart reads
 `manifest.json` / `result.json` before any send and never blindly redelivers.
+A valid matching `result.json` completes the assignment even when the manifest
+is still `delivering`, `uncertain`, or `blocked`: uncertainty is about delivery,
+not about ignoring a real candidate.
 
-| Manifest | Restart behavior |
-| --- | --- |
-| prepared | send (never left the pane) |
-| delivering | `uncertain`, no send |
-| delivered | wait for `result.json`, no send |
-| completed | return candidate, no send |
-| uncertain | return `uncertain`, no send |
-| blocked | return `blocked`, no send |
+Prepared restart sends only through the operator-configured tmux-send executable
+(never `sys.executable` or a provider CLI).
+
+`--reconcile` / `reconcile` never sends, including from `prepared`. The
+coordinator can poll durable artifacts with no session message and no model cost.
+
+| Manifest | Restart (may send only if prepared) | `--reconcile` (never sends) |
+| --- | --- | --- |
+| prepared | send via configured tmux-send | `pending` `not_sent` |
+| delivering | if result: `completed`; else `uncertain`, no send | if result: `completed`; else `pending` `in_flight` |
+| delivered | wait for `result.json`, no send | if result: `completed`; else `pending` |
+| completed | return candidate, no send | same |
+| uncertain | if result: `completed`; else `uncertain`, no send | same |
+| blocked | if result: `completed`; else `blocked`, no send | same |
+| missing job dir | prepare + send | `pending` `not_prepared` |
 
 A wait timeout does **not** cancel or kill the session and does **not** start a
 duplicate code job. It returns `pending` with assignment/job-dir identity for
@@ -59,9 +73,9 @@ later reconciliation.
 
 ## Adapter result statuses
 
-The process writes one JSON object to stdout and exits 0 for every structured
-outcome so the coordinator can inspect `status` instead of collapsing the
-result into an untyped `exit_N` failure.
+The process writes one JSON object to stdout and exits **0** for `completed`,
+`pending`, `uncertain`, and `blocked` so the coordinator can inspect `status`
+instead of collapsing those outcomes into an untyped `exit_N` failure.
 
 | `status` | `ok` | When | Coordinator |
 | --- | --- | --- | --- |
@@ -80,7 +94,7 @@ result into an untyped `exit_N` failure.
 - `dialog_refusal` (5), `draft_refusal` (6)
 - `send_unverified` (4), `send_timeout`, `interrupted`, `already_uncertain`
 - `send_failed` (other tmux-send codes)
-- `wait_timeout`
+- `wait_timeout`, `not_sent`, `not_prepared`, `in_flight`
 - `code_not_enabled`, `missing_worktree`, `invalid_worktree`, `missing_task_scope`
 - `result_token_mismatch`, `result_assignment_mismatch`, `invalid_result`, `invalid_result_kind`, `invalid_result_text`, `result_too_large`, `untrusted_evidence_rejected`
 

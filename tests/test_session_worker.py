@@ -94,12 +94,13 @@ class SessionWorkerTests(unittest.TestCase):
         kwargs.setdefault("wait_seconds", 1.0)
         kwargs.setdefault("poll_interval", 0.02)
         kwargs.setdefault("send_timeout", 2.0)
+        tmux = kwargs.pop("tmux_send", self.tmux)
         return run_job(
             payload if payload is not None else job(),
             pane=pane,
             assignments_dir=self.assignments,
             transport_root=self.transport,
-            tmux_send=self.tmux,
+            tmux_send=tmux,
             **kwargs,
         )
 
@@ -325,6 +326,148 @@ class SessionWorkerTests(unittest.TestCase):
             helper = main(["submit-result", "--job-dir", str(job_dir), "--text", "cli helper"])
         self.assertEqual(helper, 0)
         self.assertEqual(json.loads((job_dir / "result.json").read_text())["text"], "cli helper")
+
+    def seed_assignment(self, state, assignment_id="asg-seed-low-1", pane="%5",
+                        with_result=False, text="later candidate"):
+        self.assignments.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.assignments, 0o700)
+        self.transport.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.transport, 0o700)
+        job_dir = self.assignments / assignment_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(job_dir, 0o700)
+        token = "ab" * 16
+        stored = job(assignment_id=assignment_id)
+        stored.update(token=token, result_token=token, job_dir=str(job_dir),
+                      result_path=str(job_dir / "result.json"), pane=pane)
+        (job_dir / "job.json").write_text(json.dumps(stored, indent=2, sort_keys=True))
+        os.chmod(job_dir / "job.json", 0o600)
+        (job_dir / "prompt.txt").write_text("job path\nresult path\n")
+        os.chmod(job_dir / "prompt.txt", 0o600)
+        manifest = {
+            "assignment_id": assignment_id, "pane": pane, "state": state,
+            "token": token, "kind": "response",
+            "job_path": str(job_dir / "job.json"),
+            "prompt_path": str(job_dir / "prompt.txt"),
+            "result_path": str(job_dir / "result.json"),
+        }
+        (job_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        marker = self.transport / ("pane-%s.active.json" % pane[1:])
+        marker.write_text(json.dumps({
+            "assignment_id": assignment_id, "job_dir": str(job_dir),
+            "pane": pane, "state": state, "pid": 0,
+        }))
+        if with_result:
+            submit_result(job_dir, text=text)
+        return job_dir, token
+
+    def test_result_resolves_uncertain_delivering_and_blocked(self):
+        for state in ("uncertain", "delivering", "blocked"):
+            with self.subTest(state=state):
+                assignment_id = "asg-%s-low-1" % state
+                job_dir, _token = self.seed_assignment(
+                    state, assignment_id=assignment_id, with_result=True,
+                    text="resolved-%s" % state)
+                before = self.send_count()
+                result = self.run_adapter(payload=job(assignment_id=assignment_id))
+                self.assertEqual(result["status"], STATUS_COMPLETED)
+                self.assertEqual(result["text"], "resolved-%s" % state)
+                self.assertEqual(self.send_count(), before)
+                self.assertEqual(
+                    json.loads((job_dir / "manifest.json").read_text())["state"],
+                    "completed")
+
+    def test_prepared_restart_uses_configured_tmux_send(self):
+        assignment_id = "asg-prep-low-1"
+        self.seed_assignment("prepared", assignment_id=assignment_id)
+        result = self.run_adapter(payload=job(assignment_id=assignment_id))
+        self.assertEqual(result["status"], STATUS_COMPLETED)
+        args = self.recorded_args()[0]
+        self.assertEqual(Path(args[0]).resolve(), Path(self.tmux).resolve())
+        self.assertNotEqual(Path(args[0]).resolve(), Path(sys.executable).resolve())
+        self.assertEqual(args[1:6], ["--no-stash", "--wait", "0", "%5", "--file"])
+        self.assertEqual(Path(args[6]).resolve(),
+                         (self.assignments / assignment_id / "prompt.txt").resolve())
+
+    def test_reconcile_never_sends_including_prepared(self):
+        prepared_id = "asg-recon-prep-1"
+        self.seed_assignment("prepared", assignment_id=prepared_id)
+        prepared = self.run_adapter(
+            payload=job(assignment_id=prepared_id), reconcile=True)
+        self.assertEqual(prepared["status"], STATUS_PENDING)
+        self.assertEqual(prepared["reason"], "not_sent")
+        self.assertEqual(self.send_count(), 0)
+
+        missing = self.run_adapter(
+            payload=job(assignment_id="asg-recon-missing-1"), reconcile=True)
+        self.assertEqual(missing["status"], STATUS_PENDING)
+        self.assertEqual(missing["reason"], "not_prepared")
+
+        delivering_id = "asg-recon-deliv-1"
+        self.seed_assignment("delivering", assignment_id=delivering_id)
+        inflight = self.run_adapter(
+            payload=job(assignment_id=delivering_id), reconcile=True)
+        self.assertEqual(inflight["status"], STATUS_PENDING)
+        self.assertEqual(inflight["reason"], "in_flight")
+        self.assertEqual(
+            json.loads((self.assignments / delivering_id / "manifest.json").read_text())["state"],
+            "delivering")
+
+        uncertain_id = "asg-recon-unc-1"
+        self.seed_assignment("uncertain", assignment_id=uncertain_id, with_result=True,
+                             text="from session after unverified send")
+        done = self.run_adapter(payload=job(assignment_id=uncertain_id), reconcile=True)
+        self.assertEqual(done["status"], STATUS_COMPLETED)
+        self.assertEqual(done["text"], "from session after unverified send")
+        self.assertEqual(self.send_count(), 0)
+
+        absent_bin = self.run_adapter(
+            payload=job(assignment_id=prepared_id), reconcile=True,
+            tmux_send=self.root / "missing-tmux-send")
+        self.assertEqual(absent_bin["status"], STATUS_PENDING)
+        self.assertEqual(self.send_count(), 0)
+
+    def test_cli_typed_outcomes_exit_zero(self):
+        for status, payload, extra in (
+            ("pending", job(assignment_id="asg-cli-pend-1"),
+             ["--pane", "%5", "--wait-seconds", "0.02"]),
+            ("uncertain", job(assignment_id="asg-cli-unc-1"), ["--pane", "%6"]),
+            ("blocked", job(assignment_id="asg-cli-blk-1"), ["--pane", "%7"]),
+        ):
+            if status == "pending":
+                os.environ["WRITE_RESULT"] = "0"
+                os.environ.pop("TMUX_SEND_EXIT", None)
+            elif status == "uncertain":
+                os.environ["WRITE_RESULT"] = "1"
+                os.environ["TMUX_SEND_EXIT"] = "4"
+            else:
+                os.environ["WRITE_RESULT"] = "1"
+                os.environ["TMUX_SEND_EXIT"] = "5"
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = main(
+                    extra + ["--assignments-dir", str(self.assignments),
+                             "--transport-root", str(self.transport),
+                             "--tmux-send", self.tmux, "--poll-interval", "0.01"],
+                    input_bytes=json.dumps(payload).encode(),
+                )
+            self.assertEqual(code, 0, buf.getvalue())
+            emitted = json.loads(buf.getvalue())
+            self.assertEqual(emitted["status"], status)
+            self.assertFalse(emitted["ok"])
+
+        self.seed_assignment("prepared", assignment_id="asg-cli-recon-1")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                ["reconcile", "--pane", "%5", "--assignments-dir", str(self.assignments),
+                 "--transport-root", str(self.transport), "--tmux-send", self.tmux],
+                input_bytes=json.dumps(job(assignment_id="asg-cli-recon-1")).encode(),
+            )
+        self.assertEqual(code, 0)
+        emitted = json.loads(buf.getvalue())
+        self.assertEqual(emitted["status"], STATUS_PENDING)
+        self.assertEqual(emitted["reason"], "not_sent")
 
 
 if __name__ == "__main__":
