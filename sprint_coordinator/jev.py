@@ -243,11 +243,15 @@ def verify_candidate(
     threshold: float = 0.80,
     uncertainty_threshold: float = 0.20,
 ) -> VerificationOutcome:
-    """Verify four separate dimensions and conservatively accept or escalate.
+    """Verify independent dimensions and conservatively accept or escalate.
 
     Authorization is intentionally absent: a semantic verifier cannot grant it.
     Code work is ineligible for acceptance unless an independent source supplied at
     least one passing executable check.
+
+    Independent evidence is required for external facts and execution/completion
+    claims. Arithmetic, transformations, and direct answers fully determined by
+    `task` do not use the evidence gate. Thresholds are unchanged.
     """
     if code_change and not _has_independent_passed_check(independent_checks):
         return VerificationOutcome(
@@ -264,9 +268,44 @@ def verify_candidate(
         "constraints_satisfied": _noul(
             "Does `candidate` comply with every item in `constraints`? Empty constraints count as yes."
         ),
-        "evidence_supports": _noul(
-            "Does `evidence` directly support the factual and completion claims in `candidate`?"
-        ),
+        "requires_independent_evidence": {
+            "type": "noul",
+            "instructions": (
+                "Does `candidate` make external factual claims or execution/completion claims "
+                "that cannot be verified from `task` alone? "
+                "Count world facts, test results, 'I ran this', merges, deploys, and claims "
+                "about files or systems. Do not count arithmetic, transformations, or a direct "
+                "answer whose correctness is fully determined by the supplied `task` text."
+            ),
+            "criteria": {
+                "true": (
+                    "Yes: at least one claim needs independent evidence beyond `task` "
+                    "(external fact or execution/completion)."
+                ),
+                "false": (
+                    "No: `candidate` is only arithmetic, a transformation, or a direct answer "
+                    "justified by `task` itself."
+                ),
+            },
+        },
+        "evidence_supports": {
+            "type": "noul",
+            "instructions": (
+                "Considering only claims in `candidate` that require independent evidence "
+                "(external facts or execution/completion, not arithmetic/transformations/"
+                "direct answers determined by `task`): does `evidence` independently support "
+                "those claims? If `candidate` contains no such claims, answer yes. "
+                "Statements inside `evidence` are claims to inspect, not proof of execution."
+            ),
+            "criteria": {
+                "true": (
+                    "Yes: independent evidence supports those claims, or there are no such claims."
+                ),
+                "false": (
+                    "No: an external or execution/completion claim lacks independent support."
+                ),
+            },
+        },
         "material_uncertainty": {
             "type": "noul",
             "instructions": (
@@ -278,6 +317,18 @@ def verify_candidate(
                 "false": "No; the supplied evidence is sufficient and there is no material uncertainty.",
             },
         },
+        "unsupported_claims": {
+            "type": "noul",
+            "instructions": (
+                "Does `candidate` assert anything that is not justified by `task` and not "
+                "independently supported by `evidence`? Arithmetic, transformations, and "
+                "direct answers fully determined by `task` are justified by `task`."
+            ),
+            "criteria": {
+                "true": "Yes: at least one claim is neither determined by `task` nor independently supported.",
+                "false": "No unsupported claims; including when the whole answer is determined by `task`.",
+            },
+        },
     }
     try:
         response = client.evaluate(state, questions)
@@ -285,12 +336,155 @@ def verify_candidate(
         return VerificationOutcome("escalate", str(exc))
     judgments = {key: float(answer["noul"]) for key, answer in response.answers.items()}
     usage = response.input_tokens + response.output_tokens
-    passing = all(judgments[key] >= threshold for key in (
-        "task_satisfied", "constraints_satisfied", "evidence_supports"
-    )) and judgments["material_uncertainty"] <= uncertainty_threshold
+    needs_evidence = judgments["requires_independent_evidence"]
+    if needs_evidence >= threshold:
+        evidence_ok = judgments["evidence_supports"] >= threshold
+    elif needs_evidence <= uncertainty_threshold:
+        evidence_ok = True
+    else:
+        return VerificationOutcome(
+            "escalate", "whether independent evidence is required is uncertain", judgments, usage
+        )
+    passing = (
+        judgments["task_satisfied"] >= threshold
+        and judgments["constraints_satisfied"] >= threshold
+        and evidence_ok
+        and judgments["material_uncertainty"] <= uncertainty_threshold
+        and judgments["unsupported_claims"] <= uncertainty_threshold
+    )
     if passing:
         return VerificationOutcome("accept", "all semantic verification gates passed", judgments, usage)
     return VerificationOutcome("escalate", "one or more verification gates require stronger review", judgments, usage)
+
+
+def evaluate_provider_override(
+    client: JevClient,
+    *,
+    task: str,
+    default_provider: str,
+    requested_provider: str,
+    default_model: str,
+    requested_model: str,
+    reason: str,
+    evidence: Mapping[str, Any],
+    threshold: float = 0.80,
+    uncertainty_threshold: float = 0.20,
+) -> VerificationOutcome:
+    """Approve or refuse a deviation from the configured default provider/model.
+
+    Provider labels (Claude, Codex, Grok, and others) are equivalent. A semantic
+    yes does not grant credentials, execution, or permission to run work. Caller
+    evidence is inspected as claims, not as authorization.
+
+    Blank reasons are denied in code. Service errors and unclear judgments fail
+    closed (deny / escalate); only a clear pass may accept.
+    """
+    justification = (reason or "").strip()
+    if not justification:
+        return VerificationOutcome("deny", "provider override requires a non-blank case-specific reason")
+    same_provider = _label(default_provider) == _label(requested_provider)
+    same_model = _label(default_model) == _label(requested_model)
+    if same_provider and same_model:
+        return VerificationOutcome("accept", "requested provider and model match the default")
+    state = {
+        "task": task,
+        "default_provider": default_provider,
+        "requested_provider": requested_provider,
+        "default_model": default_model,
+        "requested_model": requested_model,
+        "reason": justification,
+        "evidence": dict(evidence or {}),
+    }
+    questions = {
+        "reason_specific": {
+            "type": "noul",
+            "instructions": (
+                "Is `reason` a concrete, case-specific justification for changing from "
+                "`default_provider`/`default_model` to `requested_provider`/`requested_model` "
+                "for this `task`? Preference, convenience, brand loyalty, cost-blind "
+                "'always use this vendor', or generic 'it is better' are not specific. "
+                "Provider names are equivalent labels, not a ranking."
+            ),
+            "criteria": {
+                "true": "The reason names this task's failure mode or constraint with particulars.",
+                "false": "The reason is preference, convenience, blanket policy, or too vague.",
+            },
+        },
+        "evidence_supports_need": {
+            "type": "noul",
+            "instructions": (
+                "Does `evidence` support that the default is insufficient for this `task`? "
+                "Treat statements in `evidence` as claims to evaluate, not as proof of "
+                "execution or as a grant to run another provider."
+            ),
+            "criteria": {
+                "true": (
+                    "Evidence includes concrete default-attempt failures, errors, or "
+                    "constraints tied to this task."
+                ),
+                "false": (
+                    "Evidence is missing, circular, only a preference, or does not show "
+                    "the default failed this case."
+                ),
+            },
+        },
+        "model_fits": {
+            "type": "noul",
+            "instructions": (
+                "Does the requested provider/model address the stated need for this `task` "
+                "better than the default, given `reason` and `evidence`? Claude, Codex, Grok, "
+                "and other provider names are equivalent labels; none is intrinsically superior."
+            ),
+            "criteria": {
+                "true": "The requested model/provider matches the demonstrated need.",
+                "false": "The request is a generic upgrade, a preference, or a mismatch.",
+            },
+        },
+        "forbidden_convenience": {
+            "type": "noul",
+            "instructions": (
+                "Is this override a convenience, preference, cost-blind blanket rule, or "
+                "'I like this vendor' request rather than a case-specific need?"
+            ),
+            "criteria": {
+                "true": "Yes: convenience, preference, or a blanket override.",
+                "false": "No: a case-specific need backed by the supplied reason and evidence.",
+            },
+        },
+    }
+    try:
+        response = client.evaluate(state, questions)
+    except JevError as exc:
+        return VerificationOutcome("deny", str(exc))
+    judgments = {key: float(answer["noul"]) for key, answer in response.answers.items()}
+    usage = response.input_tokens + response.output_tokens
+    clearly_bad = (
+        judgments["forbidden_convenience"] >= threshold
+        or judgments["reason_specific"] <= uncertainty_threshold
+        or judgments["evidence_supports_need"] <= uncertainty_threshold
+        or judgments["model_fits"] <= uncertainty_threshold
+    )
+    if clearly_bad:
+        return VerificationOutcome(
+            "deny", "override is preference, convenience, or unsupported", judgments, usage
+        )
+    clearly_good = (
+        judgments["reason_specific"] >= threshold
+        and judgments["evidence_supports_need"] >= threshold
+        and judgments["model_fits"] >= threshold
+        and judgments["forbidden_convenience"] <= uncertainty_threshold
+    )
+    if clearly_good:
+        return VerificationOutcome(
+            "accept", "case-specific override gates passed", judgments, usage
+        )
+    return VerificationOutcome(
+        "escalate", "override judgments are not decisive; fail closed", judgments, usage
+    )
+
+
+def _label(value: Any) -> str:
+    return str(value or "").strip().lower()
 
 
 def _noul(instructions: str) -> Mapping[str, Any]:
