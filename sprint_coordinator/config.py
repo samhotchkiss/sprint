@@ -183,6 +183,17 @@ class CoordinatorConfig:
                 raise ValueError("example or fake workers cannot run in active mode")
         if not self.require_jev_for_approval:
             raise ValueError("active mode requires verification")
+        adapter = Path(__file__).resolve().parents[1] / "bin" / "sprint-session-worker"
+        for worker in self.workers.values():
+            command = worker["command"]
+            direct = Path(command[0]).expanduser().resolve() == adapter
+            python_script = (
+                len(command) > 1
+                and Path(command[0]).name.startswith("python")
+                and Path(command[1]).expanduser().resolve() == adapter
+            )
+            if not (direct or python_script):
+                raise ValueError("session workers must use sprint-session-worker via tmux-send")
 
     @property
     def check_catalog(self) -> dict:

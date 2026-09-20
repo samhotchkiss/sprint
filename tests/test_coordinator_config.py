@@ -9,9 +9,10 @@ from sprint_coordinator.config import CoordinatorConfig, example_config, init_co
 
 def configured(project):
     raw = example_config(str(project))
+    adapter = str(Path(__file__).resolve().parents[1] / "bin" / "sprint-session-worker")
     raw["workers"] = {
-        "low": {"command": ["/usr/bin/low-worker"], "role": "response"},
-        "high": {"command": ["/usr/bin/high-worker"], "role": "response"},
+        "low": {"command": [adapter, "--pane", "%1"], "role": "response"},
+        "high": {"command": [adapter, "--pane", "%2"], "role": "response"},
     }
     return raw
 
@@ -105,6 +106,17 @@ class CoordinatorConfigTests(unittest.TestCase):
             raw.update(activation_ready=True, require_jev_for_approval=False)
             with self.assertRaisesRegex(ValueError, "verification"):
                 CoordinatorConfig(raw).validate_active()
+
+    def test_active_mode_rejects_direct_session_messaging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for command in (["grok", "--prompt-file", "request"],
+                            ["claude", "--print", "request"],
+                            ["tmux", "send-keys", "-t", "%1", "request"]):
+                raw = configured(Path(directory))
+                raw["activation_ready"] = True
+                raw["workers"]["low"]["command"] = command
+                with self.subTest(command=command), self.assertRaisesRegex(ValueError, "tmux-send"):
+                    CoordinatorConfig(raw).validate_active()
 
 
 if __name__ == "__main__":
