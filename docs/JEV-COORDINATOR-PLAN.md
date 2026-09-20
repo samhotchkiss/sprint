@@ -1,6 +1,7 @@
-# Sprint coordinator proposal
+# Sprint coordinator implementation plan
 
-September 20, 2026. Discussion draft; no coordinator cutover authorized or performed.
+September 20, 2026. Implementation approved and underway. No live coordinator
+cutover has been performed. Existing boards retain their current owner.
 
 ## Outcome
 
