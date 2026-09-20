@@ -11,8 +11,8 @@ import unittest
 from contextlib import redirect_stdout
 
 from sprint_coordinator.session_worker import (
-    STATUS_BLOCKED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PENDING,
-    STATUS_UNCERTAIN, main, run_job, submit_result,
+    AGENT_ROLES, PROVIDER_LABELS, STATUS_BLOCKED, STATUS_COMPLETED,
+    STATUS_FAILED, STATUS_PENDING, STATUS_UNCERTAIN, main, run_job, submit_result,
 )
 
 
@@ -114,6 +114,67 @@ class SessionWorkerTests(unittest.TestCase):
             return []
         return json.loads(self.capture.read_text())
 
+    def test_providers_and_roles_share_tmux_send_protocol(self):
+        templates = []
+        for provider in PROVIDER_LABELS:
+            for agent_role in AGENT_ROLES:
+                assignment_id = "asg-%s%s-1" % (provider[:2], agent_role[:3])
+                payload = job(assignment_id=assignment_id, provider=provider,
+                              agent_role=agent_role)
+                result = self.run_adapter(payload=payload, pane="%5")
+                self.assertEqual(result["status"], STATUS_COMPLETED, result)
+                args = self.recorded_args()[-1]
+                prompt = Path(args[args.index("--file") + 1])
+                templates.append(args[1:args.index("--file")] + ["--file"])
+                self.assertEqual(Path(args[0]).resolve(), Path(self.tmux).resolve())
+                self.assertEqual(args[1:6], ["--no-stash", "--wait", "0", "%5", "--file"])
+                for banned in ("--prompt-file", "--print", "--model", "--json-schema",
+                               "send-keys", "paste-buffer", "--force", "grok", "claude",
+                               "codex"):
+                    self.assertNotIn(banned, args)
+                prompt_text = prompt.read_text()
+                self.assertIn(str(prompt.parent / "job.json"), prompt_text)
+                self.assertIn(str(prompt.parent / "result.json"), prompt_text)
+                for name in PROVIDER_LABELS:
+                    self.assertNotIn(name, prompt_text)
+                stored = json.loads((prompt.parent / "job.json").read_text())
+                self.assertEqual(stored["provider"], provider)
+                self.assertEqual(stored["agent_role"], agent_role)
+                self.assertNotIn("structured_output", result)
+                self.assertEqual(result["candidate"]["text"], "session candidate")
+        self.assertEqual(len(templates), 9)
+        self.assertEqual(len(set(tuple(item) for item in templates)), 1)
+        self.assertEqual(self.send_count(), 9)
+
+    def test_provider_cli_stdout_is_not_completion(self):
+        env_dir = self.root / "env-send"
+        env_dir.mkdir()
+        executable = fake_tmux_send(env_dir, """
+import json, os, pathlib, sys
+capture = pathlib.Path(os.environ['CAPTURE_ARGS'])
+existing = json.loads(capture.read_text()) if capture.exists() else []
+existing.append(sys.argv[:])
+capture.write_text(json.dumps(existing))
+count = pathlib.Path(os.environ['SEND_COUNT'])
+count.write_text(str(int(count.read_text()) + 1 if count.exists() else 1))
+prompt = pathlib.Path(sys.argv[sys.argv.index('--file') + 1])
+(prompt.parent / 'structured_output.json').write_text(json.dumps({
+    'structured_output': {'text': 'from-cli-envelope'}, 'result': 'from-cli-envelope',
+}))
+print(json.dumps({'structured_output': {'text': 'from-cli-envelope'}}))
+sys.exit(0)
+""")
+        os.environ["WRITE_RESULT"] = "0"
+        result = self.run_adapter(
+            payload=job(assignment_id="asg-env-low-1", provider="claude"),
+            tmux_send=executable, wait_seconds=0.05)
+        self.assertEqual(result["status"], STATUS_PENDING)
+        self.assertEqual(result["reason"], "wait_timeout")
+        job_dir = Path(result["job_dir"])
+        self.assertTrue((job_dir / "structured_output.json").exists())
+        self.assertFalse((job_dir / "result.json").exists())
+        self.assertNotEqual(result.get("text"), "from-cli-envelope")
+
     def test_tmux_send_only_command_array_and_private_modes(self):
         result = self.run_adapter()
         self.assertEqual(result["status"], STATUS_COMPLETED)
@@ -188,6 +249,13 @@ class SessionWorkerTests(unittest.TestCase):
             ({"pane": "%7"}, {}, "job_transport_override"),
             ({"tmux_send": "/bin/true"}, {}, "job_transport_override"),
             ({"command": ["tmux", "send-keys"]}, {}, "job_transport_override"),
+            ({"model": "claude-opus"}, {}, "job_transport_override"),
+            ({"prompt_file": "/tmp/p"}, {}, "job_transport_override"),
+            ({"kind": "codex"}, {}, "unsupported_job_kind"),
+            ({"kind": "grok"}, {}, "unsupported_job_kind"),
+            ({"provider": "task"}, {}, "provider_role_collision"),
+            ({"agent_role": "codex"}, {}, "role_provider_collision"),
+            ({"role": "claude"}, {}, "role_provider_collision"),
         ]
         for payload_updates, kwargs, reason in cases:
             with self.subTest(reason=reason, updates=payload_updates, kwargs=kwargs):

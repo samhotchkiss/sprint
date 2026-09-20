@@ -5,9 +5,17 @@ message into that pane goes through **tmux-send**. The adapter never uses
 `tmux send-keys`, `paste-buffer`, provider CLI prompt/stdin, `--force`, or
 `--no-verify`.
 
+**Codex, Claude, and Grok are identical** on this protocol, whether the pane
+is the main/supervisor agent or a task agent. Transport, result schema, and
+crash recovery do not change by provider. `provider` is a label only.
+`agent_role` (`main`, `supervisor`, `task`) is separate from provider. Neither
+selects a CLI, prompt template, JSON envelope, or parser. There is no
+`grok` / `claude` / `codex` command path, `--prompt-file`, `--print`, or
+stdin-to-model delivery.
+
 Operator configuration chooses the pane, tmux-send executable, assignment
-directory, and (for code) worktree/scope. Jobs cannot select a pane or a
-messaging path.
+directory, and (for code) worktree/scope. Jobs cannot select a pane, provider
+CLI, or messaging path.
 
 ```sh
 bin/sprint-session-worker --pane '%5' \
@@ -52,7 +60,7 @@ is still `delivering`, `uncertain`, or `blocked`: uncertainty is about delivery,
 not about ignoring a real candidate.
 
 Prepared restart sends only through the operator-configured tmux-send executable
-(never `sys.executable` or a provider CLI).
+(never `sys.executable`, `grok`, `claude`, `codex`, or another provider CLI).
 
 `--reconcile` / `reconcile` never sends, including from `prepared`. The
 coordinator can poll durable artifacts with no session message and no model cost.
@@ -88,6 +96,7 @@ instead of collapsing those outcomes into an untyped `exit_N` failure.
 ### `reason` values
 
 - `invalid_pane`, `invalid_assignment_id`, `job_transport_override`, `unsupported_job_kind`
+- `invalid_provider_label`, `invalid_agent_role`, `provider_role_collision`, `role_provider_collision`
 - `tmux_send_not_absolute`, `tmux_send_missing`, `spawn_failed`
 - `pane_busy` (flock), `pane_held` (active marker after the previous process exited)
 - `pane_not_found` (tmux-send 3)
@@ -124,6 +133,18 @@ The session writes atomic `result.json` in the job directory:
 `kind` is `reply` for response jobs, or `reply` / `code_result` for
 operator-enabled code jobs. Payload size is capped (64KiB file, 32k text).
 Wrong id/token is `failed`. Fields that look like trusted checks are rejected.
+Provider envelopes (`structured_output`, CLI stdout, pane capture) are not
+completion.
+
+Optional job labels, recorded and ignored by transport:
+
+| field | values | not |
+| --- | --- | --- |
+| `provider` | `claude`, `codex`, `grok` (or another string label) | a CLI, model, or parser |
+| `agent_role` | `main`, `supervisor`, `task` | a provider name |
+
+A provider name in `kind` or `agent_role`, or an agent role in `provider`, is
+rejected. `kind` remains `response` / `code` only.
 
 Helper (no delivery):
 
@@ -144,5 +165,6 @@ catalog checks and Jev.
 python3 -m unittest tests.test_session_worker -q
 ```
 
-Tests use a fake tmux-send executable only. No live pane, paid call, or
-credential is required.
+Tests use a fake tmux-send executable only, including Grok, Claude, and Codex
+labels on main/supervisor/task roles. No live pane, paid call, or credential
+is required.

@@ -5,6 +5,11 @@ pane or messaging path. Delivery is a command array::
 
     [tmux-send, --no-stash, --wait, 0, <pane>, --file, <prompt>]
 
+The protocol is provider-neutral. Codex, Claude, and Grok use this same
+transport whether the pane is the main/supervisor agent or a task agent.
+``provider`` is a label only; ``agent_role`` (main / supervisor / task) is
+separate from provider. Neither selects a CLI, prompt format, or parser.
+
 Verification stays on. The process never uses ``shell=True``, ``tmux send-keys``,
 ``paste-buffer``, ``--force``, or ``--no-verify``. tmux-send exit 0 means the
 instruction was submitted, not that the session finished the job.
@@ -54,11 +59,15 @@ PANE_RE = re.compile(r"^%[0-9]+$")
 ASSIGNMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 JOB_OVERRIDE_KEYS = {
     "pane", "target", "tmux_send", "tmux-send", "allow_code", "worktree",
-    "executable", "command", "tmux",
+    "executable", "command", "tmux", "model", "prompt_file", "prompt-file",
+    "provider_cli", "cli", "structured_output",
 }
 FORBIDDEN_CODE_ACTIONS = ("merge", "push", "deploy")
 RESPONSE_KINDS = {"response", "reply"}
 CODE_KINDS = {"code"}
+# Labels only — never branch transport, prompt, or result parsing on these.
+PROVIDER_LABELS = ("claude", "codex", "grok")
+AGENT_ROLES = ("main", "supervisor", "task")
 
 MAX_ASSIGNMENT_ID = 128
 MAX_JOB_BYTES = 262144
@@ -166,6 +175,51 @@ def _job_kind(job: dict) -> str:
     if kind in CODE_KINDS:
         return "code"
     return str(kind)
+
+
+def _label(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    return value.strip().lower()
+
+
+def _provider_label(job: dict) -> tuple[str | None, dict | None]:
+    if "provider" not in job:
+        return None, None
+    label = _label(job.get("provider"))
+    if not label:
+        return None, adapter_result(STATUS_FAILED, "invalid_provider_label")
+    if label in AGENT_ROLES:
+        return None, adapter_result(STATUS_FAILED, "provider_role_collision")
+    return label, None
+
+
+def _agent_role_label(job: dict) -> tuple[str | None, dict | None]:
+    raw = None
+    if "agent_role" in job:
+        raw = job.get("agent_role")
+    elif "session_role" in job:
+        raw = job.get("session_role")
+    elif "role" in job:
+        candidate = _label(job.get("role"))
+        if candidate in AGENT_ROLES:
+            raw = job.get("role")
+        elif candidate in PROVIDER_LABELS:
+            return None, adapter_result(STATUS_FAILED, "role_provider_collision")
+        else:
+            return None, None
+    if raw is None:
+        return None, None
+    label = _label(raw)
+    if not label:
+        return None, adapter_result(STATUS_FAILED, "invalid_agent_role")
+    if label in PROVIDER_LABELS:
+        return None, adapter_result(STATUS_FAILED, "role_provider_collision")
+    if label not in AGENT_ROLES:
+        return None, adapter_result(STATUS_FAILED, "invalid_agent_role")
+    return label, None
 
 
 def _submit_helper_path() -> str:
@@ -297,6 +351,12 @@ def _validate_incoming_job(raw: Any) -> tuple[dict | None, dict | None]:
     kind = _job_kind(raw)
     if kind not in ("response", "code"):
         return None, adapter_result(STATUS_FAILED, "unsupported_job_kind")
+    _provider, error = _provider_label(raw)
+    if error is not None:
+        return None, error
+    _role, error = _agent_role_label(raw)
+    if error is not None:
+        return None, error
     return raw, None
 
 
@@ -574,6 +634,12 @@ def _run_locked(
     stored["pane"] = pane_id
     stored["submit_helper"] = _submit_helper_path()
     stored["forbidden_actions"] = list(FORBIDDEN_CODE_ACTIONS)
+    provider, _error = _provider_label(job)
+    agent_role, _error = _agent_role_label(job)
+    if provider:
+        stored["provider"] = provider
+    if agent_role:
+        stored["agent_role"] = agent_role
     if kind == "code":
         stored["code_enabled"] = True
         stored["worktree"] = str(worktree)
