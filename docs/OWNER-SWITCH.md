@@ -6,7 +6,7 @@ board. Codex, Claude, and Grok use the identical tmux-send protocol.
 This module does **not** kill panes or processes, does not change
 `worker.default_executor`, and does not skip pending events by moving the
 orchestrator cursor to head. It does not mention or install launchd; root
-wires `bin/sprint-dispatch-service` after a completed switch. Module tests
+starts `bin/sprint-dispatch-service` after the target acknowledges, then verifies completion. Module tests
 are not a live session test. Sam's live window: 2026-09-21 15:05 UTC,
 Claude → Codex on Yunagi.
 
@@ -90,5 +90,5 @@ Observed `session_tmux_window` must still match the record.
 
 Compatible with an existing process supervisor. The switch never kills PIDs
 and contains no launchd identifiers. `next_action` is the exact operator step.
-Root may start the persistent watcher after `complete`. The live source pane
+Root starts the persistent watcher at `target_acknowledged`, before `complete`. The live source pane
 stays up until the operator shutdown test; this module does not kill it.

@@ -2,8 +2,8 @@
 
 Portable Claude / Codex / Grok sessions assign cards with
 `POST /api/cards/:n/assign`. They do not go through `dispatch_policy.py`.
-This module is the server-boundary equivalent. Root must call it; this
-package does not patch `bin/sprintd`.
+This module is the server-boundary equivalent. `App.check_assignment_policy` calls it before mutation and revalidates the full
+card and worker settings under the board lock.
 
 Default builder is `settings.worker.default_executor`. Claude, Codex, and Grok
 are equivalent labels. A different **provider** needs a case-specific
@@ -11,9 +11,10 @@ are equivalent labels. A different **provider** needs a case-specific
 `evaluate_provider_override` (existing Jev contract). Preference is not a
 reason. The outcome is not execution permission.
 
-Live `worker.executors.grok` is `{kind, command, session}` with **no** `model`.
-Incoming default grok + model `grok-4.6` is free passthrough. Compare model
-only when a default model is actually configured.
+The HTTP hook resolves both the default and requested model with the same
+`resolve_dispatch` function used by the board. Configure each executor's model
+explicitly (for example, `grok-4.6`) so legacy Claude model fallbacks do not label
+an external worker incorrectly.
 
 ## Root hook
 
@@ -49,7 +50,7 @@ if not result.allowed:
 `gate_assignment` still accepts `existing=` so older callers do not break; the
 flag is ignored.
 
-## Config (opt-in)
+## Config
 
 Board file `assignment-policy.json` (0600), next to sprintd data:
 
@@ -61,7 +62,12 @@ Board file `assignment-policy.json` (0600), next to sprintd data:
 }
 ```
 
-Missing file or `enabled` not true → allow, no Jev (policy off). `daily_max_calls: 0`
+Legacy boards without this mode remain opt-in. The portable main-service installer
+creates an enabled private policy, and its runtime refuses a missing or disabled
+policy. An enabled policy with no API key still allows the default builder but
+blocks alternate builders. Standalone legacy API use without the policy remains
+ungated; this is not an OS sandbox against a hostile process with the same user
+permissions. `daily_max_calls: 0`
 means zero paid calls, not "use 200". Malformed config (bad JSON, non-object,
 non-integer cap) fail-closes as `unavailable`. Key is never read into the audit
 DB, gate result, or this repo. Default path is `~/.config/sprint/typesafe.env`.

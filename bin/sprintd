@@ -5759,6 +5759,7 @@ class App:
         declared = self.session_dead_declared(ds["last_seen_at"])
         return {
             "coordinator_supported": True,
+            "assignment_policy_supported": True,
             "coordinator": self.coordinator_state(at),
             "event_dispatch_supported": True,
             "event_dispatcher": self.event_dispatch_state(at),
@@ -6873,6 +6874,46 @@ class App:
             bits.append(d["model"])
         return " — " + " · ".join(bits)
 
+    def check_assignment_policy(self, num, executor, model, model_reason):
+        """Check a new assignment outside the board lock; bind it to read state."""
+        if not os.path.exists(os.path.join(self.data_dir, "assignment-policy.json")):
+            return None
+        from pathlib import Path
+        root = str(Path(__file__).resolve().parents[1])
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from sprint_coordinator.assignment_policy import gate_assignment
+        with self.lock:
+            card = dict(self.card_row(num))
+            worker = self.settings()["worker"]
+            before = dict(card)
+            effective = resolve_dispatch(
+                {"worker": worker},
+                executor if executor is not None else card.get("executor"),
+                model if model is not None else card.get("model"))
+            default = resolve_dispatch({"worker": worker})
+            gate_worker = json.loads(json.dumps(worker))
+            gate_worker["executors"].setdefault(default["executor"], {})["model"] = default["model"]
+            payload = {
+                "executor": effective["executor"],
+                "model": effective["model"],
+                "model_reason": model_reason,
+            }
+        try:
+            decision = gate_assignment(
+                self.data_dir, settings={"worker": gate_worker}, card_num=num,
+                payload=payload, assignment_id=secrets.token_hex(16),
+                task=card.get("body") or card.get("title") or "")
+        except Exception:
+            raise ApiError(503, "assignment_policy_unavailable",
+                           "Builder override could not be checked. Try the configured builder.") from None
+        if not decision.allowed:
+            raise ApiError(422, "assignment_override_rejected",
+                           "Builder override was not approved: " + decision.reason,
+                           field="model_reason")
+        return {"worker": worker, "card": before,
+                "decision_id": decision.decision_id, "reason": decision.reason}
+
     def assign(self, num: int, agent_name, worktree, branch,
                title=None, executor=None, model=None,
                actor: str = "session", work_kind=None,
@@ -6916,7 +6957,14 @@ class App:
                                sorted(list(known.keys()) + [BUILTIN_EXECUTOR]))))
         if model is not None:
             model = clean_model_name(model, "model")
+        policy = self.check_assignment_policy(num, executor, model, model_reason)
         with self.lock:
+            if policy:
+                current = dict(self.card_row(num))
+                if (self.settings()["worker"] != policy["worker"] or
+                        any(current.get(k) != v for k, v in policy["card"].items())):
+                    raise ApiError(409, "assignment_context_changed",
+                                   "The assignment changed while it was checked. Read it again before assigning.")
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 self.conn.execute(
@@ -6940,6 +6988,9 @@ class App:
                     "executor": executor}
                 if model:
                     note["model"] = model
+                if policy:
+                    note["assignment_policy"] = {"decision_id": policy["decision_id"],
+                                                  "reason": policy["reason"]}
                 # ...and the reason says WHICH fable ran out, so the line reads
                 # as a sentence: "assigned to sprint-card-42 on opus — fable
                 # limited until 11:50pm".

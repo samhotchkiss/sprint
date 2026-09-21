@@ -386,6 +386,8 @@ def inspect_target_health(rec: dict, observed: dict, data_dir: Path, now: float,
     # expected; do not reject a working target for advancing the cursor.
     if registered_pane(observed) != rec["target"]["pane"]:
         return False, "owner_changed"
+    if observed.get("default_executor") != rec["preserve"].get("default_executor"):
+        return False, "default_executor_changed"
     if receipt.get("cursor_seq") != _start_seq(rec):
         return False, "cursor_mismatch"
     if int(observed.get("cursor_seq") or 0) < _start_seq(rec):
@@ -478,8 +480,10 @@ class OwnerSwitch:
         self.board_data_dir = Path(board_data_dir)
         self.board = board
         self.transport = transport
-        self.project_root = Path(project_root or ".").resolve()
         self.switch_dir = Path(switch_dir) if switch_dir else self.board_data_dir
+        saved = read_json(self.switch_dir / RECORD_NAME, default={}) or {}
+        self.project_root = Path(project_root or saved.get("project_root")
+                                 or self.board_data_dir.parent).resolve()
         self.clock = clock
         self.pane_probe = pane_probe or TmuxListPanesProbe()
         self._lock = None
@@ -618,6 +622,8 @@ class OwnerSwitch:
         rec = self.load()
         if rec is None:
             return {"ok": False, "reason": "no_switch"}
+        if rec.get("rollback", {}).get("status") == "prepared":
+            return self.rollback()
         stage = rec.get("stage")
         if stage == "complete":
             return {"ok": True, "send_allowed": False, **rec}
@@ -949,6 +955,14 @@ class OwnerSwitch:
             pane = registered_pane(observed)
             if pane not in (src, dst):
                 return {"ok": False, "reason": "ownership_mismatch", **rec}
+            dispatch = read_json(self.board_data_dir / DISPATCH_NAME, default={}) or {}
+            if dispatch and dispatch.get("target") not in (src, dst):
+                return {"ok": False, "reason": "dispatch_target_mismatch", **rec}
+            # Persist the direction before either external write. advance()
+            # resumes this rollback, rather than forwarding a partial restore.
+            rec["rollback"] = {"status": "prepared", "from_pane": dst,
+                               "to_pane": src, "switch_id": rec["id"]}
+            self._save(rec)
             if pane != src:
                 body = {"session_tmux_window": src, "actor": "session"}
                 try:
@@ -962,7 +976,7 @@ class OwnerSwitch:
                 self.board_data_dir,
                 source_pane=dst,
                 target_pane=src,
-                board_cursor=int((rec.get("cursor") or {}).get("seq") or 0),
+                board_cursor=int(observed["cursor_seq"]),
                 abandon_inflight=True,
             )
             rec["dispatch_rebind_rollback"] = restore
@@ -971,6 +985,7 @@ class OwnerSwitch:
                 return {"ok": False, "reason": restore.get("reason"), **rec}
             rec["ownership"]["applied"] = False
             rec["ownership"]["current_pane"] = src
+            rec["rollback"]["status"] = "applied"
             if rec.get("transfer"):
                 rec["transfer"]["status"] = "rolled_back"
             rec["stage"] = "failed"
@@ -1093,7 +1108,7 @@ def _parse_argv(argv: list[str] | None) -> argparse.Namespace:
     sub = parser.add_subparsers(dest="command", required=True)
     plan = sub.add_parser("plan")
     plan.add_argument("--board-data-dir", required=True, type=Path)
-    plan.add_argument("--project-root", type=Path, default=Path("."))
+    plan.add_argument("--project-root", type=Path, default=None)
     plan.add_argument("--source-pane", required=True)
     plan.add_argument("--source-provider", required=True)
     plan.add_argument("--target-pane", required=True)
@@ -1105,7 +1120,7 @@ def _parse_argv(argv: list[str] | None) -> argparse.Namespace:
         cmd.add_argument("--board-data-dir", required=True, type=Path)
         cmd.add_argument("--tmux-send", type=Path, default=DEFAULT_TMUX_SEND)
         cmd.add_argument("--switch-dir", type=Path)
-        cmd.add_argument("--project-root", type=Path, default=Path("."))
+        cmd.add_argument("--project-root", type=Path, default=None)
     ack = sub.add_parser("ack")
     ack.add_argument("--board-data-dir", required=True, type=Path)
     ack.add_argument("--switch-dir", type=Path)
@@ -1116,11 +1131,11 @@ def _parse_argv(argv: list[str] | None) -> argparse.Namespace:
     ack.add_argument("--cursor-seq", type=int)
     ack.add_argument("--abandon-inflight", action="store_true")
     ack.add_argument("--tmux-send", type=Path, default=DEFAULT_TMUX_SEND)
-    ack.add_argument("--project-root", type=Path, default=Path("."))
+    ack.add_argument("--project-root", type=Path, default=None)
     exited = sub.add_parser("acknowledge-exited-source")
     exited.add_argument("--board-data-dir", required=True, type=Path)
     exited.add_argument("--switch-dir", type=Path)
-    exited.add_argument("--project-root", type=Path, default=Path("."))
+    exited.add_argument("--project-root", type=Path, default=None)
     exited.add_argument("--tmux-send", type=Path, default=DEFAULT_TMUX_SEND)
     return parser.parse_args(argv)
 

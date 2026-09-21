@@ -17,6 +17,7 @@ class Board:
 
     def autoheal(self):
         return {'tmux_window': self.target, 'event_dispatch_supported': True,
+                'assignment_policy_supported': True,
                 'coordinator': self.coordinator}
 
 
@@ -27,6 +28,7 @@ class MainServiceTests(unittest.TestCase):
         self.project = Path(self.tmp.name)
         self.data = self.project / '.sprint'
         self.data.mkdir()
+        (self.data / 'assignment-policy.json').write_text(json.dumps({'enabled': True}))
         self.board = Board()
 
     def test_restart_uses_registered_target_without_resetting_delivery(self):
@@ -49,6 +51,11 @@ class MainServiceTests(unittest.TestCase):
     def test_refuses_parallel_task_coordinator(self):
         self.board.coordinator = {'status': 'active'}
         with self.assertRaisesRegex(RuntimeError, 'already owns'):
+            service.preflight(self.project, self.board)
+
+    def test_portable_ingress_refuses_disabled_assignment_gate(self):
+        (self.data / 'assignment-policy.json').write_text(json.dumps({'enabled': False}))
+        with self.assertRaisesRegex(RuntimeError, 'requires the assignment policy'):
             service.preflight(self.project, self.board)
 
     def test_service_identity_survives_provider_change(self):

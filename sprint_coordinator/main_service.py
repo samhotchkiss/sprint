@@ -15,6 +15,7 @@ import subprocess
 import sys
 
 from sprint_coordinator.board import BoardClient
+from sprint_coordinator.config import write_json_private
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,7 +34,7 @@ def dispatcher():
     return module
 
 
-def preflight(project, board=None):
+def preflight(project, board=None, require_policy=True):
     data, _ = identity(project)
     board = board or BoardClient(data)
     settings = board.settings()
@@ -43,6 +44,8 @@ def preflight(project, board=None):
     health = board.autoheal()
     if not health.get('event_dispatch_supported'):
         raise RuntimeError('board needs event-dispatch support before starting ingress')
+    if not health.get('assignment_policy_supported'):
+        raise RuntimeError('board needs assignment-policy support before starting portable ingress')
     if health.get('coordinator'):
         raise RuntimeError('the task coordinator already owns ingress; stop it before switching modes')
     if health.get('tmux_window') != target:
@@ -51,6 +54,10 @@ def preflight(project, board=None):
     saved = dispatch.read_json(data / 'dispatch.json', {})
     if saved and saved.get('target') != target:
         raise RuntimeError('finish the acknowledged owner handoff before starting ingress')
+    if require_policy:
+        policy = dispatch.read_json(data / 'assignment-policy.json', {})
+        if not isinstance(policy, dict) or policy.get('enabled') is not True:
+            raise RuntimeError('portable main ingress requires the assignment policy gate')
     return target
 
 
@@ -90,6 +97,12 @@ def service(action, project):
         subprocess.run(['launchctl', 'bootout', domain + '/' + label], capture_output=True)
         path.unlink(missing_ok=True)
         return {'uninstalled': label}
+    preflight(project, require_policy=False)
+    policy_path = data / 'assignment-policy.json'
+    if not policy_path.exists():
+        write_json_private(policy_path, {'enabled': True,
+                           'key_file': '~/.config/sprint/typesafe.env',
+                           'daily_max_calls': 200})
     preflight(project)
     current = dispatcher().status(data)
     if current['running']:
@@ -122,6 +135,6 @@ def main(argv=None):
         else:
             print(json.dumps(service(args.action, args.project_root)))
         return 0
-    except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+    except (RuntimeError, OSError, ValueError, subprocess.CalledProcessError) as exc:
         print('sprint-dispatch-service: ' + str(exc), file=sys.stderr)
         return 1

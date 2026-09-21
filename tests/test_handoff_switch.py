@@ -138,6 +138,45 @@ class HandoffTests(unittest.TestCase):
         args.update(kwargs)
         return self.switch.plan(**args)
 
+    def test_reconstructed_cli_uses_saved_project_not_working_directory(self):
+        self.plan()
+        restored = OwnerSwitch(self.board_dir, board=self.board, transport=self.transport)
+        self.assertEqual(restored.project_root, self.dir.resolve())
+
+    def test_rollback_crash_resumes_rollback_on_advance(self):
+        from unittest.mock import patch
+        rec = self.plan()
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        self.switch.advance()
+        self.assertEqual(self.board.owner['pane'], '%8')
+        with patch('sprint_coordinator.handoff._rebind_unlocked', side_effect=RuntimeError('crash')):
+            with self.assertRaises(RuntimeError):
+                self.switch.rollback()
+        self.assertEqual(self.board.owner['pane'], '%5')
+        self.assertEqual(self.switch.load()['rollback']['status'], 'prepared')
+        restored = OwnerSwitch(self.board_dir, board=self.board, transport=self.transport)
+        result = restored.advance()
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['rollback']['status'], 'applied')
+        self.assertEqual(result['fail_reason'], 'rolled_back')
+        self.assertEqual(self.board.owner['pane'], '%5')
+
+    def test_completion_rejects_default_builder_drift(self):
+        rec = self.plan()
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        self.switch.advance()
+        self.switch.advance()
+        self.switch.ack(role="target", switch_id=rec["id"], nonce=rec["nonce"], cursor_seq=40)
+        self.switch.advance()
+        self.board.healthy_dispatcher('%8')
+        self.board.default_executor = 'claude'
+        result = self.switch.advance()
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['reason'], 'default_executor_changed')
+        self.assertNotEqual(result['stage'], 'complete')
+
     def test_plan_preserves_board_cards_executor_and_cursor(self):
         rec = self.plan()
         self.assertTrue(rec["ok"])

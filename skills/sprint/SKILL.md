@@ -2,6 +2,17 @@
 name: sprint
 description: Run a sprint board that sits on top of this live Claude Code session — boot/resume the board server, drain its event log, dispatch and supervise worker subagents per card, and handle verdicts. Trigger on "start a sprint", "feedback session", "open the board", "resume the sprint", or any request to check on / dispatch / batch sprint cards.
 ---
+## Builder selection on portable boards
+
+Use the board's configured default executor regardless of the main coordinator's
+provider. Submit the card assignment before launching a worker. With
+`assignment-policy.json` enabled, an alternate provider requires a case-specific
+`model_reason` and Jev approval at `/api/cards/:num/assign`. A rejected assignment
+authorizes no worker launch. Use the default builder or revise the concrete
+reason; do not bypass the gate by directly spawning a host-native agent.
+Already-running workers keep their assignments during a coordinator handoff.
+All session messages go through `tmux-send`.
+
 ## Service-owned boards
 
 If `/api/autoheal` reports an active `coordinator`, the deterministic service owns
