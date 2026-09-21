@@ -6592,7 +6592,7 @@ class App:
         try:
             from sprint_coordinator.publication import check_publication, PublicationRejected
         except ImportError:
-            self.log("message quality unavailable; preserving agent delivery")
+            self.log("message quality unavailable or uncertain; preserving agent delivery")
             return
         with self.lock:
             if num is None:
@@ -6611,7 +6611,7 @@ class App:
                               text=text, detail=detail, context=context)
         except PublicationRejected as exc:
             if exc.decision.get("action") == "unavailable":
-                self.log("message quality unavailable; preserving agent delivery")
+                self.log("message quality unavailable or uncertain; preserving agent delivery")
                 return
             raise ApiError(422, "message_needs_revision",
                            "Revise this draft using quality.failing, then resend. Nothing was published.",

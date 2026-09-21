@@ -92,7 +92,7 @@ Enable per board with a private `.sprint/message-quality.json`:
 No key is shipped. An absent file leaves existing installations unchanged. The
 server uses one five-second attempt, durable daily call limits, and a five-minute
 cache keyed to the exact draft and recent conversation. It returns HTTP 422 with
-`message_needs_revision` and `quality.failing` when revision is needed; an outage
+`message_needs_revision` and `quality.failing` when revision is needed; an outage, uncertain judgment
 or cap is logged and preserves delivery without claiming verification. A rejected
 draft is not published.
 The agent revises a rejected draft once; repeated automatic retries are not
@@ -102,3 +102,7 @@ Evidence packets and card descriptions are not currently covered by this gate.
 Visible chat supports safe Markdown paragraphs, lists, emphasis, code and links.
 Collapsed detail preserves log formatting by default; set `detail_format` to
 `markdown` for formatted prose. Critical decisions stay in the visible message.
+
+Publication rejects a semantic draft only on a confident failing dimension (<=0.2).
+Intermediate scores are recorded as unverified and preserve delivery. No claim of
+Jev approval is made for those messages. This favors continuity over a false refusal.

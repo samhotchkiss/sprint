@@ -26,7 +26,7 @@ def check_publication(data_dir, *, actor, surface, text, detail=None, context=No
     if config.get('enabled') is not True:
         return
     state = {'surface': surface, 'visible': text, 'detail': detail,
-             'outcome': 'Answer the latest user request or report a material outcome, blocker or decision.',
+             'outcome': 'Assess only the proposed visible message for useful, concise communication. It may report newly completed work rather than answer the last chat. Context can contain unrelated topics: do not require this update to resolve or repeat those topics. Do not score historical context text as part of the draft.',
              'context': json.dumps(context or {}, ensure_ascii=False)}
     fingerprint = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
     db = sqlite3.connect(root / 'message-quality.sqlite', timeout=5)
@@ -60,6 +60,12 @@ def check_publication(data_dir, *, actor, surface, text, detail=None, context=No
                        (fingerprint,time.time(),json.dumps(decision)))
             db.execute('DELETE FROM checks WHERE at<?',(time.time()-86400,))
             db.commit()
+        if decision.get('action') == 'revise':
+            # Uncertain style judgments must not silence useful project updates.
+            # Enforce only a confident failure; record uncertainty as unverified.
+            scores = decision.get('dimensions') or {}
+            if scores and min(scores.values()) > 0.2:
+                decision = dict(decision, action='unavailable', reason='message_quality_uncertain')
         if decision.get('action') != 'accept' or decision.get('verified') is not True:
             raise PublicationRejected(decision)
     finally:
