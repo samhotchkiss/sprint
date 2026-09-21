@@ -176,10 +176,29 @@ def cmd_override(args):
     return 0
 
 
+def cmd_continuity(args):
+    from sprint_coordinator.continuity import ContinuityInbox
+    cfg = _config(args)
+    store = Store(cfg.data_dir / "coordinator.sqlite", Clock.live())
+    try:
+        inbox = ContinuityInbox(store.conn)
+        if args.command == "continuity-ack":
+            if not args.delivery or args.through_seq is None:
+                raise ValueError("continuity-ack needs --delivery and --through-seq")
+            result = inbox.acknowledge(args.delivery, through_seq=args.through_seq)
+        else:
+            result = {"snapshot": inbox.snapshot(), "pending": inbox.pending(),
+                      "excluded_panes": inbox.excluded_panes()}
+        print(json.dumps(result, default=str))
+        return 0 if result.get("ok", True) else 1
+    finally:
+        store.close()
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Deterministic Sprint coordinator. No model runs because a timer ticked.")
-    parser.add_argument("command", choices=("init-config", "status", "run", "run-once", "override"))
+    parser.add_argument("command", choices=("init-config", "status", "run", "run-once", "override", "continuity-status", "continuity-ack"))
     parser.add_argument("--config", help="local coordinator.json (outside the repo is fine)")
     parser.add_argument("--project-root", type=Path)
     parser.add_argument("--data-dir", type=Path)
@@ -194,12 +213,16 @@ def main(argv=None) -> int:
     parser.add_argument("--assignment")
     parser.add_argument("--worker")
     parser.add_argument("--reason")
+    parser.add_argument("--delivery")
+    parser.add_argument("--through-seq", type=int)
     args = parser.parse_args(argv)
     try:
         if args.command == "init-config":
             return cmd_init_config(args)
         if args.command == "status":
             return cmd_status(args)
+        if args.command in ("continuity-status", "continuity-ack"):
+            return cmd_continuity(args)
         if args.command == "override":
             return cmd_override(args)
         if args.command == "run-once":
