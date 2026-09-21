@@ -50,8 +50,8 @@ or `failed`.
 | prepared | Observe `/api/settings`, `/api/board`, `/api/cursors/orchestrator`. Snapshot `dispatch.json` (`target`, `scanned`, `acknowledged`, `pending`, `inflight`, `wake_times`). tmux-send source quiesce (idle monitor only). |
 | source_quiesced | After source receipt. Uncertain inflight must already be covered by the **board** cursor or explicitly `abandon_inflight: true`. Then, under **both** `dispatch.lock` and `coordinator-owner.lock` (running dispatcher/service is rejected), rebind `dispatch.json` `target`, keep unread pending and wake_times, clear old inflight only after a genuine source-quiesce receipt. PUT `/api/settings` `{session_tmux_window, actor: session}` and read it back. Default executor unchanged. |
 | target_registered | tmux-send target registration. Cursor is the **board** orchestrator seq, not head. |
-| target_acknowledged | Target receipt bound to switch id + nonce + planned cursor. |
-| complete | Next action: start target coordinator. No automatic kill. Task workers may keep running. |
+| target_acknowledged | Target receipt bound to switch id + nonce + live start cursor. Waits for root to install the target ingress watcher. |
+| complete | Only after `/api/autoheal` `event_dispatcher.target` matches the target pane, the dispatch lock is held and fresh, and the target receipt is still valid. Module tests are not a live demo. |
 
 Sends are durable-before-send (`prepared` then tmux-send). Exit 4 / timeout is
 `uncertain` and **must not be resent**.

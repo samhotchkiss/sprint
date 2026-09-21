@@ -267,6 +267,10 @@ def observe(board) -> dict:
     if callable(getattr(board, "head_seq", None)):
         head = max(head, int(board.head_seq()))
     pane = settings_raw.get("session_tmux_window") or settings.get("session_tmux_window")
+    try:
+        autoheal = _board_get(board, "/api/autoheal")
+    except RuntimeError:
+        autoheal = {}
     return {
         "settings": settings,
         "session_tmux_window": pane,
@@ -275,6 +279,7 @@ def observe(board) -> dict:
         "cursor_seq": cursor_seq,
         "head_seq": head,
         "owner_pane": canonical_pane(pane),
+        "autoheal": autoheal if isinstance(autoheal, dict) else {},
     }
 
 
@@ -316,15 +321,49 @@ def _start_seq(rec: dict) -> int:
 def _validate_target_cursor(rec: dict, claimed, observed: dict):
     start = _start_seq(rec)
     head = int(observed.get("head_seq") or 0)
+    live = int(observed.get("cursor_seq") or 0)
     if claimed is None:
         claimed = start
     else:
         claimed = int(claimed)
+    if registered_pane(observed) != rec["target"]["pane"]:
+        return None, "owner_changed"
+    if live != start:
+        return None, "live_cursor_mismatch"
     if claimed == head and head > start:
         return None, "skip_pending_events"
     if claimed != start:
         return None, "cursor_mismatch"
     return claimed, None
+
+
+def inspect_target_health(rec: dict, observed: dict, data_dir: Path, now: float,
+                          project_root: Path) -> tuple[bool, str | None]:
+    """Complete only when the live dispatcher is on the target pane."""
+    receipt = (rec.get("receipts") or {}).get("target")
+    if not receipt:
+        return False, "target_receipt_missing"
+    _claimed, err = _validate_target_cursor(rec, receipt.get("cursor_seq"), observed)
+    if err:
+        return False, err
+    dispatcher = (observed.get("autoheal") or {}).get("event_dispatcher")
+    if not isinstance(dispatcher, dict):
+        return False, "await_target_health"
+    if dispatcher.get("target") != rec["target"]["pane"]:
+        return False, "dispatcher_target_mismatch"
+    live = snapshot_dispatch(read_json(Path(data_dir) / DISPATCH_NAME, default=None))
+    if live:
+        if live.get("target") != rec["target"]["pane"]:
+            return False, "dispatch_json_target_mismatch"
+        try:
+            age = now - float(live.get("heartbeat_at"))
+        except (TypeError, ValueError):
+            age = None
+        if age is not None and not (0 <= age <= 30):
+            return False, "dispatcher_stale"
+        if live.get("project_root") not in (None, str(project_root)):
+            return False, "dispatcher_project_mismatch"
+    return True, None
 
 
 def _target_send_started(rec: dict) -> bool:
@@ -532,6 +571,15 @@ class OwnerSwitch:
         if stage == "target_registered":
             return self._advance_target_registered(rec, observed)
         if stage == "target_acknowledged":
+            ready, err = inspect_target_health(
+                rec, observed, self.board_data_dir, self._now(), self.project_root)
+            rec["health_error"] = err
+            if ready is not True:
+                self._save(rec)
+                return {
+                    "ok": False, "send_allowed": False,
+                    "reason": err or "await_target_health", **rec,
+                }
             rec["stage"] = "complete"
             self._save(rec)
             return {"ok": True, "send_allowed": False, **rec}
@@ -840,9 +888,11 @@ def next_action(rec: dict) -> str:
         )
     if stage == "target_acknowledged":
         return (
-            "Start the %s coordinator on pane %s at cursor %s. "
-            "Stop only the old idle monitor. No automatic process kill."
-            % (dst.get("provider"), dst.get("pane"), cursor)
+            "Root: install/start the target ingress watcher on pane %s. "
+            "Then sprint-handoff advance to verify /api/autoheal event_dispatcher "
+            "target, held fresh lock, and target receipt at cursor %s. "
+            "Do not treat module tests as a live demo."
+            % (dst.get("pane"), cursor)
         )
     return "Inspect sprint-handoff status."
 
@@ -873,6 +923,9 @@ def _target_prompt(rec: dict, switch_dir: Path) -> str:
         "Coordinator owner switch %s." % rec["id"],
         "Project root: %s" % rec.get("project_root"),
         "Role: target take ownership. Provider label: %s." % rec["target"]["provider"],
+        "First acknowledge this handoff at the source cursor, before handling pending events.",
+        "Then end your turn. The operator starts sprint-dispatch-service to wake you for pending work.",
+        "Do not start a Monitor, polling loop, or a second watcher.",
         "Read the orchestrator event cursor from the board. Start at seq %s "
         "(latest fully handled source cursor). Do not skip to head."
         % _start_seq(rec),

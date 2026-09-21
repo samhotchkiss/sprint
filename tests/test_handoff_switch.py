@@ -1,12 +1,14 @@
 """Owner-switch tests. Injected board/transport; no paid calls or live panes."""
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 
@@ -30,6 +32,7 @@ class FakeBoard:
         self.default_executor = "grok"
         self.owner = {"provider": "claude", "pane": "%5"}
         self.puts = []
+        self.event_dispatcher = None
 
     def get(self, path):
         if path == "/api/settings":
@@ -44,7 +47,19 @@ class FakeBoard:
             return {"cards": list(self.cards), "head": self.head}
         if path == "/api/cursors/orchestrator":
             return {"seq": self.cursor}
+        if path == "/api/autoheal":
+            return {
+                "event_dispatch_supported": True,
+                "event_dispatcher": self.event_dispatcher,
+                "tmux_window": self.owner.get("pane"),
+            }
         raise AssertionError(path)
+
+    def healthy_dispatcher(self, pane):
+        self.event_dispatcher = {
+            "status": "idle", "target": pane, "acknowledged": self.cursor,
+            "scanned": self.cursor,
+        }
 
     def request(self, method, path, body=None, timeout=5.0, idempotency_key=None):
         if method == "GET":
@@ -222,9 +237,14 @@ class HandoffTests(unittest.TestCase):
         self.switch.advance()
         self.switch.ack(role="target", switch_id=rec["id"], nonce=rec["nonce"],
                         cursor_seq=40)
-        self.switch.advance()
-        self.switch.advance()
-        self.assertEqual(self.switch.load()["stage"], "complete")
+        waiting = self.switch.advance()
+        self.assertEqual(waiting.get("stage"), "target_acknowledged")
+        blocked = self.switch.advance()
+        self.assertEqual(blocked.get("reason"), "await_target_health")
+        self.assertEqual(self.switch.load()["stage"], "target_acknowledged")
+        self.board.healthy_dispatcher("%8")
+        done = self.switch.advance()
+        self.assertEqual(done.get("stage"), "complete")
         back = self.plan(source_pane="%8", source_provider="codex",
                          target_pane="%5", target_provider="claude")
         self.assertTrue(back["ok"])
@@ -505,6 +525,51 @@ class HandoffHttpTests(SprintdBase):
         worker = (settings.get("settings") or {}).get("worker") or {}
         self.assertEqual(worker.get("default_executor"),
                          rec["preserve"]["default_executor"])
+
+    def test_complete_requires_live_event_dispatcher(self):
+        from sprint_coordinator.board import BoardClient
+        data = Path(self.app.data_dir)
+        (data / "server.json").write_text(json.dumps({
+            "port": self.port, "token": "test-token",
+        }))
+        os.chmod(data / "server.json", 0o600)
+        self.req("PUT", "/api/settings", {
+            "session_tmux_window": "%5", "actor": "session",
+        })
+        client = BoardClient(data)
+        switch = OwnerSwitch(
+            data, board=client, transport=FakeTransport(),
+            project_root=Path(self.project_root), switch_dir=data)
+        rec = switch.plan(
+            source_pane="%5", source_provider="claude",
+            target_pane="%8", target_provider="codex")
+        self.assertTrue(rec["ok"], rec)
+        switch.advance()
+        switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        switch.advance()
+        switch.advance()
+        status, cur = self.get("/api/cursors/orchestrator")
+        self.assertEqual(status, 200)
+        seq = int(cur["seq"])
+        switch.ack(role="target", switch_id=rec["id"], nonce=rec["nonce"],
+                   cursor_seq=seq)
+        waiting = switch.advance()
+        self.assertEqual(waiting.get("stage"), "target_acknowledged")
+        blocked = switch.advance()
+        self.assertEqual(blocked.get("reason"), "await_target_health")
+        (data / "dispatch.json").write_text(json.dumps({
+            "version": 1, "target": "%8", "heartbeat_at": time.time(),
+            "project_root": self.app.project_root, "status": "idle",
+            "scanned": seq, "acknowledged": seq, "pending": [],
+        }))
+        lock = open(data / "dispatch.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(lock.close)
+        status, heal = self.get("/api/autoheal")
+        self.assertEqual(status, 200, heal)
+        self.assertEqual((heal.get("event_dispatcher") or {}).get("target"), "%8")
+        done = switch.advance()
+        self.assertEqual(done.get("stage"), "complete", done)
 
 
 if __name__ == "__main__":
