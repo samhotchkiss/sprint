@@ -426,7 +426,13 @@ TMUX_LIST_PANES = ["tmux", "list-panes", "-a", "-F", "#{pane_id}"]
 
 
 class TmuxListPanesProbe:
-    """Observe pane existence. Never kills or sends."""
+    """Observe pane existence via list-panes stdout. Never kills or sends.
+
+    ``tmux display-message -pt %N`` on a missing pane can exit 0 with empty
+    stdout; that must not count as absence. Only a successful list-panes
+    whose stdout does not contain the exact pane id is absence. Server errors
+    fail closed.
+    """
 
     def existing_panes(self) -> dict:
         try:
@@ -652,7 +658,13 @@ class OwnerSwitch:
 
     def _owner_mismatch(self, rec: dict, observed: dict) -> str | None:
         reg = registered_pane(observed)
-        expected = rec["target"]["pane"] if rec.get("ownership", {}).get("applied") is True else rec["source"]["pane"]
+        src = rec["source"]["pane"]
+        dst = rec["target"]["pane"]
+        if (rec.get("transfer") or {}).get("status") == "prepared":
+            if reg not in (src, dst):
+                return "unrelated_pane"
+            return None
+        expected = dst if rec.get("ownership", {}).get("applied") is True else src
         if reg != expected:
             return "owner_changed"
         return None
@@ -681,26 +693,49 @@ class OwnerSwitch:
         return {"ok": True, "send_allowed": False, "reason": "await_source_ack", **rec}
 
     def _transfer_after_source_receipt(self, rec: dict, observed: dict) -> dict:
+        src = rec["source"]["pane"]
+        dst = rec["target"]["pane"]
+        intent = rec.get("transfer") or {}
+        if intent.get("status") != "prepared":
+            rec["transfer"] = {
+                "status": "prepared",
+                "from_pane": src,
+                "to_pane": dst,
+                "switch_id": rec["id"],
+            }
+            self._save(rec)
         pair, err = acquire_owner_locks(self.board_data_dir)
         if err:
             return {"ok": False, "reason": err}
         try:
             live = observe(self.board)
-            if registered_pane(live) != rec["source"]["pane"]:
-                return {"ok": False, "reason": "owner_changed"}
+            pane = registered_pane(live)
+            if pane not in (src, dst):
+                return {"ok": False, "reason": "unrelated_pane"}
             src_receipt = (rec.get("receipts") or {}).get("source") or {}
             abandon = src_receipt.get("abandon_inflight") is True or bool(rec.get("source_exit"))
             rebound = _rebind_unlocked(
                 self.board_data_dir,
-                source_pane=rec["source"]["pane"],
-                target_pane=rec["target"]["pane"],
+                source_pane=src,
+                target_pane=dst,
                 board_cursor=int(live["cursor_seq"]),
                 abandon_inflight=abandon,
             )
             rec["dispatch_rebind"] = rebound
             if rebound.get("ok") is not True:
                 return rebound
-            return self._apply_ownership(rec, live)
+            if pane != dst:
+                applied = self._apply_ownership(rec, live)
+                if applied.get("ok") is not True:
+                    return applied
+            else:
+                rec["ownership"]["applied"] = True
+                rec["ownership"]["current_pane"] = dst
+                rec["ownership"]["patch"] = {
+                    "session_tmux_window": dst, "actor": "session",
+                }
+            rec["transfer"]["status"] = "applied"
+            return {"ok": True}
         finally:
             for handle in pair:
                 _unlock(handle)
@@ -876,8 +911,7 @@ class OwnerSwitch:
             if payload.get("role") != role:
                 continue
             if role == "target":
-                if (rec.get("stage") in ("target_acknowledged", "complete")
-                        and rec.get("receipts", {}).get("target")):
+                if rec.get("receipts", {}).get("target"):
                     continue
                 claimed, err = _validate_target_cursor(
                     rec, payload.get("cursor_seq"), observed)
@@ -905,35 +939,47 @@ class OwnerSwitch:
         stage = rec.get("stage")
         if stage in ("target_acknowledged", "complete") or _target_send_started(rec):
             return {"ok": False, "reason": "target_active", **rec}
-        observed = observe(self.board)
-        expected = rec["target"]["pane"] if rec.get("ownership", {}).get("applied") is True else rec["source"]["pane"]
-        if registered_pane(observed) != expected:
-            return {"ok": False, "reason": "ownership_mismatch", **rec}
-        if rec.get("ownership", {}).get("applied") is True:
-            body = {"session_tmux_window": rec["source"]["pane"], "actor": "session"}
-            try:
-                _board_request(self.board, "PUT", "/api/settings", body)
-            except Exception:
-                return {"ok": False, "reason": "rollback_apply_failed", **rec}
-            back = observe(self.board)
-            if registered_pane(back) != rec["source"]["pane"]:
-                return {"ok": False, "reason": "rollback_readback_mismatch", **rec}
-            rec["ownership"]["applied"] = False
-            rec["ownership"]["current_pane"] = rec["source"]["pane"]
-        rec["stage"] = "failed"
-        rec["fail_reason"] = "rolled_back"
-        if rec.get("dispatch_rebind", {}).get("ok") is True:
-            restore = rebind_dispatch_target(
+        src = rec["source"]["pane"]
+        dst = rec["target"]["pane"]
+        pair, err = acquire_owner_locks(self.board_data_dir)
+        if err:
+            return {"ok": False, "reason": err, **rec}
+        try:
+            observed = observe(self.board)
+            pane = registered_pane(observed)
+            if pane not in (src, dst):
+                return {"ok": False, "reason": "ownership_mismatch", **rec}
+            if pane != src:
+                body = {"session_tmux_window": src, "actor": "session"}
+                try:
+                    _board_request(self.board, "PUT", "/api/settings", body)
+                except Exception:
+                    return {"ok": False, "reason": "rollback_apply_failed", **rec}
+                back = observe(self.board)
+                if registered_pane(back) != src:
+                    return {"ok": False, "reason": "rollback_readback_mismatch", **rec}
+            restore = _rebind_unlocked(
                 self.board_data_dir,
-                source_pane=rec["target"]["pane"],
-                target_pane=rec["source"]["pane"],
+                source_pane=dst,
+                target_pane=src,
                 board_cursor=int((rec.get("cursor") or {}).get("seq") or 0),
                 abandon_inflight=True,
-                source_stopped=True,
             )
             rec["dispatch_rebind_rollback"] = restore
-        self._save(rec)
-        return {"ok": True, **rec}
+            if restore.get("ok") is not True:
+                self._save(rec)
+                return {"ok": False, "reason": restore.get("reason"), **rec}
+            rec["ownership"]["applied"] = False
+            rec["ownership"]["current_pane"] = src
+            if rec.get("transfer"):
+                rec["transfer"]["status"] = "rolled_back"
+            rec["stage"] = "failed"
+            rec["fail_reason"] = "rolled_back"
+            self._save(rec)
+            return {"ok": True, **rec}
+        finally:
+            for handle in pair:
+                _unlock(handle)
 
 
 def next_action(rec: dict) -> str:

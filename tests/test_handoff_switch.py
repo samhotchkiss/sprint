@@ -483,6 +483,98 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(out["observed_head"], 27)
         self.assertTrue(out["pending_since_plan"])
 
+    def test_complete_allows_cursor_progress_after_validated_target_ack(self):
+        rec = self.plan()
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        self.switch.advance()
+        self.switch.advance()
+        self.switch.ack(role="target", switch_id=rec["id"], nonce=rec["nonce"],
+                        cursor_seq=40)
+        waiting = self.switch.advance()
+        self.assertEqual(waiting.get("stage"), "target_acknowledged")
+        self.board.cursor = 55
+        self.board.head = 56
+        path = self.board_dir / "receipts" / "target.json"
+        path.write_text(json.dumps({
+            "switch_id": rec["id"], "nonce": rec["nonce"], "role": "target",
+            "cursor_seq": 99,
+        }))
+        self.board.healthy_dispatcher("%8")
+        done = self.switch.advance()
+        self.assertEqual(done.get("stage"), "complete", done)
+        self.assertIsNone(self.switch.load().get("receipt_error"))
+
+    def test_transfer_intent_reconciles_after_settings_write_crash(self):
+        rec = self.plan()
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        stored = self.switch.load()
+        stored["transfer"] = {
+            "status": "prepared",
+            "from_pane": "%5",
+            "to_pane": "%8",
+            "switch_id": rec["id"],
+        }
+        self.switch._save(stored)
+        self.board.owner["pane"] = "%8"
+        (self.board_dir / "dispatch.json").write_text(json.dumps({
+            "target": "%8", "scanned": 20, "acknowledged": 20,
+            "pending": [{"seq": 27}], "inflight": None, "wake_times": [],
+        }))
+        out = self.switch.advance()
+        self.assertEqual(out.get("stage"), "source_quiesced", out)
+        self.assertEqual(self.switch.load()["transfer"]["status"], "applied")
+        self.assertEqual(self.board.owner["pane"], "%8")
+
+        stored = self.switch.load()
+        stored["stage"] = "prepared"
+        stored["ownership"]["applied"] = False
+        stored["transfer"] = {
+            "status": "prepared",
+            "from_pane": "%5",
+            "to_pane": "%8",
+            "switch_id": rec["id"],
+        }
+        self.switch._save(stored)
+        self.board.owner["pane"] = "%99"
+        bad = self.switch.advance()
+        self.assertEqual(bad.get("reason"), "unrelated_pane")
+        self.assertEqual(self.board.owner["pane"], "%99")
+
+    def test_rollback_reports_rebind_failure(self):
+        rec = self.plan()
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        self.switch.advance()
+        (self.board_dir / "dispatch.json").write_text(json.dumps({
+            "target": "%99", "scanned": 20, "acknowledged": 20,
+            "pending": [], "inflight": None,
+        }))
+        out = self.switch.rollback()
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["reason"], "dispatch_target_mismatch")
+        self.assertNotEqual(self.switch.load()["stage"], "failed")
+
+    def test_list_panes_empty_stdout_is_absence_probe_error_is_not(self):
+        rec = self.plan()
+        self.probe.ok = True
+        self.probe.panes = []
+        ok = self.switch.acknowledge_exited_source()
+        self.assertTrue(ok["ok"], ok)
+        self.assertTrue(self.switch.load()["source_exit"]["absent"])
+        rec2_dir = self.switch.load()
+        rec2_dir["source_exit"] = None
+        rec2_dir["stage"] = "prepared"
+        self.switch._save(rec2_dir)
+        self.probe.ok = False
+        self.probe.panes = []
+        failed = self.switch.acknowledge_exited_source()
+        self.assertEqual(failed["reason"], "tmux_probe_failed")
+        import sprint_coordinator.handoff as mod
+        self.assertIn("list-panes", "".join(mod.TMUX_LIST_PANES))
+        self.assertNotIn("display-message", "".join(mod.TMUX_LIST_PANES))
+
     def test_plan_rejects_unregistered_source_pane(self):
         bad = self.plan(source_pane="%9", target_pane="%8")
         self.assertFalse(bad["ok"])
