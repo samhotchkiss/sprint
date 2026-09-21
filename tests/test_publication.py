@@ -39,3 +39,9 @@ class PublicationTest(Base):
             self.app.ask(card['num'],'Unclear?',[],actor='worker')
             self.app.card_event(card['num'],'error',{'text':'Critical failure'},actor='worker')
             self.assertEqual(self.app.card_row(card['num'])['state'],'needs_you')
+
+    def test_uncertain_quality_preserves_message(self):
+        response=SimpleNamespace(answers={k:{'noul':0.5} for k in DIMENSIONS},input_tokens=1,output_tokens=0)
+        with patch('sprint_coordinator.publication.load_api_key',return_value='test'), patch('sprint_coordinator.publication.JevClient.evaluate',return_value=response):
+            self.app.sidebar_post('A useful update.', 'session')
+            self.assertEqual(self.app.sidebar_thread()[-1]['payload']['text'],'A useful update.')
