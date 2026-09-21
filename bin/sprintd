@@ -6581,6 +6581,44 @@ class App:
 
     # -- misc writes ------------------------------------------------------
 
+    def check_message_quality(self, actor, text, detail=None, num=None):
+        if actor not in ("session", "worker"):
+            return
+        if not os.path.exists(os.path.join(self.data_dir, "message-quality.json")):
+            return
+        repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        try:
+            from sprint_coordinator.publication import check_publication, PublicationRejected
+        except ImportError:
+            self.log("message quality unavailable; preserving agent delivery")
+            return
+        with self.lock:
+            if num is None:
+                rows = self.q("SELECT actor,kind,payload FROM events WHERE card_num IS NULL "
+                                 "AND kind='chat' ORDER BY seq DESC LIMIT 8")
+                card = None
+            else:
+                rows = self.q("SELECT actor,kind,payload FROM events WHERE card_num=? "
+                                 "AND kind IN ('chat','answer','question') ORDER BY seq DESC LIMIT 8", (num,))
+                r = self.card_row(num)
+                card = {k:r[k] for k in ('title','body','state')}
+            context = {"card":card, "messages":[dict(r) for r in reversed(rows)]}
+        try:
+            check_publication(self.data_dir, actor=actor,
+                              surface="sidebar" if num is None else "card",
+                              text=text, detail=detail, context=context)
+        except PublicationRejected as exc:
+            if exc.decision.get("action") == "unavailable":
+                self.log("message quality unavailable; preserving agent delivery")
+                return
+            raise ApiError(422, "message_needs_revision",
+                           "Revise this draft using quality.failing, then resend. Nothing was published.",
+                           quality=exc.decision) from None
+        except Exception:
+            self.log("message quality failed; preserving agent delivery")
+
     def card_event(self, num: int, kind: str, payload, actor: str = "worker",
                    long_running=None) -> dict:
         if kind not in ("progress", "chat", "note", "error"):
@@ -6589,6 +6627,8 @@ class App:
         self.card_row(num)
         if not isinstance(payload, dict):
             payload = {"text": payload if isinstance(payload, str) else jdump(payload)}
+        if kind in ("chat", "note"):
+            self.check_message_quality(actor, payload.get("text"), payload.get("detail"), num)
         payload = clean_phase(payload)
         if long_running is None:
             long_running = payload.get("long_running")
@@ -6611,7 +6651,7 @@ class App:
                 "card": self.card_json(self.card_row(num), brief=True)}
 
     def card_chat(self, num: int, text: str, images=None, actor: str = "user",
-                  detail=None, reports=None) -> dict:
+                  detail=None, reports=None, detail_format=None) -> dict:
         """A line to one card's thread -- text, images, or both.
 
         Same deal as dropping work on the board: a screenshot with no words is a
@@ -6639,13 +6679,16 @@ class App:
             payload["images_only"] = True
         if detail is not None:
             payload["detail"] = detail
+            if detail_format == "markdown":
+                payload["detail_format"] = "markdown"
         return self.card_event(num, "chat", payload, actor=actor)
 
     def sidebar_post(self, text: str, actor: str, detail=None, images=None,
-                     reports=None) -> dict:
+                     reports=None, detail_format=None) -> dict:
         text = (text or "").strip()
         if actor not in ("user", "session"):
             raise ApiError(400, "bad_actor", "sidebar actor must be user or session")
+        self.check_message_quality(actor, text, detail)
         attachments = self.store_images(images)
         docs = self.store_reports(reports)
         attachments = attachments + docs
@@ -6662,6 +6705,8 @@ class App:
             payload["images_only"] = True
         if detail is not None:
             payload["detail"] = detail
+            if detail_format == "markdown":
+                payload["detail_format"] = "markdown"
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
@@ -8253,6 +8298,7 @@ def make_handler(app: App):
                 return 201, app.sidebar_post(body.get("text"),
                                              side if side == "session" else "user",
                                              detail=body.get("detail"),
+                                             detail_format=body.get("detail_format"),
                                              images=posted_images(body),
                                              reports=body.get("reports"))
 
@@ -8320,6 +8366,7 @@ def make_handler(app: App):
                 return 201, app.card_chat(num, body.get("text"),
                                           images=posted_images(body),
                                           detail=body.get("detail"),
+                                          detail_format=body.get("detail_format"),
                                           reports=body.get("reports"),
                                           actor=self.actor_or(body, "user"))
             if verb == "answer":

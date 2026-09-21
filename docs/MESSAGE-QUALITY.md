@@ -78,3 +78,27 @@ Exact comparisons: accept only when `action == "accept"` and `verified is True`.
 Call `assess_message` on the proposed outbox body. Publish only on `accept`.
 On `revise`, send `failing` back to the generator. On `unavailable`, hold the
 draft. This file does not implement that path.
+
+## Server enforcement
+
+The board server checks agent sidebar messages, card chats and notes
+before storing them. Human submissions, error reports, questions and routine machine progress do not call Jev.
+Enable per board with a private `.sprint/message-quality.json`:
+
+```json
+{"enabled":true,"daily_max_calls":200,"key_file":"~/.config/sprint/typesafe.env"}
+```
+
+No key is shipped. An absent file leaves existing installations unchanged. The
+server uses one five-second attempt, durable daily call limits, and a five-minute
+cache keyed to the exact draft and recent conversation. It returns HTTP 422 with
+`message_needs_revision` and `quality.failing` when revision is needed; an outage
+or cap is logged and preserves delivery without claiming verification. A rejected
+draft is not published.
+The agent revises a rejected draft once; repeated automatic retries are not
+allowed. This checks communication quality, not factual truth or deployment safety.
+Evidence packets and card descriptions are not currently covered by this gate.
+
+Visible chat supports safe Markdown paragraphs, lists, emphasis, code and links.
+Collapsed detail preserves log formatting by default; set `detail_format` to
+`markdown` for formatted prose. Critical decisions stay in the visible message.

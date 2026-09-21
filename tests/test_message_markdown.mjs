@@ -195,3 +195,9 @@ test('isMarkdownDetail is exact', () => {
   assert.equal(isMarkdownDetail({ payload: { detail_format: 'text' } }), false);
   assert.equal(isMarkdownDetail({ payload: {} }), false);
 });
+
+test('empty and malformed fences do not throw or loop', () => {
+  installDom();
+  assert.doesNotThrow(() => renderMarkdown(''));
+  assert.doesNotThrow(() => renderMarkdown('```a b\ntext'));
+});

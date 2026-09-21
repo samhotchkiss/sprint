@@ -82,7 +82,7 @@ function parseBlocks(src) {
     const para = [];
     while (i < lines.length) {
       if (/^\s*$/.test(lines[i])) break;
-      if (/^```/.test(lines[i])) break;
+      if (/^```([\w+-]*)[ \t]*$/.test(lines[i])) break;
       if (/^\s*[-*+][ \t]+\S/.test(lines[i])) break;
       if (/^\s*\d+\.[ \t]+\S/.test(lines[i])) break;
       para.push(lines[i]);
@@ -90,7 +90,7 @@ function parseBlocks(src) {
     }
     blocks.push({ type: 'p', text: para.join('\n') });
   }
-  if (!blocks.length) blocks.push({ type: 'p', text: source });
+  if (!blocks.length) blocks.push({ type: 'p', text: src });
   return blocks;
 }
 
@@ -154,7 +154,7 @@ function appendInline(parent, text, onCard) {
       if (mid > i && close > mid) {
         const href = safeHref(s.slice(mid + 2, close));
         if (href) {
-          const a = outbound(href);
+          const a = outbound(href, "");
           appendInline(a, s.slice(i + 1, mid), onCard);
           parent.appendChild(a);
           i = close + 1;
@@ -223,7 +223,7 @@ function outbound(href, label) {
     rel: 'noopener noreferrer',
     title: href,
     onclick: (e) => e.stopPropagation(),
-  }, label || href);
+  }, label == null ? href : label);
 }
 
 export function isMarkdownDetail(ev) {

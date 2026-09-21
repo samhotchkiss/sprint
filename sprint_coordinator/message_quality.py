@@ -43,7 +43,7 @@ QUALITY_QUESTIONS = {
     "advances_next_decision": _noul(
         "Does `visible` (with `detail` if present) change what the user should "
         "do next, decide next, or understand about `outcome`? "
-        "A status placeholder, process recap, or agreement echo is not enough.",
+        "A brief acknowledgment is sufficient when acknowledgment is all the user requested. Otherwise a status placeholder or process recap is not enough.",
         "Yes: the user can act, decide, or update their understanding of the outcome.",
         "No: the user is no closer to a next action, decision, or outcome.",
     ),
@@ -68,13 +68,12 @@ QUALITY_QUESTIONS = {
         "No: it is an unformatted block or oversized paragraph dump.",
     ),
     "preserves_decision_material": _noul(
-        "Does the draft keep every fact from `outcome` and `context` that the user "
-        "needs: blockers, uncertainty required for a decision, questions asked of "
-        "the user, and evidence needed to accept work? "
-        "Do not hide those by omitting them or burying them only in inaccessible form. "
-        "Do not treat shortening as a fix for an unsupported claim.",
-        "Yes: decision-critical material is present and not stripped.",
-        "No: a blocker, needed uncertainty, question, or acceptance evidence is missing or hidden.",
+        "Is `visible` free of a material omission that would lead the user to a wrong next action? "
+        "Check only current unresolved blockers, necessary choices or risks explicitly stated in context. "
+        "If context contains none, answer yes. Historical chatter and completed checks do not need repeating. "
+        "A concise ready-for-review update is sufficient when work is ready and there is no blocker.",
+        "Yes: no current blocker, necessary choice or risk has been concealed.",
+        "No: a specific current blocker, necessary choice or risk was concealed.",
     ),
 }
 

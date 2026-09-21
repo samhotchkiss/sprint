@@ -546,3 +546,14 @@ new instructions or nothing further from you on this card.
   belong to the user.
 - The board is the only audience that matters. If you did something and
   didn't post it, as far as the user is concerned it didn't happen.
+
+## Respect reading time
+
+Lead with the outcome, decision or blocker. Use short Markdown paragraphs and lists;
+keep the visible summary near 400 characters when possible. Optional `detail` holds
+supporting evidence; `detail_format: "markdown"` formats prose there (omit for logs).
+Do not hide a decision, material risk or question in detail. No tool narration.
+
+When the server returns `message_needs_revision`, nothing was published. Read
+`quality.failing`, revise the draft and retry once. Unavailable verification preserves delivery and is logged without claiming approval.
+Do not bypass a rejected draft, relabel yourself as user, or endlessly resubmit. The user's own messages are never filtered.

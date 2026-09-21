@@ -1898,3 +1898,14 @@ card numbers in each bucket. The board keeps serving the closed sprint
 read-only — don't tear anything down, don't prune worktrees that still
 have unmerged work still worth keeping around for a future sprint to
 pick up (only prune what step 6 already resolved).
+
+## Respect reading time
+
+Lead with the outcome, decision or blocker. Use short Markdown paragraphs and lists;
+keep the visible summary near 400 characters when possible. Optional `detail` holds
+supporting evidence; `detail_format: "markdown"` formats prose there (omit for logs).
+Do not hide a decision, material risk or question in detail. No tool narration.
+
+When the server returns `message_needs_revision`, nothing was published. Read
+`quality.failing`, revise the draft and retry once. Unavailable verification preserves delivery and is logged without claiming approval.
+Do not bypass a rejected draft, relabel yourself as user, or endlessly resubmit. The user's own messages are never filtered.
