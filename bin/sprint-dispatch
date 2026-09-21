@@ -183,10 +183,10 @@ def tick(state, board, project, save, send, at, ack_timeout=300, max_wakes=30):
     return True
 
 
-def lock_file(data):
+def lock_file(data, name="dispatch.lock"):
     data.mkdir(parents=True, exist_ok=True)
-    handle = open(data / "dispatch.lock", "a+")
-    os.chmod(data / "dispatch.lock", 0o600)
+    handle = open(data / name, "a+")
+    os.chmod(data / name, 0o600)
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -308,6 +308,18 @@ def main():
             parser.error("another dispatcher owns this board; stop it before changing/resetting")
         print(json.dumps(current))
         return 0
+    owner_fd = os.environ.pop("SPRINT_DISPATCH_OWNER_FD", None)
+    owner = (os.fdopen(int(owner_fd), "a+") if owner_fd is not None
+             and args.command == "run" else lock_file(args.data, "coordinator-owner.lock"))
+    if owner is None:
+        lease.close()
+        parser.error("another coordinator owns this board; stop it before starting ingress")
+    # Invalidate a previous task-coordinator heartbeat while holding the shared
+    # lock. The lock may now belong to this main-session dispatcher instead.
+    write_json(args.data / "coordinator-owner.json", {
+        "version": 1, "project_root": str(args.project_root),
+        "pid": os.getpid(), "heartbeat_at": time.time(), "status": "main",
+    })
     # Refuse old boards where autoheal would compete with normal dispatch.
     capability = Board(args.data).get("/api/autoheal")
     if not capability.get("event_dispatch_supported"):
@@ -315,7 +327,10 @@ def main():
     if capability.get("tmux_window") != args.target:
         parser.error("target does not match the board's registered owner")
     if args.command == "run":
-        run(args, lease)
+        try:
+            run(args, lease)
+        finally:
+            owner.close()
         return 0
     initial = read_json(args.data / "dispatch.json")
     if initial and initial["target"] != args.target and not args.reset:
@@ -336,12 +351,14 @@ def main():
         argv.append("--reset")
     # Child inherits the exact lock; avoid a double-start window.
     os.environ["SPRINT_DISPATCH_LOCK_FD"] = str(lease.fileno())
+    os.environ["SPRINT_DISPATCH_OWNER_FD"] = str(owner.fileno())
     os.environ["SPRINT_DISPATCH_INSTANCE"] = instance
     with open(args.data / "dispatch.log", "ab") as log:
         os.chmod(args.data / "dispatch.log", 0o600)
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                 start_new_session=True, pass_fds=(lease.fileno(),))
+                                 start_new_session=True, pass_fds=(lease.fileno(), owner.fileno()))
     lease.close()
+    owner.close()
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         current = status(args.data)

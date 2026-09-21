@@ -8,6 +8,28 @@ description: Run or resume a Sprint board from a live Codex session, including e
 This is the Codex host adapter for Sprint. The board is state only; this live
 Codex session is its brain.
 
+## Portable boards: preserve workers across host changes
+
+On a board using `sprint-handoff`, the main session and task workers are
+independent tmux sessions. All messages to them go through `tmux-send`, including
+follow-ups and recovery. Do not use host-native Agent/SendMessage equivalents on
+these boards. This rule overrides the legacy host mapping below.
+
+Read the current card assignment and recorded pane before launching anything.
+A worker absent from Codex's internal agent tree may still be working in tmux;
+switching from Claude does not make it dead. Preserve its worktree, branch and
+executor. Keep the board's default builder even when the coordinator provider
+changes. Never silently substitute Codex workers because the coordinator is Codex.
+
+Use `docs/OWNER-SWITCH.md` for the acknowledged handoff. Start from the saved
+orchestrator cursor, read pending events and existing card timelines, and do not
+reset a dispatcher to bypass an ownership mismatch. A receipt acknowledging the
+handoff does not acknowledge unread board events.
+
+For persistent main-session ingress use `bin/sprint-dispatch-service install
+--project-root /absolute/project` after the handoff registers this pane. End idle
+turns; the operating system restarts a crashed watcher without model polling.
+
 ## Load the canonical contract
 
 This adapter is installed as a symlink by `bin/sprint-codex-install`. Resolve

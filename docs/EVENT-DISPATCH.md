@@ -91,6 +91,21 @@ through a permission dialog. An uncertain send remains a manual recovery case.
 
 ## Supervision
 
+On macOS, install the board-specific supervisor after registering the owner:
+
+```sh
+bin/sprint-dispatch-service install --project-root /absolute/project
+bin/sprint-dispatch-service status --project-root /absolute/project
+bin/sprint-dispatch-service uninstall --project-root /absolute/project
+```
+
+It reads the registered pane at startup and retains dispatcher delivery state.
+It refuses an unreconciled target change or a competing task coordinator.
+The dispatcher and task coordinator share an ownership lock. Stop/uninstall
+the old watcher before the acknowledged switch in `docs/OWNER-SWITCH.md`;
+install the new watcher after the target accepts. No worker is stopped by this
+helper. A crash restarts automatically; an intentional clean stop stays stopped.
+
 For unattended operation, supervise `run` instead of nesting `start` inside a
 supervisor. Example launchd ProgramArguments (substitute actual absolute paths):
 
