@@ -95,9 +95,11 @@ task names while keeping `sprint-card-<n>`, `sprint-batch-<id>`, and
 agent id or canonical task path in a collapsed card-note detail so a compacted
 or resumed orchestrator can recover the mapping from the board.
 
-Before relaying to a worker, call `list_agents`. Send to a running worker; use
+For legacy boards using host-native workers only, before relaying to a worker,
+call `list_agents`. Send to a running worker; use
 `followup_task` for an idle worker. A worker missing from the current agent tree
-is dead for recovery purposes; follow the canonical fresh-agent procedure.
+is dead for recovery purposes only on those legacy boards. On portable boards,
+inspect its recorded tmux pane and use `tmux-send`; never replace a live worker.
 
 ## Event-driven ingress: end idle turns
 

@@ -91,11 +91,13 @@ def service(action, project):
         path.unlink(missing_ok=True)
         return {'uninstalled': label}
     preflight(project)
-    if dispatcher().status(data)['running']:
+    current = dispatcher().status(data)
+    if current['running']:
         # Reinstalling a healthy service is unnecessary. A standalone dispatcher
         # must be explicitly stopped first, preserving its saved delivery state.
         check = subprocess.run(['launchctl', 'print', domain + '/' + label], capture_output=True)
-        if check.returncode == 0:
+        pid = re.search(rb'^\s*pid = ([0-9]+)\s*$', check.stdout, re.M)
+        if check.returncode == 0 and pid and int(pid[1]) == current.get('pid'):
             return {'installed': label, 'already_running': True}
         raise RuntimeError('stop the standalone dispatcher before installing its supervisor')
     data.mkdir(parents=True, exist_ok=True)

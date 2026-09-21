@@ -211,6 +211,35 @@ class HTTPTests(Base):
         handle.close()
         self.assertIsNone(self.app.event_dispatch_state())
 
+    def test_main_shared_lock_never_masquerades_as_task_coordinator(self):
+        lock = dispatch.lock_file(self.data, 'coordinator-owner.lock')
+        self.addCleanup(lock.close)
+        dispatch.write_json(self.data / 'coordinator-owner.json', {
+            'version': 1, 'status': 'main', 'heartbeat_at': time.time(),
+            'project_root': self.app.project_root,
+        })
+        self.assertIsNone(self.app.coordinator_state())
+
+    def test_signal_exit_is_restartable_but_nonce_stop_is_clean(self):
+        sender = Path(self.tmp) / 'unused-sender'
+        sender.write_text('#!/bin/sh\nexit 0\n')
+        sender.chmod(0o700)
+        args = [str(ROOT / 'bin/sprint-dispatch'), 'run', '--project-root',
+                self.project_root, '--target', '%5', '--poll', '.1',
+                '--tmux-send', str(sender)]
+        child = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            state = dispatch.status(self.data)
+            if state.get('pid') == child.pid and state.get('status') == 'idle':
+                break
+            time.sleep(.05)
+        self.assertEqual(state.get('pid'), child.pid)
+        child.terminate()
+        self.assertEqual(child.wait(timeout=4), 1)
+        child.stderr.close()
+
     def test_stale_mismatched_or_future_lease_does_not_suppress_recovery(self):
         handle, state = self.lease()
         for patch in ({'heartbeat_at': time.time() - 31}, {'target': '%8'},

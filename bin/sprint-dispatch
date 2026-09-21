@@ -257,6 +257,9 @@ def run(args, lease):
         state["status"] = "stopped"
         save()
         lease.close()
+    # A received signal is not the nonce-scoped stop command or an ownership
+    # change. Let the supervisor recover incidental termination.
+    return 1 if stopping else 0
 
 
 def main():
@@ -328,10 +331,9 @@ def main():
         parser.error("target does not match the board's registered owner")
     if args.command == "run":
         try:
-            run(args, lease)
+            return run(args, lease)
         finally:
             owner.close()
-        return 0
     initial = read_json(args.data / "dispatch.json")
     if initial and initial["target"] != args.target and not args.reset:
         parser.error("saved dispatcher belongs to another target; inspect and use --reset")
