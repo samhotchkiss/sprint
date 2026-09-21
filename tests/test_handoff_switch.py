@@ -95,6 +95,17 @@ class FakeTransport:
         return {"status": "delivered", "exit": 0}
 
 
+class FakePaneProbe:
+    def __init__(self, panes=None, ok=True):
+        self.panes = list(panes or [])
+        self.ok = ok
+
+    def existing_panes(self):
+        if self.ok is not True:
+            return {"ok": False, "reason": "tmux_probe_failed", "panes": []}
+        return {"ok": True, "panes": list(self.panes)}
+
+
 def cards_fixture():
     return FakeBoard().cards
 
@@ -113,9 +124,11 @@ class HandoffTests(unittest.TestCase):
         self.board = FakeBoard()
         self.transport = FakeTransport()
         self.clock = Clock(1)
+        self.probe = FakePaneProbe(["%5", "%8", "%11"])
         self.switch = OwnerSwitch(
             self.board_dir, board=self.board, transport=self.transport,
-            project_root=self.dir, switch_dir=self.board_dir, clock=self.clock)
+            project_root=self.dir, switch_dir=self.board_dir, clock=self.clock,
+            pane_probe=self.probe)
 
     def plan(self, **kwargs):
         args = dict(source_pane="%5", source_provider="claude",
@@ -415,6 +428,37 @@ class HandoffTests(unittest.TestCase):
         self.assertTrue(ok["ok"], ok)
         live = json.loads((self.board_dir / "dispatch.json").read_text())
         self.assertEqual(live["target"], "%8")
+
+    def test_exited_source_requires_tmux_absence_and_free_locks(self):
+        rec = self.plan()
+        live = self.switch.acknowledge_exited_source()
+        self.assertEqual(live["reason"], "source_pane_live")
+        self.assertNotIn("source", self.switch.load().get("receipts") or {})
+        self.probe.ok = False
+        self.probe.panes = []
+        failed = self.switch.acknowledge_exited_source()
+        self.assertEqual(failed["reason"], "tmux_probe_failed")
+        self.probe.ok = True
+        self.probe.panes = ["%8", "%11"]
+        handle = open(self.board_dir / "dispatch.lock", "a+")
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(handle.close)
+        locked = self.switch.acknowledge_exited_source()
+        self.assertEqual(locked["reason"], "dispatcher_running")
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+        self.board.cursor = 52
+        ok = self.switch.acknowledge_exited_source()
+        self.assertTrue(ok["ok"], ok)
+        stored = self.switch.load()
+        self.assertTrue(stored["source_exit"]["absent"])
+        self.assertEqual(stored["source_exit"]["pane"], "%5")
+        self.assertEqual(stored["source_exit"]["verified_by"][:2], ["tmux", "list-panes"])
+        self.assertEqual(stored["cursor"]["start_seq"], 52)
+        self.assertNotIn("source", stored.get("receipts") or {})
+        continued = self.switch.advance()
+        self.assertEqual(continued.get("stage"), "source_quiesced")
+        self.assertEqual(self.board.owner["pane"], "%8")
 
     def test_plan_rejects_unregistered_source_pane(self):
         bad = self.plan(source_pane="%9", target_pane="%8")

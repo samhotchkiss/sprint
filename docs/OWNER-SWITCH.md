@@ -31,6 +31,7 @@ bin/sprint-handoff status --board-data-dir /path/to/.sprint
 bin/sprint-handoff advance --board-data-dir /path/to/.sprint
 bin/sprint-handoff ack --board-data-dir /path/to/.sprint \
   --role source --switch-id osw-… --nonce-file /path/to/.sprint/nonce
+bin/sprint-handoff acknowledge-exited-source --board-data-dir /path/to/.sprint
 bin/sprint-handoff rollback --board-data-dir /path/to/.sprint
 ```
 
@@ -39,6 +40,13 @@ token from `server.json` is never copied into the switch record or prompts.
 Prompts include the exact project root. Source pane must already be the
 registered `session_tmux_window`. A crash after send `prepared` is treated as
 uncertain and is never resent; a genuine receipt can settle it.
+
+If the source pane is gone (user shut down that coordinator) and wrote no
+receipt, `acknowledge-exited-source` runs `tmux list-panes -a -F #{pane_id}`
+and records absence of the **exact** source pane. A live pane or a probe
+failure is rejected. No receipt is invented. Dispatcher/coordinator locks
+must be free. Then `advance` records the live board cursor and continues.
+No process is killed.
 
 ## Stages
 
@@ -82,5 +90,5 @@ Observed `session_tmux_window` must still match the record.
 
 Compatible with an existing process supervisor. The switch never kills PIDs
 and contains no launchd identifiers. `next_action` is the exact operator step.
-Root may start the persistent watcher after `complete`; that live session test
-is still required.
+Root may start the persistent watcher after `complete`. The live source pane
+stays up until the operator shutdown test; this module does not kill it.

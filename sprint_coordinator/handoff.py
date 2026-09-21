@@ -343,9 +343,14 @@ def inspect_target_health(rec: dict, observed: dict, data_dir: Path, now: float,
     receipt = (rec.get("receipts") or {}).get("target")
     if not receipt:
         return False, "target_receipt_missing"
-    _claimed, err = _validate_target_cursor(rec, receipt.get("cursor_seq"), observed)
-    if err:
-        return False, err
+    # The receipt was validated before ingress started. Progress after that is
+    # expected; do not reject a working target for advancing the cursor.
+    if registered_pane(observed) != rec["target"]["pane"]:
+        return False, "owner_changed"
+    if receipt.get("cursor_seq") != _start_seq(rec):
+        return False, "cursor_mismatch"
+    if int(observed.get("cursor_seq") or 0) < _start_seq(rec):
+        return False, "live_cursor_mismatch"
     dispatcher = (observed.get("autoheal") or {}).get("event_dispatcher")
     if not isinstance(dispatcher, dict):
         return False, "await_target_health"
@@ -378,6 +383,25 @@ def _board_request(board, method: str, path: str, body=None):
     return fn(method, path, body)
 
 
+TMUX_LIST_PANES = ["tmux", "list-panes", "-a", "-F", "#{pane_id}"]
+
+
+class TmuxListPanesProbe:
+    """Observe pane existence. Never kills or sends."""
+
+    def existing_panes(self) -> dict:
+        try:
+            completed = subprocess.run(
+                TMUX_LIST_PANES, capture_output=True, text=True, shell=False,
+                timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return {"ok": False, "reason": "tmux_probe_failed", "panes": []}
+        if completed.returncode != 0:
+            return {"ok": False, "reason": "tmux_probe_failed", "panes": []}
+        panes = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+        return {"ok": True, "panes": panes}
+
+
 class TmuxSendTransport:
     def __init__(self, executable: Path):
         self.executable = Path(executable)
@@ -405,13 +429,14 @@ class TmuxSendTransport:
 class OwnerSwitch:
     def __init__(self, board_data_dir: Path, *, board, transport,
                  project_root: Path | None = None, switch_dir: Path | None = None,
-                 clock=None):
+                 clock=None, pane_probe=None):
         self.board_data_dir = Path(board_data_dir)
         self.board = board
         self.transport = transport
         self.project_root = Path(project_root or ".").resolve()
         self.switch_dir = Path(switch_dir) if switch_dir else self.board_data_dir
         self.clock = clock
+        self.pane_probe = pane_probe or TmuxListPanesProbe()
         self._lock = None
 
     def _now(self) -> float:
@@ -594,7 +619,7 @@ class OwnerSwitch:
 
     def _advance_prepared(self, rec: dict, observed: dict) -> dict:
         send = rec.get("sends", {}).get("source_quiesce") or {}
-        if rec.get("receipts", {}).get("source"):
+        if rec.get("receipts", {}).get("source") or rec.get("source_exit"):
             transferred = self._transfer_after_source_receipt(rec, observed)
             if transferred.get("ok") is not True:
                 rec["fail_reason"] = transferred.get("reason")
@@ -623,7 +648,8 @@ class OwnerSwitch:
             live = observe(self.board)
             if registered_pane(live) != rec["source"]["pane"]:
                 return {"ok": False, "reason": "owner_changed"}
-            abandon = rec["receipts"]["source"].get("abandon_inflight") is True
+            src_receipt = (rec.get("receipts") or {}).get("source") or {}
+            abandon = src_receipt.get("abandon_inflight") is True or bool(rec.get("source_exit"))
             rebound = _rebind_unlocked(
                 self.board_data_dir,
                 source_pane=rec["source"]["pane"],
@@ -723,6 +749,37 @@ class OwnerSwitch:
         rec["ownership"]["patch"] = body
         return {"ok": True}
 
+    def acknowledge_exited_source(self) -> dict:
+        """Record that the recorded source pane is gone. No receipt is invented."""
+        rec = self.load()
+        if rec is None:
+            return {"ok": False, "reason": "no_switch"}
+        if rec.get("stage") not in ("prepared", "source_quiesced"):
+            return {"ok": False, "reason": "wrong_stage", **rec}
+        pane = rec["source"]["pane"]
+        probe = self.pane_probe.existing_panes()
+        if probe.get("ok") is not True:
+            return {"ok": False, "reason": probe.get("reason") or "tmux_probe_failed"}
+        if pane in (probe.get("panes") or []):
+            return {"ok": False, "reason": "source_pane_live", "pane": pane}
+        pair, err = acquire_owner_locks(self.board_data_dir)
+        if err:
+            return {"ok": False, "reason": err}
+        for handle in pair:
+            _unlock(handle)
+        observed = observe(self.board)
+        rec["source_exit"] = {
+            "pane": pane,
+            "absent": True,
+            "verified_by": list(TMUX_LIST_PANES),
+            "at": self._now(),
+            "cursor_seq": int(observed["cursor_seq"]),
+        }
+        rec["cursor"]["source_acked_seq"] = int(observed["cursor_seq"])
+        rec["cursor"]["start_seq"] = int(observed["cursor_seq"])
+        self._save(rec)
+        return {"ok": True, **rec}
+
     def ack(self, *, role: str, switch_id: str, nonce: str,
             cursor_seq: int | None = None, abandon_inflight: bool = False) -> dict:
         rec = self.load()
@@ -779,6 +836,9 @@ class OwnerSwitch:
             if payload.get("role") != role:
                 continue
             if role == "target":
+                if (rec.get("stage") in ("target_acknowledged", "complete")
+                        and rec.get("receipts", {}).get("target")):
+                    continue
                 claimed, err = _validate_target_cursor(
                     rec, payload.get("cursor_seq"), observed)
                 if err:
@@ -868,7 +928,9 @@ def next_action(rec: dict) -> str:
             )
         return (
             "Wait for source ack: sprint-handoff ack --role source --switch-id %s "
-            "--nonce-file nonce. Then advance."
+            "--nonce-file nonce. If the source pane is gone after shutdown, "
+            "sprint-handoff acknowledge-exited-source (tmux list-panes only; no kill). "
+            "Then advance."
             % rec.get("id")
         )
     if stage == "source_quiesced":
@@ -970,14 +1032,20 @@ def _parse_argv(argv: list[str] | None) -> argparse.Namespace:
     ack.add_argument("--abandon-inflight", action="store_true")
     ack.add_argument("--tmux-send", type=Path, default=DEFAULT_TMUX_SEND)
     ack.add_argument("--project-root", type=Path, default=Path("."))
+    exited = sub.add_parser("acknowledge-exited-source")
+    exited.add_argument("--board-data-dir", required=True, type=Path)
+    exited.add_argument("--switch-dir", type=Path)
+    exited.add_argument("--project-root", type=Path, default=Path("."))
+    exited.add_argument("--tmux-send", type=Path, default=DEFAULT_TMUX_SEND)
     return parser.parse_args(argv)
 
 
-def _switch_from_args(args, board, transport) -> OwnerSwitch:
+def _switch_from_args(args, board, transport, pane_probe=None) -> OwnerSwitch:
     return OwnerSwitch(
         args.board_data_dir, board=board, transport=transport,
         project_root=getattr(args, "project_root", None),
         switch_dir=getattr(args, "switch_dir", None),
+        pane_probe=pane_probe,
     )
 
 
@@ -986,13 +1054,14 @@ def _load_board(board_data_dir: Path):
     return BoardClient(board_data_dir)
 
 
-def main(argv: list[str] | None = None, *, board=None, transport=None) -> int:
+def main(argv: list[str] | None = None, *, board=None, transport=None,
+         pane_probe=None) -> int:
     args = _parse_argv(argv)
     if board is None:
         board = _load_board(args.board_data_dir)
     if transport is None:
         transport = TmuxSendTransport(getattr(args, "tmux_send", DEFAULT_TMUX_SEND))
-    switch = _switch_from_args(args, board, transport)
+    switch = _switch_from_args(args, board, transport, pane_probe=pane_probe)
     if not switch.acquire():
         print(json.dumps({"ok": False, "reason": "switch_lock_held"}, sort_keys=True))
         return 1
@@ -1007,6 +1076,8 @@ def main(argv: list[str] | None = None, *, board=None, transport=None) -> int:
             result = switch.advance()
         elif args.command == "rollback":
             result = switch.rollback()
+        elif args.command == "acknowledge-exited-source":
+            result = switch.acknowledge_exited_source()
         elif args.command == "ack":
             nonce = args.nonce
             if nonce is None and args.nonce_file:
