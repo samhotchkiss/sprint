@@ -33,6 +33,11 @@ STAGES = (
 PANE_RE = re.compile(r"^%[0-9]+$")
 RECORD_NAME = "owner-switch.json"
 LOCK_NAME = "owner-switch.lock"
+DISPATCH_NAME = "dispatch.json"
+DISPATCH_LOCK_NAME = "dispatch.lock"
+DISPATCH_FIELDS = (
+    "target", "scanned", "acknowledged", "pending", "inflight", "wake_times",
+)
 DEFAULT_TMUX_SEND = Path("~/.local/bin/tmux-send").expanduser()
 
 
@@ -96,6 +101,106 @@ def _board_get(board, path: str) -> dict:
             getattr(board, "orchestrator_cursor", None)):
         return board.orchestrator_cursor() or {}
     raise RuntimeError("board_api_missing:%s" % path)
+
+
+def snapshot_dispatch(state: dict | None) -> dict | None:
+    """Copy sprint-dispatch delivery fields. Never invent a reset cursor."""
+    if not isinstance(state, dict) or not state:
+        return None
+    return {key: state.get(key) for key in DISPATCH_FIELDS}
+
+
+def inflight_resolution(state: dict | None, board_cursor: int,
+                        abandon_inflight: bool) -> dict:
+    """Uncertain inflight is handled by board cursor or explicit abandon."""
+    flight = (state or {}).get("inflight")
+    if not flight:
+        return {"ok": True, "action": "none"}
+    try:
+        through = int(flight.get("through"))
+    except (TypeError, ValueError):
+        through = None
+    if through is not None and int(board_cursor) >= through:
+        return {"ok": True, "action": "cursor_cleared"}
+    result = flight.get("result")
+    if result not in (0, None):
+        if abandon_inflight is True:
+            return {"ok": True, "action": "abandoned"}
+        return {"ok": False, "reason": "uncertain_inflight", "inflight": dict(flight)}
+    return {"ok": True, "action": "clear_after_source_stopped"}
+
+
+def _dispatch_lock(data_dir: Path):
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    handle = open(data_dir / DISPATCH_LOCK_NAME, "a+")
+    chmod_private(data_dir / DISPATCH_LOCK_NAME)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def rebind_dispatch_target(
+    data_dir: Path, *, source_pane: str, target_pane: str, board_cursor: int,
+    abandon_inflight: bool, source_stopped: bool,
+) -> dict:
+    """Point dispatch.json at the new pane under dispatch.lock.
+
+    Preserves scanned/acknowledged/pending/wake_times. Clears inflight only after
+    the source monitor stopped. Does not set any cursor to head.
+    """
+    if source_stopped is not True:
+        return {"ok": False, "reason": "source_not_stopped"}
+    data_dir = Path(data_dir)
+    path = data_dir / DISPATCH_NAME
+    lock = _dispatch_lock(data_dir)
+    if lock is None:
+        return {"ok": False, "reason": "dispatch_lock_held"}
+    try:
+        state = read_json(path, default=None)
+        if not isinstance(state, dict) or not state:
+            return {
+                "ok": True, "action": "no_dispatch_state", "rebind": None,
+                "path": str(path), "lock": str(data_dir / DISPATCH_LOCK_NAME),
+            }
+        current = state.get("target")
+        if current not in (source_pane, target_pane):
+            return {"ok": False, "reason": "dispatch_target_mismatch",
+                    "target": current}
+        gate = inflight_resolution(state, board_cursor, abandon_inflight is True)
+        if gate.get("ok") is not True:
+            return gate
+        before = snapshot_dispatch(state)
+        pending = list(state.get("pending") or [])
+        scanned = state.get("scanned")
+        acknowledged = state.get("acknowledged")
+        wake_times = list(state.get("wake_times") or [])
+        state["target"] = target_pane
+        if gate.get("action") in (
+                "cursor_cleared", "abandoned", "clear_after_source_stopped"):
+            state["inflight"] = None
+        state["pending"] = pending
+        state["scanned"] = scanned
+        state["acknowledged"] = acknowledged
+        state["wake_times"] = wake_times
+        _write_private(path, state)
+        return {
+            "ok": True,
+            "action": gate.get("action"),
+            "path": str(path),
+            "lock": str(data_dir / DISPATCH_LOCK_NAME),
+            "before": before,
+            "rebind": snapshot_dispatch(state),
+        }
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock.close()
 
 
 def snapshot_cards(board_payload: dict) -> list:
@@ -281,6 +386,12 @@ class OwnerSwitch:
             "sends": {},
             "receipts": {},
             "pending_since_plan": False,
+            "dispatch": {
+                "path": str(self.board_data_dir.resolve() / DISPATCH_NAME),
+                "lock": str(self.board_data_dir.resolve() / DISPATCH_LOCK_NAME),
+                "at_plan": snapshot_dispatch(
+                    read_json(self.board_data_dir / DISPATCH_NAME, default=None)),
+            },
             "created_at": self._now(),
         }
         self._save(rec)
@@ -298,6 +409,8 @@ class OwnerSwitch:
         rec["observed_default_executor"] = observed.get("default_executor")
         rec["observed_owner"] = observed.get("owner") or {}
         rec["cards_unchanged"] = observed["cards"] == rec.get("preserve", {}).get("cards")
+        live = snapshot_dispatch(read_json(self.board_data_dir / DISPATCH_NAME, default=None))
+        rec["dispatch_live"] = live
         rec["next_action"] = next_action(rec)
         return {"ok": True, **rec}
 
@@ -335,6 +448,22 @@ class OwnerSwitch:
             return self._send(rec, "source_quiesce", rec["source"]["pane"],
                               _source_prompt(rec, self.switch_dir))
         if rec.get("receipts", {}).get("source"):
+            abandon = rec["receipts"]["source"].get("abandon_inflight") is True
+            rebound = rebind_dispatch_target(
+                self.board_data_dir,
+                source_pane=rec["source"]["pane"],
+                target_pane=rec["target"]["pane"],
+                board_cursor=int(observed["cursor_seq"]),
+                abandon_inflight=abandon,
+                source_stopped=True,
+            )
+            rec["dispatch_rebind"] = rebound
+            if rebound.get("ok") is not True:
+                self._save(rec)
+                return {
+                    "ok": False, "send_allowed": False,
+                    "reason": rebound.get("reason"), **rec,
+                }
             rec["stage"] = "source_quiesced"
             applied = self._apply_ownership(rec, observed)
             if applied.get("ok") is not True:
@@ -429,7 +558,7 @@ class OwnerSwitch:
         return {"ok": True}
 
     def ack(self, *, role: str, switch_id: str, nonce: str,
-            cursor_seq: int | None = None) -> dict:
+            cursor_seq: int | None = None, abandon_inflight: bool = False) -> dict:
         rec = self.load()
         if rec is None:
             return {"ok": False, "reason": "no_switch"}
@@ -445,6 +574,7 @@ class OwnerSwitch:
                 return {"ok": False, "reason": "source_not_delivered"}
             rec.setdefault("receipts", {})["source"] = {
                 "switch_id": switch_id, "role": "source", "at": self._now(),
+                "abandon_inflight": abandon_inflight is True,
             }
             _write_private(self.switch_dir / "receipts" / "source.json",
                            rec["receipts"]["source"] | {"nonce": nonce})
@@ -485,6 +615,7 @@ class OwnerSwitch:
             rec.setdefault("receipts", {}).setdefault(role, {
                 "switch_id": rec["id"], "role": role,
                 "cursor_seq": payload.get("cursor_seq"),
+                "abandon_inflight": payload.get("abandon_inflight") is True,
             })
 
     def rollback(self) -> dict:
@@ -518,6 +649,16 @@ class OwnerSwitch:
             rec["ownership"]["current_provider"] = rec["source"]["provider"]
         rec["stage"] = "failed"
         rec["fail_reason"] = "rolled_back"
+        if rec.get("dispatch_rebind", {}).get("ok") is True:
+            restore = rebind_dispatch_target(
+                self.board_data_dir,
+                source_pane=rec["target"]["pane"],
+                target_pane=rec["source"]["pane"],
+                board_cursor=int((rec.get("cursor") or {}).get("seq") or 0),
+                abandon_inflight=True,
+                source_stopped=True,
+            )
+            rec["dispatch_rebind_rollback"] = restore
         self._save(rec)
         return {"ok": True, **rec}
 
@@ -534,8 +675,9 @@ def next_action(rec: dict) -> str:
     if stage == "complete":
         return (
             "Target %s on pane %s owns the board at cursor %s. "
-            "Default executor stays %s. Source task workers may keep running. "
-            "No process kill required."
+            "Default executor stays %s. dispatch.json target rebound; pending seqs kept. "
+            "Root may start the persistent watcher. Module tests are not a live session test. "
+            "Source task workers may keep running. No process kill required."
             % (dst.get("provider"), dst.get("pane"), cursor, executor)
         )
     send_src = (rec.get("sends") or {}).get("source_quiesce") or {}
@@ -590,6 +732,8 @@ def _source_prompt(rec: dict, switch_dir: Path) -> str:
         "Do not kill processes. Do not change worker.default_executor.",
         "Write receipt JSON to %s with switch_id, nonce from %s, role source."
         % (receipt, nonce_path),
+        "If dispatch inflight is uncertain, either wait until the board cursor "
+        "covers inflight.through or set abandon_inflight true on the receipt.",
         "No account secrets belong in this message or the receipt.",
         "",
     ])
@@ -641,6 +785,7 @@ def _parse_argv(argv: list[str] | None) -> argparse.Namespace:
     ack.add_argument("--nonce")
     ack.add_argument("--nonce-file", type=Path)
     ack.add_argument("--cursor-seq", type=int)
+    ack.add_argument("--abandon-inflight", action="store_true")
     ack.add_argument("--tmux-send", type=Path, default=DEFAULT_TMUX_SEND)
     ack.add_argument("--project-root", type=Path, default=Path("."))
     return parser.parse_args(argv)
@@ -690,7 +835,8 @@ def main(argv: list[str] | None = None, *, board=None, transport=None) -> int:
             else:
                 result = switch.ack(
                     role=args.role, switch_id=args.switch_id, nonce=nonce,
-                    cursor_seq=args.cursor_seq)
+                    cursor_seq=args.cursor_seq,
+                    abandon_inflight=bool(getattr(args, "abandon_inflight", False)))
         else:
             result = {"ok": False, "reason": "unknown_command"}
     finally:

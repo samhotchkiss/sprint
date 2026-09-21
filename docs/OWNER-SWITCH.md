@@ -5,8 +5,10 @@ board. Codex, Claude, and Grok use the identical tmux-send protocol.
 
 This module does **not** kill panes or processes, does not change
 `worker.default_executor`, and does not skip pending events by moving the
-orchestrator cursor to head. Root wires the live service and the real session
-test. Sam's live window: 2026-09-21 15:05 UTC, Claude → Codex on Yunagi.
+orchestrator cursor to head. It does not mention or install launchd; root
+wires `bin/sprint-dispatch-service` after a completed switch. Module tests
+are not a live session test. Sam's live window: 2026-09-21 15:05 UTC,
+Claude → Codex on Yunagi.
 
 ## Files
 
@@ -42,8 +44,8 @@ or `failed`.
 
 | Stage | What happens |
 | --- | --- |
-| prepared | Observe `/api/settings`, `/api/board`, `/api/cursors/orchestrator`. Durable record. tmux-send source quiesce (idle monitor only). |
-| source_quiesced | After source receipt. Ownership settings change here. Default executor unchanged. |
+| prepared | Observe `/api/settings`, `/api/board`, `/api/cursors/orchestrator`. Snapshot `dispatch.json` (`target`, `scanned`, `acknowledged`, `pending`, `inflight`, `wake_times`). tmux-send source quiesce (idle monitor only). |
+| source_quiesced | After source receipt. Uncertain inflight must already be covered by the **board** cursor or explicitly `abandon_inflight: true`. Then rebind `dispatch.json` `target` under `dispatch.lock`, keep unread pending, clear old inflight only because the source monitor stopped. Ownership settings change. Default executor unchanged. |
 | target_registered | tmux-send target registration. Cursor is the **board** orchestrator seq, not head. |
 | target_acknowledged | Target receipt bound to switch id + nonce + planned cursor. |
 | complete | Next action: start target coordinator. No automatic kill. Task workers may keep running. |
@@ -56,6 +58,16 @@ Sends are durable-before-send (`prepared` then tmux-send). Exit 4 / timeout is
 - project root and board data dir, URL/port
 - `worker.default_executor`
 - every card assignment, worktree, pane, executor/model on the board snapshot
+- `dispatch.json` scanned/acknowledged/pending/wake_times (never `--reset`, never discard pending)
+
+## Dispatch rebind
+
+Root's ingress refuses to start if `dispatch.json` `target` ≠ the registered pane.
+After source ack, `rebind_dispatch_target` (under `dispatch.lock`) writes the new
+pane onto the existing file. Receipt + `dispatch_rebind` on the switch record are
+enough to rebind safely. Uncertain inflight (`result` not `0`/`null`) blocks
+until `orchestrator` seq ≥ `inflight.through` or the source receipt sets
+`abandon_inflight` true (`sprint-handoff ack --abandon-inflight`).
 
 ## Rollback
 
@@ -65,5 +77,7 @@ owner.
 
 ## Supervisor
 
-Compatible with an existing process supervisor. The switch never kills PIDs.
-`next_action` is the exact operator step (advance, ack, or start target).
+Compatible with an existing process supervisor. The switch never kills PIDs
+and contains no launchd identifiers. `next_action` is the exact operator step.
+Root may start the persistent watcher after `complete`; that live session test
+is still required.

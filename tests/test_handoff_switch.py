@@ -9,7 +9,9 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 
-from sprint_coordinator.handoff import OwnerSwitch, TmuxSendTransport, main, snapshot_cards
+from sprint_coordinator.handoff import (
+    OwnerSwitch, TmuxSendTransport, main, snapshot_cards, snapshot_dispatch,
+)
 from sprint_coordinator.util import Clock
 
 
@@ -287,6 +289,106 @@ class HandoffTests(unittest.TestCase):
         self.switch.advance()
         self.assertEqual(recorded[0][1:5], ["--no-stash", "--wait", "0", "%5"])
         self.assertEqual(recorded[0][5], "--file")
+
+    def _write_dispatch(self, **fields):
+        state = {
+            "version": 1, "target": "%5", "scanned": 20, "acknowledged": 20,
+            "pending": [{"seq": 21, "card": 1, "kind": "chat"}],
+            "inflight": {"through": 20, "at": 1, "result": 0},
+            "wake_times": [1.0], "status": "awaiting_ack",
+        }
+        state.update(fields)
+        path = self.board_dir / "dispatch.json"
+        path.write_text(json.dumps(state))
+        os.chmod(path, 0o600)
+        return state
+
+    def test_rebind_preserves_pending_and_clears_inflight_after_source_stop(self):
+        before = self._write_dispatch()
+        rec = self.plan()
+        self.assertEqual(rec["dispatch"]["at_plan"]["pending"], before["pending"])
+        self.assertEqual(rec["dispatch"]["at_plan"]["scanned"], 20)
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        advanced = self.switch.advance()
+        self.assertTrue(advanced["ok"], advanced)
+        self.assertEqual(advanced["stage"], "source_quiesced")
+        live = json.loads((self.board_dir / "dispatch.json").read_text())
+        self.assertEqual(live["target"], "%8")
+        self.assertIsNone(live["inflight"])
+        self.assertEqual(live["pending"], before["pending"])
+        self.assertEqual(live["scanned"], 20)
+        self.assertEqual(live["acknowledged"], 20)
+        self.assertEqual(live["wake_times"], [1.0])
+        self.assertNotEqual(live["acknowledged"], self.board.head)
+        rebound = advanced["dispatch_rebind"]["rebind"]
+        self.assertEqual(rebound["target"], "%8")
+        self.assertEqual(snapshot_dispatch(live)["pending"], before["pending"])
+
+    def test_uncertain_inflight_blocks_until_cursor_or_abandon(self):
+        self._write_dispatch(inflight={"through": 50, "at": 1, "result": 4})
+        rec = self.plan()
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        blocked = self.switch.advance()
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(blocked["reason"], "uncertain_inflight")
+        live = json.loads((self.board_dir / "dispatch.json").read_text())
+        self.assertEqual(live["target"], "%5")
+        self.assertEqual(live["inflight"]["through"], 50)
+        self.assertEqual(live["pending"][0]["seq"], 21)
+        self.board.cursor = 50
+        cleared = self.switch.advance()
+        self.assertTrue(cleared["ok"], cleared)
+        live = json.loads((self.board_dir / "dispatch.json").read_text())
+        self.assertEqual(live["target"], "%8")
+        self.assertIsNone(live["inflight"])
+        self.assertEqual(live["pending"][0]["seq"], 21)
+
+        parked = self.switch.load()
+        parked["stage"] = "failed"
+        parked["fail_reason"] = "split-test"
+        self.switch._save(parked)
+        rec2 = self.plan(source_pane="%8", source_provider="codex",
+                         target_pane="%9", target_provider="grok")
+        self._write_dispatch(target="%8", inflight={"through": 80, "result": -1})
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec2["id"], nonce=rec2["nonce"],
+                        abandon_inflight=True)
+        abandoned = self.switch.advance()
+        self.assertTrue(abandoned["ok"], abandoned)
+        self.assertEqual(abandoned["dispatch_rebind"]["action"], "abandoned")
+        live = json.loads((self.board_dir / "dispatch.json").read_text())
+        self.assertEqual(live["target"], "%9")
+        self.assertIsNone(live["inflight"])
+        self.assertEqual(live["pending"][0]["seq"], 21)
+
+    def test_dispatch_lock_blocks_rebind(self):
+        self._write_dispatch()
+        rec = self.plan()
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        handle = open(self.board_dir / "dispatch.lock", "a+")
+        os.chmod(self.board_dir / "dispatch.lock", 0o600)
+        import fcntl
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(handle.close)
+        blocked = self.switch.advance()
+        self.assertEqual(blocked["reason"], "dispatch_lock_held")
+        live = json.loads((self.board_dir / "dispatch.json").read_text())
+        self.assertEqual(live["target"], "%5")
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+        ok = self.switch.advance()
+        self.assertTrue(ok["ok"], ok)
+        live = json.loads((self.board_dir / "dispatch.json").read_text())
+        self.assertEqual(live["target"], "%8")
+
+    def test_handoff_has_no_launchd_specifics(self):
+        import sprint_coordinator.handoff as mod
+        source = Path(mod.__file__).read_text()
+        for banned in ("launchd", "launchctl", "LaunchAgents", "KeepAlive", "plist"):
+            self.assertNotIn(banned, source)
 
     def test_tmux_send_transport_uses_command_array(self):
         fake = self.dir / "tmux-send"
