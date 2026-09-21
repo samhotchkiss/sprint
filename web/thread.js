@@ -17,7 +17,8 @@
 // Nothing in here is rebuilt on a whim. Every item carries a key and a version
 // (see `reconcile`), so a frame that changed nothing changes no DOM — which is
 // what keeps the rail still while the session's cursor ticks past underneath.
-import { h, ageSuffix, richText, firstLine, reconcile, timeEl, autolink } from './util.js';
+import { h, ageSuffix, firstLine, reconcile, timeEl, autolink } from './util.js';
+import { renderMarkdown } from './message.js';
 import { attachmentUrl, attachmentCaption } from './api.js';
 import {
   SYSTEM_KINDS, eventText, messageStatus, STATE_LABEL, normArtifacts, actorLabel,
@@ -257,7 +258,7 @@ function message(first, app) {
   if (!(ev.payload && ev.payload.images_only) || more) {
     const bubble = h('div.bubble');
     if (!(ev.payload && ev.payload.images_only)) {
-      bubble.appendChild(h('p', richText(eventText(ev), app.openCard)));
+      bubble.appendChild(h('div.md', renderMarkdown(eventText(ev), app.openCard)));
     }
     // Only a line with real detail gets an affordance — a chevron over nothing
     // is a promise the history cannot keep.
@@ -377,7 +378,7 @@ export function artifactsPanel(a, app, { past = false } = {}) {
   const box = h('div.artifacts', { class: past ? 'artifacts is-past' : 'artifacts' });
   box.appendChild(h('p.artifacts-label.accent',
     past ? 'What the agent handed over' : 'Look at this before you answer'));
-  if (a.notes) box.appendChild(h('p.artifacts-notes', richText(a.notes, app && app.openCard)));
+  if (a.notes) box.appendChild(h('div.artifacts-notes.md', renderMarkdown(a.notes, app && app.openCard)));
   if (a.attachments.length) box.appendChild(packetShots(a.attachments, app));
   if (a.url) {
     box.appendChild(h('a.btn.artifacts-live', {
@@ -390,7 +391,7 @@ export function artifactsPanel(a, app, { past = false } = {}) {
 function questionPanel(card, q, app) {
   const item = h('div.item');
   const panel = h('div.ask');
-  panel.appendChild(h('p.ask-text', richText(q.text || 'The agent is waiting on you.', app.openCard)));
+  panel.appendChild(h('div.ask-text.md', renderMarkdown(q.text || 'The agent is waiting on you.', app.openCard)));
   // Artifacts first: you cannot pick between three mockups you have not seen.
   if (q.artifacts) panel.appendChild(artifactsPanel(q.artifacts, app));
   if (q.options && q.options.length) {
@@ -430,7 +431,7 @@ function evidencePacket(packet, card, state, app) {
 
   box.appendChild(h('div',
     h('p.packet-label.good', 'The claim'),
-    h('p.packet-claim', richText(p.claim || 'No claim recorded — ask the agent what it thinks it did.',
+    h('div.packet-claim.md', renderMarkdown(p.claim || 'No claim recorded — ask the agent what it thinks it did.',
       app.openCard))));
 
   const steps = Array.isArray(p.validate) ? p.validate.filter(Boolean)
@@ -441,7 +442,7 @@ function evidencePacket(packet, card, state, app) {
       const text = typeof s === 'string' ? s : (s.text || s.step || '');
       // Card #54: a check step that says "open http://…" should be one click.
       list.appendChild(h('div.step', h('span.step-n', String(i + 1)),
-        h('p', richText(text, app.openCard))));
+        h('div.md', renderMarkdown(text, app.openCard))));
     });
     box.appendChild(h('div', h('p.packet-label.accent', 'Check it yourself'), list));
   }

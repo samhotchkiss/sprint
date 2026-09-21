@@ -4,6 +4,7 @@
 // is opt-in, and nothing above the line moves when you open it.
 import { h, autolink } from './util.js';
 import { detailOpen } from './state.js';
+import { isMarkdownDetail, renderMarkdown } from './message.js';
 
 /** The expanded text of an event, or '' when there isn't one. */
 export function detailText(ev) {
@@ -25,8 +26,11 @@ export function detailBlock(ev, app, { small = false } = {}) {
   const key = detailKey(ev);
   let open = detailOpen(key);
 
+  const markdown = isMarkdownDetail(ev);
   const body = h('div.detail-body', { hidden: !open });
-  body.appendChild(preText(text, app && app.openCard));
+  if (markdown) body.classList.add('is-markdown');
+  if (markdown) body.appendChild(renderMarkdown(text, app && app.openCard));
+  else body.appendChild(preText(text, app && app.openCard));
 
   const label = h('span.detail-label', open ? 'Less' : 'More context');
   const toggle = h('button.detail-toggle', {
