@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Plan and advance a coordinator owner switch. tmux-send only; no process kills."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from sprint_coordinator.handoff import main
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

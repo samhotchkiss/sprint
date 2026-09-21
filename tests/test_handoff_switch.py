@@ -1,0 +1,303 @@
+"""Owner-switch tests. Injected board/transport; no paid calls or live panes."""
+from __future__ import annotations
+
+import io
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+
+from sprint_coordinator.handoff import OwnerSwitch, TmuxSendTransport, main, snapshot_cards
+from sprint_coordinator.util import Clock
+
+
+class FakeBoard:
+    def __init__(self):
+        self.cards = [
+            {"num": 1, "title": "one", "state": "in_progress", "worktree": "/wt/1",
+             "branch": "sprint/card-1", "executor": "grok", "model": "grok-4",
+             "agent_name": "sprint-card-1", "pane": "%11"},
+            {"num": 2, "title": "two", "state": "needs_you", "worktree": "/wt/2",
+             "executor": "grok", "pane": "%12"},
+        ]
+        self.cursor = 40
+        self.head = 40
+        self.default_executor = "grok"
+        self.owner = {"provider": "claude", "pane": "%5"}
+        self.puts = []
+
+    def get(self, path):
+        if path == "/api/settings":
+            return {
+                "session_tmux_window": self.owner.get("pane"),
+                "settings": {
+                    "worker": {"default_executor": self.default_executor},
+                    "coordinator_owner": dict(self.owner),
+                },
+            }
+        if path == "/api/board":
+            return {"cards": list(self.cards), "head": self.head}
+        if path == "/api/cursors/orchestrator":
+            return {"seq": self.cursor}
+        raise AssertionError(path)
+
+    def put_settings(self, patch):
+        self.puts.append(patch)
+        worker = patch.get("worker") or {}
+        if "default_executor" in worker:
+            raise AssertionError("switch must not change default_executor")
+        owner = patch.get("coordinator_owner")
+        if owner:
+            self.owner = dict(self.owner, **owner)
+
+    def head_seq(self):
+        return self.head
+
+
+class FakeTransport:
+    def __init__(self, status="delivered"):
+        self.status = status
+        self.sends = []
+
+    def send(self, pane, prompt_path):
+        text = Path(prompt_path).read_text()
+        self.sends.append({"pane": pane, "path": str(prompt_path), "text": text})
+        if self.status == "uncertain":
+            return {"status": "uncertain", "exit": 4, "reason": "send_unverified"}
+        if self.status == "blocked":
+            return {"status": "blocked", "exit": 5, "reason": "dialog_refusal"}
+        return {"status": "delivered", "exit": 0}
+
+
+def cards_fixture():
+    return FakeBoard().cards
+
+
+class HandoffTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.board_dir = self.dir / ".sprint"
+        self.board_dir.mkdir()
+        (self.board_dir / "server.json").write_text(json.dumps({
+            "port": 8765, "token": "secret-board-token", "board_id": "yunagi",
+        }))
+        os.chmod(self.board_dir / "server.json", 0o600)
+        self.board = FakeBoard()
+        self.transport = FakeTransport()
+        self.clock = Clock(1)
+        self.switch = OwnerSwitch(
+            self.board_dir, board=self.board, transport=self.transport,
+            project_root=self.dir, switch_dir=self.board_dir, clock=self.clock)
+
+    def plan(self, **kwargs):
+        args = dict(source_pane="%5", source_provider="claude",
+                    target_pane="%8", target_provider="codex")
+        args.update(kwargs)
+        return self.switch.plan(**args)
+
+    def test_plan_preserves_board_cards_executor_and_cursor(self):
+        rec = self.plan()
+        self.assertTrue(rec["ok"])
+        self.assertEqual(rec["stage"], "prepared")
+        self.assertEqual(rec["preserve"]["default_executor"], "grok")
+        self.assertEqual(rec["preserve"]["cards"],
+                         snapshot_cards({"cards": self.board.cards}))
+        self.assertEqual(rec["cursor"]["seq"], 40)
+        self.assertEqual(rec["head_at_plan"], 40)
+        self.assertTrue(rec["cursor"]["never_skip_to_head"])
+        self.assertEqual(rec["board"]["port"], 8765)
+        self.assertEqual(rec["board"]["url"], "http://127.0.0.1:8765")
+        blob = json.dumps(rec)
+        self.assertNotIn("secret-board-token", blob)
+        self.assertNotIn("secret-board-token", rec["next_action"])
+
+    def test_providers_share_tmux_send_protocol(self):
+        for src, dst in (("claude", "codex"), ("codex", "grok"), ("grok", "claude")):
+            with self.subTest(src=src, dst=dst):
+                self.transport.sends.clear()
+                rec = self.plan(source_provider=src, target_provider=dst,
+                                source_pane="%5", target_pane="%8")
+                self.assertTrue(rec["ok"], rec)
+                self.switch.advance()
+                send = self.transport.sends[-1]
+                self.assertEqual(send["pane"], "%5")
+                text = send["text"]
+                self.assertIn("idle board monitor", text)
+                self.assertIn("Keep running task workers", text)
+                self.assertNotIn("--prompt-file", text)
+                rec["stage"] = "failed"
+                rec["fail_reason"] = "reset"
+                self.switch._save(rec)
+
+    def test_failed_source_ack_wrong_nonce(self):
+        rec = self.plan()
+        self.switch.advance()
+        bad = self.switch.ack(role="source", switch_id=rec["id"], nonce="nope")
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["reason"], "nonce_mismatch")
+        self.assertEqual(self.switch.load()["stage"], "prepared")
+        self.assertNotIn("source", self.switch.load().get("receipts") or {})
+
+    def test_failed_target_ack_cannot_skip_to_head(self):
+        rec = self.plan()
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        self.switch.advance()
+        self.switch.advance()
+        self.board.head = 99
+        bad = self.switch.ack(
+            role="target", switch_id=rec["id"], nonce=rec["nonce"], cursor_seq=99)
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["reason"], "skip_pending_events")
+        good = self.switch.ack(
+            role="target", switch_id=rec["id"], nonce=rec["nonce"], cursor_seq=40)
+        self.assertTrue(good["ok"])
+
+    def test_crash_after_send_does_not_resend(self):
+        rec = self.plan()
+        self.switch.advance()
+        self.assertEqual(len(self.transport.sends), 1)
+        other = OwnerSwitch(
+            self.board_dir, board=self.board, transport=self.transport,
+            project_root=self.dir, switch_dir=self.board_dir, clock=self.clock)
+        other.advance()
+        self.assertEqual(len(self.transport.sends), 1)
+        self.assertEqual(other.load()["sends"]["source_quiesce"]["status"], "delivered")
+
+    def test_uncertain_send_is_not_replayed(self):
+        self.transport.status = "uncertain"
+        rec = self.plan()
+        first = self.switch.advance()
+        self.assertEqual(first["reason"], "uncertain")
+        self.switch.advance()
+        self.assertEqual(len(self.transport.sends), 1)
+        self.assertEqual(self.switch.load()["sends"]["source_quiesce"]["status"],
+                         "uncertain")
+
+    def test_new_events_during_switch_keep_planned_cursor(self):
+        rec = self.plan()
+        self.board.head = 55
+        self.board.cards.append({"num": 3, "state": "queued", "worktree": "/wt/3"})
+        st = self.switch.status()
+        self.assertTrue(st["pending_since_plan"])
+        self.assertEqual(st["cursor"]["seq"], 40)
+        self.assertNotEqual(st["cursor"]["seq"], st["observed_head"])
+        self.assertFalse(st["cards_unchanged"])
+        self.assertEqual(self.switch.load()["preserve"]["cards"][0]["worktree"], "/wt/1")
+
+    def test_card_preservation_and_default_executor(self):
+        rec = self.plan()
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        self.switch.advance()
+        self.assertEqual(self.board.default_executor, "grok")
+        self.assertEqual(self.board.owner["provider"], "codex")
+        self.assertEqual(self.board.owner["pane"], "%8")
+        self.assertTrue(self.board.puts)
+        self.assertNotIn("worker", self.board.puts[0])
+        self.assertEqual(rec["preserve"]["cards"][0]["pane"], "%11")
+        self.assertEqual(rec["preserve"]["cards"][0]["worktree"], "/wt/1")
+
+    def test_switchback_after_complete(self):
+        rec = self.plan()
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        self.switch.advance()
+        self.switch.advance()
+        self.switch.ack(role="target", switch_id=rec["id"], nonce=rec["nonce"],
+                        cursor_seq=40)
+        self.switch.advance()
+        self.switch.advance()
+        self.assertEqual(self.switch.load()["stage"], "complete")
+        back = self.plan(source_pane="%8", source_provider="codex",
+                         target_pane="%5", target_provider="claude")
+        self.assertTrue(back["ok"])
+        self.assertEqual(back["preserve"]["default_executor"], "grok")
+        self.assertEqual(back["preserve"]["cards"][0]["worktree"], "/wt/1")
+
+    def test_rollback_before_target_consumes_and_not_after(self):
+        rec = self.plan()
+        self.switch.advance()
+        rolled = self.switch.rollback()
+        self.assertTrue(rolled["ok"])
+        self.assertEqual(self.switch.load()["stage"], "failed")
+        rec = self.plan()
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        self.switch.advance()
+        self.switch.advance()
+        self.switch.ack(role="target", switch_id=rec["id"], nonce=rec["nonce"],
+                        cursor_seq=40)
+        self.switch.advance()
+        self.assertEqual(self.switch.load()["stage"], "target_acknowledged")
+        blocked = self.switch.rollback()
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(blocked["reason"], "target_active")
+        self.assertEqual(self.board.owner["provider"], "codex")
+
+    def test_cli_plan_advance_ack_json(self):
+        board = self.board
+        transport = self.transport
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main([
+                "plan", "--board-data-dir", str(self.board_dir),
+                "--project-root", str(self.dir),
+                "--source-pane", "%5", "--source-provider", "claude",
+                "--target-pane", "%8", "--target-provider", "codex",
+                "--switch-dir", str(self.board_dir),
+            ], board=board, transport=transport)
+        self.assertEqual(code, 0)
+        printed = json.loads(buf.getvalue())
+        self.assertEqual(printed["nonce"], "<redacted>")
+        rec = json.loads((self.board_dir / "owner-switch.json").read_text())
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(main([
+                "advance", "--board-data-dir", str(self.board_dir),
+                "--switch-dir", str(self.board_dir),
+            ], board=board, transport=transport), 0)
+        with redirect_stdout(io.StringIO()):
+            code = main([
+                "ack", "--board-data-dir", str(self.board_dir),
+                "--switch-dir", str(self.board_dir),
+                "--role", "source", "--switch-id", rec["id"],
+                "--nonce-file", str(self.board_dir / "nonce"),
+            ], board=board, transport=transport)
+        self.assertEqual(code, 0)
+
+    def test_same_pane_rejected_and_transport_command_shape(self):
+        bad = self.plan(target_pane="%5")
+        self.assertEqual(bad["reason"], "competing_owner_same_pane")
+        recorded = []
+
+        class Capture:
+            def send(self, pane, prompt_path):
+                recorded.append([
+                    "/abs/tmux-send", "--no-stash", "--wait", "0", pane,
+                    "--file", str(prompt_path),
+                ])
+                return {"status": "delivered", "exit": 0}
+
+        self.switch.transport = Capture()
+        self.plan()
+        self.switch.advance()
+        self.assertEqual(recorded[0][1:5], ["--no-stash", "--wait", "0", "%5"])
+        self.assertEqual(recorded[0][5], "--file")
+
+    def test_tmux_send_transport_uses_command_array(self):
+        fake = self.dir / "tmux-send"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o700)
+        t = TmuxSendTransport(fake)
+        prompt = self.dir / "p.txt"
+        prompt.write_text("hi\n")
+        result = t.send("%3", prompt)
+        self.assertEqual(result["status"], "delivered")
+
+
+if __name__ == "__main__":
+    unittest.main()
