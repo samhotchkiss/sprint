@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -36,7 +37,7 @@ class FakeBoard:
                 "session_tmux_window": self.owner.get("pane"),
                 "settings": {
                     "worker": {"default_executor": self.default_executor},
-                    "coordinator_owner": dict(self.owner),
+                    "session_tmux_window": self.owner.get("pane"),
                 },
             }
         if path == "/api/board":
@@ -45,14 +46,20 @@ class FakeBoard:
             return {"seq": self.cursor}
         raise AssertionError(path)
 
-    def put_settings(self, patch):
-        self.puts.append(patch)
-        worker = patch.get("worker") or {}
-        if "default_executor" in worker:
-            raise AssertionError("switch must not change default_executor")
-        owner = patch.get("coordinator_owner")
-        if owner:
-            self.owner = dict(self.owner, **owner)
+    def request(self, method, path, body=None, timeout=5.0, idempotency_key=None):
+        if method == "GET":
+            return self.get(path)
+        if method == "PUT" and path == "/api/settings":
+            if body and "coordinator_owner" in body:
+                raise AssertionError("coordinator_owner is unsupported")
+            if body and "worker" in body:
+                raise AssertionError("switch must not change worker settings")
+            self.puts.append(dict(body or {}))
+            pane = (body or {}).get("session_tmux_window")
+            if pane:
+                self.owner["pane"] = pane
+            return self.get("/api/settings")
+        raise AssertionError((method, path))
 
     def head_seq(self):
         return self.head
@@ -130,6 +137,7 @@ class HandoffTests(unittest.TestCase):
                 text = send["text"]
                 self.assertIn("idle board monitor", text)
                 self.assertIn("Keep running task workers", text)
+                self.assertIn("Project root: %s" % self.dir.resolve(), text)
                 self.assertNotIn("--prompt-file", text)
                 rec["stage"] = "failed"
                 rec["fail_reason"] = "reset"
@@ -197,9 +205,11 @@ class HandoffTests(unittest.TestCase):
         self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
         self.switch.advance()
         self.assertEqual(self.board.default_executor, "grok")
-        self.assertEqual(self.board.owner["provider"], "codex")
         self.assertEqual(self.board.owner["pane"], "%8")
         self.assertTrue(self.board.puts)
+        self.assertEqual(self.board.puts[0]["session_tmux_window"], "%8")
+        self.assertEqual(self.board.puts[0]["actor"], "session")
+        self.assertNotIn("coordinator_owner", self.board.puts[0])
         self.assertNotIn("worker", self.board.puts[0])
         self.assertEqual(rec["preserve"]["cards"][0]["pane"], "%11")
         self.assertEqual(rec["preserve"]["cards"][0]["worktree"], "/wt/1")
@@ -231,15 +241,14 @@ class HandoffTests(unittest.TestCase):
         self.switch.advance()
         self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
         self.switch.advance()
-        self.switch.advance()
-        self.switch.ack(role="target", switch_id=rec["id"], nonce=rec["nonce"],
-                        cursor_seq=40)
-        self.switch.advance()
-        self.assertEqual(self.switch.load()["stage"], "target_acknowledged")
+        sent = self.switch.advance()
+        self.assertTrue(sent.get("sends", {}).get("target_register", {}).get("status")
+                        in ("delivered", "uncertain", "prepared") or sent.get("stage") in (
+                            "target_registered", "source_quiesced"))
         blocked = self.switch.rollback()
         self.assertFalse(blocked["ok"])
         self.assertEqual(blocked["reason"], "target_active")
-        self.assertEqual(self.board.owner["provider"], "codex")
+        self.assertEqual(self.board.owner["pane"], "%8")
 
     def test_cli_plan_advance_ack_json(self):
         board = self.board
@@ -256,6 +265,9 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(code, 0)
         printed = json.loads(buf.getvalue())
         self.assertEqual(printed["nonce"], "<redacted>")
+        dumped = json.dumps(printed)
+        rec_nonce = json.loads((self.board_dir / "nonce").read_text())["nonce"]
+        self.assertNotIn(rec_nonce, dumped)
         rec = json.loads((self.board_dir / "owner-switch.json").read_text())
         with redirect_stdout(io.StringIO()):
             self.assertEqual(main([
@@ -374,7 +386,7 @@ class HandoffTests(unittest.TestCase):
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.addCleanup(handle.close)
         blocked = self.switch.advance()
-        self.assertEqual(blocked["reason"], "dispatch_lock_held")
+        self.assertEqual(blocked["reason"], "dispatcher_running")
         live = json.loads((self.board_dir / "dispatch.json").read_text())
         self.assertEqual(live["target"], "%5")
         fcntl.flock(handle, fcntl.LOCK_UN)
@@ -383,6 +395,59 @@ class HandoffTests(unittest.TestCase):
         self.assertTrue(ok["ok"], ok)
         live = json.loads((self.board_dir / "dispatch.json").read_text())
         self.assertEqual(live["target"], "%8")
+
+    def test_plan_rejects_unregistered_source_pane(self):
+        bad = self.plan(source_pane="%9", target_pane="%8")
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["reason"], "source_not_registered")
+
+    def test_crash_prepared_send_is_uncertain_and_receipt_settles(self):
+        rec = self.plan()
+        rec["sends"] = {"source_quiesce": {"status": "prepared", "pane": "%5"}}
+        self.switch._save(rec)
+        blocked = self.switch.advance()
+        self.assertEqual(blocked["reason"], "uncertain")
+        self.assertEqual(self.switch.load()["sends"]["source_quiesce"]["status"],
+                         "uncertain")
+        self.assertEqual(len(self.transport.sends), 0)
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        settled = self.switch.advance()
+        self.assertTrue(settled["ok"], settled)
+        self.assertEqual(settled["stage"], "source_quiesced")
+
+    def test_file_target_receipt_enforces_cursor(self):
+        rec = self.plan()
+        self.switch.advance()
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        self.switch.advance()
+        self.switch.advance()
+        self.board.head = 99
+        path = self.board_dir / "receipts" / "target.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({
+            "switch_id": rec["id"], "nonce": rec["nonce"], "role": "target",
+            "cursor_seq": 99,
+        }))
+        os.chmod(path, 0o600)
+        out = self.switch.advance()
+        self.assertNotEqual(out.get("stage"), "target_acknowledged")
+        self.assertEqual(self.switch.load().get("receipt_error"), "skip_pending_events")
+
+    def test_source_ack_uses_live_board_cursor(self):
+        rec = self.plan()
+        self.switch.advance()
+        self.board.cursor = 47
+        self.switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        self.assertEqual(self.switch.load()["cursor"]["start_seq"], 47)
+        self.switch.advance()
+        self.switch.advance()
+        self.board.head = 80
+        bad = self.switch.ack(role="target", switch_id=rec["id"], nonce=rec["nonce"],
+                              cursor_seq=80)
+        self.assertEqual(bad["reason"], "skip_pending_events")
+        good = self.switch.ack(role="target", switch_id=rec["id"], nonce=rec["nonce"],
+                               cursor_seq=47)
+        self.assertTrue(good["ok"], good)
 
     def test_handoff_has_no_launchd_specifics(self):
         import sprint_coordinator.handoff as mod
@@ -399,6 +464,47 @@ class HandoffTests(unittest.TestCase):
         prompt.write_text("hi\n")
         result = t.send("%3", prompt)
         self.assertEqual(result["status"], "delivered")
+
+
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_sprintd import Base as SprintdBase
+except ImportError:  # pragma: no cover
+    SprintdBase = None
+
+
+@unittest.skipIf(SprintdBase is None, "sprintd test base unavailable")
+class HandoffHttpTests(SprintdBase):
+    def test_put_session_window_roundtrip(self):
+        from sprint_coordinator.board import BoardClient
+        data = Path(self.app.data_dir)
+        (data / "server.json").write_text(json.dumps({
+            "port": self.port, "token": "test-token",
+        }))
+        os.chmod(data / "server.json", 0o600)
+        status, body = self.req("PUT", "/api/settings", {
+            "session_tmux_window": "%5", "actor": "session",
+        })
+        self.assertEqual(status, 200, body)
+        client = BoardClient(data)
+        transport = FakeTransport()
+        switch = OwnerSwitch(
+            data, board=client, transport=transport,
+            project_root=Path(self.project_root), switch_dir=data)
+        rec = switch.plan(
+            source_pane="%5", source_provider="claude",
+            target_pane="%8", target_provider="codex")
+        self.assertTrue(rec["ok"], rec)
+        switch.advance()
+        switch.ack(role="source", switch_id=rec["id"], nonce=rec["nonce"])
+        out = switch.advance()
+        self.assertTrue(out["ok"], out)
+        status, settings = self.get("/api/settings")
+        self.assertEqual(status, 200)
+        self.assertEqual(settings.get("session_tmux_window"), "%8")
+        worker = (settings.get("settings") or {}).get("worker") or {}
+        self.assertEqual(worker.get("default_executor"),
+                         rec["preserve"]["default_executor"])
 
 
 if __name__ == "__main__":

@@ -34,8 +34,11 @@ bin/sprint-handoff ack --board-data-dir /path/to/.sprint \
 bin/sprint-handoff rollback --board-data-dir /path/to/.sprint
 ```
 
-Nonce is in a mode-0600 file, not printed. Board token from `server.json` is
-never copied into the switch record or prompts.
+Nonce is in a mode-0600 file. CLI output redacts every `nonce` field. Board
+token from `server.json` is never copied into the switch record or prompts.
+Prompts include the exact project root. Source pane must already be the
+registered `session_tmux_window`. A crash after send `prepared` is treated as
+uncertain and is never resent; a genuine receipt can settle it.
 
 ## Stages
 
@@ -45,7 +48,7 @@ or `failed`.
 | Stage | What happens |
 | --- | --- |
 | prepared | Observe `/api/settings`, `/api/board`, `/api/cursors/orchestrator`. Snapshot `dispatch.json` (`target`, `scanned`, `acknowledged`, `pending`, `inflight`, `wake_times`). tmux-send source quiesce (idle monitor only). |
-| source_quiesced | After source receipt. Uncertain inflight must already be covered by the **board** cursor or explicitly `abandon_inflight: true`. Then rebind `dispatch.json` `target` under `dispatch.lock`, keep unread pending, clear old inflight only because the source monitor stopped. Ownership settings change. Default executor unchanged. |
+| source_quiesced | After source receipt. Uncertain inflight must already be covered by the **board** cursor or explicitly `abandon_inflight: true`. Then, under **both** `dispatch.lock` and `coordinator-owner.lock` (running dispatcher/service is rejected), rebind `dispatch.json` `target`, keep unread pending and wake_times, clear old inflight only after a genuine source-quiesce receipt. PUT `/api/settings` `{session_tmux_window, actor: session}` and read it back. Default executor unchanged. |
 | target_registered | tmux-send target registration. Cursor is the **board** orchestrator seq, not head. |
 | target_acknowledged | Target receipt bound to switch id + nonce + planned cursor. |
 | complete | Next action: start target coordinator. No automatic kill. Task workers may keep running. |
@@ -71,9 +74,9 @@ until `orchestrator` seq ≥ `inflight.through` or the source receipt sets
 
 ## Rollback
 
-Allowed only before `target_acknowledged` / `complete`, and only when observed
-ownership still matches the record. Will not silently roll back an active new
-owner.
+Allowed only before any target send is durable (`prepared`/`uncertain`/`delivered`).
+Once the target prompt exists, rollback is refused even without a target ack.
+Observed `session_tmux_window` must still match the record.
 
 ## Supervisor
 

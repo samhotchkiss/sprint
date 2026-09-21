@@ -35,6 +35,7 @@ RECORD_NAME = "owner-switch.json"
 LOCK_NAME = "owner-switch.lock"
 DISPATCH_NAME = "dispatch.json"
 DISPATCH_LOCK_NAME = "dispatch.lock"
+OWNER_LOCK_NAME = "coordinator-owner.lock"
 DISPATCH_FIELDS = (
     "target", "scanned", "acknowledged", "pending", "inflight", "wake_times",
 )
@@ -130,11 +131,11 @@ def inflight_resolution(state: dict | None, board_cursor: int,
     return {"ok": True, "action": "clear_after_source_stopped"}
 
 
-def _dispatch_lock(data_dir: Path):
-    data_dir = Path(data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    handle = open(data_dir / DISPATCH_LOCK_NAME, "a+")
-    chmod_private(data_dir / DISPATCH_LOCK_NAME)
+def _try_lock(path: Path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+")
+    chmod_private(path)
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -143,64 +144,90 @@ def _dispatch_lock(data_dir: Path):
     return handle
 
 
+def _unlock(handle) -> None:
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
+def acquire_owner_locks(data_dir: Path):
+    """Both locks, or neither. Held lock means the dispatcher/service is running."""
+    data_dir = Path(data_dir)
+    dispatch = _try_lock(data_dir / DISPATCH_LOCK_NAME)
+    if dispatch is None:
+        return None, "dispatcher_running"
+    owner = _try_lock(data_dir / OWNER_LOCK_NAME)
+    if owner is None:
+        _unlock(dispatch)
+        return None, "coordinator_running"
+    return (dispatch, owner), None
+
+
+def _rebind_unlocked(
+    data_dir: Path, *, source_pane: str, target_pane: str, board_cursor: int,
+    abandon_inflight: bool,
+) -> dict:
+    path = Path(data_dir) / DISPATCH_NAME
+    state = read_json(path, default=None)
+    if not isinstance(state, dict) or not state:
+        return {
+            "ok": True, "action": "no_dispatch_state", "rebind": None,
+            "path": str(path), "lock": str(Path(data_dir) / DISPATCH_LOCK_NAME),
+        }
+    current = state.get("target")
+    if current not in (source_pane, target_pane):
+        return {"ok": False, "reason": "dispatch_target_mismatch", "target": current}
+    gate = inflight_resolution(state, board_cursor, abandon_inflight is True)
+    if gate.get("ok") is not True:
+        return gate
+    before = snapshot_dispatch(state)
+    pending = list(state.get("pending") or [])
+    scanned = state.get("scanned")
+    acknowledged = state.get("acknowledged")
+    wake_times = list(state.get("wake_times") or [])
+    state["target"] = target_pane
+    if gate.get("action") in (
+            "cursor_cleared", "abandoned", "clear_after_source_stopped"):
+        state["inflight"] = None
+    state["pending"] = pending
+    state["scanned"] = scanned
+    state["acknowledged"] = acknowledged
+    state["wake_times"] = wake_times
+    _write_private(path, state)
+    return {
+        "ok": True,
+        "action": gate.get("action"),
+        "path": str(path),
+        "lock": str(Path(data_dir) / DISPATCH_LOCK_NAME),
+        "before": before,
+        "rebind": snapshot_dispatch(state),
+    }
+
+
 def rebind_dispatch_target(
     data_dir: Path, *, source_pane: str, target_pane: str, board_cursor: int,
     abandon_inflight: bool, source_stopped: bool,
 ) -> dict:
-    """Point dispatch.json at the new pane under dispatch.lock.
-
-    Preserves scanned/acknowledged/pending/wake_times. Clears inflight only after
-    the source monitor stopped. Does not set any cursor to head.
-    """
+    """Point dispatch.json at the new pane under dispatch.lock + owner lock."""
     if source_stopped is not True:
         return {"ok": False, "reason": "source_not_stopped"}
-    data_dir = Path(data_dir)
-    path = data_dir / DISPATCH_NAME
-    lock = _dispatch_lock(data_dir)
-    if lock is None:
-        return {"ok": False, "reason": "dispatch_lock_held"}
+    pair, err = acquire_owner_locks(data_dir)
+    if err:
+        return {"ok": False, "reason": err}
     try:
-        state = read_json(path, default=None)
-        if not isinstance(state, dict) or not state:
-            return {
-                "ok": True, "action": "no_dispatch_state", "rebind": None,
-                "path": str(path), "lock": str(data_dir / DISPATCH_LOCK_NAME),
-            }
-        current = state.get("target")
-        if current not in (source_pane, target_pane):
-            return {"ok": False, "reason": "dispatch_target_mismatch",
-                    "target": current}
-        gate = inflight_resolution(state, board_cursor, abandon_inflight is True)
-        if gate.get("ok") is not True:
-            return gate
-        before = snapshot_dispatch(state)
-        pending = list(state.get("pending") or [])
-        scanned = state.get("scanned")
-        acknowledged = state.get("acknowledged")
-        wake_times = list(state.get("wake_times") or [])
-        state["target"] = target_pane
-        if gate.get("action") in (
-                "cursor_cleared", "abandoned", "clear_after_source_stopped"):
-            state["inflight"] = None
-        state["pending"] = pending
-        state["scanned"] = scanned
-        state["acknowledged"] = acknowledged
-        state["wake_times"] = wake_times
-        _write_private(path, state)
-        return {
-            "ok": True,
-            "action": gate.get("action"),
-            "path": str(path),
-            "lock": str(data_dir / DISPATCH_LOCK_NAME),
-            "before": before,
-            "rebind": snapshot_dispatch(state),
-        }
+        return _rebind_unlocked(
+            data_dir, source_pane=source_pane, target_pane=target_pane,
+            board_cursor=board_cursor, abandon_inflight=abandon_inflight)
     finally:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        lock.close()
+        for handle in pair:
+            _unlock(handle)
 
 
 def snapshot_cards(board_payload: dict) -> list:
@@ -239,16 +266,77 @@ def observe(board) -> dict:
         head = max(head, int(board_payload["head"]))
     if callable(getattr(board, "head_seq", None)):
         head = max(head, int(board.head_seq()))
+    pane = settings_raw.get("session_tmux_window") or settings.get("session_tmux_window")
     return {
         "settings": settings,
-        "session_tmux_window": settings_raw.get("session_tmux_window"),
+        "session_tmux_window": pane,
         "default_executor": worker.get("default_executor"),
         "cards": snapshot_cards(board_payload),
         "cursor_seq": cursor_seq,
         "head_seq": head,
-        "owner": (settings.get("coordinator_owner") or settings_raw.get("coordinator_owner")
-                  or {}),
+        "owner_pane": canonical_pane(pane),
     }
+
+
+def registered_pane(observed: dict) -> str | None:
+    return canonical_pane(observed.get("session_tmux_window") or observed.get("owner_pane"))
+
+
+def public_payload(value):
+    """Drop secrets from CLI output. Nonce stays in the private file."""
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if key == "nonce":
+                out[key] = "<redacted>"
+            else:
+                out[key] = public_payload(item)
+        return out
+    if isinstance(value, list):
+        return [public_payload(item) for item in value]
+    return value
+
+
+def _freeze_prepared_sends(rec: dict) -> None:
+    """A crash after durable 'prepared' is uncertain. Never retry the send."""
+    for send in (rec.get("sends") or {}).values():
+        if isinstance(send, dict) and send.get("status") == "prepared":
+            send["status"] = "uncertain"
+            send["reason"] = send.get("reason") or "crash_after_prepare"
+
+
+def _start_seq(rec: dict) -> int:
+    cursor = rec.get("cursor") or {}
+    for key in ("start_seq", "source_acked_seq", "seq"):
+        if cursor.get(key) is not None:
+            return int(cursor[key])
+    return 0
+
+
+def _validate_target_cursor(rec: dict, claimed, observed: dict):
+    start = _start_seq(rec)
+    head = int(observed.get("head_seq") or 0)
+    if claimed is None:
+        claimed = start
+    else:
+        claimed = int(claimed)
+    if claimed == head and head > start:
+        return None, "skip_pending_events"
+    if claimed != start:
+        return None, "cursor_mismatch"
+    return claimed, None
+
+
+def _target_send_started(rec: dict) -> bool:
+    send = (rec.get("sends") or {}).get("target_register") or {}
+    return send.get("status") in ("prepared", "uncertain", "delivered")
+
+
+def _board_request(board, method: str, path: str, body=None):
+    fn = getattr(board, "request", None)
+    if not callable(fn):
+        raise RuntimeError("board_request_missing")
+    return fn(method, path, body)
 
 
 class TmuxSendTransport:
@@ -345,10 +433,13 @@ class OwnerSwitch:
             return {"ok": False, "reason": "invalid_provider"}
         if src_pane == dst_pane:
             return {"ok": False, "reason": "competing_owner_same_pane"}
+        observed = observe(self.board)
+        if registered_pane(observed) != src_pane:
+            return {"ok": False, "reason": "source_not_registered",
+                    "registered": registered_pane(observed)}
         existing = self.load()
         if existing and existing.get("stage") not in ("complete", "failed"):
             return {"ok": False, "reason": "switch_in_progress", "id": existing.get("id")}
-        observed = observe(self.board)
         default_executor = observed.get("default_executor")
         nonce = secrets.token_hex(16)
         switch_id = "osw-" + sha256_text("%s|%s|%s" % (
@@ -381,7 +472,7 @@ class OwnerSwitch:
                 "source_provider": src_prov,
                 "target_provider": dst_prov,
                 "applied": False,
-                "current_provider": src_prov,
+                "current_pane": src_pane,
             },
             "sends": {},
             "receipts": {},
@@ -407,7 +498,7 @@ class OwnerSwitch:
         rec["observed_head"] = observed["head_seq"]
         rec["observed_cursor"] = observed["cursor_seq"]
         rec["observed_default_executor"] = observed.get("default_executor")
-        rec["observed_owner"] = observed.get("owner") or {}
+        rec["observed_owner_pane"] = registered_pane(observed)
         rec["cards_unchanged"] = observed["cards"] == rec.get("preserve", {}).get("cards")
         live = snapshot_dispatch(read_json(self.board_data_dir / DISPATCH_NAME, default=None))
         rec["dispatch_live"] = live
@@ -426,7 +517,14 @@ class OwnerSwitch:
         observed = observe(self.board)
         rec["pending_since_plan"] = int(observed["head_seq"]) > int(rec.get("head_at_plan") or 0)
         rec["observed_head"] = observed["head_seq"]
-        self._ingest_receipts(rec)
+        rec["observed_cursor"] = observed["cursor_seq"]
+        _freeze_prepared_sends(rec)
+        owner_err = self._owner_mismatch(rec, observed)
+        if owner_err:
+            rec["fail_reason"] = owner_err
+            self._save(rec)
+            return {"ok": False, "send_allowed": False, "reason": owner_err, **rec}
+        self._ingest_receipts(rec, observed)
         if stage == "prepared":
             return self._advance_prepared(rec, observed)
         if stage == "source_quiesced":
@@ -439,45 +537,67 @@ class OwnerSwitch:
             return {"ok": True, "send_allowed": False, **rec}
         return {"ok": False, "reason": "unknown_stage", **rec}
 
+    def _owner_mismatch(self, rec: dict, observed: dict) -> str | None:
+        reg = registered_pane(observed)
+        expected = rec["target"]["pane"] if rec.get("ownership", {}).get("applied") is True else rec["source"]["pane"]
+        if reg != expected:
+            return "owner_changed"
+        return None
+
     def _advance_prepared(self, rec: dict, observed: dict) -> dict:
         send = rec.get("sends", {}).get("source_quiesce") or {}
-        if send.get("status") in ("uncertain",):
-            self._save(rec)
-            return {"ok": False, "send_allowed": False, "reason": "uncertain", **rec}
-        if send.get("status") not in ("delivered",):
-            return self._send(rec, "source_quiesce", rec["source"]["pane"],
-                              _source_prompt(rec, self.switch_dir))
         if rec.get("receipts", {}).get("source"):
-            abandon = rec["receipts"]["source"].get("abandon_inflight") is True
-            rebound = rebind_dispatch_target(
-                self.board_data_dir,
-                source_pane=rec["source"]["pane"],
-                target_pane=rec["target"]["pane"],
-                board_cursor=int(observed["cursor_seq"]),
-                abandon_inflight=abandon,
-                source_stopped=True,
-            )
-            rec["dispatch_rebind"] = rebound
-            if rebound.get("ok") is not True:
+            transferred = self._transfer_after_source_receipt(rec, observed)
+            if transferred.get("ok") is not True:
+                rec["fail_reason"] = transferred.get("reason")
                 self._save(rec)
                 return {
                     "ok": False, "send_allowed": False,
-                    "reason": rebound.get("reason"), **rec,
+                    "reason": transferred.get("reason"), **rec,
                 }
             rec["stage"] = "source_quiesced"
-            applied = self._apply_ownership(rec, observed)
-            if applied.get("ok") is not True:
-                rec["stage"] = "failed"
-                rec["fail_reason"] = applied.get("reason") or "ownership_apply_failed"
-                self._save(rec)
-                return {"ok": False, "send_allowed": False, **rec}
             self._save(rec)
             return {"ok": True, "send_allowed": False, **rec}
+        if send.get("status") == "uncertain":
+            self._save(rec)
+            return {"ok": False, "send_allowed": False, "reason": "uncertain", **rec}
+        if send.get("status") != "delivered":
+            return self._send(rec, "source_quiesce", rec["source"]["pane"],
+                              _source_prompt(rec, self.switch_dir))
         self._save(rec)
         return {"ok": True, "send_allowed": False, "reason": "await_source_ack", **rec}
 
+    def _transfer_after_source_receipt(self, rec: dict, observed: dict) -> dict:
+        pair, err = acquire_owner_locks(self.board_data_dir)
+        if err:
+            return {"ok": False, "reason": err}
+        try:
+            live = observe(self.board)
+            if registered_pane(live) != rec["source"]["pane"]:
+                return {"ok": False, "reason": "owner_changed"}
+            abandon = rec["receipts"]["source"].get("abandon_inflight") is True
+            rebound = _rebind_unlocked(
+                self.board_data_dir,
+                source_pane=rec["source"]["pane"],
+                target_pane=rec["target"]["pane"],
+                board_cursor=int(live["cursor_seq"]),
+                abandon_inflight=abandon,
+            )
+            rec["dispatch_rebind"] = rebound
+            if rebound.get("ok") is not True:
+                return rebound
+            return self._apply_ownership(rec, live)
+        finally:
+            for handle in pair:
+                _unlock(handle)
+
     def _advance_source_quiesced(self, rec: dict) -> dict:
         send = rec.get("sends", {}).get("target_register") or {}
+        if rec.get("receipts", {}).get("target") and send.get("status") in (
+                "delivered", "uncertain"):
+            rec["stage"] = "target_registered"
+            self._save(rec)
+            return {"ok": True, "send_allowed": False, **rec}
         if send.get("status") == "uncertain":
             self._save(rec)
             return {"ok": False, "send_allowed": False, "reason": "uncertain", **rec}
@@ -519,6 +639,7 @@ class OwnerSwitch:
             "prompt_path": str(prompt_path),
         }
         self._save(rec)
+        # Crash after this save: status stays prepared, later frozen to uncertain.
         result = self.transport.send(pane, prompt_path)
         rec["sends"][name]["status"] = result.get("status")
         rec["sends"][name]["exit"] = result.get("exit")
@@ -539,22 +660,19 @@ class OwnerSwitch:
         default_executor = rec["preserve"].get("default_executor")
         if observed.get("default_executor") != default_executor:
             return {"ok": False, "reason": "default_executor_changed"}
-        patch = {
-            "coordinator_owner": {
-                "provider": rec["target"]["provider"],
-                "pane": rec["target"]["pane"],
-                "switch_id": rec["id"],
-            }
-        }
-        fn = getattr(self.board, "put_settings", None) or getattr(self.board, "apply_owner", None)
-        if callable(fn):
-            try:
-                fn(patch)
-            except Exception:
-                return {"ok": False, "reason": "ownership_apply_failed"}
+        pane = rec["target"]["pane"]
+        body = {"session_tmux_window": pane, "actor": "session"}
+        try:
+            _board_request(self.board, "PUT", "/api/settings", body)
+        except Exception:
+            return {"ok": False, "reason": "ownership_apply_failed"}
+        back = observe(self.board)
+        if registered_pane(back) != pane:
+            return {"ok": False, "reason": "ownership_readback_mismatch",
+                    "registered": registered_pane(back)}
         rec["ownership"]["applied"] = True
-        rec["ownership"]["current_provider"] = rec["target"]["provider"]
-        rec["ownership"]["patch"] = patch
+        rec["ownership"]["current_pane"] = pane
+        rec["ownership"]["patch"] = body
         return {"ok": True}
 
     def ack(self, *, role: str, switch_id: str, nonce: str,
@@ -568,29 +686,29 @@ class OwnerSwitch:
             return {"ok": False, "reason": "nonce_mismatch"}
         if role not in ("source", "target"):
             return {"ok": False, "reason": "invalid_role"}
+        _freeze_prepared_sends(rec)
+        observed = observe(self.board)
         if role == "source":
             send = (rec.get("sends") or {}).get("source_quiesce") or {}
-            if send.get("status") != "delivered":
+            if send.get("status") not in ("delivered", "uncertain"):
                 return {"ok": False, "reason": "source_not_delivered"}
             rec.setdefault("receipts", {})["source"] = {
                 "switch_id": switch_id, "role": "source", "at": self._now(),
                 "abandon_inflight": abandon_inflight is True,
+                "cursor_seq": int(observed["cursor_seq"]),
             }
+            rec["cursor"]["source_acked_seq"] = int(observed["cursor_seq"])
+            rec["cursor"]["start_seq"] = int(observed["cursor_seq"])
             _write_private(self.switch_dir / "receipts" / "source.json",
                            rec["receipts"]["source"] | {"nonce": nonce})
             self._save(rec)
             return {"ok": True, **rec}
         send = (rec.get("sends") or {}).get("target_register") or {}
-        if send.get("status") != "delivered" and rec.get("stage") != "target_registered":
+        if send.get("status") not in ("delivered", "uncertain") and rec.get("stage") != "target_registered":
             return {"ok": False, "reason": "target_not_delivered"}
-        observed = observe(self.board)
-        planned = int(rec["cursor"]["seq"])
-        head = int(observed["head_seq"])
-        claimed = planned if cursor_seq is None else int(cursor_seq)
-        if claimed == head and head > planned:
-            return {"ok": False, "reason": "skip_pending_events"}
-        if claimed != planned:
-            return {"ok": False, "reason": "cursor_mismatch"}
+        claimed, err = _validate_target_cursor(rec, cursor_seq, observed)
+        if err:
+            return {"ok": False, "reason": err}
         rec.setdefault("receipts", {})["target"] = {
             "switch_id": switch_id, "role": "target", "at": self._now(),
             "cursor_seq": claimed,
@@ -600,7 +718,7 @@ class OwnerSwitch:
         self._save(rec)
         return {"ok": True, **rec}
 
-    def _ingest_receipts(self, rec: dict) -> None:
+    def _ingest_receipts(self, rec: dict, observed: dict) -> None:
         for role in ("source", "target"):
             path = self.switch_dir / "receipts" / ("%s.json" % role)
             payload = read_json(path, default=None)
@@ -612,41 +730,49 @@ class OwnerSwitch:
                 continue
             if payload.get("role") != role:
                 continue
+            if role == "target":
+                claimed, err = _validate_target_cursor(
+                    rec, payload.get("cursor_seq"), observed)
+                if err:
+                    rec["receipt_error"] = err
+                    continue
+                rec.setdefault("receipts", {})[role] = {
+                    "switch_id": rec["id"], "role": role,
+                    "cursor_seq": claimed,
+                    "abandon_inflight": payload.get("abandon_inflight") is True,
+                }
+                continue
             rec.setdefault("receipts", {}).setdefault(role, {
                 "switch_id": rec["id"], "role": role,
-                "cursor_seq": payload.get("cursor_seq"),
+                "cursor_seq": int(observed["cursor_seq"]),
                 "abandon_inflight": payload.get("abandon_inflight") is True,
             })
+            if rec.get("cursor", {}).get("start_seq") is None:
+                rec["cursor"]["source_acked_seq"] = int(observed["cursor_seq"])
+                rec["cursor"]["start_seq"] = int(observed["cursor_seq"])
 
     def rollback(self) -> dict:
         rec = self.load()
         if rec is None:
             return {"ok": False, "reason": "no_switch"}
         stage = rec.get("stage")
-        if stage in ("target_acknowledged", "complete"):
+        if stage in ("target_acknowledged", "complete") or _target_send_started(rec):
             return {"ok": False, "reason": "target_active", **rec}
         observed = observe(self.board)
-        observed_owner = (observed.get("owner") or {}).get("provider")
-        current = rec.get("ownership", {}).get("current_provider")
-        if observed_owner and observed_owner != current:
+        expected = rec["target"]["pane"] if rec.get("ownership", {}).get("applied") is True else rec["source"]["pane"]
+        if registered_pane(observed) != expected:
             return {"ok": False, "reason": "ownership_mismatch", **rec}
         if rec.get("ownership", {}).get("applied") is True:
-            restore = {
-                "coordinator_owner": {
-                    "provider": rec["source"]["provider"],
-                    "pane": rec["source"]["pane"],
-                    "switch_id": rec["id"],
-                    "rolled_back": True,
-                }
-            }
-            fn = getattr(self.board, "put_settings", None) or getattr(self.board, "apply_owner", None)
-            if callable(fn):
-                try:
-                    fn(restore)
-                except Exception:
-                    return {"ok": False, "reason": "rollback_apply_failed", **rec}
+            body = {"session_tmux_window": rec["source"]["pane"], "actor": "session"}
+            try:
+                _board_request(self.board, "PUT", "/api/settings", body)
+            except Exception:
+                return {"ok": False, "reason": "rollback_apply_failed", **rec}
+            back = observe(self.board)
+            if registered_pane(back) != rec["source"]["pane"]:
+                return {"ok": False, "reason": "rollback_readback_mismatch", **rec}
             rec["ownership"]["applied"] = False
-            rec["ownership"]["current_provider"] = rec["source"]["provider"]
+            rec["ownership"]["current_pane"] = rec["source"]["pane"]
         rec["stage"] = "failed"
         rec["fail_reason"] = "rolled_back"
         if rec.get("dispatch_rebind", {}).get("ok") is True:
@@ -667,7 +793,7 @@ def next_action(rec: dict) -> str:
     stage = rec.get("stage")
     src = rec.get("source") or {}
     dst = rec.get("target") or {}
-    cursor = (rec.get("cursor") or {}).get("seq")
+    cursor = _start_seq(rec)
     executor = (rec.get("preserve") or {}).get("default_executor")
     if stage == "failed":
         return "Switch failed (%s). Inspect panes; do not kill workers." % (
@@ -726,6 +852,7 @@ def _source_prompt(rec: dict, switch_dir: Path) -> str:
     nonce_path = switch_dir / "nonce"
     return "\n".join([
         "Coordinator owner switch %s." % rec["id"],
+        "Project root: %s" % rec.get("project_root"),
         "Role: source quiesce. Provider label: %s." % rec["source"]["provider"],
         "Stop only your idle board monitor and new dispatches.",
         "Keep running task workers, worktrees, and panes.",
@@ -744,9 +871,11 @@ def _target_prompt(rec: dict, switch_dir: Path) -> str:
     nonce_path = switch_dir / "nonce"
     return "\n".join([
         "Coordinator owner switch %s." % rec["id"],
+        "Project root: %s" % rec.get("project_root"),
         "Role: target take ownership. Provider label: %s." % rec["target"]["provider"],
-        "Read the orchestrator event cursor from the board. Planned seq is %s."
-        % rec["cursor"]["seq"],
+        "Read the orchestrator event cursor from the board. Start at seq %s "
+        "(latest fully handled source cursor). Do not skip to head."
+        % _start_seq(rec),
         "Never set the cursor to head to skip pending events.",
         "Preserve card assignments, worktrees, panes, and worker.default_executor=%s."
         % rec["preserve"].get("default_executor"),
@@ -841,9 +970,7 @@ def main(argv: list[str] | None = None, *, board=None, transport=None) -> int:
             result = {"ok": False, "reason": "unknown_command"}
     finally:
         switch.release()
-    public = dict(result)
-    if "nonce" in public:
-        public["nonce"] = "<redacted>"
+    public = public_payload(result)
     print(json.dumps(public, sort_keys=True, default=str))
     return 0 if public.get("ok") is True else 1
 
