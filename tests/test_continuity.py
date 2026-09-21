@@ -110,7 +110,7 @@ class ContinuityTests(unittest.TestCase):
             event(73, "worker", "error", 11, text="typecheck failed"),
             event(74, "worker", "evidence", 15, text="diff ready"),
             event(75, "worker", "question", 12, text="which fixture?"),
-            event(76, "user", "retry", 10),
+            event(76, "user", "note", 10, retry=True, text="retry"),
             event(77, "system", "state", 10, to="queued"),
         ])
         by_seq = {i["seq"]: i for i in self.inbox.pending()}
@@ -130,7 +130,8 @@ class ContinuityTests(unittest.TestCase):
         self.inbox.register_snapshot(snapshot_cards(), cutoff_seq=50)
         self.inbox.record_events([event(80, "worker", "evidence", 11, text="one")])
         first = self.inbox.prepare_delivery(11)
-        self.assertTrue(first["ok"])
+        self.assertIs(first["ok"], True)
+        self.assertIs(first["send_allowed"], True)
         self.assertEqual(first["status"], "prepared")
         self.assertEqual(first["item_seqs"], [80])
         self.inbox.record_events([
@@ -139,16 +140,21 @@ class ContinuityTests(unittest.TestCase):
         ])
         self.assertEqual([i["seq"] for i in self.inbox.pending(11)], [81, 82])
         again = self.inbox.prepare_delivery(11)
+        self.assertIs(again["send_allowed"], False)
+        self.assertIs(again["ok"], False)
         self.assertTrue(again["batched"])
         self.assertEqual(again["id"], first["id"])
         self.assertEqual(again["item_seqs"], [80])
         self.inbox.mark_submitted(first["id"], status="submitted")
         still = self.inbox.prepare_delivery(11)
         self.assertEqual(still["id"], first["id"])
+        self.assertIs(still["send_allowed"], False)
+        self.assertEqual(still["reason"], "already_submitted")
         ack = self.inbox.acknowledge(first["id"], through_seq=80)
         self.assertEqual(ack["acknowledged_seqs"], [80])
         self.assertEqual([i["seq"] for i in self.inbox.pending(11)], [81, 82])
         nxt = self.inbox.prepare_delivery(11)
+        self.assertIs(nxt["send_allowed"], True)
         self.assertEqual(nxt["item_seqs"], [81, 82])
 
     def test_ack_cannot_eat_later_events_or_other_cards(self):
@@ -183,11 +189,67 @@ class ContinuityTests(unittest.TestCase):
         inbox = self.reopen()
         blocked = inbox.prepare_delivery(12)
         self.assertEqual(blocked["reason"], "uncertain")
-        self.assertEqual(blocked["delivery"]["id"], delivery["id"])
+        self.assertIs(blocked["send_allowed"], False)
+        self.assertEqual(blocked["id"], delivery["id"])
         self.assertEqual(inbox.pending(12), [])
         row = inbox.conn.execute(
             "SELECT status FROM continuity_items WHERE seq=100").fetchone()
         self.assertEqual(row["status"], "inflight")
+
+    def test_identity_is_board_seq_not_payload_id(self):
+        self.inbox.register_snapshot(snapshot_cards(), cutoff_seq=50)
+        shared = "untrusted-duplicate-id"
+        inserted = self.inbox.record_events([
+            event(110, "user", "answer", 12, id=shared, text="first"),
+            event(111, "user", "answer", 12, id=shared, text="second"),
+        ])
+        self.assertEqual(inserted, [110, 111])
+        pending = self.inbox.pending(12)
+        self.assertEqual([i["seq"] for i in pending], [110, 111])
+        self.assertEqual([i["event_id"] for i in pending], ["seq:110", "seq:111"])
+        self.assertEqual(pending[0]["payload"]["id"], shared)
+        self.assertEqual(pending[1]["payload"]["id"], shared)
+
+    def test_retry_is_user_note_with_retry_true(self):
+        self.inbox.register_snapshot(snapshot_cards(), cutoff_seq=50)
+        inserted = self.inbox.record_events([
+            event(120, "user", "note", 10, retry=True, text="try again"),
+            event(121, "user", "note", 10, retry=False, text="just a note"),
+            event(122, "user", "note", 10, retry=1, text="truthy but not bool True"),
+            event(123, "user", "note", 10, text="ordinary note"),
+            event(124, "user", "retry", 10, text="kind retry is not the board event"),
+        ])
+        self.assertEqual(inserted, [120])
+        self.assertEqual(self.inbox.pending(10)[0]["intent"], "resume")
+        self.assertIs(actionable(event(120, "user", "note", 10, retry=True)), True)
+        self.assertIs(actionable(event(122, "user", "note", 10, retry=1)), False)
+
+    def test_state_transitions_unfreeze_held_and_terminal(self):
+        self.inbox.register_snapshot(snapshot_cards(), cutoff_seq=50)
+        self.assertEqual(self.inbox.prepare_delivery(13)["reason"], "excluded")
+        self.inbox.record_events([
+            event(130, "user", "note", 13, retry=True),
+            event(131, "system", "state", 13, to="queued"),
+        ])
+        rec = self.inbox.card(13)
+        self.assertEqual(rec["state"], "queued")
+        self.assertFalse(rec["held"])
+        self.assertEqual(rec["dispatch"], "waiting")
+        batch = self.inbox.prepare_delivery(13)
+        self.assertIs(batch["send_allowed"], True)
+        self.assertEqual(batch["item_seqs"], [130, 131])
+
+        self.inbox.record_events([event(132, "system", "state", 12, to="in_progress")])
+        self.assertEqual(self.inbox.card(12)["dispatch"], "occupied")
+        self.inbox.record_events([event(133, "system", "state", 12, to="needs_you")])
+        self.assertEqual(self.inbox.card(12)["dispatch"], "waiting")
+        self.inbox.record_events([event(134, "system", "state", 15, to="completed")])
+        self.assertEqual(self.inbox.card(15)["dispatch"], "done")
+        self.assertNotIn("%15", self.inbox.excluded_panes())
+        self.inbox.record_events([event(135, "system", "state", 11, to="canceled")])
+        self.assertEqual(self.inbox.card(11)["dispatch"], "done")
+        self.assertEqual(self.inbox.prepare_delivery(11)["reason"], "done")
+        self.assertIs(self.inbox.prepare_delivery(11)["send_allowed"], False)
 
     def test_module_does_not_send_or_import_tmux(self):
         import sprint_coordinator.continuity as mod

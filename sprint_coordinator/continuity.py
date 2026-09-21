@@ -15,14 +15,16 @@ from sprint_coordinator.util import sha256_text
 
 UNFINISHED_STATES = ("queued", "in_progress", "needs_you", "ready", "integrating")
 HELD_STATES = ("held",)
+TERMINAL_STATES = ("completed", "canceled", "rejected")
 NOISE_KINDS = ("heartbeat", "cursor", "progress", "phase")
-USER_LIFECYCLE = ("answer", "verdict", "action", "retry")
+USER_LIFECYCLE = ("answer", "verdict", "action")
 WORKER_LIFECYCLE = ("evidence", "error", "question")
-STATE_TO = ("queued", "ready", "integrating", "failed")
+STATE_TO = (
+    "queued", "ready", "integrating", "failed", "held", "needs_you",
+    "in_progress", "completed", "canceled", "rejected",
+)
 RESUME_VERDICTS = ("bounce",)
-NOTICE_VERDICTS = ("approve", "reject", "cancel", "hold")
-RESUME_ACTIONS = ("retry", "resume")
-NOTICE_ACTIONS = ("cancel", "hold")
+RESUME_ACTIONS = ("retry", "resume", "release")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS continuity_snapshot (
@@ -98,6 +100,11 @@ def _payload(event: dict) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _is_retry_note(event: dict) -> bool:
+    payload = _payload(event)
+    return event.get("actor") == "user" and event.get("kind") == "note" and payload.get("retry") is True
+
+
 def actionable(event: dict) -> bool:
     """Lifecycle only. Chat generation, progress, and session echoes are out."""
     if not isinstance(event, dict):
@@ -108,6 +115,8 @@ def actionable(event: dict) -> bool:
         return False
     if _card_num(event) is None:
         return False
+    if _is_retry_note(event):
+        return True
     if actor == "user" and kind in USER_LIFECYCLE:
         return True
     if actor == "worker" and kind in WORKER_LIFECYCLE:
@@ -122,6 +131,8 @@ def classify(event: dict) -> str:
     """resume = work may continue; notice = record only; wait = do not start."""
     kind = event.get("kind")
     payload = _payload(event)
+    if _is_retry_note(event):
+        return "resume"
     if kind == "answer":
         return "resume"
     if kind == "verdict":
@@ -129,15 +140,19 @@ def classify(event: dict) -> str:
         if verdict in RESUME_VERDICTS:
             return "resume"
         return "notice"
-    if kind in ("action", "retry"):
-        action = str(payload.get("action") or payload.get("name") or kind).lower()
-        if kind == "retry" or action in RESUME_ACTIONS:
+    if kind == "action":
+        action = str(payload.get("action") or payload.get("name") or "").lower()
+        if action in RESUME_ACTIONS:
             return "resume"
         return "notice"
     if kind == "state":
         to = payload.get("to", payload.get("state"))
         if to == "needs_you":
             return "wait"
+        if to in HELD_STATES:
+            return "wait"
+        if to in TERMINAL_STATES:
+            return "notice"
         return "notice"
     return "notice"
 
@@ -145,11 +160,9 @@ def classify(event: dict) -> str:
 def _dispatch_for(state: str, held: bool) -> str:
     if held or state in HELD_STATES:
         return "excluded"
-    if state == "needs_you":
-        return "waiting"
-    if state == "queued":
-        return "waiting"
-    if state == "ready":
+    if state in TERMINAL_STATES:
+        return "done"
+    if state in ("needs_you", "queued", "ready", "failed"):
         return "waiting"
     if state in ("in_progress", "integrating"):
         return "occupied"
@@ -255,7 +268,8 @@ class ContinuityInbox:
     def excluded_panes(self) -> list:
         rows = self.conn.execute(
             "SELECT DISTINCT pane FROM continuity_cards WHERE pane IS NOT NULL "
-            "AND pane != '' ORDER BY pane"
+            "AND pane != '' AND dispatch IN ('occupied','excluded','waiting') "
+            "ORDER BY pane"
         ).fetchall()
         return [row["pane"] for row in rows]
 
@@ -285,7 +299,7 @@ class ContinuityInbox:
                 if card_num is None:
                     continue
                 payload = _payload(event)
-                event_id = str(payload.get("id") or "seq:%d" % seq)
+                event_id = "seq:%d" % seq
                 intent = classify(event)
                 try:
                     self.conn.execute(
@@ -298,6 +312,9 @@ class ContinuityInbox:
                     inserted.append(seq)
                 except sqlite3.IntegrityError:
                     continue
+                if event.get("kind") == "state":
+                    to = payload.get("to", payload.get("state"))
+                    self._upsert_card_state(card_num, to, seq)
             self._commit()
         except Exception:
             self._rollback()
@@ -316,6 +333,26 @@ class ContinuityInbox:
                 (int(card_num),)).fetchall()
         return [_item_dict(row) for row in rows]
 
+    def _upsert_card_state(self, card_num: int, state, seq: int) -> None:
+        if state not in STATE_TO:
+            return
+        state = str(state)
+        held = 1 if state in HELD_STATES else 0
+        dispatch = _dispatch_for(state, bool(held))
+        existing = self.conn.execute(
+            "SELECT card_num FROM continuity_cards WHERE card_num=?",
+            (int(card_num),)).fetchone()
+        if existing is None:
+            self.conn.execute(
+                "INSERT INTO continuity_cards(card_num, state, agent_name, pane, worktree, "
+                "branch, last_event_seq, dispatch, held) VALUES(?,?,NULL,NULL,NULL,NULL,?,?,?)",
+                (int(card_num), state, int(seq), dispatch, held))
+            return
+        self.conn.execute(
+            "UPDATE continuity_cards SET state=?, last_event_seq=?, dispatch=?, held=? "
+            "WHERE card_num=?",
+            (state, int(seq), dispatch, held, int(card_num)))
+
     def _inflight(self, card_num: int) -> dict | None:
         row = self.conn.execute(
             "SELECT * FROM continuity_deliveries WHERE card_num=? AND status IN "
@@ -327,20 +364,15 @@ class ContinuityInbox:
         """Persist a card batch before any send. Does not invoke tmux-send."""
         card_num = int(card_num)
         rec = self.card(card_num)
-        if rec is not None and rec["dispatch"] == "excluded":
-            return {"ok": False, "reason": "excluded", "card_num": card_num}
+        if rec is not None and rec["dispatch"] in ("excluded", "done"):
+            return {
+                "ok": False, "send_allowed": False, "reason": rec["dispatch"],
+                "card_num": card_num,
+            }
         existing = self._inflight(card_num)
         if existing is not None:
-            if existing["status"] == "uncertain":
-                return {
-                    "ok": False,
-                    "reason": "uncertain",
-                    "card_num": card_num,
-                    "delivery": existing,
-                }
-            existing["ok"] = True
-            existing["batched"] = True
-            return existing
+            reason = "uncertain" if existing["status"] == "uncertain" else "already_" + existing["status"]
+            return _delivery_view(existing, send_allowed=False, reason=reason, batched=True)
         items = self.pending(card_num)
         if not items:
             return None
@@ -363,16 +395,16 @@ class ContinuityInbox:
         except Exception:
             self._rollback()
             raise
-        return {
-            "ok": True,
+        return _delivery_view({
             "id": delivery_id,
             "card_num": card_num,
             "status": "prepared",
             "item_seqs": seqs,
             "through_seq": through_seq,
             "created_at": created,
-            "batched": False,
-        }
+            "submitted_at": None,
+            "last_error": None,
+        }, send_allowed=True, batched=False)
 
     def mark_submitted(self, delivery_id: str, status: str = "submitted",
                        error: str | None = None, now=None) -> dict | None:
@@ -466,6 +498,8 @@ def _item_dict(row) -> dict:
 
 
 def _delivery_dict(row) -> dict:
+    if isinstance(row, dict) and "item_seqs" in row:
+        return dict(row)
     return {
         "id": row["id"],
         "card_num": row["card_num"],
@@ -476,3 +510,14 @@ def _delivery_dict(row) -> dict:
         "submitted_at": row["submitted_at"],
         "last_error": row["last_error"],
     }
+
+
+def _delivery_view(row, *, send_allowed: bool, reason: str | None = None,
+                   batched: bool = False) -> dict:
+    rec = _delivery_dict(row)
+    rec["ok"] = send_allowed is True
+    rec["send_allowed"] = send_allowed is True
+    rec["batched"] = batched is True
+    if reason:
+        rec["reason"] = reason
+    return rec
