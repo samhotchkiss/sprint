@@ -14,7 +14,7 @@ cursor, cards, worker assignments, worktrees, and Grok builder default.
 | Old main heartbeat cannot impersonate task-service ownership | Actual server class test |
 | Claude → Codex keeps unread messages | Demo: message 27 received one reply, event 30; Codex cursor advanced from 20 to 29. `/tmp/sprint-handoff-demo-acceptance.json` |
 | Worker remains alive and assigned | Claude pane %114 closed; worker fixture PID 31727 stayed alive in %134; card 1 and Grok default unchanged. This checks process lifetime, not a product build. |
-| Actual shutdown without a graceful source receipt | Rehearsal pending |
+| Shutdown without a graceful receipt | Source-exited tests verify exact absent pane, reject live pane/probe errors, and preserve the cursor. The demo also closed Claude after its graceful receipt; abrupt live Yunagi shutdown remains part of Sam's test. |
 | Live Yunagi switch | Reserved for Sam's test |
 
 ## Before the live test
@@ -36,3 +36,23 @@ The main-session watcher and the autonomous task coordinator are distinct ingres
 modes. Do not run both on the same board. Changing the main agent must not change
 which provider builds a card. Incoming email and unrelated Yunagi product work
 are outside this infrastructure rehearsal.
+
+## Release verification
+
+- 90 scoped tests passed; 9 assignment HTTP tests also passed against the exact
+  patched live server source. Final independent Codex review reported no blockers.
+- Live Yunagi reports all three capabilities: deterministic event dispatch,
+  task coordination, and assignment policy. Owner remains Claude pane `%72`.
+- Live demo HTTP allowed Grok and rejected an unjustified alternate executor
+  with 422, preserving the existing assignment. No paid call was needed.
+- One real Jev override check approved a concrete independent-review reason:
+  935 tokens, 0.93 seconds. It used a private temporary one-call budget.
+- Both synthetic cards were canceled after verification and the worker fixture
+  was stopped. The demo remains on Codex with an idle deterministic watcher.
+- Current TypeSafe documentation URLs were unavailable during this check; the
+  existing typed integration was exercised against the live service.
+
+Private acceptance receipts are under `/tmp/sprint-*-acceptance.json` and
+`/tmp/sprint-live-*-result.json`. They contain no API credentials. The live
+server remains in its serving checkout; the reviewed source and portable tools
+are in `/Users/sam/dev/sprint-event-dispatch`.
