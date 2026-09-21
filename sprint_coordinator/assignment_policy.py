@@ -1,12 +1,15 @@
 """Server-boundary gate for POST /api/cards/:n/assign.
 
-Default builder is settings.worker.default_executor. A different provider or
-model needs a case-specific reason and Jev evaluate_provider_override. Same
-default does not call a model. Approvals are per assignment fingerprint; a
-changed card/model/reason/default cannot reuse an older allow.
+Default builder is settings.worker.default_executor. A different provider
+needs a case-specific reason and Jev evaluate_provider_override. Model is
+compared only when a default model is actually configured. Same default does
+not call a model.
 
-Root wires this at the mutation. This module does not edit sprintd.
-Existing live assignments (existing=True) are not gated.
+Root supplies the effective assignment (COALESCE of request + existing card)
+and a fresh assignment_id per HTTP mutation. This module does not fill omitted
+executor/model from board defaults, does not trust existing=True, and does not
+cache an allow across requests. Root wires this; this module does not edit
+sprintd.
 """
 
 from __future__ import annotations
@@ -25,7 +28,6 @@ from sprint_coordinator.jev import (
 from sprint_coordinator.util import canonical_json, chmod_private, sha256_text
 
 
-PROVIDERS = ("grok", "claude", "codex")
 CONFIG_NAME = "assignment-policy.json"
 DB_NAME = "assignment-policy.sqlite"
 DEFAULT_KEY_FILE = "~/.config/sprint/typesafe.env"
@@ -39,7 +41,7 @@ CREATE TABLE IF NOT EXISTS usage (
 );
 CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY,
-  nonce TEXT NOT NULL UNIQUE,
+  nonce TEXT NOT NULL,
   fingerprint TEXT NOT NULL,
   assignment_id TEXT NOT NULL,
   card_num INTEGER NOT NULL,
@@ -49,6 +51,7 @@ CREATE TABLE IF NOT EXISTS audit (
   created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS audit_assignment_fp ON audit (assignment_id, fingerprint, id);
+CREATE INDEX IF NOT EXISTS audit_nonce ON audit (nonce, id);
 """
 
 
@@ -103,15 +106,27 @@ def _reason_from_payload(payload: Mapping[str, Any]) -> str:
     return ""
 
 
+def _payload_text(payload: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        if key not in payload or payload.get(key) is None:
+            continue
+        return _label(payload.get(key))
+    return ""
+
+
 def requested_identity(settings: Mapping[str, Any], payload: Mapping[str, Any]) -> dict:
+    """Read the effective assignment as supplied by root.
+
+    Omitted executor/model stay empty. They are not filled from
+    settings.worker.default_executor or an executor spec model.
+    """
     worker = (settings or {}).get("worker") or {}
     default_provider = _label(worker.get("default_executor"))
     executors = worker.get("executors") if isinstance(worker.get("executors"), dict) else {}
-    requested_provider = _label(payload.get("executor") or payload.get("provider") or default_provider)
     default_spec = executors.get(default_provider) if isinstance(executors.get(default_provider), dict) else {}
-    requested_spec = executors.get(requested_provider) if isinstance(executors.get(requested_provider), dict) else {}
     default_model = _label(default_spec.get("model") or worker.get("model") or "")
-    requested_model = _label(payload.get("model") if payload.get("model") is not None else requested_spec.get("model") or default_model)
+    requested_provider = _payload_text(payload, "executor", "provider")
+    requested_model = _payload_text(payload, "model")
     return {
         "default_provider": default_provider,
         "default_model": default_model,
@@ -122,10 +137,14 @@ def requested_identity(settings: Mapping[str, Any], payload: Mapping[str, Any]) 
 
 
 def is_default_request(identity: Mapping[str, Any]) -> bool:
-    return (
-        _label(identity.get("default_provider")) == _label(identity.get("requested_provider"))
-        and _label(identity.get("default_model")) == _label(identity.get("requested_model"))
-    )
+    if _label(identity.get("default_provider")) != _label(identity.get("requested_provider")):
+        return False
+    if not _label(identity.get("default_provider")):
+        return False
+    default_model = _label(identity.get("default_model"))
+    if not default_model:
+        return True
+    return default_model == _label(identity.get("requested_model"))
 
 
 def fingerprint_for(*, card_num: int, assignment_id: str, identity: Mapping[str, Any]) -> str:
@@ -141,18 +160,69 @@ def fingerprint_for(*, card_num: int, assignment_id: str, identity: Mapping[str,
     return sha256_text(canonical_json(body))
 
 
+def _parse_daily_max(raw: Mapping[str, Any]) -> int:
+    if "daily_max_calls" not in raw or raw.get("daily_max_calls") is None:
+        return DEFAULT_DAILY_MAX
+    value = raw.get("daily_max_calls")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("daily_max_calls")
+    return int(value)
+
+
 def load_config(data_dir: Path) -> dict | None:
     path = Path(data_dir) / CONFIG_NAME
     if not path.exists():
         return None
     raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or raw.get("enabled") is not True:
+    if not isinstance(raw, dict):
+        raise ValueError("assignment_policy_config_invalid")
+    if raw.get("enabled") is not True:
         return None
+    key_file = raw.get("key_file")
+    if key_file is None:
+        key_file = DEFAULT_KEY_FILE
+    elif not isinstance(key_file, str) or not key_file.strip():
+        raise ValueError("key_file")
     return {
         "enabled": True,
-        "key_file": str(raw.get("key_file") or DEFAULT_KEY_FILE),
-        "daily_max_calls": int(raw.get("daily_max_calls") or DEFAULT_DAILY_MAX),
+        "key_file": key_file,
+        "daily_max_calls": _parse_daily_max(raw),
     }
+
+
+def _audit_sql(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit'"
+    ).fetchone()
+    return "" if row is None or row[0] is None else str(row[0])
+
+
+def _nonce_unique_in_schema(sql: str) -> bool:
+    compact = " ".join(sql.split()).upper()
+    return "NONCE TEXT NOT NULL UNIQUE" in compact or "NONCE TEXT UNIQUE" in compact
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    sql = _audit_sql(conn)
+    if _nonce_unique_in_schema(sql):
+        conn.execute("ALTER TABLE audit RENAME TO audit_legacy_unique_nonce")
+    conn.executescript(SCHEMA)
+    legacy = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='audit_legacy_unique_nonce'"
+    ).fetchone()
+    if legacy is None:
+        return
+    conn.execute(
+        "INSERT INTO audit(id, nonce, fingerprint, assignment_id, card_num, event, "
+        "snapshot_json, detail_json, created_at) "
+        "SELECT id, nonce, fingerprint, assignment_id, card_num, event, "
+        "snapshot_json, detail_json, created_at FROM audit_legacy_unique_nonce"
+    )
+    conn.execute("DROP TABLE audit_legacy_unique_nonce")
+    conn.executescript(
+        "CREATE INDEX IF NOT EXISTS audit_assignment_fp ON audit (assignment_id, fingerprint, id);"
+        "CREATE INDEX IF NOT EXISTS audit_nonce ON audit (nonce, id);"
+    )
 
 
 def _connect(data_dir: Path) -> sqlite3.Connection:
@@ -161,7 +231,7 @@ def _connect(data_dir: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(SCHEMA)
+    _ensure_schema(conn)
     chmod_private(path)
     return conn
 
@@ -169,13 +239,7 @@ def _connect(data_dir: Path) -> sqlite3.Connection:
 def _write_audit(conn: sqlite3.Connection, *, nonce: str, fingerprint: str,
                  assignment_id: str, card_num: int, event: str,
                  snapshot: Mapping[str, Any], detail: Mapping[str, Any],
-                 created_at: float, row_id: int | None = None) -> int:
-    if row_id is not None:
-        conn.execute(
-            "UPDATE audit SET event=?, detail_json=? WHERE id=?",
-            (event, canonical_json(detail), int(row_id)),
-        )
-        return int(row_id)
+                 created_at: float) -> int:
     cur = conn.execute(
         "INSERT INTO audit(nonce, fingerprint, assignment_id, card_num, event, "
         "snapshot_json, detail_json, created_at) VALUES (?,?,?,?,?,?,?,?)",
@@ -183,14 +247,6 @@ def _write_audit(conn: sqlite3.Connection, *, nonce: str, fingerprint: str,
          canonical_json(snapshot), canonical_json(detail), created_at),
     )
     return int(cur.lastrowid)
-
-
-def _latest_event(conn: sqlite3.Connection, assignment_id: str, fingerprint: str) -> str | None:
-    row = conn.execute(
-        "SELECT event FROM audit WHERE assignment_id=? AND fingerprint=? ORDER BY id DESC LIMIT 1",
-        (assignment_id, fingerprint),
-    ).fetchone()
-    return None if row is None else str(row["event"])
 
 
 def _gate(action: str, reason: str, *, nonce: str, fingerprint: str,
@@ -263,13 +319,15 @@ def gate_assignment(
 ) -> AssignmentGate:
     """Return allow/deny/unavailable. Only action==allow may mutate assign.
 
-    Root calls this at POST /api/cards/:n/assign (new assignments) and may
-    revalidate the same assignment_id + fingerprint before write.
+    Root calls this at POST /api/cards/:n/assign with the effective payload
+    (request COALESCE existing card) and a fresh assignment_id. `existing` is
+    ignored: live rows are preserved by not calling assign on handoff.
     """
+    del existing
     ts = _now(now)
     nonce = secrets.token_hex(16)
     identity = requested_identity(settings, payload or {})
-    aid = str(assignment_id or payload.get("assignment_id") or ("pending:" + nonce))
+    aid = str(assignment_id) if assignment_id else ("pending:" + nonce)
     identity = dict(identity, card_num=int(card_num), assignment_id=aid)
     fp = fingerprint_for(card_num=int(card_num), assignment_id=aid, identity=identity)
     snapshot = {
@@ -281,7 +339,6 @@ def gate_assignment(
         "requested_model": identity["requested_model"],
         "reason": identity["reason"],
         "task": str(task or payload.get("task") or payload.get("title") or ""),
-        "existing": bool(existing),
     }
     try:
         config = load_config(Path(data_dir))
@@ -293,15 +350,6 @@ def gate_assignment(
                      fingerprint=fp, snapshot=snapshot, identity=identity)
     conn = _connect(Path(data_dir))
     try:
-        if existing is True:
-            decision_id = _write_audit(
-                conn, nonce=nonce, fingerprint=fp, assignment_id=aid,
-                card_num=int(card_num), event="preserved", snapshot=snapshot,
-                detail={"reason": "existing_assignment"}, created_at=ts)
-            conn.commit()
-            return _gate("allow", "existing_assignment_preserved", nonce=nonce,
-                         fingerprint=fp, snapshot=snapshot, identity=identity,
-                         decision_id=decision_id)
         if is_default_request(identity):
             decision_id = _write_audit(
                 conn, nonce=nonce, fingerprint=fp, assignment_id=aid,
@@ -319,16 +367,6 @@ def gate_assignment(
             return _gate("deny", "override_reason_required", nonce=nonce,
                          fingerprint=fp, snapshot=snapshot, identity=identity,
                          decision_id=decision_id)
-        prior = _latest_event(conn, aid, fp)
-        if prior == "allowed":
-            decision_id = _write_audit(
-                conn, nonce=nonce, fingerprint=fp, assignment_id=aid,
-                card_num=int(card_num), event="revalidated", snapshot=snapshot,
-                detail={"reason": "same_assignment_fingerprint"}, created_at=ts)
-            conn.commit()
-            return _gate("allow", "same_assignment_fingerprint", nonce=nonce,
-                         fingerprint=fp, snapshot=snapshot, identity=identity,
-                         decision_id=decision_id)
         cap = _reserve(conn, config["daily_max_calls"], ts)
         if cap:
             decision_id = _write_audit(
@@ -338,7 +376,7 @@ def gate_assignment(
             conn.commit()
             return _gate("unavailable", cap, nonce=nonce, fingerprint=fp,
                          snapshot=snapshot, identity=identity, decision_id=decision_id)
-        reserved_id = _write_audit(
+        _write_audit(
             conn, nonce=nonce, fingerprint=fp, assignment_id=aid,
             card_num=int(card_num), event="reserved", snapshot=snapshot,
             detail={"reason": "jev_reserved"}, created_at=ts)
@@ -355,8 +393,7 @@ def gate_assignment(
                 decision_id = _write_audit(
                     conn, nonce=nonce, fingerprint=fp, assignment_id=aid,
                     card_num=int(card_num), event="unavailable", snapshot=snapshot,
-                    detail={"reason": "verifier_unavailable"},
-                    created_at=ts, row_id=reserved_id)
+                    detail={"reason": "verifier_unavailable"}, created_at=ts)
                 conn.commit()
                 return _gate("unavailable", "verifier_unavailable", nonce=nonce,
                              fingerprint=fp, snapshot=snapshot, identity=identity,
@@ -365,9 +402,9 @@ def gate_assignment(
             outcome = fn(
                 jev,
                 task=snapshot["task"] or ("card %s" % card_num),
-                default_provider=identity["default_provider"] or "grok",
+                default_provider=identity["default_provider"],
                 requested_provider=identity["requested_provider"],
-                default_model=identity["default_model"] or identity["requested_model"],
+                default_model=identity["default_model"],
                 requested_model=identity["requested_model"],
                 reason=identity["reason"],
                 evidence=dict(evidence or payload.get("evidence") or {}),
@@ -376,8 +413,7 @@ def gate_assignment(
             decision_id = _write_audit(
                 conn, nonce=nonce, fingerprint=fp, assignment_id=aid,
                 card_num=int(card_num), event="unavailable", snapshot=snapshot,
-                detail={"reason": "verifier_unavailable"},
-                created_at=ts, row_id=reserved_id)
+                detail={"reason": "verifier_unavailable"}, created_at=ts)
             conn.commit()
             return _gate("unavailable", "verifier_unavailable", nonce=nonce,
                          fingerprint=fp, snapshot=snapshot, identity=identity,
@@ -388,8 +424,7 @@ def gate_assignment(
             decision_id = _write_audit(
                 conn, nonce=nonce, fingerprint=fp, assignment_id=aid,
                 card_num=int(card_num), event="unavailable", snapshot=snapshot,
-                detail={"reason": "malformed_verifier_response"},
-                created_at=ts, row_id=reserved_id)
+                detail={"reason": "malformed_verifier_response"}, created_at=ts)
             conn.commit()
             return _gate("unavailable", "malformed_verifier_response", nonce=nonce,
                          fingerprint=fp, snapshot=snapshot, identity=identity,
@@ -409,7 +444,7 @@ def gate_assignment(
         decision_id = _write_audit(
             conn, nonce=nonce, fingerprint=fp, assignment_id=aid,
             card_num=int(card_num), event=event, snapshot=snapshot,
-            detail=detail, created_at=ts, row_id=reserved_id)
+            detail=detail, created_at=ts)
         conn.commit()
         return _gate(gate_action, gate_reason, nonce=nonce, fingerprint=fp,
                      snapshot=snapshot, identity=identity, judgments=judgments,
