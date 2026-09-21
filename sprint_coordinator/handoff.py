@@ -258,14 +258,7 @@ def observe(board) -> dict:
     board_payload = _board_get(board, "/api/board")
     cursor_raw = _board_get(board, "/api/cursors/orchestrator")
     cursor_seq = int(cursor_raw.get("seq") or 0)
-    events = board_payload.get("events") or []
-    head = 0
-    if events:
-        head = max(int(ev.get("seq") or 0) for ev in events)
-    if board_payload.get("head") is not None:
-        head = max(head, int(board_payload["head"]))
-    if callable(getattr(board, "head_seq", None)):
-        head = max(head, int(board.head_seq()))
+    head = _board_head(board, board_payload)
     pane = settings_raw.get("session_tmux_window") or settings.get("session_tmux_window")
     try:
         autoheal = _board_get(board, "/api/autoheal")
@@ -281,6 +274,52 @@ def observe(board) -> dict:
         "owner_pane": canonical_pane(pane),
         "autoheal": autoheal if isinstance(autoheal, dict) else {},
     }
+
+
+def _board_head(board, board_payload: dict) -> int:
+    """GET /api/board uses `seq` for the log head, not `head`."""
+    head = 0
+    for key in ("seq", "head"):
+        value = board_payload.get(key)
+        if value is None:
+            continue
+        try:
+            head = max(head, int(value))
+        except (TypeError, ValueError):
+            pass
+    for event in board_payload.get("events") or ():
+        try:
+            head = max(head, int(event.get("seq") or 0))
+        except (TypeError, ValueError):
+            pass
+    if callable(getattr(board, "head_seq", None)):
+        try:
+            head = max(head, int(board.head_seq()))
+        except (TypeError, ValueError):
+            pass
+    if head > 0:
+        return head
+    try:
+        page = _board_get(board, "/api/events?after=0&limit=1")
+        if page.get("head") is not None:
+            head = max(head, int(page["head"]))
+    except (RuntimeError, TypeError, ValueError, AssertionError):
+        pass
+    return head
+
+
+def _bind_source_cursor(rec: dict, observed: dict) -> None:
+    """Accept older source receipts that omitted cursor_seq."""
+    src = (rec.get("receipts") or {}).get("source")
+    if not src and not rec.get("source_exit"):
+        return
+    live = int(observed.get("cursor_seq") or 0)
+    if src is not None and src.get("cursor_seq") is None:
+        src["cursor_seq"] = live
+    if rec.get("cursor", {}).get("start_seq") is None:
+        rec.setdefault("cursor", {})
+        rec["cursor"]["source_acked_seq"] = live
+        rec["cursor"]["start_seq"] = live
 
 
 def registered_pane(observed: dict) -> str | None:
@@ -589,6 +628,7 @@ class OwnerSwitch:
             self._save(rec)
             return {"ok": False, "send_allowed": False, "reason": owner_err, **rec}
         self._ingest_receipts(rec, observed)
+        _bind_source_cursor(rec, observed)
         if stage == "prepared":
             return self._advance_prepared(rec, observed)
         if stage == "source_quiesced":
@@ -852,12 +892,11 @@ class OwnerSwitch:
                 continue
             rec.setdefault("receipts", {}).setdefault(role, {
                 "switch_id": rec["id"], "role": role,
-                "cursor_seq": int(observed["cursor_seq"]),
+                "cursor_seq": payload.get("cursor_seq"),
                 "abandon_inflight": payload.get("abandon_inflight") is True,
+                "at": payload.get("at"),
             })
-            if rec.get("cursor", {}).get("start_seq") is None:
-                rec["cursor"]["source_acked_seq"] = int(observed["cursor_seq"])
-                rec["cursor"]["start_seq"] = int(observed["cursor_seq"])
+            _bind_source_cursor(rec, observed)
 
     def rollback(self) -> dict:
         rec = self.load()

@@ -44,7 +44,9 @@ class FakeBoard:
                 },
             }
         if path == "/api/board":
-            return {"cards": list(self.cards), "head": self.head}
+            return {"cards": list(self.cards), "seq": self.head}
+        if path.startswith("/api/events"):
+            return {"events": [], "head": self.head, "cursor": self.cursor}
         if path == "/api/cursors/orchestrator":
             return {"seq": self.cursor}
         if path == "/api/autoheal":
@@ -460,6 +462,27 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(continued.get("stage"), "source_quiesced")
         self.assertEqual(self.board.owner["pane"], "%8")
 
+    def test_legacy_source_receipt_without_cursor_seq_is_accepted(self):
+        self.board.cursor = 20
+        self.board.head = 20
+        rec = self.plan()
+        self.switch.advance()
+        path = self.board_dir / "receipts" / "source.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({
+            "switch_id": rec["id"], "nonce": rec["nonce"], "role": "source",
+            "at": 1, "abandon_inflight": False,
+        }))
+        os.chmod(path, 0o600)
+        self.board.head = 27
+        out = self.switch.advance()
+        self.assertTrue(out["ok"], out)
+        stored = self.switch.load()
+        self.assertEqual(stored["stage"], "source_quiesced")
+        self.assertEqual(stored["cursor"]["start_seq"], 20)
+        self.assertEqual(out["observed_head"], 27)
+        self.assertTrue(out["pending_since_plan"])
+
     def test_plan_rejects_unregistered_source_pane(self):
         bad = self.plan(source_pane="%9", target_pane="%8")
         self.assertFalse(bad["ok"])
@@ -539,6 +562,27 @@ except ImportError:  # pragma: no cover
 
 @unittest.skipIf(SprintdBase is None, "sprintd test base unavailable")
 class HandoffHttpTests(SprintdBase):
+    def test_observe_uses_board_seq_as_head(self):
+        from sprint_coordinator.board import BoardClient
+        from sprint_coordinator.handoff import observe
+        data = Path(self.app.data_dir)
+        (data / "server.json").write_text(json.dumps({
+            "port": self.port, "token": "test-token",
+        }))
+        os.chmod(data / "server.json", 0o600)
+        self.new_card("during-switch message")
+        status, board = self.get("/api/board")
+        self.assertEqual(status, 200)
+        self.assertIn("seq", board)
+        self.assertNotIn("head", board)
+        self.assertGreater(int(board["seq"]), 0)
+        client = BoardClient(data)
+        seen = observe(client)
+        self.assertEqual(seen["head_seq"], int(board["seq"]))
+        status, events = self.get("/api/events?after=0&limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(int(events["head"]), seen["head_seq"])
+
     def test_put_session_window_roundtrip(self):
         from sprint_coordinator.board import BoardClient
         data = Path(self.app.data_dir)
