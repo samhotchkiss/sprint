@@ -45,6 +45,12 @@ def actionable(event):
         return False
     if actor == "user":
         return True
+    # Review waits and unchanged dependencies remain visible on the board.
+    # Their timers require no agent decision; actual unblocks/verdicts still wake.
+    if (actor == "server" and kind == "stuck"
+            and payload.get("state") in ("ready", "blocked")
+            and not payload.get("rule")):
+        return False
     if kind in ("submitted", "chat", "answer", "question", "evidence", "verdict",
                 "error", "agent_silent", "stuck", "limit_cleared"):
         return True

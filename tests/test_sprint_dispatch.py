@@ -66,6 +66,27 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.state['scanned'], 4)
         self.assertEqual(self.board.cursor, 0)
 
+    def test_wait_reminders_do_not_spend_wakes_but_real_changes_do(self):
+        self.board.events = [
+            event(1, 'server', 'stuck', {'state': 'ready'}),
+            event(2, 'server', 'stuck', {'state': 'blocked'}),
+        ]
+        self.step()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.state['scanned'], 2)
+        self.assertEqual(self.board.cursor, 0)
+        for seq, actor, kind, payload in [
+            (3, 'server', 'stuck', {'state': 'in_progress', 'rule': 'worker_gone'}),
+            (4, 'server', 'note', {'blocked_by_change': True, 'blocked_by': None}),
+            (5, 'user', 'verdict', {'verdict': 'approve'}),
+            (6, 'user', 'chat', {}),
+        ]:
+            self.board.cursor = seq - 1
+            self.board.events.append(event(seq, actor, kind, payload))
+            before = len(self.sent)
+            self.step(100 + seq)
+            self.assertEqual(len(self.sent), before + 1)
+
     def test_burst_once_partial_ack_and_later_event(self):
         self.board.events = [event(1), event(2)]
         self.step()
