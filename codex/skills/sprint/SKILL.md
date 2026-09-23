@@ -8,6 +8,28 @@ description: Run or resume a Sprint board from a live Codex session, including e
 This is the Codex host adapter for Sprint. The board is state only; this live
 Codex session is its brain.
 
+## Portable boards: preserve workers across host changes
+
+On a board using `sprint-handoff`, the main session and task workers are
+independent tmux sessions. All messages to them go through `tmux-send`, including
+follow-ups and recovery. Do not use host-native Agent/SendMessage equivalents on
+these boards. This rule overrides the legacy host mapping below.
+
+Read the current card assignment and recorded pane before launching anything.
+A worker absent from Codex's internal agent tree may still be working in tmux;
+switching from Claude does not make it dead. Preserve its worktree, branch and
+executor. Keep the board's default builder even when the coordinator provider
+changes. Never silently substitute Codex workers because the coordinator is Codex.
+
+Use `docs/OWNER-SWITCH.md` for the acknowledged handoff. Start from the saved
+orchestrator cursor, read pending events and existing card timelines, and do not
+reset a dispatcher to bypass an ownership mismatch. A receipt acknowledging the
+handoff does not acknowledge unread board events.
+
+For persistent main-session ingress use `bin/sprint-dispatch-service install
+--project-root /absolute/project` after the handoff registers this pane. End idle
+turns; the operating system restarts a crashed watcher without model polling.
+
 ## Load the canonical contract
 
 This adapter is installed as a symlink by `bin/sprint-codex-install`. Resolve
@@ -64,7 +86,7 @@ Interpret the canonical host terms as follows:
 | SendMessage | `collaboration.send_message` for a running turn; `collaboration.followup_task` to resume an idle worker |
 | Agent/task inspection | `collaboration.list_agents` |
 | Stop a canceled worker | `collaboration.interrupt_agent` |
-| Monitor | the yielded-tail ingress below |
+| Monitor | `sprint-dispatch`, outside the model turn |
 
 Codex task names accept underscores, not the board's hyphens. Use
 `sprint_card_<n>`, `sprint_batch_<id>`, and `sprint_review_<n>` as collaboration
@@ -77,30 +99,120 @@ Before relaying to a worker, call `list_agents`. Send to a running worker; use
 `followup_task` for an idle worker. A worker missing from the current agent tree
 is dead for recovery purposes; follow the canonical fresh-agent procedure.
 
-## Persistent event ingress
+## Event-driven ingress: end idle turns
 
-Codex has no tool literally named `Monitor`, but a yielded `functions.exec`
-cell provides the same behavior:
+Use `bin/sprint-dispatch`, the deterministic watcher described in the canonical
+skill. It owns polling and `tmux-send`; it makes **no model calls**. There is no
+Codex `Monitor` emulation, yielded-tail loop, timed `functions.wait`, or
+`write_stdin` polling loop for ingress. Never keep a Codex turn alive merely
+because a worker or test process is running.
 
-1. Start `bin/sprintd tail --after <persisted-cursor>` with `exec_command` and a
-   short initial yield.
-2. In the same JavaScript cell, loop on `write_stdin` for that command session.
-   When output arrives, emit it with `text(...)` and call `yield_control()`.
-3. Keep the returned cell id. After handling and fully draining the event log,
-   call `functions.wait` on that cell to return to the same live tail.
-4. A tail line is only a wake signal. Always fetch the full event/card and run
-   the canonical cursor drain before acting.
+After confirming ownership and registering this session's exact pane:
 
-If a yielded cell is unavailable, use the canonical `sprintd wait --timeout
-60` fallback. Re-arm before draining every time. Keep the orchestrator turn
-alive while the sprint is open; use commentary for concise progress and put
-all board-originated replies back on the board. If the host forces a turn end,
-re-ground before the next action and rely on the correctly registered tmux
-autoheal target for recovery.
+```bash
+"$SPRINT_REPO/bin/sprint-dispatch" start --project-root "$PROJECT_ROOT" --target "%5"
+```
+
+Replace `%5` with the pane returned by tmux, never a guessed address. Read the
+startup result. Do not claim the watcher is running if startup failed. After
+handling the available event batch and persisting the orchestrator cursor,
+**end your turn**. Workers must report decisions/results through the board so
+the watcher can wake you. Stop the dispatcher on handoff or End Sprint; do not
+leave a second ingress listener attached. The watcher will stop on target
+ownership changes without claiming the new session.
+
+If no tmux target exists, report that unattended wakeup is unavailable. Handle
+the current batch and return; do not replace the missing channel with paid
+model polling. The user can resume manually or set up a dedicated tmux session.
+
+### Small dispatcher, separate specialists
+
+For a newly created dedicated routing session, prefer `gpt-5.6-luna` with low
+reasoning. Do not silently change the user's active session model. The watcher
+itself is ordinary code and needs no model configuration or API credentials.
+Keep routing context to the incoming event, relevant card, worker assignment,
+and applicable standing instructions. Do not fork a whole coordinator history
+into workers. Use stronger agents for ambiguous decisions, complex work, and
+review. The dispatcher should assign once, then wait outside the model; worker
+completion, a question, or failure is the next reason to wake.
+
+Bound each assignment with an outcome, allowed scope, and time/usage limit.
+No repeated “status?” follow-ups. No automatic review loop without new changes
+or evidence. When a worker finishes, handle its result once; do not turn a
+finished specialist into a permanent polling assistant.
 
 Shell environments do not persist automatically across Codex tool calls.
 Re-read `.sprint/server.json` after restarts and pass `SPRINT_SERVER` and
 `SPRINT_TOKEN` inline to each API/helper command that needs them.
+
+## Matrix is a transport for the same sidebar
+
+On every Codex-owned Sprint start or resume, after the board is healthy and
+this session's exact tmux target is registered, start the text bridge:
+
+```bash
+"$SPRINT_REPO/bin/sprint-matrix" --project-root "$PROJECT_ROOT" start
+```
+
+Resolve `SPRINT_REPO` from this skill as described above and
+`PROJECT_ROOT` from the board. `start` is idempotent: it creates one private,
+non-federated Matrix room per project board, invites the allowed user, and
+reuses that room across Sprint runs and process restarts. Read its JSON output,
+share `room_url` with the user, and never claim Matrix is connected unless
+`running` is true. On failure, run `sprint-matrix doctor`, report the degraded
+browser-only state plainly, and retry only after addressing the reported cause.
+
+The bridge loads credentials from `${XDG_CONFIG_HOME:-$HOME/.config}/sprint/matrix.env`
+with direct environment variables taking precedence. For Sam's first-time
+setup, if that file is absent, install the existing server credentials without
+printing them:
+
+```bash
+ssh -i "$HOME/.ssh/hotch_matrix_ed25519" ubuntu@matrix.hotch.org \
+  'sudo cat /matrix/voice-gateway/config/matrix.env' | \
+  "$SPRINT_REPO/bin/sprint-matrix" install-env
+```
+
+The installer keeps only the homeserver, bot access token, bot user, and
+allowed user, and writes the file mode `0600`. Never post those values to the
+board, Matrix, logs, or commentary.
+
+Matrix text is ordinary durable sidebar input with `reply_to: "sidebar"`.
+Drain it exactly like text typed on the board and answer once through
+`POST /api/sidebar` as `actor: "session"`; do not also call a Matrix reply
+helper or launch a second model. The bridge mirrors that same reply to Matrix,
+mirrors browser-origin sidebar text into Matrix, and suppresses Matrix-origin
+echoes. Voice notes and live calls are outside this text bridge: do not call,
+and do not imply audio support merely because text is running.
+
+Voice is an optional sibling process and must never hold up the board or text.
+If `CODEX_SESSION_ID` is set, tmux can return this exact pane, and a local voice
+runner has been configured with `sprint-matrix install-voice-runner`, start
+incoming-call support after the text command has returned `running: true`:
+
+```bash
+TMUX_TARGET=$(tmux display-message -p '#{pane_id}')
+"$SPRINT_REPO/bin/sprint-matrix" --project-root "$PROJECT_ROOT" voice-start \
+  --tmux-target "$TMUX_TARGET" \
+  --codex-session-id "$CODEX_SESSION_ID"
+```
+
+This binds the listener to the room created by the text bridge and seeds its
+Realtime context from this exact Codex session. It only answers calls Sam
+places in that room; it does not place an outgoing call. Treat `running: true,
+ready: false` as warming up. Only say voice is ready after `voice-status`
+returns `ready: true`. If any prerequisite is absent or startup fails, post one
+plain status line and keep the fully working text room; do not retry voice in a
+loop and do not stop the text sidecar. An initial "waiting to accept the room
+invite" result is normal. The first Matrix-origin sidebar message proves Sam
+has joined; retry `voice-start` once when that event is drained.
+
+On the canonical End Sprint path, stop the sidecar before stopping the board:
+
+```bash
+"$SPRINT_REPO/bin/sprint-matrix" --project-root "$PROJECT_ROOT" voice-stop
+"$SPRINT_REPO/bin/sprint-matrix" --project-root "$PROJECT_ROOT" stop
+```
 
 ## Dispatching Codex workers
 

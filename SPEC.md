@@ -19,6 +19,7 @@ recovery must be easy. The user always runs claude inside tmux.
 | Piece | What |
 |---|---|
 | `bin/sprintd` | Single-file executable Python 3.9+ **stdlib only** (http.server + sqlite3). Subcommands: `start`, `stop`, `status`, `tail`, `wait`, `doctor`, `hub`. Owns all state. |
+| `bin/sprint-matrix` | Optional stdlib-only per-board Matrix text sidecar and voice-listener supervisor. Text travels through the board's durable event log and never runs a second model. Voice is a separately supervised, non-blocking MatrixRTC transport bound to the exact Codex session. |
 | `web/` | Vanilla JS/CSS/HTML SPA served by sprintd from disk. No build step, no CDN, no external requests. |
 | `skills/sprint/SKILL.md` | The orchestrator brain: boot, resume, event-drain loop, dispatch, batching, liveness response, evidence gate, verdicts, end-sprint. |
 | `agents/sprint-worker.md` | Worker subagent definition + reporting contract. |
@@ -109,6 +110,9 @@ recovery must be easy. The user always runs claude inside tmux.
   verdict as `card:<num>`, because attribution says who WROTE a card, never who owns it.
 - `evidence(card_num, packet JSON, created_at)`.
 - `cursors(name PRIMARY KEY, seq)` — the session persists its drain cursor here (`orchestrator`).
+- `bridge_events(bridge, external_id, event_seq, created_at)` — atomic idempotency receipts for
+  external chat ingress. Matrix records its event id in the same transaction that appends the
+  ordinary user/sidebar event, so sync retries cannot produce duplicate turns.
 - `questions(id, card_num, text, options JSON NULL, artifacts JSON NULL, answered_at NULL)` — answer
   idempotency: second answer to the same question id is a 409, surfaced gently in UI. `artifacts`
   is what a **decision request** hands over with its question (`{url?, attachments?, notes?}`) —
@@ -281,6 +285,11 @@ follow-up question takes the offer away again.
   `GET /api/settings` + `PUT /api/settings` (dispatch policy — see Settings & executors);
   `GET /api/reground?reason=revival|boot|manual_reset|periodic` — the whole working state in one
   read (see Re-grounding).
+- Matrix transport ingress: `POST /api/bridges/matrix/inbound`
+  `{event_id, text, sender?}`. A new event returns 201; replaying the same Matrix event id returns
+  200 with `duplicate: true`. Either way there is at most one ordinary `actor: user`,
+  `reply_to: sidebar` event for the orchestrator to handle. The authenticated sidecar filters the
+  allowed sender before using this endpoint; the server remains state only.
 - `GET /api/events?after=SEQ&limit=N` — the drain endpoint. `GET /api/stream` — SSE (browser),
   heartbeat comment every 15s, browsers auto-reconnect with Last-Event-ID. The stream opens with a
   named `hello` frame (`generation`, `started_at`, `cursor`, `head`) and every `cursor` frame carries

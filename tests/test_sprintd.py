@@ -1950,6 +1950,54 @@ class TestReplyToRouting(Base):
         self.assertEqual(timeline[0]["payload"]["reply_to"], "card:%d" % num)
 
 
+class TestMatrixBridgeIngress(Base):
+    """Matrix is another sidebar transport, not another orchestrator."""
+
+    def matrix_post(self, event_id="$event-1", text="hello from Matrix"):
+        return self.post("/api/bridges/matrix/inbound", {
+            "event_id": event_id,
+            "text": text,
+            "sender": "@sam:hotch.org",
+        })
+
+    def test_matrix_message_is_an_ordinary_routable_sidebar_user_event(self):
+        status, body = self.matrix_post()
+        self.assertEqual(status, 201, body)
+        event = body["event"]
+        self.assertFalse(body["duplicate"])
+        self.assertIsNone(event["card_num"])
+        self.assertEqual(event["actor"], "user")
+        self.assertEqual(event["kind"], "chat")
+        self.assertEqual(event["payload"]["text"], "hello from Matrix")
+        self.assertEqual(event["payload"]["reply_to"], "sidebar")
+        self.assertEqual(event["payload"]["source_surface"], "matrix")
+        self.assertEqual(event["payload"]["source_event_id"], "$event-1")
+        self.assertEqual(event["payload"]["source_sender"], "@sam:hotch.org")
+
+    def test_replayed_matrix_event_is_deduplicated_atomically(self):
+        first_status, first = self.matrix_post()
+        second_status, second = self.matrix_post(text="a replay with changed text")
+        self.assertEqual(first_status, 201, first)
+        self.assertEqual(second_status, 200, second)
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(second["event"]["seq"], first["event"]["seq"])
+        matrix_rows = [
+            event for event in self.get("/api/sidebar")[1]["events"]
+            if event["payload"].get("source_surface") == "matrix"
+        ]
+        self.assertEqual(len(matrix_rows), 1)
+        self.assertEqual(matrix_rows[0]["payload"]["text"], "hello from Matrix")
+
+    def test_bad_matrix_delivery_is_named_and_writes_nothing(self):
+        before = self.app.max_seq()
+        status, body = self.post("/api/bridges/matrix/inbound", {
+            "event_id": "", "text": "hello",
+        })
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"], "bad_external_id")
+        self.assertEqual(self.app.max_seq(), before)
+
+
 class TestRetryIsIdempotent(Base):
     """A send that failed VISIBLY has to be retryable safely.
 

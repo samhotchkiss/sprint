@@ -61,6 +61,11 @@ class TestCodexInstall(unittest.TestCase):
         self.assertIn("yield_control", text)
         self.assertIn("gpt-5.6-luna", text)
         self.assertIn("namespace worker branches with the board slug", text)
+        self.assertIn("bin/sprint-matrix", text)
+        self.assertIn('reply_to: "sidebar"', text)
+        self.assertIn("do not also call a Matrix reply", text)
+        self.assertIn("voice-start", text)
+        self.assertIn("ready: true", text)
         self.assertTrue((ADAPTER / "agents" / "openai.yaml").is_file())
 
 

@@ -68,7 +68,9 @@ DEFAULT_HUB_PORT = 8300         # one hub per machine, fixed so the URL is memor
 #       /api/cards/<n>/seen records the read receipt the highlight is derived from)
 #   6 — the switcher's square (`chat_unread` on /api/board and on every siblings
 #       row; POST /api/sidebar/seen records the manager channel's read receipt)
-API_VERSION = 6
+#   7 — external chat transports can post a deduplicated sidebar message
+#       (`POST /api/bridges/matrix/inbound`) without creating a second brain
+API_VERSION = 7
 DATA_DIRNAME = ".sprint"
 HUB_DIRNAME = ".sprint"         # under $HOME: the machine-wide (cross-project) state
 REGISTRY_FILENAME = "registry.json"
@@ -852,6 +854,18 @@ CREATE TABLE IF NOT EXISTS idempotency (
   body TEXT NOT NULL,
   created_at REAL NOT NULL
 );
+
+-- Delivery receipts for external chat transports. The bridge and the sidebar
+-- event are committed together, so replaying a Matrix /sync batch after a
+-- crash cannot duplicate a human message on the board.
+CREATE TABLE IF NOT EXISTS bridge_events (
+  bridge TEXT NOT NULL,
+  external_id TEXT NOT NULL,
+  event_seq INTEGER NOT NULL,
+  created_at REAL NOT NULL,
+  PRIMARY KEY (bridge, external_id)
+);
+CREATE INDEX IF NOT EXISTS bridge_events_seq ON bridge_events(event_seq);
 """
 
 ATTACH_NAME_RE = re.compile(r"^([0-9a-f]{64})\.(png|jpe?g)$")
@@ -6586,6 +6600,54 @@ class App:
         self.notify()
         return {"ok": True, "event": self.event_row(seq)}
 
+    def bridge_sidebar_post(self, bridge: str, external_id: str, text: str,
+                            sender: str = None) -> dict:
+        """Atomically dedupe one external human message into the sidebar.
+
+        Matrix /sync is at-least-once across a process crash. Keeping the
+        receipt in the same SQLite transaction as the sidebar event makes a
+        replay harmless while still leaving the ordinary orchestrator cursor
+        as Sprint's only work queue.
+        """
+        bridge = (bridge or "").strip().lower()
+        external_id = (external_id or "").strip()
+        text = (text or "").strip()
+        if bridge != "matrix":
+            raise ApiError(400, "bad_bridge", "bridge must be matrix", field="bridge")
+        if not external_id or len(external_id) > 1024:
+            raise ApiError(400, "bad_external_id",
+                           "event_id must be 1 to 1024 characters", field="event_id")
+        if not text:
+            raise ApiError(400, "missing_field", "text is required", field="text")
+
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                seen = self.conn.execute(
+                    "SELECT event_seq FROM bridge_events WHERE bridge=? AND external_id=?",
+                    (bridge, external_id)).fetchone()
+                if seen is not None:
+                    self.conn.execute("COMMIT")
+                    return {"ok": True, "duplicate": True,
+                            "event": self.event_row(int(seen["event_seq"]))}
+                payload = {
+                    "text": text,
+                    "source_surface": bridge,
+                    "source_event_id": external_id,
+                }
+                if isinstance(sender, str) and sender.strip():
+                    payload["source_sender"] = sender.strip()[:255]
+                seq = self._append_event(None, "user", "chat", payload)
+                self.conn.execute(
+                    "INSERT INTO bridge_events(bridge, external_id, event_seq, created_at) "
+                    "VALUES(?,?,?,?)", (bridge, external_id, seq, now()))
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.notify()
+        return {"ok": True, "duplicate": False, "event": self.event_row(seq)}
+
     def sidebar_thread(self, after: int = 0, limit: int = 500) -> list:
         """Sprint-level user/session lines only -- never worker telemetry.
 
@@ -8168,6 +8230,12 @@ def make_handler(app: App):
                                              detail=body.get("detail"),
                                              images=posted_images(body),
                                              reports=body.get("reports"))
+
+            if path == "/api/bridges/matrix/inbound":
+                result = app.bridge_sidebar_post(
+                    "matrix", body.get("event_id"), body.get("text"),
+                    sender=body.get("sender"))
+                return (200 if result.get("duplicate") else 201), result
 
             if path == "/api/batches":
                 return 201, app.make_batch(body.get("card_nums"), body.get("agent_name"),

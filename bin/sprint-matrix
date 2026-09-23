@@ -1,0 +1,1014 @@
+#!/usr/bin/env python3
+"""Bridge one Sprint board's sidebar to one private Matrix room.
+
+The bridge is transport only. Matrix messages are posted into Sprint's
+durable sidebar event log; the live Sprint orchestrator remains the only brain.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+SCRIPT = os.path.realpath(__file__)
+STATE_FILENAME = "matrix.json"
+LOG_FILENAME = "matrix.log"
+VOICE_STATE_FILENAME = "matrix-voice.json"
+VOICE_LOG_FILENAME = "matrix-voice.log"
+VOICE_READY_FILENAME = "matrix-voice-ready.json"
+VOICE_RUNNER_CONFIG_FILENAME = "matrix-voice-runner"
+SYNC_TIMEOUT_MS = 1000
+POLL_BACKOFF_MAX = 10.0
+MATRIX_ENV_NAMES = (
+    "MATRIX_HOMESERVER",
+    "MATRIX_ACCESS_TOKEN",
+    "MATRIX_USER_ID",
+    "MATRIX_ALLOWED_USER_ID",
+)
+MATRIX_ENV_REQUIRED = ("MATRIX_ACCESS_TOKEN", "MATRIX_ALLOWED_USER_ID")
+
+
+class BridgeError(RuntimeError):
+    pass
+
+
+class HttpError(BridgeError):
+    def __init__(self, status, detail, payload=None):
+        super().__init__("HTTP %s: %s" % (status, detail))
+        self.status = status
+        self.detail = detail
+        self.payload = payload or {}
+
+
+def jdump(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def read_json(path, fallback=None):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return fallback
+
+
+def write_json_atomic(path, value):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    temporary = "%s.%d.%d.tmp" % (path, os.getpid(), time.time_ns())
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def write_text_atomic(path, value):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    temporary = "%s.%d.%d.tmp" % (path, os.getpid(), time.time_ns())
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def default_env_file():
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if not config_home:
+        config_home = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(config_home, "sprint", "matrix.env")
+
+
+def default_voice_runner_file():
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if not config_home:
+        config_home = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(config_home, "sprint", VOICE_RUNNER_CONFIG_FILENAME)
+
+
+def parse_env_text(raw):
+    values = {}
+    for line_number, raw_line in enumerate(raw.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        name, separator, value = line.partition("=")
+        name = name.strip()
+        if not separator or not name:
+            raise BridgeError("invalid Matrix env line %d" % line_number)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise BridgeError("invalid quoted value on Matrix env line %d" %
+                                  line_number) from exc
+        elif len(value) >= 2 and value[0] == value[-1] == "'":
+            value = value[1:-1]
+        if name in MATRIX_ENV_NAMES:
+            if not isinstance(value, str) or not value or "\n" in value or "\0" in value:
+                raise BridgeError("invalid value for %s" % name)
+            values[name] = value
+    return values
+
+
+def load_env_file(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            values = parse_env_text(handle.read())
+    except FileNotFoundError:
+        return False
+    for name, value in values.items():
+        os.environ.setdefault(name, value)
+    return True
+
+
+def install_env_text(raw, path):
+    values = parse_env_text(raw)
+    missing = [name for name in MATRIX_ENV_REQUIRED if not values.get(name)]
+    if missing:
+        raise BridgeError("Matrix env input is missing %s" % ", ".join(missing))
+    body = "".join("%s=%s\n" % (name, json.dumps(values[name]))
+                   for name in MATRIX_ENV_NAMES if name in values)
+    write_text_atomic(path, body)
+    return path
+
+
+def iso_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def find_project_root(start=None):
+    start = os.path.realpath(start or os.getcwd())
+    try:
+        result = subprocess.run(
+            ["git", "-C", start, "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+            text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BridgeError("cannot find Sprint project root from %s (%s)" % (start, exc))
+    return os.path.realpath(result.stdout.strip())
+
+
+def paths_for(project_root, data_dir=None):
+    data = os.path.realpath(data_dir or os.path.join(project_root, ".sprint"))
+    return {
+        "data_dir": data,
+        "server": os.path.join(data, "server.json"),
+        "state": os.path.join(data, STATE_FILENAME),
+        "log": os.path.join(data, LOG_FILENAME),
+        "voice_state": os.path.join(data, VOICE_STATE_FILENAME),
+        "voice_log": os.path.join(data, VOICE_LOG_FILENAME),
+        "voice_ready": os.path.join(data, VOICE_READY_FILENAME),
+        "voice_runtime": os.path.join(data, "matrix-voice-runtime"),
+    }
+
+
+def require_env(name):
+    value = os.environ.get(name)
+    if not value:
+        raise BridgeError("%s is required" % name)
+    return value
+
+
+def request_json(url, method="GET", token=None, body=None, timeout=15.0):
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    raw_body = None
+    if body is not None:
+        raw_body = jdump(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=raw_body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            return response.status, json.loads(raw.decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            payload = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        detail = payload.get("error") or payload.get("message") or raw[:500]
+        raise HttpError(exc.code, detail, payload) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise BridgeError("request failed for %s (%s)" % (url, exc)) from exc
+
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def pid_is_bridge(pid, project_root):
+    if not pid_alive(pid):
+        return False
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    command = result.stdout.strip()
+    return SCRIPT in command and os.path.realpath(project_root) in command
+
+
+def pid_is_voice_supervisor(pid, project_root):
+    if not pid_alive(pid):
+        return False
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    command = result.stdout.strip()
+    return (SCRIPT in command and os.path.realpath(project_root) in command and
+            "voice-run" in command)
+
+
+def room_url(room_id):
+    return "https://matrix.to/#/" + urllib.parse.quote(room_id, safe="")
+
+
+class BoardClient:
+    def __init__(self, server_path):
+        self.server_path = server_path
+
+    def config(self):
+        info = read_json(self.server_path)
+        if not isinstance(info, dict) or not info.get("port") or not info.get("token"):
+            raise BridgeError("Sprint board is not running (%s is missing or stale)" % self.server_path)
+        return {
+            "base": "http://127.0.0.1:%d" % int(info["port"]),
+            "token": info["token"],
+        }
+
+    def request(self, path, method="GET", body=None):
+        config = self.config()
+        return request_json(config["base"] + path, method=method,
+                            token=config["token"], body=body)
+
+    def settings(self):
+        return self.request("/api/settings")[1]
+
+    def events(self, after, limit=200):
+        query = urllib.parse.urlencode({"after": int(after), "limit": int(limit)})
+        return self.request("/api/events?" + query)[1]
+
+    def matrix_inbound(self, event_id, text, sender):
+        return self.request("/api/bridges/matrix/inbound", method="POST", body={
+            "event_id": event_id,
+            "text": text,
+            "sender": sender,
+        })[1]
+
+
+class MatrixClient:
+    def __init__(self, homeserver, access_token):
+        self.homeserver = homeserver.rstrip("/")
+        self.access_token = access_token
+
+    def request(self, path, method="GET", body=None, timeout=15.0):
+        return request_json(self.homeserver + path, method=method,
+                            token=self.access_token, body=body, timeout=timeout)[1]
+
+    def whoami(self):
+        return self.request("/_matrix/client/v3/account/whoami")
+
+    def create_room(self, name, topic, invite_user):
+        result = self.request("/_matrix/client/v3/createRoom", method="POST", body={
+            "name": name,
+            "topic": topic,
+            "preset": "private_chat",
+            "is_direct": True,
+            "invite": [invite_user],
+            "creation_content": {"m.federate": False},
+        })
+        room_id = result.get("room_id")
+        if not room_id:
+            raise BridgeError("Matrix createRoom returned no room_id")
+        return room_id
+
+    def invite(self, room_id, user_id):
+        encoded = urllib.parse.quote(room_id, safe="")
+        try:
+            self.request("/_matrix/client/v3/rooms/%s/invite" % encoded,
+                         method="POST", body={"user_id": user_id})
+        except HttpError as exc:
+            code = exc.payload.get("errcode")
+            if code != "M_ALREADY_JOINED":
+                raise
+
+    def membership(self, room_id, user_id):
+        room = urllib.parse.quote(room_id, safe="")
+        user = urllib.parse.quote(user_id, safe="")
+        try:
+            content = self.request(
+                "/_matrix/client/v3/rooms/%s/state/m.room.member/%s" % (room, user))
+        except HttpError as exc:
+            if exc.status == 404 or exc.payload.get("errcode") == "M_NOT_FOUND":
+                return None
+            raise
+        membership = content.get("membership")
+        return membership if isinstance(membership, str) else None
+
+    def sync(self, room_id, since=None, timeout_ms=SYNC_TIMEOUT_MS):
+        filter_value = jdump({
+            "account_data": {"types": []},
+            "presence": {"types": []},
+            "room": {
+                "rooms": [room_id],
+                "account_data": {"types": []},
+                "ephemeral": {"types": []},
+                "state": {"types": []},
+                "timeline": {"limit": 100, "types": ["m.room.message"]},
+            },
+        })
+        query = {"filter": filter_value, "timeout": str(int(timeout_ms))}
+        if since:
+            query["since"] = since
+        return self.request("/_matrix/client/v3/sync?" + urllib.parse.urlencode(query),
+                            timeout=max(15.0, timeout_ms / 1000.0 + 10.0))
+
+    def send(self, room_id, txn_id, text, notice=True):
+        room = urllib.parse.quote(room_id, safe="")
+        txn = urllib.parse.quote(txn_id, safe="")
+        return self.request(
+            "/_matrix/client/v3/rooms/%s/send/m.room.message/%s" % (room, txn),
+            method="PUT", body={"msgtype": "m.notice" if notice else "m.text", "body": text})
+
+
+class SprintMatrixBridge:
+    def __init__(self, project_root, paths, room_id=None, room_name=None,
+                 matrix=None, board=None, state=None, persist=None, log=None):
+        self.project_root = os.path.realpath(project_root)
+        self.paths = paths
+        self.requested_room_id = room_id
+        self.requested_room_name = room_name
+        self.allowed_user_id = require_env("MATRIX_ALLOWED_USER_ID")
+        self.matrix_user_id = os.environ.get("MATRIX_USER_ID") or ""
+        self.matrix = matrix or MatrixClient(
+            os.environ.get("MATRIX_HOMESERVER", "https://matrix.hotch.org"),
+            require_env("MATRIX_ACCESS_TOKEN"))
+        self.board = board or BoardClient(paths["server"])
+        self.state = dict(state or read_json(paths["state"], {}) or {})
+        self.persist_callback = persist
+        self.log_callback = log
+        self.stop_requested = False
+        self.project_key = hashlib.sha256(self.project_root.encode("utf-8")).hexdigest()[:16]
+
+    def log(self, message, **fields):
+        record = {"at": iso_now(), "message": message, **fields}
+        if self.log_callback:
+            self.log_callback(record)
+        else:
+            print(jdump(record), flush=True)
+
+    def persist(self, **patch):
+        self.state.update(patch)
+        self.state["project_root"] = self.project_root
+        if self.persist_callback:
+            self.persist_callback(dict(self.state))
+        else:
+            write_json_atomic(self.paths["state"], self.state)
+
+    def board_identity(self):
+        settings = self.board.settings()
+        name = self.requested_room_name or settings.get("name") or os.path.basename(self.project_root)
+        agent = settings.get("agent_name") or "Sprint"
+        return name, agent
+
+    def ensure_room(self):
+        room_id = self.requested_room_id or self.state.get("room_id")
+        created = False
+        sprint_name, agent_name = self.board_identity()
+        if self.requested_room_id and self.requested_room_id != self.state.get("room_id"):
+            # A sync token belongs to the room timeline it came from. Reset both
+            # cursors before switching rooms so history is anchored at "now"
+            # and no board message is accidentally skipped in the new room.
+            self.persist(room_id=room_id, sync_token=None, board_cursor=None,
+                         announced_room_id=None, room_url=None)
+        if not room_id:
+            room_name = "Sprint — %s" % sprint_name
+            topic = "Live Sprint sidebar chat with %s" % agent_name
+            room_id = self.matrix.create_room(room_name, topic, self.allowed_user_id)
+            created = True
+            self.persist(room_id=room_id, room_name=room_name,
+                         room_created_at=iso_now(), sync_token=None,
+                         announced_room_id=None)
+        else:
+            membership = self.matrix.membership(room_id, self.allowed_user_id)
+            if membership not in ("invite", "join"):
+                self.matrix.invite(room_id, self.allowed_user_id)
+            self.persist(room_id=room_id,
+                         room_name=self.state.get("room_name") or "Sprint — %s" % sprint_name)
+
+        link = room_url(room_id)
+        if self.state.get("announced_room_id") != room_id:
+            intro = ("Sprint chat is connected to the board sidebar for %s. "
+                     "Messages sent here and on the board reach the same main agent."
+                     % sprint_name)
+            self.matrix.send(room_id, "sprint-%s-room-ready" % self.project_key, intro)
+            self.persist(announced_room_id=room_id, room_url=link)
+        self.log("matrix room ready", room_id=room_id, room_url=link, created=created)
+        return room_id
+
+    @staticmethod
+    def normalize_matrix_event(event, allowed_user_id):
+        if event.get("type") != "m.room.message" or event.get("sender") != allowed_user_id:
+            return None
+        content = event.get("content") or {}
+        replacement = content.get("m.new_content") or {}
+        msgtype = replacement.get("msgtype") or content.get("msgtype")
+        body = replacement.get("body") if replacement else content.get("body")
+        if msgtype != "m.text" or not isinstance(body, str) or not body.strip():
+            return None
+        event_id = event.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            return None
+        return {"event_id": event_id, "sender": event.get("sender"), "text": body.strip()}
+
+    def ingest_matrix_event(self, event):
+        normalized = self.normalize_matrix_event(event, self.allowed_user_id)
+        if not normalized:
+            return False
+        result = self.board.matrix_inbound(
+            normalized["event_id"], normalized["text"], normalized["sender"])
+        self.log("matrix message posted to Sprint", event_id=normalized["event_id"],
+                 sprint_seq=(result.get("event") or {}).get("seq"),
+                 duplicate=bool(result.get("duplicate")))
+        return True
+
+    def sync_matrix_once(self, room_id):
+        since = self.state.get("sync_token")
+        result = self.matrix.sync(room_id, since=since,
+                                  timeout_ms=0 if not since else SYNC_TIMEOUT_MS)
+        if not since:
+            self.persist(sync_token=result.get("next_batch"), matrix_initialized_at=iso_now())
+            return 0
+        events = (((result.get("rooms") or {}).get("join") or {}).get(room_id) or {})
+        events = ((events.get("timeline") or {}).get("events") or [])
+        count = 0
+        for event in events:
+            if self.ingest_matrix_event(event):
+                count += 1
+        self.persist(sync_token=result.get("next_batch") or since,
+                     last_matrix_sync_at=iso_now())
+        return count
+
+    def board_txn_id(self, seq):
+        return "sprint-%s-sidebar-%d" % (self.project_key, int(seq))
+
+    def matrix_text_for_board_event(self, event):
+        payload = event.get("payload") or {}
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        if event.get("card_num") is not None or event.get("kind") not in ("chat", "note", "answer"):
+            return None
+        if event.get("actor") not in ("user", "session"):
+            return None
+        if payload.get("source_surface") == "matrix":
+            return None
+        if event.get("actor") == "user":
+            return "From the Sprint board:\n" + text.strip()
+        return text.strip()
+
+    def drain_board_once(self, room_id):
+        cursor = self.state.get("board_cursor")
+        if not isinstance(cursor, int):
+            snapshot = self.board.events(0, limit=1)
+            cursor = int(snapshot.get("head") or 0)
+            self.persist(board_cursor=cursor, board_initialized_at=iso_now())
+            return 0
+        mirrored = 0
+        while True:
+            page = self.board.events(cursor, limit=200)
+            events = page.get("events") or []
+            if not events:
+                break
+            for event in events:
+                text = self.matrix_text_for_board_event(event)
+                if text:
+                    self.matrix.send(room_id, self.board_txn_id(event["seq"]), text)
+                    mirrored += 1
+                cursor = int(event["seq"])
+                self.persist(board_cursor=cursor, last_board_drain_at=iso_now())
+            if len(events) < 200:
+                break
+        return mirrored
+
+    def initialize(self):
+        who = self.matrix.whoami()
+        actual_user = who.get("user_id")
+        if self.matrix_user_id and actual_user and actual_user != self.matrix_user_id:
+            raise BridgeError("Matrix token belongs to %s, expected %s" %
+                              (actual_user, self.matrix_user_id))
+        room_id = self.ensure_room()
+        self.sync_matrix_once(room_id)
+        self.drain_board_once(room_id)
+        self.persist(pid=os.getpid(), ready_at=iso_now(), last_error=None,
+                     matrix_user_id=actual_user or self.matrix_user_id)
+        return room_id
+
+    def run(self):
+        room_id = self.initialize()
+        failures = 0
+        while not self.stop_requested:
+            try:
+                inbound = self.sync_matrix_once(room_id)
+                outbound = self.drain_board_once(room_id)
+                failures = 0
+                if inbound or outbound:
+                    self.log("bridge cycle", inbound=inbound, outbound=outbound)
+            except Exception as exc:
+                failures += 1
+                delay = min(POLL_BACKOFF_MAX, 0.5 * (2 ** min(failures, 5)))
+                self.persist(last_error=str(exc), last_error_at=iso_now(),
+                             consecutive_failures=failures)
+                self.log("bridge cycle failed", error=str(exc), retry_seconds=delay)
+                deadline = time.time() + delay
+                while not self.stop_requested and time.time() < deadline:
+                    time.sleep(min(0.2, deadline - time.time()))
+        self.persist(pid=None, stopped_at=iso_now(), consecutive_failures=0)
+
+
+def cmd_run(args):
+    root = find_project_root(args.project_root)
+    paths = paths_for(root, args.data_dir)
+    existing = read_json(paths["state"], {}) or {}
+    owner = existing.get("pid")
+    if owner and owner != os.getpid() and pid_is_bridge(owner, root):
+        raise BridgeError("Sprint Matrix bridge is already running as pid %d" % owner)
+
+    bridge = SprintMatrixBridge(root, paths, room_id=args.room_id, room_name=args.name)
+
+    def stop(_signo, _frame):
+        bridge.stop_requested = True
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, stop)
+    bridge.persist(pid=os.getpid(), started_at=iso_now(), ready_at=None, last_error=None)
+    try:
+        bridge.run()
+        return 0
+    except Exception as exc:
+        bridge.persist(pid=None, last_error=str(exc), last_error_at=iso_now())
+        bridge.log("bridge stopped", error=str(exc))
+        raise
+
+
+def child_argv(args, root):
+    argv = [sys.executable, SCRIPT, "--project-root", root]
+    if args.data_dir:
+        argv += ["--data-dir", os.path.realpath(args.data_dir)]
+    argv.append("run")
+    if args.room_id:
+        argv += ["--room-id", args.room_id]
+    if args.name:
+        argv += ["--name", args.name]
+    return argv
+
+
+def public_status(root, paths):
+    state = read_json(paths["state"], {}) or {}
+    pid = state.get("pid")
+    running = bool(pid_is_bridge(pid, root))
+    return {
+        "running": running,
+        "pid": pid if running else None,
+        "project_root": root,
+        "room_id": state.get("room_id"),
+        "room_url": state.get("room_url") or
+                    (room_url(state["room_id"]) if state.get("room_id") else None),
+        "room_name": state.get("room_name"),
+        "ready_at": state.get("ready_at"),
+        "board_cursor": state.get("board_cursor"),
+        "last_matrix_sync_at": state.get("last_matrix_sync_at"),
+        "last_board_drain_at": state.get("last_board_drain_at"),
+        "last_error": state.get("last_error"),
+        "voice": public_voice_status(root, paths),
+    }
+
+
+def public_voice_status(root, paths):
+    state = read_json(paths["voice_state"], {}) or {}
+    pid = state.get("pid")
+    running = bool(pid_is_voice_supervisor(pid, root))
+    ready_state = read_json(paths["voice_ready"], {}) or {}
+    ready_pid = ready_state.get("pid")
+    ready = bool(running and pid_alive(ready_pid) and
+                 ready_state.get("room_id") == state.get("room_id"))
+    return {
+        "running": running,
+        "ready": ready,
+        "pid": pid if running else None,
+        "child_pid": state.get("child_pid") if running else None,
+        "room_id": state.get("room_id"),
+        "tmux_target": state.get("tmux_target"),
+        "codex_session_id": state.get("codex_session_id"),
+        "started_at": state.get("started_at"),
+        "ready_at": ready_state.get("ready_at") if ready else None,
+        "stopped_at": state.get("stopped_at"),
+        "last_error": state.get("last_error"),
+        "last_exit_code": state.get("last_exit_code"),
+    }
+
+
+def update_voice_state(paths, **patch):
+    state = read_json(paths["voice_state"], {}) or {}
+    state.update(patch)
+    write_json_atomic(paths["voice_state"], state)
+    return state
+
+
+def voice_environment(root, paths, room_id, board_config):
+    environment = dict(os.environ)
+    environment.update({
+        "MATRIX_ROOM_ID": room_id,
+        "CODEX_SOURCE_CWD": root,
+        "MATRIX_VOICE_RUNTIME_DIR": paths["voice_runtime"],
+        "MATRIX_VOICE_READY_FILE": paths["voice_ready"],
+        "SPRINT_SERVER": board_config["base"],
+        "SPRINT_TOKEN": board_config["token"],
+    })
+    return environment
+
+
+def cmd_start(args):
+    root = find_project_root(args.project_root)
+    paths = paths_for(root, args.data_dir)
+    os.makedirs(paths["data_dir"], mode=0o700, exist_ok=True)
+    status = public_status(root, paths)
+    if status["running"]:
+        print(jdump(status))
+        return 0
+    # Fail before forking when credentials or the board are absent.
+    require_env("MATRIX_ACCESS_TOKEN")
+    require_env("MATRIX_ALLOWED_USER_ID")
+    BoardClient(paths["server"]).settings()
+    if args.foreground:
+        return cmd_run(args)
+
+    log_handle = open(paths["log"], "a", encoding="utf-8")
+    try:
+        process = subprocess.Popen(
+            child_argv(args, root), stdin=subprocess.DEVNULL,
+            stdout=log_handle, stderr=log_handle, start_new_session=True,
+            close_fds=True)
+    finally:
+        log_handle.close()
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        state = read_json(paths["state"], {}) or {}
+        if state.get("pid") == process.pid and state.get("ready_at"):
+            print(jdump(public_status(root, paths)))
+            return 0
+        if process.poll() is not None:
+            raise BridgeError(state.get("last_error") or
+                              "Sprint Matrix bridge exited before becoming ready")
+        time.sleep(0.1)
+    process.terminate()
+    raise BridgeError("Sprint Matrix bridge did not become ready within 30 seconds")
+
+
+def cmd_stop(args):
+    root = find_project_root(args.project_root)
+    paths = paths_for(root, args.data_dir)
+    stop_voice_process(root, paths)
+    state = read_json(paths["state"], {}) or {}
+    pid = state.get("pid")
+    if not pid_is_bridge(pid, root):
+        state.update({"pid": None, "stopped_at": iso_now()})
+        write_json_atomic(paths["state"], state)
+        print(jdump({"ok": True, "stopped": False, **public_status(root, paths)}))
+        return 0
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + 10.0
+    while time.time() < deadline and pid_alive(pid):
+        time.sleep(0.1)
+    if pid_alive(pid):
+        raise BridgeError("Sprint Matrix bridge pid %d did not stop" % pid)
+    print(jdump({"ok": True, "stopped": True, **public_status(root, paths)}))
+    return 0
+
+
+def cmd_status(args):
+    root = find_project_root(args.project_root)
+    paths = paths_for(root, args.data_dir)
+    status = public_status(root, paths)
+    print(jdump(status))
+    return 0 if status["running"] else 1
+
+
+def cmd_doctor(args):
+    root = find_project_root(args.project_root)
+    paths = paths_for(root, args.data_dir)
+    board = BoardClient(paths["server"])
+    board_settings = board.settings()
+    matrix = MatrixClient(
+        os.environ.get("MATRIX_HOMESERVER", "https://matrix.hotch.org"),
+        require_env("MATRIX_ACCESS_TOKEN"))
+    allowed = require_env("MATRIX_ALLOWED_USER_ID")
+    who = matrix.whoami()
+    print(jdump({
+        "ok": True,
+        "project_root": root,
+        "sprint_name": board_settings.get("name"),
+        "matrix_user_id": who.get("user_id"),
+        "allowed_user_id": allowed,
+    }))
+    return 0
+
+
+def resolve_voice_runner(value=None):
+    runner = value or os.environ.get("SPRINT_MATRIX_VOICE_RUNNER")
+    if not runner:
+        try:
+            with open(default_voice_runner_file(), encoding="utf-8") as handle:
+                runner = handle.read().strip()
+        except FileNotFoundError:
+            runner = None
+    if not runner:
+        raise BridgeError(
+            "no Matrix voice runner is configured; use install-voice-runner PATH")
+    runner = os.path.realpath(os.path.expanduser(runner))
+    if not os.path.isfile(runner) or not os.access(runner, os.X_OK):
+        raise BridgeError("Matrix voice runner is not executable: %s" % runner)
+    return runner
+
+
+def voice_child_argv(args, root, runner):
+    argv = [sys.executable, SCRIPT, "--project-root", root]
+    if args.data_dir:
+        argv += ["--data-dir", os.path.realpath(args.data_dir)]
+    argv += [
+        "voice-run",
+        "--runner", runner,
+        "--tmux-target", args.tmux_target,
+        "--codex-session-id", args.codex_session_id,
+    ]
+    return argv
+
+
+def cmd_voice_run(args):
+    root = find_project_root(args.project_root)
+    paths = paths_for(root, args.data_dir)
+    os.makedirs(paths["data_dir"], mode=0o700, exist_ok=True)
+    owner = (read_json(paths["voice_state"], {}) or {}).get("pid")
+    if owner and owner != os.getpid() and pid_is_voice_supervisor(owner, root):
+        raise BridgeError("Sprint Matrix voice listener is already running as pid %d" % owner)
+
+    text_state = read_json(paths["state"], {}) or {}
+    room_id = text_state.get("room_id")
+    if not room_id:
+        raise BridgeError("Sprint Matrix text bridge has no room yet")
+    runner = resolve_voice_runner(args.runner)
+
+    try:
+        os.unlink(paths["voice_ready"])
+    except FileNotFoundError:
+        pass
+
+    child = None
+    stopping = False
+
+    def stop(_signo, _frame):
+        nonlocal stopping
+        stopping = True
+        if child is not None and child.poll() is None:
+            child.terminate()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, stop)
+
+    try:
+        board_config = BoardClient(paths["server"]).config()
+        child = subprocess.Popen(
+            [runner, args.tmux_target, args.codex_session_id],
+            stdin=subprocess.DEVNULL,
+            env=voice_environment(root, paths, room_id, board_config),
+            close_fds=True)
+        update_voice_state(
+            paths,
+            pid=os.getpid(),
+            child_pid=child.pid,
+            project_root=root,
+            runner=runner,
+            room_id=room_id,
+            tmux_target=args.tmux_target,
+            codex_session_id=args.codex_session_id,
+            started_at=iso_now(),
+            stopped_at=None,
+            last_error=None,
+            last_exit_code=None,
+        )
+        return_code = child.wait()
+        if not stopping and return_code != 0:
+            raise BridgeError("Matrix voice runner exited with status %d" % return_code)
+        update_voice_state(
+            paths, pid=None, child_pid=None, stopped_at=iso_now(),
+            last_exit_code=return_code, last_error=None)
+        return 0
+    except Exception as exc:
+        update_voice_state(
+            paths, pid=None, child_pid=None, stopped_at=iso_now(),
+            last_exit_code=child.poll() if child is not None else None,
+            last_error=str(exc))
+        raise
+    finally:
+        try:
+            os.unlink(paths["voice_ready"])
+        except FileNotFoundError:
+            pass
+
+
+def cmd_voice_start(args):
+    root = find_project_root(args.project_root)
+    paths = paths_for(root, args.data_dir)
+    os.makedirs(paths["data_dir"], mode=0o700, exist_ok=True)
+    text_status = public_status(root, paths)
+    if not text_status["running"] or not text_status.get("room_id"):
+        raise BridgeError("start the Sprint Matrix text bridge before voice")
+    allowed = require_env("MATRIX_ALLOWED_USER_ID")
+    matrix = MatrixClient(
+        os.environ.get("MATRIX_HOMESERVER", "https://matrix.hotch.org"),
+        require_env("MATRIX_ACCESS_TOKEN"))
+    membership = matrix.membership(text_status["room_id"], allowed)
+    if membership != "join":
+        raise BridgeError(
+            "Matrix voice is waiting for %s to accept the Sprint room invite" % allowed)
+    current = public_voice_status(root, paths)
+    if current["running"]:
+        if (current.get("tmux_target") != args.tmux_target or
+                current.get("codex_session_id") != args.codex_session_id):
+            raise BridgeError(
+                "Matrix voice is owned by a different live Codex session (%s)" %
+                (current.get("codex_session_id") or "unknown"))
+        print(jdump({"ok": True, **current}))
+        return 0
+
+    runner = resolve_voice_runner(args.runner)
+    log_handle = open(paths["voice_log"], "a", encoding="utf-8")
+    try:
+        process = subprocess.Popen(
+            voice_child_argv(args, root, runner), stdin=subprocess.DEVNULL,
+            stdout=log_handle, stderr=log_handle, start_new_session=True,
+            close_fds=True)
+    finally:
+        log_handle.close()
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        state = read_json(paths["voice_state"], {}) or {}
+        if state.get("pid") == process.pid and state.get("child_pid"):
+            print(jdump({"ok": True, **public_voice_status(root, paths)}))
+            return 0
+        if process.poll() is not None:
+            raise BridgeError(state.get("last_error") or
+                              "Sprint Matrix voice listener exited during startup")
+        time.sleep(0.1)
+    process.terminate()
+    raise BridgeError("Sprint Matrix voice supervisor did not start within 5 seconds")
+
+
+def stop_voice_process(root, paths):
+    state = read_json(paths["voice_state"], {}) or {}
+    pid = state.get("pid")
+    if not pid_is_voice_supervisor(pid, root):
+        update_voice_state(paths, pid=None, child_pid=None, stopped_at=iso_now())
+        try:
+            os.unlink(paths["voice_ready"])
+        except FileNotFoundError:
+            pass
+        return False
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + 15.0
+    while time.time() < deadline and pid_alive(pid):
+        time.sleep(0.1)
+    if pid_alive(pid):
+        raise BridgeError("Sprint Matrix voice supervisor pid %d did not stop" % pid)
+    return True
+
+
+def cmd_voice_stop(args):
+    root = find_project_root(args.project_root)
+    paths = paths_for(root, args.data_dir)
+    stopped = stop_voice_process(root, paths)
+    print(jdump({"ok": True, "stopped": stopped,
+                 **public_voice_status(root, paths)}))
+    return 0
+
+
+def cmd_voice_status(args):
+    root = find_project_root(args.project_root)
+    status = public_voice_status(root, paths_for(root, args.data_dir))
+    print(jdump(status))
+    return 0 if status["running"] else 1
+
+
+def cmd_install_voice_runner(args):
+    runner = resolve_voice_runner(args.path)
+    config_path = default_voice_runner_file()
+    write_text_atomic(config_path, runner + "\n")
+    print(jdump({"ok": True, "runner_file": config_path, "mode": "0600"}))
+    return 0
+
+
+def cmd_install_env(args):
+    if sys.stdin.isatty():
+        raise BridgeError("install-env reads Matrix KEY=value credentials from stdin")
+    path = os.path.realpath(os.path.expanduser(args.env_file))
+    install_env_text(sys.stdin.read(), path)
+    print(jdump({"ok": True, "env_file": path, "mode": "0600"}))
+    return 0
+
+
+def parser():
+    cli = argparse.ArgumentParser(prog="sprint-matrix")
+    cli.add_argument("--project-root")
+    cli.add_argument("--data-dir")
+    cli.add_argument("--env-file", default=default_env_file())
+    commands = cli.add_subparsers(dest="command", required=True)
+    start = commands.add_parser("start")
+    start.add_argument("--room-id")
+    start.add_argument("--name")
+    start.add_argument("--foreground", action="store_true")
+    start.set_defaults(func=cmd_start)
+    run = commands.add_parser("run", help=argparse.SUPPRESS)
+    run.add_argument("--room-id")
+    run.add_argument("--name")
+    run.set_defaults(func=cmd_run)
+    commands.add_parser("stop").set_defaults(func=cmd_stop)
+    commands.add_parser("status").set_defaults(func=cmd_status)
+    commands.add_parser("doctor").set_defaults(func=cmd_doctor)
+    voice_start = commands.add_parser("voice-start")
+    voice_start.add_argument("--runner")
+    voice_start.add_argument("--tmux-target", required=True)
+    voice_start.add_argument("--codex-session-id", required=True)
+    voice_start.set_defaults(func=cmd_voice_start)
+    voice_run = commands.add_parser("voice-run", help=argparse.SUPPRESS)
+    voice_run.add_argument("--runner", required=True)
+    voice_run.add_argument("--tmux-target", required=True)
+    voice_run.add_argument("--codex-session-id", required=True)
+    voice_run.set_defaults(func=cmd_voice_run)
+    commands.add_parser("voice-stop").set_defaults(func=cmd_voice_stop)
+    commands.add_parser("voice-status").set_defaults(func=cmd_voice_status)
+    install_voice = commands.add_parser("install-voice-runner")
+    install_voice.add_argument("path")
+    install_voice.set_defaults(func=cmd_install_voice_runner)
+    commands.add_parser("install-env").set_defaults(func=cmd_install_env)
+    return cli
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        if args.command != "install-env":
+            load_env_file(os.path.realpath(os.path.expanduser(args.env_file)))
+        return args.func(args)
+    except (BridgeError, HttpError) as exc:
+        print("sprint-matrix: %s" % exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

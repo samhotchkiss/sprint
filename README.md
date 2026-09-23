@@ -47,6 +47,43 @@ One board owns one project root. To run two boards against the same repository,
 use a separate git worktree as the second board's project root; the Codex
 adapter does this automatically rather than renaming or racing a live board.
 
+### Matrix text chat for Codex
+
+Codex Sprint starts `bin/sprint-matrix` alongside each board. The sidecar
+creates one private, non-federated Matrix room for that project, invites the
+configured user, and reuses the room after restarts. Matrix text enters the
+same durable sidebar event log as board text; the live Codex Sprint session is
+still the only brain. Its one sidebar reply is mirrored back to Matrix, and
+text typed in the browser sidebar is mirrored into Matrix without echo loops.
+
+Install the Matrix credentials once from an existing env file:
+
+```
+bin/sprint-matrix install-env < /path/to/matrix.env
+```
+
+This writes `${XDG_CONFIG_HOME:-$HOME/.config}/sprint/matrix.env` mode `0600`
+and keeps only `MATRIX_HOMESERVER`, `MATRIX_ACCESS_TOKEN`, `MATRIX_USER_ID`,
+and `MATRIX_ALLOWED_USER_ID`. Direct environment variables override the local
+file. `sprint-matrix start`, `status`, `doctor`, and `stop` are available for
+manual diagnostics.
+
+On Sam's Codex host, Sprint can also supervise the existing MatrixRTC listener
+without coupling it to text startup:
+
+```
+bin/sprint-matrix install-voice-runner /path/to/run-session-call-listener
+bin/sprint-matrix voice-start \
+  --tmux-target "$TMUX_PANE" --codex-session-id "$CODEX_SESSION_ID"
+bin/sprint-matrix voice-status
+bin/sprint-matrix voice-stop
+```
+
+The listener answers incoming calls in that Sprint's Matrix room and seeds its
+Realtime conversation from the exact Codex session. Voice has a separate
+process, state file, log, and stop path: if it cannot start, Matrix and board
+text keep working. Voice notes are not transcribed by this sidecar.
+
 ## Dependencies
 
 - Python 3.9+ (stdlib only — no `pip install` anywhere in this plugin)
