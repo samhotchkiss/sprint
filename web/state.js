@@ -452,9 +452,18 @@ export function applyBoard(board) {
   if (Array.isArray(sidebar)) {
     const lines = sidebar.map(normEvent).filter(Boolean);
     const texts = new Set(lines.map((e) => e.payload && e.payload.text));
-    // keep any of our own lines the board has not caught up with yet
-    const echoes = store.sidebar.filter((e) => e.localEcho && !texts.has(e.payload && e.payload.text));
-    store.sidebar = lines.concat(echoes);
+    const freshSeqs = new Set(lines.map((e) => e.seq).filter((s) => s != null));
+    // This snapshot is a recent-window PREVIEW (sidebar_thread(limit=200)
+    // server-side), not the full thread -- so it is not authoritative about
+    // absence. A confirmed message (it has a real seq) that this particular
+    // window does not reach far enough back to include is not gone; enough
+    // newer chat just pushed it out. Carry it forward, the same way we carry
+    // forward one of our own not-yet-confirmed echoes.
+    const carried = store.sidebar.filter((e) =>
+      (e.seq != null && !freshSeqs.has(e.seq)) ||
+      (e.seq == null && e.localEcho && !texts.has(e.payload && e.payload.text)));
+    store.sidebar = lines.concat(carried)
+      .sort((a, b) => (a.seq != null ? a.seq : a.sortSeq) - (b.seq != null ? b.seq : b.sortSeq));
   }
 
   // Scoped to the open sprint by the server — never a lifetime total, because

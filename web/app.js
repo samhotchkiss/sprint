@@ -700,6 +700,11 @@ async function sessionChat(text, images, key, reuse) {
     if (seq && !Number.isNaN(seq)) {
       line.seq = seq;
       line.ts = res.event.ts || line.ts;
+      // It has a real seq now -- it is the server's own line, not a stand-in
+      // for one. Leaving this true forever meant a LATER message with the
+      // same text could wipe this confirmed one out (state.js matches
+      // localEcho lines by text alone).
+      line.localEcho = false;
       store.seq = Math.max(store.seq, seq);
     }
     render();
