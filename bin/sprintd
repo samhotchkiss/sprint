@@ -169,6 +169,11 @@ EVENT_KINDS = (
     # session woke up; `revive_gave_up` is the ending, and the one line that
     # tells a person what to physically go and do.
     "session_dead", "revive_attempted", "revive_result", "revive_gave_up",
+    # Cross-card patterns the per-card stuck sweep cannot see on its own:
+    # several cards blaming the same still-stuck card, or a card that keeps
+    # collecting "still blocked" notes without ever actually clearing.
+    # Sprint-level, written only by the board itself. See sweep_cascades().
+    "cascade",
 )
 
 # Headers page JavaScript is FORBIDDEN to set or remove on `fetch` (the fetch
@@ -377,6 +382,13 @@ STUCK_STATES = tuple(r[0] for r in STUCK_RULES)
 # only thing that proves somebody dealt with it.
 DEFAULT_SWEEP_BACKOFF = (600.0, 1800.0, 5400.0)   # 10m -> 30m -> 90m -> silence
 DEFAULT_SWEEP_MAX_REMINDERS = 3
+
+# Cascade sweep: two patterns invisible to a sweep that only ever looks at one
+# card at a time. See sweep_cascades() for what each one means and why the
+# ordinary per-card sweep above cannot see it.
+DEFAULT_CASCADE_MIN_FANIN = 3          # this many cards blaming the same one is a pattern
+DEFAULT_CASCADE_STALE_SECONDS = 86400.0    # 24h in a stuck state, however often "rechecked"
+DEFAULT_CASCADE_REPEAT_SECONDS = 86400.0   # re-alert cadence once a cascade/stale card is standing
 
 # `needs_you` is a different animal from the other four states (#67). Those
 # four are parked on the SESSION or the AGENT -- something that can act on a
@@ -2294,6 +2306,12 @@ class App:
         self.sweep_max_reminders = (
             int(sweep_max_reminders) if sweep_max_reminders is not None
             else env_int("SPRINT_SWEEP_MAX_REMINDERS", DEFAULT_SWEEP_MAX_REMINDERS))
+        self.cascade_min_fanin = env_int("SPRINT_CASCADE_MIN_FANIN",
+                                         DEFAULT_CASCADE_MIN_FANIN)
+        self.cascade_stale_seconds = env_float("SPRINT_CASCADE_STALE_SECONDS",
+                                               DEFAULT_CASCADE_STALE_SECONDS)
+        self.cascade_repeat_seconds = env_float("SPRINT_CASCADE_REPEAT_SECONDS",
+                                                DEFAULT_CASCADE_REPEAT_SECONDS)
 
         # Killed-agent detection. Same reasoning as the sweep thresholds: a
         # twenty-minute rule is only testable if twenty minutes can be two
@@ -4603,6 +4621,13 @@ class App:
                 self.sweep_session_dead()
             except Exception:
                 self.log("dead-session sweep failed: %s" % traceback.format_exc())
+            # Last of all: it reads the states the sweeps above may have just
+            # posted a `stuck` event about, so a fan-in or a stale-despite-
+            # rechecked card is caught the same tick it would otherwise start.
+            try:
+                self.sweep_cascades()
+            except Exception:
+                self.log("cascade sweep failed: %s" % traceback.format_exc())
 
     def sweep_stuck(self) -> int:
         placeholders = ",".join("?" * len(STUCK_STATES))
@@ -4628,6 +4653,119 @@ class App:
                     self.conn.execute("ROLLBACK")
                     raise
             fired += 1
+        if fired:
+            self.notify()
+        return fired
+
+    # -- cascade sweep ------------------------------------------------------
+    #
+    # `sweep_stuck` looks at one card at a time, and it goes quiet after three
+    # reminders by design (a klaxon that never stops is noise). Both of those
+    # are right for a single card and wrong for what they add up to on a busy
+    # board: nine cards all silently blaming the same tenth card, or a card
+    # that has been "still blocked, will recheck" for three days straight
+    # because each recheck note politely restarts its own clock. Nobody ever
+    # sees the shape -- only the individual, quiet, unremarkable parts of it.
+    # This sweep looks across cards instead of at one, and it is deliberately
+    # allowed to keep talking after the per-card sweep has gone silent: that
+    # silence is exactly the gap it exists to fill.
+
+    def _cascade_recently_posted(self, rule: str, key: str) -> bool:
+        """Has this exact cascade/stale-card already had its say inside the
+        repeat window? Cheap LIKE pre-filter, then a real parse -- same shape
+        as `_episode_seq` -- so a reason string that happens to contain the
+        word cannot fake a match."""
+        cutoff = now() - self.cascade_repeat_seconds
+        for row in self.q(
+                "SELECT payload FROM events WHERE card_num IS NULL AND kind='cascade' "
+                "AND ts>? AND payload LIKE '%cascade_rule%' ORDER BY seq DESC LIMIT 50",
+                (cutoff,)):
+            payload = jload(row["payload"], {}) or {}
+            if payload.get("cascade_rule") == rule and payload.get("cascade_key") == key:
+                return True
+        return False
+
+    def _post_cascade(self, rule: str, key: str, text: str, **fields) -> bool:
+        payload = {"text": text, "cascade_rule": rule, "cascade_key": key}
+        payload.update(fields)
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._append_event(None, "server", "cascade", payload)
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        return True
+
+    def sweep_cascades(self) -> int:
+        """Two patterns the per-card sweep cannot see:
+
+          * FAN-IN -- several cards' own recorded `reason` names the same
+            other (still-stuck) card. Answering or unblocking that ONE card
+            clears all of them, and nothing today says so out loud.
+          * STALE DESPITE LOOKING BUSY -- a `blocked` card's re-check clock
+            (`stuck_baseline`) restarts on every note, on purpose: an active
+            recheck deserves the window it just bought back. That is right
+            for a wall someone is genuinely watching and wrong for one that
+            collects "still blocked" notes forever without ever clearing.
+            The state's real age -- since it last actually CHANGED, from
+            `card_json`'s own `state_since` -- says what the resettable clock
+            cannot.
+
+        Both fire at most once per `cascade_repeat_seconds` per card/cascade,
+        and deliberately keep firing past the point `sweep_stuck` goes quiet:
+        that silence is the gap this sweep exists to close.
+        """
+        placeholders = ",".join("?" * len(STUCK_STATES))
+        rows = self.q("SELECT * FROM cards WHERE state IN (%s)" % placeholders,
+                      STUCK_STATES)
+        if not rows:
+            return 0
+        cards = {r["num"]: self.card_json(r, brief=True) for r in rows}
+        fired = 0
+
+        # -- fan-in: who does each card's own reason blame? -----------------
+        dependents = {}
+        for num, c in cards.items():
+            for m in re.findall(r"\d{1,4}", c.get("reason") or ""):
+                other = int(m)
+                if other != num and other in cards:
+                    dependents.setdefault(other, set()).add(num)
+        for blocker, deps in sorted(dependents.items()):
+            if len(deps) < self.cascade_min_fanin:
+                continue
+            key = str(blocker)
+            if self._cascade_recently_posted("fan_in", key):
+                continue
+            nums = sorted(deps)
+            text = ("#%d is what %d other card%s (%s) say is in their way -- "
+                    "clearing #%d clears all of them at once"
+                    % (blocker, len(nums), "" if len(nums) == 1 else "s",
+                       ", ".join("#%d" % n for n in nums), blocker))
+            if self._post_cascade("fan_in", key, text,
+                                  blocker=blocker, dependents=nums):
+                fired += 1
+
+        # -- stale despite looking busy --------------------------------------
+        cutoff = now() - self.cascade_stale_seconds
+        for num, c in sorted(cards.items()):
+            since = c.get("state_since")
+            if not since or since >= cutoff:
+                continue
+            key = str(num)
+            if self._cascade_recently_posted("stale_owed", key):
+                continue
+            text = ("#%d has been %s for %s straight -- long past where the "
+                    "ordinary reminders stop. Whatever notes say it is still "
+                    "being rechecked, it has not actually moved; worth a "
+                    "real look, not another recheck note."
+                    % (num, c["state"], human_span(now() - since)))
+            if self._post_cascade("stale_owed", key, text,
+                                  card_num=num, state=c["state"],
+                                  state_since=since):
+                fired += 1
+
         if fired:
             self.notify()
         return fired

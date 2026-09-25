@@ -12695,6 +12695,124 @@ class TestSessionDeadDetection(AutohealBase):
         self.assertEqual(auto["attempts"], 0)
 
 
+class TestCascadeSweep(Base):
+    """Sam: 'this is where we need a monitor to keep things from stalling
+    out. intelligently.' The incident this covers: 32 cards sitting blocked
+    on a live yunagi board, nine of them all blaming the same still-open
+    card, several others collecting 'still blocked, will recheck' notes for
+    days without ever actually clearing. `sweep_stuck` only ever looks at one
+    card, and it goes quiet after three reminders by design -- neither
+    property lets it see, or keep saying, either shape. These tests build
+    both shapes directly and check the cascade sweep names them."""
+
+    def setUp(self):
+        super().setUp()
+        self.app.cascade_min_fanin = 3
+        self.app.cascade_stale_seconds = 100.0
+        self.app.cascade_repeat_seconds = 100.0
+
+    def block(self, text, reason):
+        num = self.new_card(text)["num"]
+        self.to_in_progress(num)
+        status, _ = self.post("/api/cards/%d/state" % num,
+                              {"state": "blocked", "reason": reason})
+        self.assertEqual(status, 200)
+        return num
+
+    def rewind_state(self, num, seconds):
+        """Move only this card's last state-transition into the past -- the
+        real test of `state_since`, which must ignore how many times a note
+        has 'rechecked' it since."""
+        with self.app.lock:
+            self.app.conn.execute(
+                "UPDATE events SET ts = ts - ? WHERE card_num=? AND kind='state' "
+                "AND seq = (SELECT MAX(seq) FROM events WHERE card_num=? AND kind='state')",
+                (seconds, num, num))
+
+    def cascades(self, rule=None):
+        rows = self.app.q("SELECT * FROM events WHERE card_num IS NULL AND kind='cascade' "
+                          "ORDER BY seq")
+        out = [sprintd.App.event_json(r) for r in rows]
+        return [e for e in out if rule is None or e["payload"].get("cascade_rule") == rule]
+
+    def test_three_or_more_cards_blaming_the_same_card_is_named_as_one_pattern(self):
+        blocker = self.block("root cause", "root cause under investigation")
+        deps = [self.block("dep %d" % i, "waiting_on_%d_release" % blocker)
+                for i in range(3)]
+        self.assertEqual(self.app.sweep_cascades(), 1)
+        fan = self.cascades("fan_in")
+        self.assertEqual(len(fan), 1)
+        self.assertEqual(fan[0]["payload"]["blocker"], blocker)
+        self.assertEqual(fan[0]["payload"]["dependents"], sorted(deps))
+        for d in deps:
+            self.assertIn("#%d" % d, fan[0]["payload"]["text"])
+        self.assertIn("#%d" % blocker, fan[0]["payload"]["text"])
+
+    def test_two_cards_blaming_the_same_card_is_not_yet_a_pattern(self):
+        blocker = self.block("root cause", "root cause under investigation")
+        for i in range(2):
+            self.block("dep %d" % i, "waiting_on_%d_release" % blocker)
+        self.assertEqual(self.app.sweep_cascades(), 0)
+        self.assertEqual(self.cascades("fan_in"), [])
+
+    def test_a_reference_to_a_card_that_is_not_actually_stuck_does_not_count(self):
+        done = self.new_card("already shipped")["num"]
+        self.to_in_progress(done)
+        status, body = self.post("/api/cards/%d/ready" % done, {"packet": dict(GOOD_PACKET)})
+        self.assertEqual(status, 200, body)
+        status, _ = self.post("/api/cards/%d/verdict" % done, {"verdict": "approve"})
+        self.assertEqual(status, 200)
+        status, body = self.post("/api/cards/%d/integrated" % done, {"ok": True})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.state_of(done), "completed")
+        for i in range(3):
+            self.block("dep %d" % i, "waiting_on_%d_release" % done)
+        self.assertEqual(self.app.sweep_cascades(), 0)
+
+    def test_the_same_cascade_does_not_repeat_inside_the_window(self):
+        blocker = self.block("root cause", "root cause under investigation")
+        for i in range(3):
+            self.block("dep %d" % i, "waiting_on_%d_release" % blocker)
+        self.assertEqual(self.app.sweep_cascades(), 1)
+        self.assertEqual(self.app.sweep_cascades(), 0)
+        self.assertEqual(len(self.cascades("fan_in")), 1)
+
+    def test_a_card_stuck_past_the_stale_cutoff_is_named_even_with_no_fanin(self):
+        num = self.block("lone straggler", "waiting on a third party")
+        self.rewind_state(num, self.app.cascade_stale_seconds + 30)
+        self.assertEqual(self.app.sweep_cascades(), 1)
+        stale = self.cascades("stale_owed")
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0]["payload"]["card_num"], num)
+        self.assertIn("#%d" % num, stale[0]["payload"]["text"])
+
+    def test_a_card_inside_the_cutoff_is_not_yet_stale(self):
+        self.block("fresh enough", "still checking")
+        self.assertEqual(self.app.sweep_cascades(), 0)
+
+    def test_rechecking_notes_do_not_hide_a_genuinely_stale_card(self):
+        """The exact incident: `stuck_baseline` (the per-card sweep's clock)
+        restarts on every note, so a card that gets 'still blocked, will
+        recheck' notes every day never trips the ordinary reminders again.
+        `state_since` must not be fooled the same way."""
+        num = self.block("kept getting rechecked", "waiting on a third party")
+        self.rewind_state(num, self.app.cascade_stale_seconds + 30)
+        status, _ = self.post("/api/cards/%d/events" % num,
+                              {"kind": "note", "payload": {"text": "still blocked, will recheck"}})
+        self.assertEqual(status, 201)
+        self.assertEqual(self.app.sweep_cascades(), 1)
+        self.assertEqual(self.cascades("stale_owed")[0]["payload"]["card_num"], num)
+
+    def test_cascade_kind_is_sprint_level_and_server_authored(self):
+        blocker = self.block("root cause", "root cause under investigation")
+        for i in range(3):
+            self.block("dep %d" % i, "waiting_on_%d_release" % blocker)
+        self.app.sweep_cascades()
+        ev = self.cascades("fan_in")[0]
+        self.assertIsNone(ev["card_num"])
+        self.assertEqual(ev["actor"], "server")
+
+
 class TestEventDispatcherHandoffToAutoheal(AutohealBase):
     """A live `sprint-dispatch` process makes the board defer to it -- one
     system trying to wake the session is enough. But that dispatcher can
