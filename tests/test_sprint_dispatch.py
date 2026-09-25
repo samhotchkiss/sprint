@@ -156,7 +156,8 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.state['inflight']['through'], 1001)
 
     def test_filters_lifecycle_and_unblocked_dependencies(self):
-        for kind in ('question', 'error', 'evidence', 'stuck', 'agent_silent', 'limit_cleared'):
+        for kind in ('question', 'error', 'evidence', 'stuck', 'agent_silent',
+                     'limit_cleared', 'cascade'):
             self.assertTrue(dispatch.actionable(event(1, 'worker', kind)))
         self.assertTrue(dispatch.actionable(event(1, 'server', 'note',
                         {'blocked_by_change': True, 'blocked_by': None})))

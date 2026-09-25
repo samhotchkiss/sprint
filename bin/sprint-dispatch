@@ -52,7 +52,7 @@ def actionable(event):
             and not payload.get("rule")):
         return False
     if kind in ("submitted", "chat", "answer", "question", "evidence", "verdict",
-                "error", "agent_silent", "stuck", "limit_cleared"):
+                "error", "agent_silent", "stuck", "limit_cleared", "cascade"):
         return True
     if kind == "state":
         return payload.get("to", payload.get("state")) in (
