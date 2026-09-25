@@ -7,6 +7,7 @@ temp data dir. Port 8377 (the real default) is never touched.
 
 import base64
 import datetime
+import fcntl
 import hashlib
 import http.client
 import importlib.util
@@ -12692,6 +12693,75 @@ class TestSessionDeadDetection(AutohealBase):
         self.assertEqual(auto["tmux_window"], "test-window")
         self.assertTrue(auto["revive_wanted"])
         self.assertEqual(auto["attempts"], 0)
+
+
+class TestEventDispatcherHandoffToAutoheal(AutohealBase):
+    """A live `sprint-dispatch` process makes the board defer to it -- one
+    system trying to wake the session is enough. But that dispatcher can
+    deliver exactly one wake and then only ever REPORT status; it has no
+    retry, no escalation, and no way to ask the hub for help. The incident
+    this covers: a session went fully dark under a live dispatcher, its own
+    wake went unacknowledged (`needs_attention`), and nothing here revived it
+    -- a human had to notice and type into the tmux window by hand. Deferring
+    forever just because a dispatcher process happens to be running was the
+    bug; these pin down where deferring has to stop."""
+
+    def _write_dispatch(self, status, heartbeat_age=5.0, target="test-window"):
+        payload = {
+            "version": 1, "target": target, "scanned": 1, "acknowledged": 1,
+            "pending": [], "inflight": None, "status": status, "deliveries": 1,
+            "instance": "x", "pid": os.getpid(),
+            "project_root": self.app.project_root,
+            "ack_timeout": 300, "heartbeat_at": time.time() - heartbeat_age,
+            "wake_times": [],
+        }
+        with open(os.path.join(self.app.data_dir, "dispatch.json"), "w") as fh:
+            json.dump(payload, fh)
+        # event_dispatch_state() only trusts this file while a real process
+        # holds the flock on dispatch.lock -- exactly what `sprint-dispatch
+        # run` does for as long as it is alive. Held for the test's duration
+        # the same way; released (and the file closed) on cleanup.
+        lock_fh = open(os.path.join(self.app.data_dir, "dispatch.lock"), "a+")
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(lock_fh.close)
+        return payload
+
+    def test_a_healthy_dispatcher_still_makes_autoheal_stand_down(self):
+        self.owed_card("integrating")
+        self.go_quiet()
+        self._write_dispatch("awaiting_ack")
+        state = self.app.session_dead_state()
+        self.assertFalse(state["dead"])
+        self.assertEqual(state["reason"], "event_dispatcher")
+
+    def test_needs_attention_hands_control_back_to_autoheal(self):
+        self.owed_card("integrating")
+        self.go_quiet()
+        self._write_dispatch("needs_attention")
+        state = self.app.session_dead_state()
+        self.assertTrue(state["dead"], state)
+        self.assertIsNone(state["reason"])
+
+    def test_budget_limited_also_hands_control_back(self):
+        self.owed_card("integrating")
+        self.go_quiet()
+        self._write_dispatch("budget_limited")
+        state = self.app.session_dead_state()
+        self.assertTrue(state["dead"], state)
+
+    def test_a_needs_attention_dispatcher_actually_gets_revived(self):
+        """The point of the fix, end to end: the hub's own revive claim has to
+        succeed once autoheal is no longer standing down for a dispatcher that
+        already gave up on its own single wake attempt."""
+        self.owed_card("integrating")
+        self.go_quiet()
+        self._write_dispatch("needs_attention")
+        self.assertTrue(self.app.revive_state()["wanted"])
+        status, body = self.post("/api/autoheal/revive", {"by": "hub"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["attempt"], 1)
+        self.assertEqual(len(self.events_of("revive_attempted")), 1)
 
 
 class TestReviveClaimAndCaps(AutohealBase):

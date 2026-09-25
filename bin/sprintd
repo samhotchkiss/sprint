@@ -15,6 +15,7 @@ Subcommands: start | stop | status | tail | wait | doctor | hub
 from __future__ import annotations
 
 import argparse
+import fcntl
 import base64
 import binascii
 import datetime
@@ -2926,6 +2927,12 @@ class App:
         version of this (a kill between the two) recovers on the next open.
         """
         argv = list(self.restart_argv or [])
+        # A self-restart must not restore a stale startup pane after a handoff.
+        for i, arg in enumerate(argv):
+            if arg == "--tmux-window" and i + 1 < len(argv):
+                argv[i + 1] = self.session_tmux_window()
+            elif arg.startswith("--tmux-window="):
+                argv[i] = "--tmux-window=" + self.session_tmux_window()
         if not argv:
             self.log("self-restart wanted but no argv was recorded")
             return False
@@ -5193,11 +5200,27 @@ class App:
             "busy": "session is on it — catching up",
             "offline": "session offline — items will queue",
         }[status]
+        dispatcher = self.event_dispatch_state(ts)
+        if dispatcher:
+            mode = dispatcher["status"]
+            if mode == "budget_limited":
+                status, note = "offline", "wake-up budget reached — events retained"
+            elif mode == "needs_attention":
+                status, note = "offline", "wake-up not acknowledged — inspect the session"
+            elif mode == "idle":
+                status, note = "online", "watching for actionable events — session resting"
+            elif mode != "account_limited":
+                status, note = "busy", "wake-up pending — waiting for the session"
+        coordinator = self.coordinator_state(ts)
+        if coordinator:
+            status, note = "online", None
         return {
+            "coordinator": coordinator,
             "status": status,
             # `online` is what the UI keys its banner off: busy is NOT offline.
             "online": status != "offline",
             "note": note,
+            "event_dispatcher": dispatcher,
             "cursor": cursor_seq,
             "head": head,
             "pending": pending,
@@ -5212,6 +5235,7 @@ class App:
             "waiter_online_seconds": self.waiter_online_seconds,
             "waiter_gone_seconds": self.waiter_gone_seconds,
         }
+
 
     # -- dead-session autoheal --------------------------------------------
     #
@@ -5277,6 +5301,62 @@ class App:
                        "AND cleared_at IS NULL AND resets_at > ? LIMIT 1",
                        (at,)) is not None
 
+    def coordinator_state(self, at=None):
+        """Only a fresh lease plus the board-wide OS lock proves service ownership."""
+        at = now() if at is None else at
+        try:
+            with open(os.path.join(self.data_dir, "coordinator-owner.json")) as fh:
+                state = json.load(fh)
+            if not isinstance(state, dict):
+                return None
+            age = at - float(state["heartbeat_at"])
+            if (state.get("version") != 1 or not 0 <= age <= 30
+                    or state.get("project_root") != self.project_root
+                    or state.get("status") != "active"):
+                return None
+            with open(os.path.join(self.data_dir, "coordinator-owner.lock"), "r+") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return {k: state.get(k) for k in ("status", "ingest_cursor", "heartbeat_at")}
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+        return None
+
+
+    def event_dispatch_state(self, at=None):
+        """A live deterministic dispatcher owns wake delivery, not consumption.
+
+        Require both a fresh lease and a held OS lock. A stale file/PID cannot
+        suppress fallback recovery. Never move the orchestrator cursor here.
+        """
+        at = now() if at is None else at
+        try:
+            with open(os.path.join(self.data_dir, "dispatch.json")) as fh:
+                state = json.load(fh)
+            if not isinstance(state, dict):
+                return None
+            age = at - float(state["heartbeat_at"])
+            if (state.get("version") != 1 or not 0 <= age <= 30
+                    or state.get("target") != self.session_tmux_window()
+                    or state.get("project_root") != self.project_root
+                    or state.get("status") not in (
+                        "starting", "idle", "collecting", "dispatching", "awaiting_ack",
+                        "needs_attention", "account_limited", "budget_limited")):
+                return None
+            with open(os.path.join(self.data_dir, "dispatch.lock"), "r+") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return {k: state.get(k) for k in (
+                        "status", "target", "acknowledged", "scanned", "deliveries")}
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+        return None
+
+
     def session_dead_state(self, at: float = None) -> dict:
         """Is this board's session dead, and everything the answer stands on.
 
@@ -5301,8 +5381,27 @@ class App:
         limited = self.account_limit_active(at)
         cursor = self.cursor_seq()
         head = self.max_seq()
+        dispatcher = self.event_dispatch_state(at)
         if limited:
             reason = "account_limited"
+        elif self.coordinator_state(at):
+            reason = "coordinator"
+        elif dispatcher and dispatcher.get("status") not in (
+                "needs_attention", "budget_limited"):
+            # A dispatcher working normally (idle/collecting/dispatching/
+            # awaiting_ack within its OWN ack_timeout) has this covered --
+            # deferring here avoids two systems both trying to wake the same
+            # session. But `needs_attention`/`budget_limited` is the
+            # dispatcher itself saying its one wake attempt did not land and
+            # it has no further escalation of its own (it only ever reports
+            # status; it never retries, never gives up out loud, never asks
+            # the hub for help). Falling through here, instead of trusting
+            # "a dispatcher exists" forever, is what lets the board's own
+            # quiet/owed check -- and the hub's actual multi-attempt revival
+            # -- take over. Without this, a session that goes fully dark
+            # under a live dispatcher is never autohealed at all; a human
+            # has to notice and type into the terminal by hand.
+            reason = "event_dispatcher"
         elif quiet < self.session_dead_seconds:
             reason = "alive"
         elif not owed_count:
@@ -5324,6 +5423,7 @@ class App:
             "account_limited": limited,
             "tmux_window": self.session_tmux_window(),
         }
+
 
     def _sprint_events(self, kind: str, since_ts: float = None) -> list:
         """Sprint-level (card_num IS NULL) events of one kind, oldest first."""
@@ -5690,6 +5790,11 @@ class App:
         rev = self.revive_state(at, dead=ds)
         declared = self.session_dead_declared(ds["last_seen_at"])
         return {
+            "coordinator_supported": True,
+            "assignment_policy_supported": True,
+            "coordinator": self.coordinator_state(at),
+            "event_dispatch_supported": True,
+            "event_dispatcher": self.event_dispatch_state(at),
             # Is there a channel at all? No tmux window means this board is not
             # autohealable, and saying so is better than a silent no-op.
             "registered": bool(ds["tmux_window"]),
@@ -5715,6 +5820,7 @@ class App:
                              if rev["gave_up"] and ds["dead"] else None),
             "hold": rev["hold"],
         }
+
 
     def session_dead_declared(self, since_ts: float):
         """The `session_dead` event for the CURRENT death episode, or None.
@@ -6508,6 +6614,44 @@ class App:
 
     # -- misc writes ------------------------------------------------------
 
+    def check_message_quality(self, actor, text, detail=None, num=None):
+        if actor not in ("session", "worker"):
+            return
+        if not os.path.exists(os.path.join(self.data_dir, "message-quality.json")):
+            return
+        repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        try:
+            from sprint_coordinator.publication import check_publication, PublicationRejected
+        except ImportError:
+            self.log("message quality unavailable or uncertain; preserving agent delivery")
+            return
+        with self.lock:
+            if num is None:
+                rows = self.q("SELECT actor,kind,payload FROM events WHERE card_num IS NULL "
+                                 "AND kind='chat' ORDER BY seq DESC LIMIT 8")
+                card = None
+            else:
+                rows = self.q("SELECT actor,kind,payload FROM events WHERE card_num=? "
+                                 "AND kind IN ('chat','answer','question') ORDER BY seq DESC LIMIT 8", (num,))
+                r = self.card_row(num)
+                card = {k:r[k] for k in ('title','body','state')}
+            context = {"card":card, "messages":[dict(r) for r in reversed(rows)]}
+        try:
+            check_publication(self.data_dir, actor=actor,
+                              surface="sidebar" if num is None else "card",
+                              text=text, detail=detail, context=context)
+        except PublicationRejected as exc:
+            if exc.decision.get("action") == "unavailable":
+                self.log("message quality unavailable or uncertain; preserving agent delivery")
+                return
+            raise ApiError(422, "message_needs_revision",
+                           "Revise this draft using quality.failing, then resend. Nothing was published.",
+                           quality=exc.decision) from None
+        except Exception:
+            self.log("message quality failed; preserving agent delivery")
+
     def card_event(self, num: int, kind: str, payload, actor: str = "worker",
                    long_running=None) -> dict:
         if kind not in ("progress", "chat", "note", "error"):
@@ -6516,6 +6660,8 @@ class App:
         self.card_row(num)
         if not isinstance(payload, dict):
             payload = {"text": payload if isinstance(payload, str) else jdump(payload)}
+        if kind in ("chat", "note"):
+            self.check_message_quality(actor, payload.get("text"), payload.get("detail"), num)
         payload = clean_phase(payload)
         if long_running is None:
             long_running = payload.get("long_running")
@@ -6538,7 +6684,7 @@ class App:
                 "card": self.card_json(self.card_row(num), brief=True)}
 
     def card_chat(self, num: int, text: str, images=None, actor: str = "user",
-                  detail=None, reports=None) -> dict:
+                  detail=None, reports=None, detail_format=None) -> dict:
         """A line to one card's thread -- text, images, or both.
 
         Same deal as dropping work on the board: a screenshot with no words is a
@@ -6566,13 +6712,16 @@ class App:
             payload["images_only"] = True
         if detail is not None:
             payload["detail"] = detail
+            if detail_format == "markdown":
+                payload["detail_format"] = "markdown"
         return self.card_event(num, "chat", payload, actor=actor)
 
     def sidebar_post(self, text: str, actor: str, detail=None, images=None,
-                     reports=None) -> dict:
+                     reports=None, detail_format=None) -> dict:
         text = (text or "").strip()
         if actor not in ("user", "session"):
             raise ApiError(400, "bad_actor", "sidebar actor must be user or session")
+        self.check_message_quality(actor, text, detail)
         attachments = self.store_images(images)
         docs = self.store_reports(reports)
         attachments = attachments + docs
@@ -6589,6 +6738,8 @@ class App:
             payload["images_only"] = True
         if detail is not None:
             payload["detail"] = detail
+            if detail_format == "markdown":
+                payload["detail_format"] = "markdown"
         with self.lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
@@ -6803,6 +6954,46 @@ class App:
             bits.append(d["model"])
         return " — " + " · ".join(bits)
 
+    def check_assignment_policy(self, num, executor, model, model_reason):
+        """Check a new assignment outside the board lock; bind it to read state."""
+        if not os.path.exists(os.path.join(self.data_dir, "assignment-policy.json")):
+            return None
+        from pathlib import Path
+        root = str(Path(__file__).resolve().parents[1])
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from sprint_coordinator.assignment_policy import gate_assignment
+        with self.lock:
+            card = dict(self.card_row(num))
+            worker = self.settings()["worker"]
+            before = dict(card)
+            effective = resolve_dispatch(
+                {"worker": worker},
+                executor if executor is not None else card.get("executor"),
+                model if model is not None else card.get("model"))
+            default = resolve_dispatch({"worker": worker})
+            gate_worker = json.loads(json.dumps(worker))
+            gate_worker["executors"].setdefault(default["executor"], {})["model"] = default["model"]
+            payload = {
+                "executor": effective["executor"],
+                "model": effective["model"],
+                "model_reason": model_reason,
+            }
+        try:
+            decision = gate_assignment(
+                self.data_dir, settings={"worker": gate_worker}, card_num=num,
+                payload=payload, assignment_id=secrets.token_hex(16),
+                task=card.get("body") or card.get("title") or "")
+        except Exception:
+            raise ApiError(503, "assignment_policy_unavailable",
+                           "Builder override could not be checked. Try the configured builder.") from None
+        if not decision.allowed:
+            raise ApiError(422, "assignment_override_rejected",
+                           "Builder override was not approved: " + decision.reason,
+                           field="model_reason")
+        return {"worker": worker, "card": before,
+                "decision_id": decision.decision_id, "reason": decision.reason}
+
     def assign(self, num: int, agent_name, worktree, branch,
                title=None, executor=None, model=None,
                actor: str = "session", work_kind=None,
@@ -6846,7 +7037,14 @@ class App:
                                sorted(list(known.keys()) + [BUILTIN_EXECUTOR]))))
         if model is not None:
             model = clean_model_name(model, "model")
+        policy = self.check_assignment_policy(num, executor, model, model_reason)
         with self.lock:
+            if policy:
+                current = dict(self.card_row(num))
+                if (self.settings()["worker"] != policy["worker"] or
+                        any(current.get(k) != v for k, v in policy["card"].items())):
+                    raise ApiError(409, "assignment_context_changed",
+                                   "The assignment changed while it was checked. Read it again before assigning.")
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 self.conn.execute(
@@ -6870,6 +7068,9 @@ class App:
                     "executor": executor}
                 if model:
                     note["model"] = model
+                if policy:
+                    note["assignment_policy"] = {"decision_id": policy["decision_id"],
+                                                  "reason": policy["reason"]}
                 # ...and the reason says WHICH fable ran out, so the line reads
                 # as a sentence: "assigned to sprint-card-42 on opus — fable
                 # limited until 11:50pm".
@@ -8228,6 +8429,7 @@ def make_handler(app: App):
                 return 201, app.sidebar_post(body.get("text"),
                                              side if side == "session" else "user",
                                              detail=body.get("detail"),
+                                             detail_format=body.get("detail_format"),
                                              images=posted_images(body),
                                              reports=body.get("reports"))
 
@@ -8301,6 +8503,7 @@ def make_handler(app: App):
                 return 201, app.card_chat(num, body.get("text"),
                                           images=posted_images(body),
                                           detail=body.get("detail"),
+                                          detail_format=body.get("detail_format"),
                                           reports=body.get("reports"),
                                           actor=self.actor_or(body, "user"))
             if verb == "answer":
